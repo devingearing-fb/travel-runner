@@ -232,17 +232,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .degraded: .systemRed
         }
 
-        let config = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
-        if let base = NSImage(systemSymbolName: "suitcase.rolling.fill", accessibilityDescription: "Travel Runner"),
-           let configured = base.withSymbolConfiguration(config) {
-            let size = NSSize(width: 18, height: 18)
-            let tinted = NSImage(size: size, flipped: false) { rect in
-                color.set()
-                configured.draw(in: rect)
-                return true
-            }
-            tinted.isTemplate = false
-            button.image = tinted
+        let symbolConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
+            .applying(.init(paletteColors: [color]))
+        if let symbol = NSImage(systemSymbolName: "suitcase.rolling.fill", accessibilityDescription: "Travel Runner")?
+            .withSymbolConfiguration(symbolConfig) {
+            symbol.isTemplate = false
+            button.image = symbol
         }
 
         button.alphaValue = (currentHealth == .starting && pulseState) ? 0.4 : 1.0
@@ -275,24 +270,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Global Hotkey
 
     private func setupGlobalHotkey() {
+        let isHotkey: (NSEvent) -> Bool = { event in
+            let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            return flags.contains([.control, .shift])
+                && event.charactersIgnoringModifiers?.lowercased() == "t"
+        }
+
         globalHotkeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.modifierFlags.contains([.control, .shift]),
-               event.charactersIgnoringModifiers == "t" {
-                Task { @MainActor in
-                    self?.togglePanel()
-                }
+            guard isHotkey(event) else { return }
+            Task { @MainActor in
+                self?.togglePanel()
             }
         }
 
         localHotkeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            if event.modifierFlags.contains([.control, .shift]),
-               event.charactersIgnoringModifiers == "t" {
-                Task { @MainActor in
-                    self?.togglePanel()
-                }
-                return nil
+            guard isHotkey(event) else { return event }
+            Task { @MainActor in
+                self?.togglePanel()
             }
-            return event
+            return nil
         }
     }
 

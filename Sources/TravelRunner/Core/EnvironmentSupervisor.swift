@@ -220,17 +220,28 @@ final class EnvironmentSupervisor {
                     self.completedPhases.insert(phase.rawValue)
                 }
 
-                // After GROUND phase completes (Supabase is up), check migrations.
-                // If new migrations detected, auto-run db:reset before continuing.
+                // After GROUND phase completes (Supabase is up), check migrations
+                // AND verify the database actually has application tables.
+                // Triggers db:reset when: first run, migrations changed, or DB is empty
+                // (e.g. fresh Docker volume with no tables applied).
                 if phase == .ground && !didMigrationCheck {
                     didMigrationCheck = true
                     let portalCwd = config.services.first(where: { $0.id == "supabase" })?.resolvedCwd
                     if let cwd = portalCwd {
-                        let needsReset = !self.migrationTracker.hasEverRun()
+                        let migrationsChanged = !self.migrationTracker.hasEverRun()
                             || self.migrationTracker.migrationsChanged(portalCwd: cwd)
+                        var dbEmpty = false
+                        if !migrationsChanged {
+                            let hasTables = await self.databaseHasAppTables(portalCwd: cwd)
+                            dbEmpty = !hasTables
+                        }
+                        let needsReset = migrationsChanged || dbEmpty
                         if needsReset {
+                            let reason = dbEmpty
+                                ? "Empty database detected — running db:reset..."
+                                : "New migrations detected — running db:reset..."
                             await MainActor.run {
-                                self.lastError = "New migrations detected — running db:reset..."
+                                self.lastError = reason
                                 self.dbResetRunning = true
                             }
                             let ok = await self.runDbReset(cwd: cwd)
@@ -985,6 +996,32 @@ final class EnvironmentSupervisor {
 
     private func isStripeAvailable() async -> Bool {
         await runShellCommand("which stripe >/dev/null 2>&1 && stripe config --list >/dev/null 2>&1")
+    }
+
+    private func databaseHasAppTables(portalCwd: String) async -> Bool {
+        let projectId = URL(fileURLWithPath: portalCwd).lastPathComponent
+        let container = "supabase_db_\(projectId)"
+        let query = "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'"
+        let command = "docker exec \(container) psql -U postgres -d postgres -tAc \"\(query)\" 2>/dev/null"
+        return await withCheckedContinuation { continuation in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+            process.arguments = ["-l", "-c", command]
+            let pipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = FileHandle.nullDevice
+            process.terminationHandler = { proc in
+                guard proc.terminationStatus == 0 else {
+                    continuation.resume(returning: false)
+                    return
+                }
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+                let count = Int(output) ?? 0
+                continuation.resume(returning: count > 0)
+            }
+            do { try process.run() } catch { continuation.resume(returning: false) }
+        }
     }
 
     private func runDbReset(cwd: String) async -> Bool {
