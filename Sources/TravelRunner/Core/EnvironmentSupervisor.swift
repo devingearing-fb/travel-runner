@@ -709,6 +709,21 @@ final class EnvironmentSupervisor {
             }
         }
 
+        // Skip Stripe if the CLI isn't installed or authenticated
+        if serviceID == "stripe" {
+            let available = await isStripeAvailable()
+            if !available {
+                await MainActor.run {
+                    state.phase = .skipped
+                }
+                await logStore.append(
+                    serviceID: serviceID,
+                    entry: LogEntry(stream: .stdout, text: "[travel-runner] Stripe CLI not available — skipping")
+                )
+                return
+            }
+        }
+
         // For non-reuse services, kill any stale occupant on the port
         if !definition.shouldReuseIfRunning, let port = definition.probe?.port, definition.resolvedType == .daemon {
             if isPortBound(port) {
@@ -893,7 +908,7 @@ final class EnvironmentSupervisor {
             health = .stopped
         } else if daemonStates.contains(.failed) {
             health = .degraded
-        } else if daemonStates.allSatisfy({ $0 == .running || $0 == .completed }) {
+        } else if daemonStates.allSatisfy({ $0 == .running || $0 == .completed || $0 == .skipped }) {
             health = .healthy
         } else {
             health = .starting

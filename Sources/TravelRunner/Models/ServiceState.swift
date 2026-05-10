@@ -6,6 +6,7 @@ enum ServicePhase: String, Sendable {
     case starting = "STARTING"
     case running = "RUNNING"
     case completed = "DONE"
+    case skipped = "SKIPPED"
     case failed = "FAILED"
     case stopping = "STOPPING"
     case stopped = "STOPPED"
@@ -15,6 +16,7 @@ enum ServicePhase: String, Sendable {
         case .pending: .gray
         case .starting: .orange
         case .running, .completed: .green
+        case .skipped: .secondary
         case .failed: .red
         case .stopping: .yellow
         case .stopped: .gray

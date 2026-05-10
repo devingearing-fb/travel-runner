@@ -159,6 +159,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let state = supervisor.serviceStates[serviceID] else { continue }
             let indicator: String = switch state.phase {
             case .running, .completed: "\u{2705}"
+            case .skipped: "\u{23ED}\u{FE0F}"
             case .failed: "\u{274C}"
             case .starting: "\u{1F7E0}"
             case .stopping: "\u{1F7E1}"

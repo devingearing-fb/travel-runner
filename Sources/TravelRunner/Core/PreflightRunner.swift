@@ -83,10 +83,12 @@ struct PreflightRunner: Sendable {
             return .failed(message: "\(runtime.displayName) not responding", fix: "Open \(runtime.appName) manually")
 
         case "stripe-auth":
-            let ok = await shellExitCode("stripe config --list") == 0
+            let hasStripe = await shellExitCode("which stripe >/dev/null 2>&1") == 0
+            if !hasStripe { return .warning(message: "Not installed — Stripe will be skipped") }
+            let ok = await shellExitCode("stripe config --list >/dev/null 2>&1") == 0
             return ok
                 ? .passed(detail: "Authenticated")
-                : .failed(message: "Not authenticated", fix: "Run: stripe login")
+                : .warning(message: "Not authenticated — Stripe will be skipped")
 
         case "yalc":
             let ok = await shellExitCode("which yalc") == 0
