@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "registry_port_range": [19999, 20009],
+  "services": [
+    {
+      "id": "supabase",
+      "name": "Supabase",
+      "cmd": ["npx", "supabase", "start"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
+      "probe": { "type": "tcp", "port": 54322, "timeout": 300 },
+      "restart": "on-failure",
+      "phase": "ground",
+      "reuse_if_running": true,
+      "depends_on": []
+    },
+    {
+      "id": "yalc-link",
+      "name": "yalc Link",
+      "cmd": ["yalc", "link", "@fastbreak-amateur/fb-travel-data"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
+      "type": "oneshot",
+      "phase": "gateway",
+      "depends_on": ["supabase"]
+    },
+    {
+      "id": "universal-login",
+      "name": "Universal Login",
+      "cmd": ["npm", "run", "dev"],
+      "cwd": "~/Documents/Codebases/fb-amateur-universal-login",
+      "probe": { "type": "tcp", "port": 3000 },
+      "restart": "on-failure",
+      "phase": "gateway",
+      "depends_on": ["yalc-link"]
+    },
+    {
+      "id": "stripe",
+      "name": "Stripe CLI",
+      "cmd": ["stripe", "listen", "--forward-to", "http://localhost:3002/api/webhooks/stripe"],
+      "probe": {
+        "type": "stdout_regex",
+        "pattern": "whsec_[A-Za-z0-9]+",
+        "artifact": "STRIPE_WEBHOOK_SECRET"
+      },
+      "restart": "on-failure",
+      "phase": "gateway",
+      "depends_on": ["universal-login"]
+    },
+    {
+      "id": "travel-portal",
+      "name": "Travel Portal",
+      "cmd": ["npm", "run", "dev"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
+      "env": { "PINO_PRETTY": "false" },
+      "probe": { "type": "tcp", "port": 3002 },
+      "restart": "on-failure",
+      "phase": "portal",
+      "depends_on": ["universal-login"]
+    }
+  ]
+}
