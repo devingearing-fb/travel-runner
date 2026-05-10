@@ -24,10 +24,10 @@ APP_BUNDLE="$APP_NAME.app"
 BUNDLE_ID="ai.fastbreak.travel-runner"
 
 # ── Update these after initial setup ───────────────────────────────────────
-DEVELOPER_ID="${DEVELOPER_ID:-Developer ID Application: YOUR_TEAM_NAME (TEAM_ID)}"
+DEVELOPER_ID="${DEVELOPER_ID:-Developer ID Application: Devin Gearing (JR7Z6LSD98)}"
 NOTARIZE_PROFILE="${NOTARIZE_PROFILE:-travel-runner-notarize}"
-GITHUB_REPO="${GITHUB_REPO:-fastbreak-ai/travel-runner}"
-EDDSA_PUBLIC_KEY="${EDDSA_PUBLIC_KEY:-PASTE_EDDSA_PUBLIC_KEY_HERE}"
+GITHUB_REPO="${GITHUB_REPO:-devingearing-fb/travel-runner}"
+EDDSA_PUBLIC_KEY="${EDDSA_PUBLIC_KEY:-Z7c9sySgE0b4RH8NOK405c3mv/7w4NKMrs3DJDCxHsU=}"
 # ────────────────────────────────────────────────────────────────────────────
 
 VERSION="${1:?Usage: ./release.sh <version> [--draft]}"
