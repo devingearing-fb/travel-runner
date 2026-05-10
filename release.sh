@@ -68,10 +68,10 @@ cp ".build/release/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/"
 RESOURCE_BUNDLE=".build/release/${APP_NAME}_${APP_NAME}.bundle"
 [ -d "$RESOURCE_BUNDLE" ] && cp -R "$RESOURCE_BUNDLE" "$APP_BUNDLE/Contents/Resources/"
 
-# Copy Sparkle framework
+# Copy Sparkle framework (use ditto to avoid ._AppleDouble files)
 SPARKLE_FW=$(find .build/artifacts -name "Sparkle.framework" -type d 2>/dev/null | head -1)
 if [ -n "$SPARKLE_FW" ] && [ -d "$SPARKLE_FW" ]; then
-    cp -R "$SPARKLE_FW" "$APP_BUNDLE/Contents/Frameworks/"
+    ditto "$SPARKLE_FW" "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
     install_name_tool -add_rpath @executable_path/../Frameworks \
         "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
 fi
