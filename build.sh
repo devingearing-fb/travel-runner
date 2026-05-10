@@ -130,6 +130,11 @@ mkdir -p "$APP_BUNDLE/Contents/Resources"
 # Copy binary
 cp ".build/release/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/"
 
+# Copy app icon
+if [ -f "AppIcon.icns" ]; then
+    cp AppIcon.icns "$APP_BUNDLE/Contents/Resources/"
+fi
+
 # Copy SPM resource bundle (contains default-services.json)
 RESOURCE_BUNDLE=".build/release/${APP_NAME}_${APP_NAME}.bundle"
 if [ -d "$RESOURCE_BUNDLE" ]; then
@@ -171,6 +176,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
 </dict>
 </plist>
 PLIST

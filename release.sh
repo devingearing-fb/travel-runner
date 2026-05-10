@@ -63,6 +63,8 @@ mkdir -p "$APP_BUNDLE/Contents/Frameworks"
 
 cp ".build/release/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/"
 
+[ -f "AppIcon.icns" ] && cp AppIcon.icns "$APP_BUNDLE/Contents/Resources/"
+
 RESOURCE_BUNDLE=".build/release/${APP_NAME}_${APP_NAME}.bundle"
 [ -d "$RESOURCE_BUNDLE" ] && cp -R "$RESOURCE_BUNDLE" "$APP_BUNDLE/Contents/Resources/"
 
@@ -100,6 +102,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <string>14.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>SUFeedURL</key>
     <string>https://github.com/$GITHUB_REPO/releases/latest/download/appcast.xml</string>
     <key>SUPublicEDKey</key>
