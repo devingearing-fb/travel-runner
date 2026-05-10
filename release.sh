@@ -121,17 +121,22 @@ echo "  ✓ App packaged"
 # ── 3. Codesign ─────────────────────────────────────────────────────────────
 echo "  [3/7] Signing with Developer ID..."
 
-# Sign Sparkle components inside-out
-if [ -d "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework" ]; then
-    for helper in Autoupdate "Installer.app" "Updater.app"; do
-        TARGET="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework/Versions/B/$helper"
-        [ -e "$TARGET" ] && codesign --force --options runtime --sign "$DEVELOPER_ID" "$TARGET"
+# Sign all Sparkle components inside-out (binaries, XPC services, apps, framework)
+SPARKLE="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+if [ -d "$SPARKLE" ]; then
+    find "$SPARKLE" -type f -perm +111 -o -name "*.dylib" | while read binary; do
+        codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$binary"
     done
-    codesign --force --options runtime --sign "$DEVELOPER_ID" \
-        "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+    for xpc in "$SPARKLE"/Versions/B/XPCServices/*.xpc; do
+        [ -d "$xpc" ] && codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$xpc"
+    done
+    for app in "$SPARKLE"/Versions/B/*.app; do
+        [ -d "$app" ] && codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$app"
+    done
+    codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" "$SPARKLE"
 fi
 
-codesign --force --options runtime --sign "$DEVELOPER_ID" \
+codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" \
     --entitlements TravelRunner.entitlements \
     "$APP_BUNDLE"
 
