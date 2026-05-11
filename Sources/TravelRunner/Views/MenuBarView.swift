@@ -173,6 +173,10 @@ struct MenuBarView: View {
             .foregroundStyle(.secondary)
             .help("Settings")
 
+            Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(.tertiary)
+
             Button(action: { NSApplication.shared.terminate(nil) }) {
                 Image(systemName: "power")
             }
