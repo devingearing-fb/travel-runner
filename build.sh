@@ -21,7 +21,7 @@ APP_NAME="TravelRunner"
 APP_BUNDLE="$APP_NAME.app"
 BUNDLE_ID="ai.fastbreak.travel-runner"
 VERSION="${VERSION:-0.1.0}"
-BUILD_NUMBER="${BUILD_NUMBER:-$(date +%s)}"
+BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M%S)}"
 
 INSTALL=false
 RUN=false
@@ -178,6 +178,14 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <true/>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
+    <key>SUFeedURL</key>
+    <string>https://github.com/devingearing-fb/travel-runner/releases/latest/download/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>Z7c9sySgE0b4RH8NOK405c3mv/7w4NKMrs3DJDCxHsU=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUAllowsAutomaticUpdates</key>
+    <true/>
 </dict>
 </plist>
 PLIST
