@@ -457,7 +457,7 @@ final class EnvironmentSupervisor {
                 serviceStates[serviceID]?.phase = .starting
 
                 let cmd = mode
-                    ? "npm run dev -- --hostname \(ip)"
+                    ? "npm run dev -- --hostname 0.0.0.0"
                     : "npm run dev"
 
                 // When in LAN mode, override env vars so URLs point to the
@@ -662,7 +662,7 @@ final class EnvironmentSupervisor {
         let lanServices: Set<String> = ["travel-portal", "universal-login"]
         guard lanServices.contains(serviceID) else { return definition }
 
-        let cmd = "npm run dev -- --hostname \(ip)"
+        let cmd = "npm run dev -- --hostname 0.0.0.0"
         var envOverrides = definition.env ?? [:]
 
         if serviceID == "universal-login" {
