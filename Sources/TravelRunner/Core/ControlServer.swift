@@ -14,6 +14,7 @@ actor ControlServer {
         let stopAll: @Sendable () async -> Void
         let toggleLan: @Sendable () async -> Void
         let restartCascade: @Sendable (String) async -> Void
+        let dbReset: @Sendable () async -> Void
     }
 
     func start(actions: Actions, logStore: LogStore) async throws {
@@ -68,6 +69,11 @@ actor ControlServer {
 
         await server.appendRoute("POST /api/toggle-lan") { _ in
             await actions.toggleLan()
+            return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
+        }
+
+        await server.appendRoute("POST /api/db-reset") { _ in
+            await actions.dbReset()
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
 

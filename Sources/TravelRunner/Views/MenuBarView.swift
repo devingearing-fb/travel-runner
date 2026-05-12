@@ -24,6 +24,8 @@ struct MenuBarView: View {
     @State private var logCounts: [String: LogCounts] = [:]
     @State private var preflightExpanded = true
     @State private var diagnosticCopied = false
+    @State private var dbResetHasLogs = false
+    @State private var dbResetEntries: [LogEntry] = []
 
     var isFirstRun: Bool {
         ConfigLoader.isFirstRun && supervisor.sortedServiceIDs.isEmpty
@@ -96,6 +98,15 @@ struct MenuBarView: View {
                         logCounts[sid] = await supervisor.logStore.counts(for: sid)
                     }
                 }
+                // Poll db-reset logs
+                let dbVersion = await supervisor.logStore.version(for: "db-reset")
+                if dbVersion > 0 {
+                    dbResetHasLogs = true
+                    dbResetEntries = await supervisor.logStore.entries(for: "db-reset")
+                } else if !supervisor.dbResetRunning {
+                    dbResetHasLogs = false
+                }
+
                 try? await Task.sleep(for: .milliseconds(1000))
             }
         }
@@ -290,6 +301,10 @@ struct MenuBarView: View {
                     .padding(.horizontal, 4)
                 }
 
+                if supervisor.dbResetRunning || dbResetHasLogs {
+                    dbResetConsole
+                }
+
                 let groups = supervisor.servicesByPhase()
                 ForEach(groups, id: \.phase) { group in
                     PhaseSection(
@@ -441,6 +456,60 @@ struct MenuBarView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+    }
+
+    // MARK: - DB Reset Console
+
+    private var dbResetConsole: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                if supervisor.dbResetRunning {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.caption2)
+                }
+                Text("Database Reset")
+                    .font(.system(.caption, design: .monospaced))
+                    .fontWeight(.bold)
+                Spacer()
+                if !supervisor.dbResetRunning && dbResetHasLogs {
+                    Button {
+                        Task { await supervisor.logStore.clear(serviceID: "db-reset") }
+                        dbResetEntries = []
+                        dbResetHasLogs = false
+                    } label: {
+                        Image(systemName: "xmark.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Dismiss")
+                }
+            }
+
+            TerminalTextView(
+                entries: dbResetEntries,
+                autoScroll: true,
+                format: { entry in
+                    let text = entry.text
+                    let color: NSColor = if text.contains("error") || text.contains("ERROR") {
+                        .systemRed
+                    } else if text.contains("✓") || text.contains("done") || text.contains("complete") {
+                        .systemGreen
+                    } else {
+                        .white
+                    }
+                    return (text, color)
+                }
+            )
+            .frame(height: 140)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+        }
+        .padding(10)
+        .background(Color.blue.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     // MARK: - Diagnostic Bundle

@@ -355,6 +355,9 @@ final class EnvironmentSupervisor {
                     },
                     restartCascade: { [weak self] serviceId in
                         await MainActor.run { self?.restartCascade(serviceId) }
+                    },
+                    dbReset: { [weak self] in
+                        await MainActor.run { self?.resetDatabase() }
                     }
                 ),
                 logStore: logStore
@@ -598,6 +601,23 @@ final class EnvironmentSupervisor {
                     lastError = "Cascade restart failed at \(id): \(error)"
                     recalculateHealth()
                     return
+                }
+
+                // After Supabase comes back, check if DB is empty and auto-reset
+                if id == "supabase", let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd {
+                    let hasTables = await databaseHasAppTables(portalCwd: cwd)
+                    if !hasTables {
+                        dbResetRunning = true
+                        lastError = "Empty database detected — running db:reset..."
+                        let ok = await runDbReset(cwd: cwd)
+                        dbResetRunning = false
+                        if ok {
+                            lastError = nil
+                            migrationTracker.recordCurrentHash(portalCwd: cwd)
+                        } else {
+                            lastError = "db:reset failed — check logs"
+                        }
+                    }
                 }
             }
             recalculateHealth()
