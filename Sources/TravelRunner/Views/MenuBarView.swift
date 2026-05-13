@@ -31,6 +31,16 @@ struct MenuBarView: View {
         ConfigLoader.isFirstRun && supervisor.sortedServiceIDs.isEmpty
     }
 
+    private var allPreflightsPassed: Bool {
+        !supervisor.preflightChecks.isEmpty && supervisor.preflightChecks.allSatisfy { $0.result.isPassed }
+    }
+
+    private var failedServices: [ServiceState] {
+        supervisor.sortedServiceIDs
+            .compactMap { supervisor.serviceStates[$0] }
+            .filter { $0.phase == .failed || $0.isCircuitBroken }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             if showSettings || isFirstRun {
@@ -52,10 +62,22 @@ struct MenuBarView: View {
             Divider()
 
             if let error = supervisor.lastError {
-                errorBanner(error)
-            }
-            if supervisor.migrationsBannerVisible {
-                migrationBanner
+                alertBanner(
+                    icon: "exclamationmark.triangle.fill",
+                    color: .red,
+                    text: error,
+                    subtitle: supervisor.rootCauseDescription,
+                    action: ("Retry", { supervisor.retryStartAll() })
+                )
+            } else if supervisor.migrationsBannerVisible {
+                alertBanner(
+                    icon: "arrow.triangle.2.circlepath",
+                    color: .orange,
+                    text: "Migrations changed since last db:reset",
+                    subtitle: nil,
+                    action: ("Reset DB", { supervisor.resetDatabase() }),
+                    onDismiss: { supervisor.dismissMigrationsBanner() }
+                )
             }
 
             tabBar
@@ -83,9 +105,6 @@ struct MenuBarView: View {
                 )
                 .frame(minHeight: 300, maxHeight: .infinity)
             }
-
-            Divider()
-            controlSection
         }
         .task {
             while !Task.isCancelled {
@@ -98,7 +117,6 @@ struct MenuBarView: View {
                         logCounts[sid] = await supervisor.logStore.counts(for: sid)
                     }
                 }
-                // Poll db-reset logs
                 let dbVersion = await supervisor.logStore.version(for: "db-reset")
                 if dbVersion > 0 {
                     dbResetHasLogs = true
@@ -136,6 +154,11 @@ struct MenuBarView: View {
                     .foregroundStyle(.secondary)
             }
 
+            ServiceDotMinimap(
+                serviceStates: supervisor.serviceStates,
+                sortedIDs: supervisor.sortedServiceIDs
+            )
+
             if let sid = selectedTab.serviceID, let branch = gitBranches[sid] {
                 HStack(spacing: 3) {
                     Image(systemName: "arrow.triangle.branch")
@@ -152,73 +175,105 @@ struct MenuBarView: View {
 
             Spacer()
 
-            if selectedTab == .booking {
-                Button {
-                    supervisor.clearCacheAndRestart("travel-portal")
-                } label: {
-                    Label("Clear Cache & Restart", systemImage: "arrow.clockwise")
-                        .font(.caption2)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
-                .tint(.orange)
-            }
+            primaryActionButton
 
-            if let ip = supervisor.localIP, supervisor.networkMode {
-                Text(ip)
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.green)
-            }
-
-            Button(action: { supervisor.toggleNetworkMode() }) {
-                Image(systemName: supervisor.networkMode ? "wifi" : "wifi.slash")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(supervisor.networkMode ? .green : .secondary)
-            .help(supervisor.networkMode ? "LAN mode ON — tap to disable" : "Enable LAN mode for mobile testing")
-
-            Button(action: { showSettings = true }) {
-                Image(systemName: "gearshape")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-            .help("Settings")
-
-            Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
-                .font(.system(.caption2, design: .monospaced))
-                .foregroundStyle(.tertiary)
-
-            if supervisor.debugTrackingEnabled {
-                if supervisor.debugOpenIssueCount > 0 {
-                    HStack(spacing: 3) {
-                        Image(systemName: "ant.fill")
-                            .font(.system(size: 9))
-                        Text("\(supervisor.debugOpenIssueCount)")
-                            .font(.system(.caption2, design: .rounded))
-                            .fontWeight(.bold)
-                    }
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.orange, in: Capsule())
-                    .help("\(supervisor.debugOpenIssueCount) open debug issue\(supervisor.debugOpenIssueCount == 1 ? "" : "s")")
-                } else {
-                    Image(systemName: "ant.fill")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.green.opacity(0.6))
-                        .help("Debug tracking active — 0 open issues")
-                }
-            }
-
-            Button(action: { NSApplication.shared.terminate(nil) }) {
-                Image(systemName: "power")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-            .help("Quit Travel Runner")
+            overflowMenu
         }
         .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var primaryActionButton: some View {
+        if supervisor.health == .stopped {
+            Button(action: { supervisor.startAll() }) {
+                Label("Start", systemImage: "play.fill")
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
+            .controlSize(.small)
+        } else if supervisor.health == .degraded && supervisor.currentPhase == .idle {
+            Button("Retry") { supervisor.retryStartAll() }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+                .controlSize(.small)
+        } else if supervisor.health == .starting {
+            HStack(spacing: 4) {
+                ProgressView().controlSize(.small)
+                Button(action: { supervisor.stopAll() }) {
+                    Image(systemName: "stop.fill")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        } else {
+            Button(action: { supervisor.stopAll() }) {
+                Label("Stop", systemImage: "stop.fill")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+        }
+    }
+
+    private var overflowMenu: some View {
+        Menu {
+            if supervisor.networkMode, let ip = supervisor.localIP {
+                Label(ip, systemImage: "wifi")
+            }
+            Button(action: { supervisor.toggleNetworkMode() }) {
+                Label(
+                    supervisor.networkMode ? "Disable LAN Mode" : "Enable LAN Mode",
+                    systemImage: supervisor.networkMode ? "wifi" : "wifi.slash"
+                )
+            }
+
+            Divider()
+
+            Button("Clear Cache & Restart Portal") {
+                supervisor.clearCacheAndRestart("travel-portal")
+            }
+            Button("Reset Database") {
+                supervisor.resetDatabase()
+            }
+
+            Divider()
+
+            Button(action: { Task { await copyDiagnosticBundle() } }) {
+                Label(
+                    diagnosticCopied ? "Copied!" : "Copy Diagnostics",
+                    systemImage: diagnosticCopied ? "checkmark" : "doc.text.magnifyingglass"
+                )
+            }
+
+            Button(action: { showSettings = true }) {
+                Label("Settings...", systemImage: "gearshape")
+            }
+
+            Divider()
+
+            if supervisor.debugTrackingEnabled {
+                let count = supervisor.debugOpenIssueCount
+                Label(
+                    count > 0 ? "\(count) open debug issue\(count == 1 ? "" : "s")" : "Debug tracking active",
+                    systemImage: "ant.fill"
+                )
+            }
+
+            let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+            Label("v\(version)", systemImage: "info.circle")
+
+            Divider()
+
+            Button("Quit Travel Runner") {
+                NSApplication.shared.terminate(nil)
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 24)
     }
 
     // MARK: - Tab Bar
@@ -278,43 +333,78 @@ struct MenuBarView: View {
         }
     }
 
-    // MARK: - Error Banner
+    // MARK: - Alert Banner
 
-    private func errorBanner(_ error: String) -> some View {
+    private func alertBanner(
+        icon: String,
+        color: Color,
+        text: String,
+        subtitle: String?,
+        action: (label: String, handler: () -> Void),
+        onDismiss: (() -> Void)? = nil
+    ) -> some View {
         HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.red)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(error)
+            Image(systemName: icon)
+                .foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(text)
                     .font(.caption)
-                    .lineLimit(3)
-                if let rootCause = supervisor.rootCauseDescription {
-                    Text(rootCause)
+                    .lineLimit(2)
+                if let subtitle {
+                    Text(subtitle)
                         .font(.caption2)
                         .foregroundStyle(.orange)
                 }
             }
             Spacer()
-            Button("Retry") {
-                supervisor.retryStartAll()
+            Button(action.label) { action.handler() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(color)
+            if let onDismiss {
+                Button {
+                    onDismiss()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
         }
-        .padding(10)
-        .background(Color.red.opacity(0.1))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(color.opacity(0.1))
     }
 
     // MARK: - Services Tab Content
 
     private var servicesContent: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 10) {
-                if !supervisor.preflightChecks.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                // Triage zone — failed services auto-expand at top
+                ForEach(failedServices) { state in
+                    TriageCard(
+                        state: state,
+                        logStore: supervisor.logStore,
+                        onRestart: { supervisor.restartService(state.id) },
+                        onCascadeRestart: { supervisor.restartCascade(state.id) },
+                        onClearCache: state.id == "travel-portal"
+                            ? { supervisor.clearCacheAndRestart(state.id) } : nil,
+                        onPublishRetry: state.id == "yalc-link"
+                            ? { supervisor.publishAndRetryYalc() } : nil
+                    )
+                    .transition(.opacity)
+                }
+                .animation(.easeInOut(duration: 0.15), value: failedServices.map(\.id))
+
+                // Preflight — only during startup, hidden once all pass
+                if !supervisor.preflightChecks.isEmpty && !allPreflightsPassed {
                     preflightSection
                 }
 
-                if supervisor.health != .stopped {
+                // Timeline strip — startup only
+                if supervisor.health == .starting {
                     TimelineStrip(
                         currentPhase: supervisor.currentPhase,
                         completedPhases: supervisor.completedPhases,
@@ -323,6 +413,7 @@ struct MenuBarView: View {
                     .padding(.horizontal, 4)
                 }
 
+                // DB setup pipeline
                 if let pipeline = supervisor.dbSetupPipeline,
                    pipeline.isRunning || pipeline.steps.contains(where: { $0.status != .pending }) {
                     DbSetupPipelineView(
@@ -336,23 +427,27 @@ struct MenuBarView: View {
                     dbResetConsole
                 }
 
+                // Service list — phase sections with compact rows (failed filtered out)
+                let failedIDs = Set(failedServices.map(\.id))
                 let groups = supervisor.servicesByPhase()
                 ForEach(groups, id: \.phase) { group in
-                    PhaseSection(
-                        phase: group.phase,
-                        services: group.services,
-                        logStore: supervisor.logStore,
-                        onRestart: { supervisor.restartService($0) },
-                        onCascadeRestart: { supervisor.restartCascade($0) },
-                        onPublishRetry: group.phase == "GATEWAY" ? { supervisor.publishAndRetryYalc() } : nil,
-                        onResetDb: group.phase == "GROUND" ? { supervisor.resetDatabase() } : nil,
-                        dbResetRunning: supervisor.dbResetRunning
-                    )
+                    let healthyServices = group.services.filter { !failedIDs.contains($0.id) }
+                    if !healthyServices.isEmpty {
+                        PhaseSection(
+                            phase: group.phase,
+                            services: healthyServices,
+                            logStore: supervisor.logStore,
+                            onRestart: { supervisor.restartService($0) },
+                            onCascadeRestart: { supervisor.restartCascade($0) },
+                            onPublishRetry: group.phase == "GATEWAY" ? { supervisor.publishAndRetryYalc() } : nil,
+                            dbResetRunning: supervisor.dbResetRunning
+                        )
+                    }
                 }
             }
-            .padding(12)
+            .padding(10)
         }
-        .frame(maxHeight: 420)
+        .frame(minHeight: 300, maxHeight: .infinity)
     }
 
     // MARK: - Preflight
@@ -414,79 +509,6 @@ struct MenuBarView: View {
             }
         }
         .font(.caption)
-    }
-
-    // MARK: - Migration Banner
-
-    private var migrationBanner: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .foregroundStyle(.orange)
-            Text("Migrations changed since last db:reset")
-                .font(.caption)
-            Spacer()
-            Button("Reset DB") { supervisor.resetDatabase() }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .tint(.orange)
-            Button {
-                supervisor.dismissMigrationsBanner()
-            } label: {
-                Image(systemName: "xmark")
-                    .font(.caption2)
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
-        }
-        .padding(10)
-        .background(Color.orange.opacity(0.1))
-    }
-
-    // MARK: - Controls
-
-    private var controlSection: some View {
-        HStack {
-            if supervisor.health == .stopped {
-                Button(action: { supervisor.startAll() }) {
-                    Label("Start All", systemImage: "play.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.green)
-                .controlSize(.regular)
-            } else if supervisor.health == .degraded && supervisor.currentPhase == .idle {
-                Button("Retry") { supervisor.retryStartAll() }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.orange)
-                Button("Start Anyway") { supervisor.startAll(skipPreflight: true) }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            } else {
-                Button(action: { supervisor.stopAll() }) {
-                    Label("Stop All", systemImage: "stop.fill")
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(.red)
-            }
-
-            Spacer()
-
-            Button {
-                Task { await copyDiagnosticBundle() }
-            } label: {
-                Image(systemName: diagnosticCopied ? "checkmark" : "doc.text.magnifyingglass")
-                    .font(.caption)
-                    .foregroundStyle(diagnosticCopied ? .green : .secondary)
-            }
-            .buttonStyle(.borderless)
-            .help("Copy diagnostic bundle")
-
-            if supervisor.health == .starting {
-                ProgressView()
-                    .controlSize(.small)
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
     }
 
     // MARK: - DB Reset Console

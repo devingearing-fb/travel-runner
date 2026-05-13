@@ -7,31 +7,18 @@ struct PhaseSection: View {
     let onRestart: (String) -> Void
     let onCascadeRestart: ((String) -> Void)?
     let onPublishRetry: (() -> Void)?
-    var onResetDb: (() -> Void)? = nil
     var dbResetRunning: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack {
+            HStack(spacing: 4) {
                 Text(phase)
-                    .font(.system(.caption2, design: .monospaced))
-                    .fontWeight(.bold)
-                    .foregroundStyle(.secondary)
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.tertiary)
 
                 Rectangle()
-                    .fill(Color.secondary.opacity(0.2))
-                    .frame(height: 1)
-
-                if phase == "GROUND", let resetDb = onResetDb {
-                    if dbResetRunning {
-                        ProgressView().controlSize(.mini)
-                    } else {
-                        Button("Reset DB") { resetDb() }
-                            .buttonStyle(.bordered)
-                            .controlSize(.mini)
-                            .help("Run npx supabase db reset")
-                    }
-                }
+                    .fill(Color.secondary.opacity(0.12))
+                    .frame(height: 0.5)
             }
             .padding(.top, 4)
 

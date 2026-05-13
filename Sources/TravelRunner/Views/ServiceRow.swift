@@ -11,22 +11,22 @@ struct ServiceRow: View {
     @State private var logEntries: [LogEntry] = []
     @State private var lastVersion: Int = 0
 
+    private var showSubtitle: Bool {
+        state.restartCount > 0 || state.isCircuitBroken || state.capturedArtifact != nil
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            // Main row
+        VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 Circle()
                     .fill(state.phase.color)
                     .frame(width: 7, height: 7)
 
                 Text(state.definition.displayName)
-                    .font(.system(.callout, design: .monospaced))
+                    .font(.system(.caption, design: .monospaced))
                     .fontWeight(.medium)
                     .lineLimit(1)
 
-                Spacer()
-
-                // Port badge
                 if let port = state.definition.probe?.port {
                     Text(":\(port)")
                         .font(.system(.caption2, design: .monospaced))
@@ -36,6 +36,19 @@ struct ServiceRow: View {
                 Text(state.phase.rawValue)
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(state.phase == .failed ? .red : .secondary)
+
+                if let started = state.lastStarted, state.phase == .running {
+                    Text("up \(started, style: .relative)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                if state.phase == .failed, let stopped = state.lastStopped {
+                    Text("failed \(stopped, style: .relative)")
+                        .font(.caption2)
+                        .foregroundStyle(.red.opacity(0.7))
+                }
+
+                Spacer()
 
                 if state.phase == .running || state.phase == .failed {
                     Button(action: onRestart) {
@@ -66,35 +79,26 @@ struct ServiceRow: View {
                 .help(showLogs ? "Hide logs" : "Show logs")
             }
 
-            // Subtitle line: timestamps, restart count, secret
-            HStack(spacing: 8) {
-                if let started = state.lastStarted, state.phase == .running {
-                    Text("up \(started, style: .relative)")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-                if state.phase == .failed, let stopped = state.lastStopped {
-                    Text("failed \(stopped, style: .relative)")
-                        .font(.caption2)
-                        .foregroundStyle(.red.opacity(0.7))
-                }
-                if state.isCircuitBroken {
-                    Text("crash-looping — auto-restart stopped")
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                } else if state.restartCount > 0 {
-                    Text("restarted \(state.restartCount)x")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                }
-                if let artifact = state.capturedArtifact {
-                    Text(artifact.prefix(20) + "...")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
+            if showSubtitle {
+                HStack(spacing: 8) {
+                    if state.isCircuitBroken {
+                        Text("crash-looping — auto-restart stopped")
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                    } else if state.restartCount > 0 {
+                        Text("restarted \(state.restartCount)x")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .contentTransition(.numericText())
+                    }
+                    if let artifact = state.capturedArtifact {
+                        Text(artifact.prefix(20) + "...")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
-            // Publish & Retry for yalc failures
             if state.phase == .failed, let retry = onPublishRetry {
                 Button("Publish & Retry") { retry() }
                     .buttonStyle(.bordered)
@@ -102,7 +106,6 @@ struct ServiceRow: View {
                     .tint(.orange)
             }
 
-            // Log viewer
             if showLogs {
                 logView
                     .frame(height: 120)
@@ -118,7 +121,7 @@ struct ServiceRow: View {
                     }
             }
         }
-        .padding(.vertical, 3)
+        .padding(.vertical, 2)
         .padding(.horizontal, 4)
         .onChange(of: state.phase) { _, newPhase in
             if newPhase == .failed { showLogs = true }

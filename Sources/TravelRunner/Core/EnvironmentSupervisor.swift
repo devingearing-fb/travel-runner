@@ -449,6 +449,7 @@ final class EnvironmentSupervisor {
             return
         }
         Task {
+            serviceStates[serviceID]?.phase = .stopping
             await processRunner.stop(serviceID: serviceID)
             serviceStates[serviceID]?.phase = .starting
 
@@ -618,6 +619,7 @@ final class EnvironmentSupervisor {
 
     func restartService(_ serviceID: String) {
         Task {
+            serviceStates[serviceID]?.phase = .stopping
             await processRunner.stop(serviceID: serviceID)
             serviceStates[serviceID]?.phase = .pending
             serviceStates[serviceID]?.restartCount = 0
@@ -896,7 +898,10 @@ final class EnvironmentSupervisor {
         if !definition.shouldReuseIfRunning, let port = definition.probe?.port, definition.resolvedType == .daemon {
             if isPortBound(port) {
                 await killPortOccupants(port)
-                try? await Task.sleep(for: .milliseconds(500))
+                for _ in 0..<10 {
+                    try? await Task.sleep(for: .milliseconds(500))
+                    if !isPortBound(port) { break }
+                }
             }
         }
 
