@@ -15,6 +15,9 @@ actor ControlServer {
         let toggleLan: @Sendable () async -> Void
         let restartCascade: @Sendable (String) async -> Void
         let dbReset: @Sendable () async -> Void
+        let dbSetupRun: @Sendable (String) async -> Void
+        let dbSetupRetry: @Sendable (String) async -> Void
+        let dbSetupCancel: @Sendable () async -> Void
     }
 
     func start(actions: Actions, logStore: LogStore) async throws {
@@ -74,6 +77,34 @@ actor ControlServer {
 
         await server.appendRoute("POST /api/db-reset") { _ in
             await actions.dbReset()
+            return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
+        }
+
+        await server.appendRoute("POST /api/db-setup") { request in
+            let body = try? await request.bodyData
+            let profile: String
+            if let body, let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+               let p = json["profile"] as? String {
+                profile = p
+            } else {
+                profile = "reset"
+            }
+            await actions.dbSetupRun(profile)
+            return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
+        }
+
+        await server.appendRoute("POST /api/db-setup/retry/*") { request in
+            let parts = request.path.split(separator: "/")
+            guard parts.count >= 4 else {
+                return HTTPResponse(statusCode: .badRequest, body: Data("Usage: /api/db-setup/retry/{stepId}".utf8))
+            }
+            let stepId = String(parts[3])
+            await actions.dbSetupRetry(stepId)
+            return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
+        }
+
+        await server.appendRoute("POST /api/db-setup/cancel") { _ in
+            await actions.dbSetupCancel()
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
 

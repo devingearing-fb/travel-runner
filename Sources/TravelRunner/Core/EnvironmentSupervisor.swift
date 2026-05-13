@@ -16,6 +16,7 @@ final class EnvironmentSupervisor {
     var startupBeganAt: Date? = nil
     var migrationsBannerVisible = false
     var dbResetRunning = false
+    var dbSetupPipeline: DbSetupPipeline? = nil
     var networkMode = false
     var localIP: String? = nil
     var panelVisible = false
@@ -49,6 +50,7 @@ final class EnvironmentSupervisor {
     private var stdoutProbes: [String: StdoutProbe] = [:]
     private var observerRegistered = false
     private var phaseStartedAt: Date? = nil
+    private var dbSetupRunner: DbSetupRunner?
 
     // MARK: - Types
 
@@ -358,6 +360,15 @@ final class EnvironmentSupervisor {
                     },
                     dbReset: { [weak self] in
                         await MainActor.run { self?.resetDatabase() }
+                    },
+                    dbSetupRun: { [weak self] profile in
+                        await MainActor.run { self?.runDbSetup(profile: profile) }
+                    },
+                    dbSetupRetry: { [weak self] stepId in
+                        await MainActor.run { self?.runDbSetup(from: stepId) }
+                    },
+                    dbSetupCancel: { [weak self] in
+                        await MainActor.run { self?.cancelDbSetup() }
                     }
                 ),
                 logStore: logStore
@@ -649,26 +660,54 @@ final class EnvironmentSupervisor {
         }
     }
 
-    func resetDatabase() {
-        guard !dbResetRunning else { return }
+    func resetDatabase(profile: String = "reset") {
+        runDbSetup(profile: profile)
+    }
+
+    func runDbSetup(from stepId: String? = nil, profile: String = "reset") {
+        guard dbSetupPipeline?.isRunning != true else { return }
         guard let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd else {
             lastError = "Cannot find supabase service cwd in config"
             return
         }
+
+        let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
+        let steps: [DbSetupStep]
+        if FileManager.default.fileExists(atPath: manifestPath) {
+            steps = DbManifestLoader.load(from: manifestPath, profile: profile)
+        } else {
+            steps = DbSetupPipeline.buildDefault()
+        }
+
+        let pipeline = DbSetupPipeline()
+        pipeline.steps = steps
+        dbSetupPipeline = pipeline
         dbResetRunning = true
         migrationsBannerVisible = false
         lastError = nil
 
+        let runner = DbSetupRunner(portalCwd: cwd, logStore: logStore)
+        dbSetupRunner = runner
+
         Task {
-            let ok = await runDbReset(cwd: cwd)
+            await runner.run(pipeline: pipeline, from: stepId)
             dbResetRunning = false
-            if ok {
+            if pipeline.allRequiredPassed {
                 migrationTracker.recordCurrentHash(portalCwd: cwd)
                 lastError = nil
-            } else {
-                lastError = "db:reset failed — expand Supabase logs for details"
+            } else if let failed = pipeline.firstFailed {
+                lastError = "DB setup failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
             }
         }
+    }
+
+    func cancelDbSetup() {
+        Task { await dbSetupRunner?.cancel() }
+        dbResetRunning = false
+    }
+
+    func dismissDbSetup() {
+        dbSetupPipeline = nil
     }
 
     func dismissMigrationsBanner() {

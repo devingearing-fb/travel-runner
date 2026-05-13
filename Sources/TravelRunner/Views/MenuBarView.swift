@@ -301,7 +301,16 @@ struct MenuBarView: View {
                     .padding(.horizontal, 4)
                 }
 
-                if supervisor.dbResetRunning || dbResetHasLogs {
+                if let pipeline = supervisor.dbSetupPipeline,
+                   pipeline.isRunning || pipeline.steps.contains(where: { $0.status != .pending }) {
+                    DbSetupPipelineView(
+                        pipeline: pipeline,
+                        isRunning: supervisor.dbResetRunning,
+                        onRetryFrom: { supervisor.runDbSetup(from: $0) },
+                        onCancel: { supervisor.cancelDbSetup() },
+                        onDismiss: { supervisor.dismissDbSetup() }
+                    )
+                } else if supervisor.dbResetRunning || dbResetHasLogs {
                     dbResetConsole
                 }
 
