@@ -188,19 +188,26 @@ struct MenuBarView: View {
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(.tertiary)
 
-            if supervisor.debugTrackingEnabled && supervisor.debugOpenIssueCount > 0 {
-                HStack(spacing: 3) {
+            if supervisor.debugTrackingEnabled {
+                if supervisor.debugOpenIssueCount > 0 {
+                    HStack(spacing: 3) {
+                        Image(systemName: "ant.fill")
+                            .font(.system(size: 9))
+                        Text("\(supervisor.debugOpenIssueCount)")
+                            .font(.system(.caption2, design: .rounded))
+                            .fontWeight(.bold)
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.orange, in: Capsule())
+                    .help("\(supervisor.debugOpenIssueCount) open debug issue\(supervisor.debugOpenIssueCount == 1 ? "" : "s")")
+                } else {
                     Image(systemName: "ant.fill")
                         .font(.system(size: 9))
-                    Text("\(supervisor.debugOpenIssueCount)")
-                        .font(.system(.caption2, design: .rounded))
-                        .fontWeight(.bold)
+                        .foregroundStyle(.green.opacity(0.6))
+                        .help("Debug tracking active — 0 open issues")
                 }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 2)
-                .background(Color.orange, in: Capsule())
-                .help("\(supervisor.debugOpenIssueCount) open debug issue\(supervisor.debugOpenIssueCount == 1 ? "" : "s")")
             }
 
             Button(action: { NSApplication.shared.terminate(nil) }) {
