@@ -170,6 +170,104 @@ curl -s -X POST http://localhost:19900/api/toggle-lan
 
 Check the resulting state with `/api/status` — the `lan` and `ip` fields reflect the current mode.
 
+### POST /api/restart-cascade/{serviceId}
+
+Restarts a service AND all its dependents in topological order. Stops dependents first (reverse order), then restarts from the target forward. Use when a dependency change needs to propagate (e.g., restarting universal-login should also restart travel-portal).
+
+```bash
+curl -s -X POST http://localhost:19900/api/restart-cascade/universal-login
+```
+
+Response: `{"ok": true}` — cascade runs async.
+
+### POST /api/db-reset
+
+Triggers a database reset using the legacy monolithic approach (`npm run db:setup --reset-only`). Prefer `/api/db-setup` for granular control.
+
+```bash
+curl -s -X POST http://localhost:19900/api/db-reset
+```
+
+### POST /api/db-setup
+
+Runs the granular database setup pipeline. Accepts an optional JSON body with a profile name.
+
+```bash
+# Default "reset" profile (migrations + seed + hotels)
+curl -s -X POST http://localhost:19900/api/db-setup
+
+# Full setup including remote contract fetch
+curl -s -X POST http://localhost:19900/api/db-setup \
+  -H "Content-Type: application/json" \
+  -d '{"profile": "full"}'
+
+# Fast: just migrations + seed, skip hotels
+curl -s -X POST http://localhost:19900/api/db-setup \
+  -H "Content-Type: application/json" \
+  -d '{"profile": "fast"}'
+```
+
+**Profiles:** `full` (all 7 steps), `reset` (skip remote contracts), `fast` (skip hotels + contracts)
+
+### POST /api/db-setup/retry/{stepId}
+
+Re-run the database setup pipeline from a specific step. Steps before the retry point keep their previous status.
+
+```bash
+curl -s -X POST http://localhost:19900/api/db-setup/retry/load-hotels
+```
+
+**Step IDs:** `check-prerequisites`, `start-supabase`, `sync-migrations`, `reset-database`, `load-hotels`, `copy-event-data`, `verify-data`
+
+### POST /api/db-setup/cancel
+
+Cancel a running database setup pipeline.
+
+```bash
+curl -s -X POST http://localhost:19900/api/db-setup/cancel
+```
+
+### GET /api/debug/issues
+
+List open debug-tracking issues. Returns `[]` if debug-tracking is not enabled.
+
+```bash
+curl -s http://localhost:19900/api/debug/issues | python3 -m json.tool
+```
+
+**Response shape:**
+```json
+[
+  {
+    "id": "20260513T143022_service-crash-travel-portal",
+    "summary": "Travel Portal exited with code 1",
+    "severity": "error",
+    "category": "service_crash",
+    "created_at": "2026-05-13T14:30:22Z"
+  }
+]
+```
+
+### POST /api/debug/issues
+
+Manually capture a debug issue. The system auto-captures most errors, but use this for issues the auto-capture missed.
+
+```bash
+curl -s -X POST http://localhost:19900/api/debug/issues \
+  -H "Content-Type: application/json" \
+  -d '{"description": "Portal showing stale data after branch switch"}'
+```
+
+### POST /api/debug/issues/close/{id}
+
+Close a debug issue after fixing it. Moves from `open/` to `closed/`.
+
+```bash
+curl -s -X POST "http://localhost:19900/api/debug/issues/close/20260513T143022_service-crash-travel-portal" \
+  -H "Content-Type: application/json" \
+  -d '{"resolution": "Fixed missing RLS grant in migration"}'
+```
+
 ## Service IDs
 
 | ID | Service | Type | Port |
@@ -203,3 +301,17 @@ Check the resulting state with `/api/status` — the `lan` and `ip` fields refle
 2. `GET /api/status` — read the `ip` field
 3. Navigate to `http://{ip}:3002` on the mobile device
 4. `POST /api/toggle-lan` again to disable when done
+
+### "Diagnosing with debug-tracking"
+
+1. `GET /api/debug/issues` — check for auto-captured issues first
+2. If an issue exists, read it for pre-captured context (logs, state, git branches)
+3. After fixing the root cause, close it: `POST /api/debug/issues/close/{id}`
+4. Issues persist at `~/Desktop/debug-tracking/open/` if the API is unavailable
+
+### "Database won't reset"
+
+1. `POST /api/db-setup` — run the granular pipeline (shows per-step progress)
+2. If a step fails, check the UI for the specific error and recovery guidance
+3. Retry from the failed step: `POST /api/db-setup/retry/{stepId}`
+4. For a clean slate: `POST /api/db-setup` with `{"profile": "full"}`
