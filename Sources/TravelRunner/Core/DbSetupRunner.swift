@@ -85,6 +85,10 @@ actor DbSetupRunner {
 
     // MARK: - Step Execution
 
+    func executeStepPublic(_ step: DbSetupStep) async -> Bool {
+        await executeStep(step)
+    }
+
     private func executeStep(_ step: DbSetupStep) async -> Bool {
         await MainActor.run {
             step.status = .running

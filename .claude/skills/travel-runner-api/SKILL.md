@@ -227,6 +227,48 @@ Cancel a running database setup pipeline.
 curl -s -X POST http://localhost:19900/api/db-setup/cancel
 ```
 
+### GET /api/db-setup/status
+
+Returns the current state of the database setup pipeline with per-step details.
+
+```bash
+curl -s http://localhost:19900/api/db-setup/status | python3 -m json.tool
+```
+
+**Response shape:**
+```json
+{
+  "running": true,
+  "steps": [
+    { "id": "check-prerequisites", "name": "Prerequisites", "status": "PASSED", "elapsed_seconds": 2, "optional": false },
+    { "id": "start-supabase", "name": "Start Supabase", "status": "PASSED", "elapsed_seconds": 1, "optional": false },
+    { "id": "sync-migrations", "name": "Sync Migrations", "status": "PASSED", "elapsed_seconds": 0, "optional": false },
+    { "id": "reset-database", "name": "Apply Migrations", "status": "RUNNING", "progress": 0.65, "progress_label": "Migration 110/167", "optional": false },
+    { "id": "load-hotels", "name": "Load Hotels", "status": "PENDING", "optional": true },
+    { "id": "copy-event-data", "name": "Event Contracts", "status": "PENDING", "optional": true },
+    { "id": "verify-data", "name": "Verify Data", "status": "PENDING", "optional": false }
+  ]
+}
+```
+
+**Step status values:** `PENDING`, `RUNNING`, `CHECKING` (health check), `PASSED`, `FAILED`, `SKIPPED`, `TIMED_OUT`
+
+Failed steps include `error` and `recovery` fields with diagnostic info.
+
+### POST /api/db-setup/step/{stepId}
+
+Run a single database setup step independently. Does NOT run the full pipeline — just executes the one step. Useful for re-running just hotel load or just verification.
+
+```bash
+# Re-run just the hotel data load
+curl -s -X POST http://localhost:19900/api/db-setup/step/load-hotels
+
+# Re-run just verification
+curl -s -X POST http://localhost:19900/api/db-setup/step/verify-data
+```
+
+**Step IDs:** `check-prerequisites`, `start-supabase`, `sync-migrations`, `reset-database`, `load-hotels`, `copy-event-data`, `verify-data`
+
 ### GET /api/debug/issues
 
 List open debug-tracking issues. Returns `[]` if debug-tracking is not enabled.

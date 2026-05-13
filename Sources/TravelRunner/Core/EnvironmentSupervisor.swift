@@ -382,6 +382,12 @@ final class EnvironmentSupervisor {
                     dbSetupCancel: { [weak self] in
                         await MainActor.run { self?.cancelDbSetup() }
                     },
+                    dbSetupStatus: { [weak self] in
+                        await MainActor.run { self?.dbSetupStatusJSON() ?? "{}" }
+                    },
+                    dbSetupRunStep: { [weak self] stepId in
+                        await MainActor.run { self?.runDbSetupStep(stepId) }
+                    },
                     debugListIssues: { [weak self] in
                         guard let self, let tracker = await MainActor.run(body: { self.debugTracker }) else { return "[]" }
                         let issues: [[String: String]] = await tracker.listOpenIssues()
@@ -747,6 +753,61 @@ final class EnvironmentSupervisor {
                 )}
             }
         }
+    }
+
+    func runDbSetupStep(_ stepId: String) {
+        guard let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd else { return }
+        if dbSetupPipeline == nil {
+            let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
+            let steps: [DbSetupStep]
+            if FileManager.default.fileExists(atPath: manifestPath) {
+                steps = DbManifestLoader.load(from: manifestPath, profile: "full")
+            } else {
+                steps = DbSetupPipeline.buildDefault()
+            }
+            let pipeline = DbSetupPipeline()
+            pipeline.steps = steps
+            dbSetupPipeline = pipeline
+        }
+
+        guard let pipeline = dbSetupPipeline,
+              let step = pipeline.steps.first(where: { $0.id == stepId }) else { return }
+
+        let runner = DbSetupRunner(portalCwd: cwd, logStore: logStore)
+        dbSetupRunner = runner
+
+        Task {
+            dbResetRunning = true
+            let _ = await runner.executeStepPublic(step)
+            dbResetRunning = false
+        }
+    }
+
+    func dbSetupStatusJSON() -> String {
+        guard let pipeline = dbSetupPipeline else { return "{\"running\":false,\"steps\":[]}" }
+        var steps: [[String: Any]] = []
+        for step in pipeline.steps {
+            var dict: [String: Any] = [
+                "id": step.id,
+                "name": step.name,
+                "status": step.status.rawValue,
+                "optional": step.isOptional,
+            ]
+            if let elapsed = step.elapsed { dict["elapsed_seconds"] = Int(elapsed) }
+            if let msg = step.errorMessage { dict["error"] = msg }
+            if let guidance = step.recoveryGuidance { dict["recovery"] = guidance }
+            if let health = step.healthResult { dict["health_result"] = health }
+            if let progress = step.progress { dict["progress"] = progress }
+            if let label = step.progressLabel { dict["progress_label"] = label }
+            steps.append(dict)
+        }
+        let result: [String: Any] = [
+            "running": pipeline.isRunning,
+            "steps": steps,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]),
+           let str = String(data: data, encoding: .utf8) { return str }
+        return "{}"
     }
 
     func cancelDbSetup() {

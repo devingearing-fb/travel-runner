@@ -18,6 +18,8 @@ actor ControlServer {
         let dbSetupRun: @Sendable (String) async -> Void
         let dbSetupRetry: @Sendable (String) async -> Void
         let dbSetupCancel: @Sendable () async -> Void
+        let dbSetupStatus: @Sendable () async -> String
+        let dbSetupRunStep: @Sendable (String) async -> Void
         let debugListIssues: @Sendable () async -> String
         let debugCapture: @Sendable (String) async -> String
         let debugCloseIssue: @Sendable (String, String?) async -> String
@@ -108,6 +110,21 @@ actor ControlServer {
 
         await server.appendRoute("POST /api/db-setup/cancel") { _ in
             await actions.dbSetupCancel()
+            return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
+        }
+
+        await server.appendRoute("GET /api/db-setup/status") { _ in
+            let json = await actions.dbSetupStatus()
+            return HTTPResponse(statusCode: .ok, headers: [.contentType: "application/json"], body: Data(json.utf8))
+        }
+
+        await server.appendRoute("POST /api/db-setup/step/*") { request in
+            let parts = request.path.split(separator: "/")
+            guard parts.count >= 4 else {
+                return HTTPResponse(statusCode: .badRequest, body: Data("Usage: /api/db-setup/step/{stepId}".utf8))
+            }
+            let stepId = String(parts[3])
+            await actions.dbSetupRunStep(stepId)
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
 
