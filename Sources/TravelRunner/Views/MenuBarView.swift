@@ -140,17 +140,17 @@ struct MenuBarView: View {
     // MARK: - Header
 
     private var headerSection: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             Circle()
                 .fill(supervisor.health.color)
-                .frame(width: 10, height: 10)
+                .frame(width: 8, height: 8)
             Text(supervisor.health.rawValue)
-                .font(.system(.headline, design: .monospaced))
+                .font(.system(.caption, design: .monospaced))
                 .fontWeight(.bold)
 
             if supervisor.health == .starting, let began = supervisor.startupBeganAt {
                 Text(began, style: .relative)
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
             }
 
@@ -160,27 +160,31 @@ struct MenuBarView: View {
             )
 
             if let sid = selectedTab.serviceID, let branch = gitBranches[sid] {
-                HStack(spacing: 3) {
+                HStack(spacing: 2) {
                     Image(systemName: "arrow.triangle.branch")
-                        .font(.system(size: 9))
+                        .font(.system(size: 8))
                     Text(branch)
                         .font(.system(.caption2, design: .monospaced))
+                        .lineLimit(1)
                 }
                 .foregroundStyle(.secondary)
-                .padding(.horizontal, 6)
+                .padding(.horizontal, 5)
                 .padding(.vertical, 2)
                 .background(Color.secondary.opacity(0.12))
                 .clipShape(RoundedRectangle(cornerRadius: 3))
+                .layoutPriority(-1)
             }
 
-            Spacer()
+            Spacer(minLength: 4)
 
             primaryActionButton
+                .fixedSize()
 
             overflowMenu
+                .fixedSize()
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
     }
 
     @ViewBuilder
