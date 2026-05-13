@@ -23,6 +23,9 @@ final class EnvironmentSupervisor {
     var rootCauseServiceID: String? = nil
     var phaseTimings: [String: TimeInterval] = [:]
     var onServiceCrash: (@MainActor (String, Int32) -> Void)? = nil
+    var debugTrackingEnabled = false
+    var debugOpenIssueCount = 0
+    var gitBranches: [String: String] = [:]
 
     var rootCauseDescription: String? {
         guard let rootID = rootCauseServiceID, let graph else { return nil }
@@ -51,6 +54,7 @@ final class EnvironmentSupervisor {
     private var observerRegistered = false
     private var phaseStartedAt: Date? = nil
     private var dbSetupRunner: DbSetupRunner?
+    private var debugTracker: DebugTracker?
 
     // MARK: - Types
 
@@ -117,6 +121,9 @@ final class EnvironmentSupervisor {
 
             // Start control API server
             startControlServer()
+
+            // Initialize debug tracking (opt-in via ~/Desktop/debug-tracking/config.json)
+            Task { await initDebugTracking() }
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this
         } catch {
@@ -169,6 +176,11 @@ final class EnvironmentSupervisor {
                         self.lastError = "Preflight failed — \(summary)"
                         self.currentPhase = .idle
                     }
+                    await self.captureDebugIssue(
+                        trigger: "preflight_failure",
+                        serviceID: nil,
+                        summary: "Preflight failed — \(summary)"
+                    )
                     return
                 }
             }
@@ -369,6 +381,35 @@ final class EnvironmentSupervisor {
                     },
                     dbSetupCancel: { [weak self] in
                         await MainActor.run { self?.cancelDbSetup() }
+                    },
+                    debugListIssues: { [weak self] in
+                        guard let self, let tracker = await MainActor.run(body: { self.debugTracker }) else { return "[]" }
+                        let issues: [[String: String]] = await tracker.listOpenIssues()
+                        if let data = try? JSONSerialization.data(withJSONObject: issues, options: [.sortedKeys]),
+                           let str = String(data: data, encoding: .utf8) { return str }
+                        return "[]"
+                    },
+                    debugCapture: { [weak self] description in
+                        guard let self else { return "{\"ok\":false}" }
+                        await MainActor.run {
+                            Task { await self.captureDebugIssue(
+                                trigger: "manual",
+                                serviceID: nil,
+                                summary: description
+                            )}
+                        }
+                        return "{\"ok\":true}"
+                    },
+                    debugCloseIssue: { [weak self] id, resolution in
+                        guard let self, let tracker = await MainActor.run(body: { self.debugTracker }) else {
+                            return "{\"ok\":false,\"error\":\"debug tracking not enabled\"}"
+                        }
+                        let ok = await tracker.closeIssue(id: id, resolution: resolution ?? "Closed via API")
+                        if ok {
+                            let count = await tracker.openIssueCount()
+                            await MainActor.run { self.debugOpenIssueCount = count }
+                        }
+                        return ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"issue not found\"}"
                     }
                 ),
                 logStore: logStore
@@ -697,6 +738,13 @@ final class EnvironmentSupervisor {
                 lastError = nil
             } else if let failed = pipeline.firstFailed {
                 lastError = "DB setup failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
+                Task { await captureDebugIssue(
+                    trigger: "db_setup_failure",
+                    serviceID: nil,
+                    summary: "DB setup failed at \(failed.name)",
+                    errorMessage: failed.errorMessage,
+                    recoveryGuidance: failed.recoveryGuidance
+                )}
             }
         }
     }
@@ -924,6 +972,11 @@ final class EnvironmentSupervisor {
                 state.failureTimestamps.append(.now)
                 if !isShuttingDown && !state.isCircuitBroken {
                     onServiceCrash?(state.definition.displayName, exitCode)
+                    Task { await captureDebugIssue(
+                        trigger: "service_crash",
+                        serviceID: serviceID,
+                        summary: "\(state.definition.displayName) exited with code \(exitCode)"
+                    )}
                 }
             }
 
@@ -942,6 +995,11 @@ final class EnvironmentSupervisor {
         if state.failureTimestamps.count >= 3 {
             state.isCircuitBroken = true
             lastError = "\(state.definition.displayName) is crash-looping — auto-restart stopped"
+            Task { await captureDebugIssue(
+                trigger: "circuit_breaker",
+                serviceID: serviceID,
+                summary: "\(state.definition.displayName) crash-looping — circuit breaker tripped"
+            )}
             return
         }
 
@@ -999,9 +1057,76 @@ final class EnvironmentSupervisor {
                     state.phase = .failed
                     recalculateHealth()
                     scheduleRestart(serviceID: serviceID)
+                    Task { await self.captureDebugIssue(
+                        trigger: "probe_timeout",
+                        serviceID: serviceID,
+                        summary: "\(state.definition.displayName) failed wake probe"
+                    )}
                 }
             }
         }
+    }
+
+    // MARK: - Debug Tracking
+
+    private func initDebugTracking() async {
+        let tracker = DebugTracker()
+        let enabled = await tracker.isEnabled()
+        debugTracker = enabled ? tracker : nil
+        debugTrackingEnabled = enabled
+        debugOpenIssueCount = enabled ? await tracker.openIssueCount() : 0
+
+        Task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                let tracker = DebugTracker()
+                let enabled = await tracker.isEnabled()
+                let count = enabled ? await tracker.openIssueCount() : 0
+                await MainActor.run {
+                    self.debugTrackingEnabled = enabled
+                    self.debugOpenIssueCount = count
+                    self.debugTracker = enabled ? tracker : nil
+                }
+            }
+        }
+    }
+
+    func captureDebugIssue(
+        trigger: String,
+        serviceID: String?,
+        summary: String,
+        errorMessage: String? = nil,
+        recoveryGuidance: String? = nil
+    ) async {
+        guard let tracker = debugTracker else { return }
+
+        let snapshots = serviceStates.values.map { state in
+            ServiceStateSnapshot(
+                id: state.id,
+                phase: state.phase.rawValue,
+                pid: state.pid,
+                exitCode: state.exitCode,
+                restartCount: state.restartCount,
+                isCircuitBroken: state.isCircuitBroken,
+                uptimeSeconds: state.lastStarted.map { Int(Date.now.timeIntervalSince($0)) }
+            )
+        }
+
+        var logEntries: [DebugTracker.LogEntry] = []
+        if let sid = serviceID {
+            let raw = await logStore.entries(for: sid)
+            logEntries = raw.map { DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: sid, line: $0.text) }
+        }
+
+        let _ = await tracker.captureIssue(
+            trigger: trigger,
+            serviceId: serviceID,
+            errorMessage: errorMessage ?? summary,
+            logEntries: logEntries,
+            stateSnapshots: snapshots
+        )
+
+        debugOpenIssueCount = await tracker.openIssueCount()
     }
 
     // MARK: - Private: Helpers

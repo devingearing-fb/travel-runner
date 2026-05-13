@@ -18,6 +18,9 @@ actor ControlServer {
         let dbSetupRun: @Sendable (String) async -> Void
         let dbSetupRetry: @Sendable (String) async -> Void
         let dbSetupCancel: @Sendable () async -> Void
+        let debugListIssues: @Sendable () async -> String
+        let debugCapture: @Sendable (String) async -> String
+        let debugCloseIssue: @Sendable (String, String?) async -> String
     }
 
     func start(actions: Actions, logStore: LogStore) async throws {
@@ -106,6 +109,36 @@ actor ControlServer {
         await server.appendRoute("POST /api/db-setup/cancel") { _ in
             await actions.dbSetupCancel()
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
+        }
+
+        await server.appendRoute("GET /api/debug/issues") { _ in
+            let json = await actions.debugListIssues()
+            return HTTPResponse(statusCode: .ok, headers: [.contentType: "application/json"], body: Data(json.utf8))
+        }
+
+        await server.appendRoute("POST /api/debug/issues") { request in
+            let body = try? await request.bodyData
+            let desc: String
+            if let body, let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+               let d = json["description"] as? String { desc = d }
+            else { desc = "Manual capture via API" }
+            let result = await actions.debugCapture(desc)
+            return HTTPResponse(statusCode: .ok, headers: [.contentType: "application/json"], body: Data(result.utf8))
+        }
+
+        await server.appendRoute("POST /api/debug/issues/close/*") { request in
+            let parts = request.path.split(separator: "/")
+            guard parts.count >= 5 else {
+                return HTTPResponse(statusCode: .badRequest, body: Data("Usage: /api/debug/issues/close/{id}".utf8))
+            }
+            let id = String(parts[4...].joined(separator: "/"))
+            let body = try? await request.bodyData
+            let resolution: String?
+            if let body, let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any] {
+                resolution = json["resolution"] as? String
+            } else { resolution = nil }
+            let result = await actions.debugCloseIssue(id, resolution)
+            return HTTPResponse(statusCode: .ok, headers: [.contentType: "application/json"], body: Data(result.utf8))
         }
 
         await server.appendRoute("POST /api/restart-cascade/*") { request in

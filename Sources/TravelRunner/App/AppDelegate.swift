@@ -174,6 +174,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
 
+        if supervisor.debugTrackingEnabled && supervisor.debugOpenIssueCount > 0 {
+            menu.addItem(.separator())
+            let debugItem = NSMenuItem(
+                title: "\u{1F41C} \(supervisor.debugOpenIssueCount) open debug issue\(supervisor.debugOpenIssueCount == 1 ? "" : "s")",
+                action: nil,
+                keyEquivalent: ""
+            )
+            debugItem.isEnabled = false
+            menu.addItem(debugItem)
+        }
+
         menu.addItem(.separator())
 
         let openItem = NSMenuItem(title: "Open Travel Runner", action: #selector(openPanel), keyEquivalent: "")
