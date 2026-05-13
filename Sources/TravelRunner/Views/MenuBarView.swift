@@ -144,20 +144,18 @@ struct MenuBarView: View {
             Circle()
                 .fill(supervisor.health.color)
                 .frame(width: 8, height: 8)
-            Text(supervisor.health.rawValue)
-                .font(.system(.caption, design: .monospaced))
-                .fontWeight(.bold)
-
-            if supervisor.health == .starting, let began = supervisor.startupBeganAt {
-                Text(began, style: .relative)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
 
             ServiceDotMinimap(
                 serviceStates: supervisor.serviceStates,
                 sortedIDs: supervisor.sortedServiceIDs
             )
+
+            if supervisor.health == .starting, let began = supervisor.startupBeganAt {
+                Text(began, style: .relative)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
 
             if let sid = selectedTab.serviceID, let branch = gitBranches[sid] {
                 HStack(spacing: 2) {
@@ -172,19 +170,17 @@ struct MenuBarView: View {
                 .padding(.vertical, 2)
                 .background(Color.secondary.opacity(0.12))
                 .clipShape(RoundedRectangle(cornerRadius: 3))
-                .layoutPriority(-1)
             }
 
-            Spacer(minLength: 4)
+            Spacer()
 
             primaryActionButton
-                .fixedSize()
 
             overflowMenu
-                .fixedSize()
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
+        .clipped()
     }
 
     @ViewBuilder
@@ -277,7 +273,6 @@ struct MenuBarView: View {
                 .foregroundStyle(.secondary)
         }
         .menuStyle(.borderlessButton)
-        .frame(width: 24)
     }
 
     // MARK: - Tab Bar
