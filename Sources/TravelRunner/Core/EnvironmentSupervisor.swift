@@ -939,6 +939,7 @@ final class EnvironmentSupervisor {
     // MARK: - Private: Service Lifecycle
 
     private func startService(_ serviceID: String) async throws {
+        guard !isShuttingDown, health != .stopped else { return }
         guard let state = serviceStates[serviceID],
               let definition = graph?.nodes[serviceID] else { return }
 
