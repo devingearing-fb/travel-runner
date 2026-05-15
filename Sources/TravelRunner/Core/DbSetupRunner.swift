@@ -118,12 +118,12 @@ actor DbSetupRunner {
             process.standardError = pipe
 
             let guard_ = CompletionGuard()
+            let lineBuffer = TerminalLineBuffer()
 
             pipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }
-                for line in lines {
+                for line in lineBuffer.feed(text) {
                     if line.hasPrefix("##db:") {
                         let payload = String(line.dropFirst(5))
                         Task { @MainActor in
@@ -143,6 +143,11 @@ actor DbSetupRunner {
 
             process.terminationHandler = { proc in
                 pipe.fileHandleForReading.readabilityHandler = nil
+                if let remaining = lineBuffer.flush() {
+                    let entry = LogEntry(stream: .stdout, text: remaining)
+                    Task { @MainActor in step.logEntries.append(entry) }
+                    Task { await logStore.append(serviceID: "db-setup-\(stepID)", entry: entry) }
+                }
                 if guard_.claim() {
                     continuation.resume(returning: (proc.terminationStatus, false))
                 }

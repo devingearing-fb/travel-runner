@@ -33,11 +33,13 @@ actor ProcessRunner {
 
         let stdoutHandle = stdoutPipe.fileHandleForReading
         let stderrHandle = stderrPipe.fileHandleForReading
+        let stdoutBuffer = TerminalLineBuffer()
+        let stderrBuffer = TerminalLineBuffer()
 
         stdoutHandle.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }
+            let lines = stdoutBuffer.feed(text)
             guard !lines.isEmpty else { return }
             onStdout(lines)
         }
@@ -45,7 +47,7 @@ actor ProcessRunner {
         stderrHandle.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            let lines = text.components(separatedBy: .newlines).filter { !$0.isEmpty }
+            let lines = stderrBuffer.feed(text)
             guard !lines.isEmpty else { return }
             onStderr(lines)
         }
@@ -53,6 +55,8 @@ actor ProcessRunner {
         process.terminationHandler = { proc in
             stdoutHandle.readabilityHandler = nil
             stderrHandle.readabilityHandler = nil
+            if let remaining = stdoutBuffer.flush() { onStdout([remaining]) }
+            if let remaining = stderrBuffer.flush() { onStderr([remaining]) }
             onTermination(proc.terminationStatus)
         }
 

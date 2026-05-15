@@ -1302,11 +1302,12 @@ final class EnvironmentSupervisor {
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = pipe
+            let lineBuffer = TerminalLineBuffer()
 
             pipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                for line in text.components(separatedBy: .newlines) where !line.isEmpty {
+                for line in lineBuffer.feed(text) {
                     Task {
                         await logStore.append(serviceID: "db-reset", entry: LogEntry(stream: .stdout, text: line))
                     }
@@ -1315,6 +1316,9 @@ final class EnvironmentSupervisor {
 
             process.terminationHandler = { proc in
                 pipe.fileHandleForReading.readabilityHandler = nil
+                if let remaining = lineBuffer.flush() {
+                    Task { await logStore.append(serviceID: "db-reset", entry: LogEntry(stream: .stdout, text: remaining)) }
+                }
                 continuation.resume(returning: proc.terminationStatus == 0)
             }
             do { try process.run() } catch { continuation.resume(returning: false) }
