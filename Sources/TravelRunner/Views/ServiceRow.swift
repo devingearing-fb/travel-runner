@@ -6,6 +6,7 @@ struct ServiceRow: View {
     let onRestart: () -> Void
     var onPublishRetry: (() -> Void)? = nil
     var onCascadeRestart: (() -> Void)? = nil
+    var isStale: Bool = false
 
     @State private var showLogs = false
     @State private var logEntries: [LogEntry] = []
@@ -36,6 +37,15 @@ struct ServiceRow: View {
                 Text(state.phase.rawValue)
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(state.phase == .failed ? .red : .secondary)
+
+                if isStale {
+                    Text("stale")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.orange, in: Capsule())
+                }
 
                 if let started = state.lastStarted, state.phase == .running {
                     Text("up \(started, style: .relative)")

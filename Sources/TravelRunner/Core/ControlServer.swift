@@ -23,6 +23,9 @@ actor ControlServer {
         let debugListIssues: @Sendable () async -> String
         let debugCapture: @Sendable (String) async -> String
         let debugCloseIssue: @Sendable (String, String?) async -> String
+        let yalcRelink: @Sendable () async -> Void
+        let yalcToggleAuto: @Sendable () async -> Void
+        let yalcStatus: @Sendable () async -> String
     }
 
     func start(actions: Actions, logStore: LogStore) async throws {
@@ -165,6 +168,21 @@ actor ControlServer {
             }
             let serviceId = String(parts[2])
             await actions.restartCascade(serviceId)
+            return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
+        }
+
+        await server.appendRoute("GET /api/yalc/status") { _ in
+            let json = await actions.yalcStatus()
+            return HTTPResponse(statusCode: .ok, headers: [.contentType: "application/json"], body: Data(json.utf8))
+        }
+
+        await server.appendRoute("POST /api/yalc/relink") { _ in
+            await actions.yalcRelink()
+            return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
+        }
+
+        await server.appendRoute("POST /api/yalc/toggle-auto") { _ in
+            await actions.yalcToggleAuto()
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
 

@@ -229,6 +229,17 @@ struct MenuBarView: View {
 
             Divider()
 
+            Toggle("Auto-relink fb-travel-data", isOn: Binding(
+                get: { supervisor.autoRelinkYalc },
+                set: { supervisor.setAutoRelinkYalc($0) }
+            ))
+
+            if supervisor.yalcStale {
+                Button("Relink fb-travel-data Now") {
+                    supervisor.publishAndRetryYalc()
+                }
+            }
+
             Button("Clear Cache & Restart Portal") {
                 supervisor.clearCacheAndRestart("travel-portal")
             }
@@ -439,7 +450,8 @@ struct MenuBarView: View {
                             onRestart: { supervisor.restartService($0) },
                             onCascadeRestart: { supervisor.restartCascade($0) },
                             onPublishRetry: group.phase == "GATEWAY" ? { supervisor.publishAndRetryYalc() } : nil,
-                            dbResetRunning: supervisor.dbResetRunning
+                            dbResetRunning: supervisor.dbResetRunning,
+                            isServiceStale: { $0 == "yalc-link" && supervisor.yalcStale }
                         )
                     }
                 }

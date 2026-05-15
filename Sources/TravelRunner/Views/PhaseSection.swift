@@ -8,6 +8,7 @@ struct PhaseSection: View {
     let onCascadeRestart: ((String) -> Void)?
     let onPublishRetry: (() -> Void)?
     var dbResetRunning: Bool = false
+    var isServiceStale: ((String) -> Bool)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -28,7 +29,8 @@ struct PhaseSection: View {
                     logStore: logStore,
                     onRestart: { onRestart(state.id) },
                     onPublishRetry: state.id == "yalc-link" ? onPublishRetry : nil,
-                    onCascadeRestart: onCascadeRestart.map { callback in { callback(state.id) } }
+                    onCascadeRestart: onCascadeRestart.map { callback in { callback(state.id) } },
+                    isStale: isServiceStale?(state.id) ?? false
                 )
             }
         }

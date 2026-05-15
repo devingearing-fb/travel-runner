@@ -26,6 +26,8 @@ final class EnvironmentSupervisor {
     var debugTrackingEnabled = false
     var debugOpenIssueCount = 0
     var gitBranches: [String: String] = [:]
+    var yalcStale = false
+    var autoRelinkYalc = UserDefaults.standard.bool(forKey: "autoRelinkYalc")
 
     var rootCauseDescription: String? {
         guard let rootID = rootCauseServiceID, let graph else { return nil }
@@ -55,6 +57,8 @@ final class EnvironmentSupervisor {
     private var phaseStartedAt: Date? = nil
     private var dbSetupRunner: DbSetupRunner?
     private var debugTracker: DebugTracker?
+    private var yalcWatcher: YalcWatcher?
+    private var yalcRelinkInProgress = false
 
     // MARK: - Types
 
@@ -124,6 +128,13 @@ final class EnvironmentSupervisor {
 
             // Initialize debug tracking (opt-in via ~/Desktop/debug-tracking/config.json)
             Task { await initDebugTracking() }
+
+            // Initialize yalc staleness watcher
+            if let travelDataPath = config.paths?.travelData, !travelDataPath.isEmpty {
+                let watcher = YalcWatcher(travelDataDir: travelDataPath)
+                yalcWatcher = watcher
+                Task { await startYalcWatching(watcher: watcher) }
+            }
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this
         } catch {
@@ -338,7 +349,12 @@ final class EnvironmentSupervisor {
                         let health = await MainActor.run { self.health.rawValue }
                         let lan = await MainActor.run { self.networkMode }
                         let ip = await MainActor.run { self.localIP ?? "none" }
-                        let dict: [String: Any] = ["health": health, "services": states, "lan": lan, "ip": ip]
+                        let yalcStale = await MainActor.run { self.yalcStale }
+                        let yalcAuto = await MainActor.run { self.autoRelinkYalc }
+                        let dict: [String: Any] = [
+                            "health": health, "services": states, "lan": lan, "ip": ip,
+                            "yalc": ["stale": yalcStale, "auto_relink": yalcAuto] as [String: Any]
+                        ]
                         if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
                            let str = String(data: data, encoding: .utf8) { return str }
                         return "{}"
@@ -416,6 +432,19 @@ final class EnvironmentSupervisor {
                             await MainActor.run { self.debugOpenIssueCount = count }
                         }
                         return ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"issue not found\"}"
+                    },
+                    yalcRelink: { [weak self] in
+                        await MainActor.run { self?.publishAndRetryYalc() }
+                    },
+                    yalcToggleAuto: { [weak self] in
+                        await MainActor.run {
+                            guard let self else { return }
+                            self.setAutoRelinkYalc(!self.autoRelinkYalc)
+                        }
+                    },
+                    yalcStatus: { [weak self] in
+                        guard let self else { return "{}" }
+                        return await self.yalcStatusJSON()
                     }
                 ),
                 logStore: logStore
@@ -706,6 +735,52 @@ final class EnvironmentSupervisor {
                 serviceStates["yalc-link"]?.phase = .failed
                 lastError = "yalc publish failed — check fb-travel-data build"
             }
+        }
+    }
+
+    func setAutoRelinkYalc(_ enabled: Bool) {
+        autoRelinkYalc = enabled
+        UserDefaults.standard.set(enabled, forKey: "autoRelinkYalc")
+    }
+
+    func yalcStatusJSON() async -> String {
+        guard let watcher = yalcWatcher else { return "{\"configured\":false}" }
+        let stale = await watcher.isStale
+        let autoRelink = autoRelinkYalc
+        let srcMtime = await watcher.sourceModifiedAt
+        let distMtime = await watcher.lastBuiltAt
+
+        var dict: [String: Any] = [
+            "configured": true,
+            "stale": stale,
+            "auto_relink": autoRelink,
+        ]
+        if let src = srcMtime { dict["source_modified"] = ISO8601DateFormatter().string(from: src) }
+        if let dist = distMtime { dict["last_built"] = ISO8601DateFormatter().string(from: dist) }
+
+        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+           let str = String(data: data, encoding: .utf8) { return str }
+        return "{}"
+    }
+
+    private func startYalcWatching(watcher: YalcWatcher) async {
+        while !Task.isCancelled {
+            let stale = await watcher.check()
+            await MainActor.run { self.yalcStale = stale }
+
+            if stale && autoRelinkYalc && !yalcRelinkInProgress && health == .healthy {
+                let settled = await watcher.sourceSettled
+                if settled {
+                    await MainActor.run {
+                        self.yalcRelinkInProgress = true
+                        self.publishAndRetryYalc()
+                    }
+                    try? await Task.sleep(for: .seconds(10))
+                    await MainActor.run { self.yalcRelinkInProgress = false }
+                }
+            }
+
+            try? await Task.sleep(for: .seconds(5))
         }
     }
 
