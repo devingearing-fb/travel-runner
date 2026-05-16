@@ -20,6 +20,7 @@ struct MenuBarView: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
     @State private var selectedTab: AppTab = .services
     @State private var showSettings = false
+    @State private var showSettingsPage = false
     @State private var gitBranches: [String: String] = [:]
     @State private var logCounts: [String: LogCounts] = [:]
     @State private var preflightExpanded = true
@@ -48,6 +49,14 @@ struct MenuBarView: View {
                     showSettings = false
                     supervisor.loadConfig()
                 }
+            } else if showSettingsPage {
+                SettingsPageView(
+                    onDismiss: { showSettingsPage = false },
+                    onReconfigureRepos: {
+                        showSettingsPage = false
+                        showSettings = true
+                    }
+                )
             } else {
                 mainContent
             }
@@ -272,7 +281,7 @@ struct MenuBarView: View {
                 )
             }
 
-            Button(action: { showSettings = true }) {
+            Button(action: { showSettingsPage = true }) {
                 Label("Settings...", systemImage: "gearshape")
             }
 
