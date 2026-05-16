@@ -592,6 +592,8 @@ final class EnvironmentSupervisor {
             dbMode = .local
         }
 
+        guard health != .stopped else { return }
+
         let servicesToRestart = ["travel-portal", "universal-login"]
         Task {
             for serviceID in servicesToRestart {
