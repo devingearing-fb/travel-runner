@@ -150,6 +150,15 @@ struct MenuBarView: View {
                 sortedIDs: supervisor.sortedServiceIDs
             )
 
+            if supervisor.dbMode == .remote {
+                Text("DEV DB")
+                    .font(.system(size: 9, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(Color.purple, in: Capsule())
+            }
+
             if supervisor.health == .starting, let began = supervisor.startupBeganAt {
                 Text(began, style: .relative)
                     .font(.caption2)
@@ -228,6 +237,13 @@ struct MenuBarView: View {
             }
 
             Divider()
+
+            Button(action: { supervisor.toggleDatabaseMode() }) {
+                Label(
+                    supervisor.dbMode == .local ? "Switch to Dev Database" : "Switch to Local Database",
+                    systemImage: supervisor.dbMode == .local ? "cloud" : "externaldrive"
+                )
+            }
 
             Toggle("Auto-relink fb-travel-data", isOn: Binding(
                 get: { supervisor.autoRelinkYalc },

@@ -48,7 +48,8 @@ enum ConfigLoader {
             "paths": [
                 "travel_data": repos.travelData ?? "",
                 "booking_portal": portalPath,
-                "universal_login": loginPath
+                "universal_login": loginPath,
+                "partner_portal": repos.partnerPortal ?? ""
             ] as [String: Any],
             "services": [
                 [

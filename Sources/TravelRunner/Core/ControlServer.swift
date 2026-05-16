@@ -26,6 +26,7 @@ actor ControlServer {
         let yalcRelink: @Sendable () async -> Void
         let yalcToggleAuto: @Sendable () async -> Void
         let yalcStatus: @Sendable () async -> String
+        let toggleDbMode: @Sendable () async -> Void
     }
 
     func start(actions: Actions, logStore: LogStore) async throws {
@@ -183,6 +184,11 @@ actor ControlServer {
 
         await server.appendRoute("POST /api/yalc/toggle-auto") { _ in
             await actions.yalcToggleAuto()
+            return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
+        }
+
+        await server.appendRoute("POST /api/toggle-db-mode") { _ in
+            await actions.toggleDbMode()
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
 

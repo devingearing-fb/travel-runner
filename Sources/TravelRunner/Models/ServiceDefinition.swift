@@ -18,11 +18,13 @@ struct RepoPaths: Codable, Sendable {
     let travelData: String?
     let bookingPortal: String?
     let universalLogin: String?
+    let partnerPortal: String?
 
     enum CodingKeys: String, CodingKey {
         case travelData = "travel_data"
         case bookingPortal = "booking_portal"
         case universalLogin = "universal_login"
+        case partnerPortal = "partner_portal"
     }
 }
 

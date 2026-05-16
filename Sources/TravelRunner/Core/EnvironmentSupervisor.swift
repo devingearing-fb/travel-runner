@@ -28,6 +28,9 @@ final class EnvironmentSupervisor {
     var gitBranches: [String: String] = [:]
     var yalcStale = false
     var autoRelinkYalc = UserDefaults.standard.bool(forKey: "autoRelinkYalc")
+    var dbMode: DatabaseMode = .local
+
+    enum DatabaseMode: String, Sendable { case local, remote }
 
     var rootCauseDescription: String? {
         guard let rootID = rootCauseServiceID, let graph else { return nil }
@@ -59,6 +62,8 @@ final class EnvironmentSupervisor {
     private var debugTracker: DebugTracker?
     private var yalcWatcher: YalcWatcher?
     private var yalcRelinkInProgress = false
+    private var localSupabaseAnonKey: String?
+    private var localSupabaseSigningKey: String?
 
     // MARK: - Types
 
@@ -122,6 +127,7 @@ final class EnvironmentSupervisor {
 
             // Always reset .env.local files to localhost on startup
             resetEnvToLocalhost()
+            cacheLocalSupabaseKeys()
 
             // Start control API server
             startControlServer()
@@ -351,9 +357,11 @@ final class EnvironmentSupervisor {
                         let ip = await MainActor.run { self.localIP ?? "none" }
                         let yalcStale = await MainActor.run { self.yalcStale }
                         let yalcAuto = await MainActor.run { self.autoRelinkYalc }
+                        let dbMode = await MainActor.run { self.dbMode.rawValue }
                         let dict: [String: Any] = [
                             "health": health, "services": states, "lan": lan, "ip": ip,
-                            "yalc": ["stale": yalcStale, "auto_relink": yalcAuto] as [String: Any]
+                            "yalc": ["stale": yalcStale, "auto_relink": yalcAuto] as [String: Any],
+                            "db_mode": dbMode
                         ]
                         if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
                            let str = String(data: data, encoding: .utf8) { return str }
@@ -445,6 +453,9 @@ final class EnvironmentSupervisor {
                     yalcStatus: { [weak self] in
                         guard let self else { return "{}" }
                         return await self.yalcStatusJSON()
+                    },
+                    toggleDbMode: { [weak self] in
+                        await MainActor.run { self?.toggleDatabaseMode() }
                     }
                 ),
                 logStore: logStore
@@ -462,6 +473,13 @@ final class EnvironmentSupervisor {
             env.write(key: "LOCAL_SUPABASE_URL", value: "http://localhost:54321")
             env.write(key: "NEXT_PUBLIC_WEBAPP_URL", value: "http://localhost:3002")
             env.write(key: "LOGIN_URL", value: "http://localhost:3000/login/init")
+            env.write(key: "NEXT_PUBLIC_LOCAL_DEV", value: "true")
+            if let anonKey = localSupabaseAnonKey {
+                env.write(key: "LOCAL_SUPABASE_ANON_KEY", value: anonKey)
+            }
+            if let signingKey = localSupabaseSigningKey {
+                env.write(key: "LOCAL_SUPABASE_SIGNING_KEY", value: signingKey)
+            }
         }
         if let cwd = loginCwd {
             let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
@@ -469,7 +487,14 @@ final class EnvironmentSupervisor {
             env.write(key: "AMATEUR_SUPABASE_URL", value: "http://localhost:54321")
             env.write(key: "NEXT_PUBLIC_SITE_URL", value: "http://localhost:3000")
             env.write(key: "NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", value: "http://localhost:3000")
+            if let anonKey = localSupabaseAnonKey {
+                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anonKey)
+            }
+            if let signingKey = localSupabaseSigningKey {
+                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
+            }
         }
+        dbMode = .local
     }
 
     func clearCacheAndRestart(_ serviceID: String) {
@@ -494,6 +519,126 @@ final class EnvironmentSupervisor {
                 lastError = "\(error)"
                 recalculateHealth()
             }
+        }
+    }
+
+    // MARK: - Database Mode Toggle
+
+    private func cacheLocalSupabaseKeys() {
+        guard let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd else { return }
+        let envPath = (portalCwd as NSString).appendingPathComponent(".env.local")
+        guard let content = try? String(contentsOfFile: envPath, encoding: .utf8) else { return }
+        for line in content.components(separatedBy: "\n") {
+            if line.hasPrefix("LOCAL_SUPABASE_ANON_KEY=") {
+                localSupabaseAnonKey = String(line.dropFirst("LOCAL_SUPABASE_ANON_KEY=".count))
+            }
+            if line.hasPrefix("LOCAL_SUPABASE_SIGNING_KEY=") {
+                localSupabaseSigningKey = String(line.dropFirst("LOCAL_SUPABASE_SIGNING_KEY=".count))
+            }
+        }
+    }
+
+    private func readRemoteCredentials() -> (url: String, anonKey: String, signingKey: String)? {
+        guard let raw = config?.paths?.partnerPortal, !raw.isEmpty else {
+            lastError = "Partner portal path not configured — open Settings"
+            return nil
+        }
+        let partnerPath = NSString(string: raw).expandingTildeInPath
+        let envPath = (partnerPath as NSString).appendingPathComponent(".env.local")
+        guard let content = try? String(contentsOfFile: envPath, encoding: .utf8) else {
+            lastError = "Cannot read \(envPath)"
+            return nil
+        }
+        var url: String?
+        var anonKey: String?
+        var signingKey: String?
+        for line in content.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("AMATEUR_SUPABASE_URL_DEV=") {
+                url = String(trimmed.dropFirst("AMATEUR_SUPABASE_URL_DEV=".count))
+            }
+            if trimmed.hasPrefix("AMATEUR_SUPABASE_ANON_KEY_DEV=") {
+                anonKey = String(trimmed.dropFirst("AMATEUR_SUPABASE_ANON_KEY_DEV=".count))
+            }
+            if trimmed.hasPrefix("AMATEUR_SUPABASE_SIGNING_KEY_DEV=") {
+                signingKey = String(trimmed.dropFirst("AMATEUR_SUPABASE_SIGNING_KEY_DEV=".count))
+            }
+        }
+        guard let u = url, let a = anonKey, let s = signingKey else {
+            lastError = "Missing AMATEUR_SUPABASE_*_DEV vars in partner portal .env.local"
+            return nil
+        }
+        return (u, a, s)
+    }
+
+    func toggleDatabaseMode() {
+        guard health == .healthy || health == .stopped else {
+            lastError = "Cannot switch database while services are starting"
+            return
+        }
+
+        if dbMode == .local {
+            guard let remote = readRemoteCredentials() else { return }
+
+            let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
+            let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
+
+            if let cwd = portalCwd {
+                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
+                env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: remote.url)
+                env.write(key: "LOCAL_SUPABASE_URL", value: remote.url)
+                env.write(key: "LOCAL_SUPABASE_ANON_KEY", value: remote.anonKey)
+                env.write(key: "LOCAL_SUPABASE_SIGNING_KEY", value: remote.signingKey)
+                env.write(key: "AMATEUR_SUPABASE_URL_DEV", value: remote.url)
+                env.write(key: "AMATEUR_SUPABASE_ANON_KEY_DEV", value: remote.anonKey)
+                env.write(key: "NEXT_PUBLIC_LOCAL_DEV", value: "false")
+            }
+            if let cwd = loginCwd {
+                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
+                env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: remote.url)
+                env.write(key: "AMATEUR_SUPABASE_URL", value: remote.url)
+                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: remote.anonKey)
+                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: remote.signingKey)
+            }
+
+            dbMode = .remote
+        } else {
+            resetEnvToLocalhost()
+
+            let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
+            let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
+
+            if let cwd = portalCwd, let anonKey = localSupabaseAnonKey, let signingKey = localSupabaseSigningKey {
+                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
+                env.write(key: "LOCAL_SUPABASE_ANON_KEY", value: anonKey)
+                env.write(key: "LOCAL_SUPABASE_SIGNING_KEY", value: signingKey)
+                env.write(key: "NEXT_PUBLIC_LOCAL_DEV", value: "true")
+            }
+            if let cwd = loginCwd, let anonKey = localSupabaseAnonKey, let signingKey = localSupabaseSigningKey {
+                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
+                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anonKey)
+                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
+            }
+
+            dbMode = .local
+        }
+
+        let servicesToRestart = ["travel-portal", "universal-login"]
+        Task {
+            for serviceID in servicesToRestart {
+                serviceStates[serviceID]?.phase = .stopping
+            }
+            for serviceID in servicesToRestart {
+                await processRunner.stop(serviceID: serviceID)
+                serviceStates[serviceID]?.phase = .starting
+                do {
+                    try await startService(serviceID)
+                } catch {
+                    serviceStates[serviceID]?.phase = .failed
+                    lastError = "DB mode switch failed for \(serviceID): \(error)"
+                }
+            }
+            recalculateHealth()
         }
     }
 

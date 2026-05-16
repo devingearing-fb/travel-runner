@@ -4,6 +4,7 @@ struct DetectedRepos: Sendable {
     var bookingPortal: String?
     var universalLogin: String?
     var travelData: String?
+    var partnerPortal: String?
 
     var allDetected: Bool {
         bookingPortal != nil && universalLogin != nil && travelData != nil
@@ -93,6 +94,16 @@ enum RepoDetector {
                let pkgName = json["name"] as? String,
                pkgName.contains("fb-travel-data") {
                 result.travelData = path
+            }
+        }
+
+        // Partner portal: directory name contains "partner-portal"
+        if result.partnerPortal == nil {
+            if name.lowercased().contains("partner-portal") {
+                let pkg = (path as NSString).appendingPathComponent("package.json")
+                if fm.fileExists(atPath: pkg) {
+                    result.partnerPortal = path
+                }
             }
         }
     }
