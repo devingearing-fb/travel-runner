@@ -538,37 +538,17 @@ final class EnvironmentSupervisor {
         }
     }
 
-    private func readRemoteCredentials() -> (url: String, anonKey: String, signingKey: String)? {
-        guard let raw = config?.paths?.partnerPortal, !raw.isEmpty else {
-            lastError = "Partner portal path not configured — open Settings"
-            return nil
-        }
-        let partnerPath = NSString(string: raw).expandingTildeInPath
-        let envPath = (partnerPath as NSString).appendingPathComponent(".env.local")
-        guard let content = try? String(contentsOfFile: envPath, encoding: .utf8) else {
-            lastError = "Cannot read \(envPath)"
-            return nil
-        }
-        var url: String?
-        var anonKey: String?
-        var signingKey: String?
+    private func readEnvFile(_ path: String) -> [String: String] {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
+        var vars: [String: String] = [:]
         for line in content.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("AMATEUR_SUPABASE_URL_DEV=") {
-                url = String(trimmed.dropFirst("AMATEUR_SUPABASE_URL_DEV=".count))
-            }
-            if trimmed.hasPrefix("AMATEUR_SUPABASE_ANON_KEY_DEV=") {
-                anonKey = String(trimmed.dropFirst("AMATEUR_SUPABASE_ANON_KEY_DEV=".count))
-            }
-            if trimmed.hasPrefix("AMATEUR_SUPABASE_SIGNING_KEY_DEV=") {
-                signingKey = String(trimmed.dropFirst("AMATEUR_SUPABASE_SIGNING_KEY_DEV=".count))
-            }
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), let eqIdx = trimmed.firstIndex(of: "=") else { continue }
+            let key = String(trimmed[..<eqIdx])
+            let value = String(trimmed[trimmed.index(after: eqIdx)...])
+            vars[key] = value
         }
-        guard let u = url, let a = anonKey, let s = signingKey else {
-            lastError = "Missing AMATEUR_SUPABASE_*_DEV vars in partner portal .env.local"
-            return nil
-        }
-        return (u, a, s)
+        return vars
     }
 
     func toggleDatabaseMode() {
@@ -577,49 +557,38 @@ final class EnvironmentSupervisor {
             return
         }
 
+        let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
+        let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
+
         if dbMode == .local {
-            guard let remote = readRemoteCredentials() else { return }
-
-            let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
-            let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
-
-            if let cwd = portalCwd {
-                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-                env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: remote.url)
-                env.write(key: "LOCAL_SUPABASE_URL", value: remote.url)
-                env.write(key: "LOCAL_SUPABASE_ANON_KEY", value: remote.anonKey)
-                env.write(key: "LOCAL_SUPABASE_SIGNING_KEY", value: remote.signingKey)
-                env.write(key: "AMATEUR_SUPABASE_URL_DEV", value: remote.url)
-                env.write(key: "AMATEUR_SUPABASE_ANON_KEY_DEV", value: remote.anonKey)
-                env.write(key: "NEXT_PUBLIC_LOCAL_DEV", value: "false")
+            guard let cwd = portalCwd else { return }
+            let remotePath = (cwd as NSString).appendingPathComponent(".env.remote")
+            let remote = readEnvFile(remotePath)
+            guard let remoteUrl = remote["NEXT_PUBLIC_SUPABASE_URL"], !remoteUrl.isEmpty else {
+                lastError = ".env.remote not found or missing NEXT_PUBLIC_SUPABASE_URL — create it in the booking portal"
+                return
             }
-            if let cwd = loginCwd {
-                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-                env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: remote.url)
-                env.write(key: "AMATEUR_SUPABASE_URL", value: remote.url)
-                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: remote.anonKey)
-                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: remote.signingKey)
+
+            let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
+            for (key, value) in remote {
+                env.write(key: key, value: value)
+            }
+
+            if let loginCwd {
+                let loginEnv = EnvCompatLayer(envFilePaths: [loginCwd + "/.env.local"])
+                loginEnv.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: remoteUrl)
+                loginEnv.write(key: "AMATEUR_SUPABASE_URL", value: remoteUrl)
+                if let anonKey = remote["LOCAL_SUPABASE_ANON_KEY"] {
+                    loginEnv.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anonKey)
+                }
+                if let signingKey = remote["LOCAL_SUPABASE_SIGNING_KEY"] {
+                    loginEnv.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
+                }
             }
 
             dbMode = .remote
         } else {
             resetEnvToLocalhost()
-
-            let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
-            let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
-
-            if let cwd = portalCwd, let anonKey = localSupabaseAnonKey, let signingKey = localSupabaseSigningKey {
-                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-                env.write(key: "LOCAL_SUPABASE_ANON_KEY", value: anonKey)
-                env.write(key: "LOCAL_SUPABASE_SIGNING_KEY", value: signingKey)
-                env.write(key: "NEXT_PUBLIC_LOCAL_DEV", value: "true")
-            }
-            if let cwd = loginCwd, let anonKey = localSupabaseAnonKey, let signingKey = localSupabaseSigningKey {
-                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anonKey)
-                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
-            }
-
             dbMode = .local
         }
 
