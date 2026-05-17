@@ -104,6 +104,16 @@ enum ConfigLoader {
                     "restart": "on-failure",
                     "phase": "portal",
                     "depends_on": ["stripe"]
+                ],
+                [
+                    "id": "partner-portal",
+                    "name": "Partner Portal",
+                    "cmd": ["npm", "run", "dev", "--", "-p", "3001"],
+                    "cwd": repos.partnerPortal ?? "",
+                    "probe": ["type": "tcp", "port": 3001],
+                    "restart": "on-failure",
+                    "phase": "portal",
+                    "depends_on": ["yalc-link"]
                 ]
             ] as [[String: Any]]
         ]

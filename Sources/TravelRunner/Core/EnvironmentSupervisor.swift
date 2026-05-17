@@ -29,6 +29,7 @@ final class EnvironmentSupervisor {
     var yalcStale = false
     var autoRelinkYalc = UserDefaults.standard.bool(forKey: "autoRelinkYalc")
     var dbMode: DatabaseMode = .local
+    var partnerPortalEnabled = UserDefaults.standard.bool(forKey: "partnerPortalEnabled")
 
     enum DatabaseMode: String, Sendable { case local, remote }
 
@@ -494,6 +495,17 @@ final class EnvironmentSupervisor {
                 env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
             }
         }
+        if let rawPartner = config?.paths?.partnerPortal, !rawPartner.isEmpty {
+            let partnerPath = NSString(string: rawPartner).expandingTildeInPath
+            let localEnvPath = (partnerPath as NSString).appendingPathComponent(".env.local.local")
+            if FileManager.default.fileExists(atPath: localEnvPath) {
+                let source = readEnvFile(localEnvPath)
+                let env = EnvCompatLayer(envFilePaths: [partnerPath + "/.env.local"])
+                for (key, value) in source {
+                    env.write(key: key, value: value)
+                }
+            }
+        }
         dbMode = .local
     }
 
@@ -586,6 +598,22 @@ final class EnvironmentSupervisor {
                 }
             }
 
+            if let rawPartner2 = config?.paths?.partnerPortal, !rawPartner2.isEmpty {
+                let partnerPath = NSString(string: rawPartner2).expandingTildeInPath
+                let partnerEnv = EnvCompatLayer(envFilePaths: [partnerPath + "/.env.local"])
+                partnerEnv.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: remoteUrl)
+                partnerEnv.write(key: "SUPABASE_URL", value: remoteUrl)
+                partnerEnv.write(key: "AMATEUR_SUPABASE_URL_DEV", value: remoteUrl)
+                if let anonKey = remote["LOCAL_SUPABASE_ANON_KEY"] {
+                    partnerEnv.write(key: "AMATEUR_SUPABASE_ANON_KEY_DEV", value: anonKey)
+                }
+                if let signingKey = remote["LOCAL_SUPABASE_SIGNING_KEY"] {
+                    partnerEnv.write(key: "AMATEUR_SUPABASE_SIGNING_KEY_DEV", value: signingKey)
+                }
+                partnerEnv.write(key: "LOGIN_URL", value: "http://localhost:3000/login/init")
+                partnerEnv.write(key: "NEXT_PUBLIC_WEBAPP_URL", value: "http://localhost:3001")
+            }
+
             dbMode = .remote
         } else {
             resetEnvToLocalhost()
@@ -594,7 +622,10 @@ final class EnvironmentSupervisor {
 
         guard health != .stopped else { return }
 
-        let servicesToRestart = ["travel-portal", "universal-login"]
+        var servicesToRestart = ["travel-portal", "universal-login"]
+        if partnerPortalEnabled && serviceStates["partner-portal"] != nil {
+            servicesToRestart.append("partner-portal")
+        }
         Task {
             for serviceID in servicesToRestart {
                 serviceStates[serviceID]?.phase = .stopping
@@ -859,6 +890,30 @@ final class EnvironmentSupervisor {
         UserDefaults.standard.set(enabled, forKey: "autoRelinkYalc")
     }
 
+    func setPartnerPortalEnabled(_ enabled: Bool) {
+        partnerPortalEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "partnerPortalEnabled")
+        if enabled {
+            setupPartnerPortalEnv()
+        }
+    }
+
+    private func setupPartnerPortalEnv() {
+        guard let rawPartnerCwd = config?.paths?.partnerPortal, !rawPartnerCwd.isEmpty else { return }
+        let partnerCwd = NSString(string: rawPartnerCwd).expandingTildeInPath
+
+        let localEnvPath = (partnerCwd as NSString).appendingPathComponent(".env.local.local")
+        guard FileManager.default.fileExists(atPath: localEnvPath) else { return }
+
+        if dbMode == .local {
+            let source = readEnvFile(localEnvPath)
+            let env = EnvCompatLayer(envFilePaths: [partnerCwd + "/.env.local"])
+            for (key, value) in source {
+                env.write(key: key, value: value)
+            }
+        }
+    }
+
     func yalcStatusJSON() async -> String {
         guard let watcher = yalcWatcher else { return "{\"configured\":false}" }
         let stale = await watcher.isStale
@@ -1058,6 +1113,11 @@ final class EnvironmentSupervisor {
         guard !isShuttingDown, health != .stopped else { return }
         guard let state = serviceStates[serviceID],
               let definition = graph?.nodes[serviceID] else { return }
+
+        if serviceID == "partner-portal" && !partnerPortalEnabled {
+            await MainActor.run { state.phase = .skipped }
+            return
+        }
 
         // Reuse-if-running: Docker-managed services (Supabase) persist between sessions.
         // If the port is already bound, skip starting and mark as running.
@@ -1424,7 +1484,7 @@ final class EnvironmentSupervisor {
                 switch phase {
                 case "ground": return id == "supabase" || id == "db-reset"
                 case "gateway": return id == "yalc-link" || id == "universal-login" || id == "stripe"
-                case "portal": return id == "travel-portal"
+                case "portal": return id == "travel-portal" || id == "partner-portal"
                 default: return false
                 }
             }

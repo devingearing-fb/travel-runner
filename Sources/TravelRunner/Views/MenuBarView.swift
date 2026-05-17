@@ -5,6 +5,7 @@ enum AppTab: String, CaseIterable {
     case stripe = "Stripe"
     case booking = "Booking"
     case login = "Login"
+    case partner = "Partner"
 
     var serviceID: String? {
         switch self {
@@ -12,6 +13,7 @@ enum AppTab: String, CaseIterable {
         case .stripe: "stripe"
         case .booking: "travel-portal"
         case .login: "universal-login"
+        case .partner: "partner-portal"
         }
     }
 }
@@ -110,6 +112,12 @@ struct MenuBarView: View {
             case .login:
                 ServiceConsoleView(
                     serviceID: "universal-login",
+                    logStore: supervisor.logStore
+                )
+                .frame(minHeight: 300, maxHeight: .infinity)
+            case .partner:
+                ServiceConsoleView(
+                    serviceID: "partner-portal",
                     logStore: supervisor.logStore
                 )
                 .frame(minHeight: 300, maxHeight: .infinity)
@@ -356,6 +364,7 @@ struct MenuBarView: View {
         case .stripe: "bolt.fill"
         case .booking: "globe"
         case .login: "person.badge.key"
+        case .partner: "building.2"
         }
     }
 
@@ -365,6 +374,7 @@ struct MenuBarView: View {
         case .stripe: .purple
         case .booking: .blue
         case .login: .green
+        case .partner: .orange
         }
     }
 

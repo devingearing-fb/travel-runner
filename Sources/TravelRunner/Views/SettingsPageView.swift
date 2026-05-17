@@ -103,6 +103,25 @@ struct SettingsPageView: View {
 
                 settingsRow {
                     Toggle(isOn: Binding(
+                        get: { supervisor.partnerPortalEnabled },
+                        set: { supervisor.setPartnerPortalEnabled($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("Partner Portal", systemImage: "building.2")
+                                .font(.system(.caption, design: .monospaced))
+                            Text("Run partner portal on port 3001 sharing the same database")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                }
+
+                Divider().padding(.leading, 32)
+
+                settingsRow {
+                    Toggle(isOn: Binding(
                         get: { supervisor.autoRelinkYalc },
                         set: { supervisor.setAutoRelinkYalc($0) }
                     )) {
