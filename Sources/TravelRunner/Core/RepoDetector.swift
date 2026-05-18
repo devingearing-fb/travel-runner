@@ -55,9 +55,7 @@ enum RepoDetector {
         switch role {
         case .bookingPortal:
             return fm.fileExists(atPath: (expanded as NSString).appendingPathComponent("supabase/config.toml"))
-        case .universalLogin:
-            return fm.fileExists(atPath: (expanded as NSString).appendingPathComponent("package.json"))
-        case .travelData:
+        case .universalLogin, .travelData, .partnerPortal:
             return fm.fileExists(atPath: (expanded as NSString).appendingPathComponent("package.json"))
         }
     }
@@ -112,12 +110,14 @@ enum RepoDetector {
         case bookingPortal = "Travel Booking Portal"
         case universalLogin = "Universal Login"
         case travelData = "fb-travel-data"
+        case partnerPortal = "Partner Portal"
 
         var description: String {
             switch self {
             case .bookingPortal: "Supabase, dev server, yalc link target"
             case .universalLogin: "Auth gateway (port 3000)"
             case .travelData: "Shared domain package (yalc publish source)"
+            case .partnerPortal: "Hotel partner portal (port 3001)"
             }
         }
 
@@ -126,6 +126,7 @@ enum RepoDetector {
             case .bookingPortal: "globe"
             case .universalLogin: "person.badge.key"
             case .travelData: "shippingbox"
+            case .partnerPortal: "building.2"
             }
         }
     }

@@ -1,0 +1,160 @@
+---
+description: Control the travel-runner local dev environment via its HTTP API at localhost:19900. Use when checking service status, reading logs, restarting services, clearing cache, toggling LAN/database mode, or managing the dev environment.
+globs:
+alwaysApply: false
+---
+
+# travel-runner Control API
+
+travel-runner is a macOS menu bar app that supervises the local dev environment. It starts services in dependency order (Supabase → Stripe/Login/yalc → Portal), monitors health, and exposes an HTTP control API on `http://localhost:19900`.
+
+## Check availability
+
+```bash
+curl -sf http://localhost:19900/api/status > /dev/null && echo "running" || echo "not running"
+```
+
+## Endpoints
+
+### GET /api/status
+Full environment state. Always start here.
+```bash
+curl -s http://localhost:19900/api/status | python3 -m json.tool
+```
+Response: `{ "health": "HEALTHY|STARTING|DEGRADED|STOPPED", "services": { "<id>": { "phase": "RUNNING|STARTING|FAILED|STOPPED|DONE|PENDING", "pid": "..." } }, "lan": false, "ip": "none", "db_mode": "local|remote", "yalc": { "stale": false, "auto_relink": false } }`
+
+### GET /api/logs/{serviceId}?lines=N
+Last N log lines (default 50). Lines are `{ "stream": "stdout|stderr", "text": "..." }`.
+```bash
+curl -s "http://localhost:19900/api/logs/travel-portal?lines=100" | python3 -m json.tool
+```
+
+Filter errors from Pino JSON logs:
+```bash
+curl -s "http://localhost:19900/api/logs/travel-portal?lines=200" | python3 -c "
+import json, sys
+for entry in json.load(sys.stdin):
+    text = entry['text']
+    if text.startswith('{'):
+        try:
+            obj = json.loads(text)
+            if obj.get('level', 0) >= 50:
+                print(f\"[ERR] [{obj.get('module','?')}] {obj.get('msg','')}\")
+        except: pass
+    elif 'error' in text.lower():
+        print(f'[ERR] {text}')
+"
+```
+
+### POST /api/restart/{serviceId}
+Restart a single service. Returns immediately; restart is async.
+```bash
+curl -s -X POST http://localhost:19900/api/restart/travel-portal
+```
+
+### POST /api/clear-cache-restart/{serviceId}
+Delete `.next/` cache then restart. Use for stale Turbopack/module-not-found errors.
+```bash
+curl -s -X POST http://localhost:19900/api/clear-cache-restart/travel-portal
+```
+
+### POST /api/restart-cascade/{serviceId}
+Restart a service AND all dependents in topological order.
+```bash
+curl -s -X POST http://localhost:19900/api/restart-cascade/universal-login
+```
+
+### POST /api/start-all
+Start the full service DAG. Only works when health is STOPPED.
+```bash
+curl -s -X POST http://localhost:19900/api/start-all
+```
+
+### POST /api/stop-all
+Gracefully stop all services.
+```bash
+curl -s -X POST http://localhost:19900/api/stop-all
+```
+
+### POST /api/toggle-lan
+Toggle LAN mode for mobile testing. Patches `.env.local` files with LAN IP, restarts portal + login bound to `0.0.0.0`.
+```bash
+curl -s -X POST http://localhost:19900/api/toggle-lan
+```
+
+### POST /api/toggle-db-mode
+Toggle between local Supabase (localhost:54321) and remote dev database. Patches `.env.local` files and restarts portal + login.
+```bash
+curl -s -X POST http://localhost:19900/api/toggle-db-mode
+```
+
+### POST /api/db-reset
+Trigger database reset (migrations + seed + hotel data).
+```bash
+curl -s -X POST http://localhost:19900/api/db-reset
+```
+
+### POST /api/db-setup
+Granular database setup pipeline. Optional body: `{"profile": "full|reset|fast"}`.
+```bash
+curl -s -X POST http://localhost:19900/api/db-setup
+```
+
+### GET /api/db-setup/status
+Current pipeline state with per-step progress.
+```bash
+curl -s http://localhost:19900/api/db-setup/status | python3 -m json.tool
+```
+
+### POST /api/yalc/relink
+Manually trigger fb-travel-data rebuild + yalc publish + relink.
+```bash
+curl -s -X POST http://localhost:19900/api/yalc/relink
+```
+
+### GET /api/yalc/status
+Check yalc staleness and auto-relink status.
+```bash
+curl -s http://localhost:19900/api/yalc/status | python3 -m json.tool
+```
+
+### GET /api/debug/issues
+List open auto-captured debug issues.
+```bash
+curl -s http://localhost:19900/api/debug/issues | python3 -m json.tool
+```
+
+### POST /api/debug/issues
+Manually capture a debug issue.
+```bash
+curl -s -X POST http://localhost:19900/api/debug/issues -H "Content-Type: application/json" -d '{"description": "..."}'
+```
+
+### POST /api/debug/issues/close/{id}
+Close a resolved issue.
+```bash
+curl -s -X POST "http://localhost:19900/api/debug/issues/close/{id}" -H "Content-Type: application/json" -d '{"resolution": "..."}'
+```
+
+## Service IDs
+
+| ID | Service | Port |
+|----|---------|------|
+| `supabase` | Local Supabase (Docker) | 54321 |
+| `universal-login` | Auth gateway | 3000 |
+| `stripe` | Stripe CLI webhook listener | — |
+| `travel-portal` | Booking portal (Next.js) | 3002 |
+| `partner-portal` | Partner portal (Next.js) | 3001 |
+| `yalc-link` | yalc link for fb-travel-data | — |
+
+## Common workflows
+
+**Portal showing errors:** `GET /api/status` → `GET /api/logs/travel-portal?lines=200` → filter for level 50. If module-not-found: `POST /api/clear-cache-restart/travel-portal`.
+
+**Service won't start:** `GET /api/status` → find FAILED service → `GET /api/logs/{id}?lines=100` → `POST /api/restart/{id}`.
+
+**Mobile testing:** `POST /api/toggle-lan` → `GET /api/status` (read `ip` field) → browse `http://{ip}:3002`.
+
+**Database issues:** `POST /api/db-setup` → `GET /api/db-setup/status` to monitor → retry failed steps with `POST /api/db-setup/retry/{stepId}`.
+
+**Stale fb-travel-data:** `GET /api/yalc/status` → if stale: `POST /api/yalc/relink`.

@@ -14,10 +14,10 @@ struct SetupView: View {
     @State private var currentStep: SetupStep = .paths
     @State private var checker: EnvironmentChecker?
 
-    // Step 1 state
     @State private var bookingPortalPath: String = ""
     @State private var universalLoginPath: String = ""
     @State private var travelDataPath: String = ""
+    @State private var partnerPortalPath: String = ""
     @State private var dropTargetHighlighted = false
     @State private var statusMessage: String? = nil
 
@@ -72,6 +72,7 @@ struct SetupView: View {
                     repoRow(role: .bookingPortal, path: $bookingPortalPath)
                     repoRow(role: .universalLogin, path: $universalLoginPath)
                     repoRow(role: .travelData, path: $travelDataPath)
+                    repoRow(role: .partnerPortal, path: $partnerPortalPath)
 
                     if let msg = statusMessage {
                         HStack {
@@ -211,7 +212,8 @@ struct SetupView: View {
         let repos = DetectedRepos(
             bookingPortal: bookingPortalPath,
             universalLogin: universalLoginPath,
-            travelData: travelDataPath.isEmpty ? nil : travelDataPath
+            travelData: travelDataPath.isEmpty ? nil : travelDataPath,
+            partnerPortal: partnerPortalPath.isEmpty ? nil : partnerPortalPath
         )
         do {
             try ConfigLoader.generate(from: repos)
@@ -227,6 +229,7 @@ struct SetupView: View {
             if let p = paths.bookingPortal, !p.isEmpty { bookingPortalPath = p }
             if let p = paths.universalLogin, !p.isEmpty { universalLoginPath = p }
             if let p = paths.travelData, !p.isEmpty { travelDataPath = p }
+            if let p = paths.partnerPortal, !p.isEmpty { partnerPortalPath = p }
         }
         if bookingPortalPath.isEmpty || universalLoginPath.isEmpty {
             for service in config.services {
@@ -255,6 +258,10 @@ struct SetupView: View {
         if let p = detected.travelData, travelDataPath.isEmpty {
             travelDataPath = p
             filled.append("fb-travel-data")
+        }
+        if let p = detected.partnerPortal, partnerPortalPath.isEmpty {
+            partnerPortalPath = p
+            filled.append("Partner Portal")
         }
 
         var missing: [String] = []
