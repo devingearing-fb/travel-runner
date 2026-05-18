@@ -54,12 +54,10 @@ struct ServiceConsoleView: View {
 
             statusBar
         }
-        .task {
+        .task(id: serviceID) {
+            lastVersion = 0
+            logEntries = []
             while !Task.isCancelled {
-                if !supervisor.panelVisible {
-                    try? await Task.sleep(for: .seconds(2))
-                    continue
-                }
                 let v = await logStore.version(for: serviceID)
                 if v != lastVersion {
                     lastVersion = v

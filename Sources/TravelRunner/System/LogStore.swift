@@ -117,6 +117,20 @@ actor LogStore {
         levelCounts.removeAll()
         versions.removeAll()
     }
+
+    func allEntries() -> [LogEntry] {
+        buffers.values
+            .flatMap(\.allElements)
+            .sorted { $0.timestamp < $1.timestamp }
+    }
+
+    func allVersion() -> Int {
+        versions.values.reduce(0, +)
+    }
+
+    func serviceIDs() -> [String] {
+        Array(buffers.keys)
+    }
 }
 
 struct RingBuffer<Element: Sendable>: Sendable {

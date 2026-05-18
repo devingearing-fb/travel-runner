@@ -27,6 +27,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         updateController = UpdateController()
 
+        WorkshopPanel.shared.configure(supervisor: supervisor)
+
         setupNotifications()
         setupStatusItem()
         setupPanel()
@@ -191,6 +193,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openItem.target = self
         menu.addItem(openItem)
 
+        let workshopItem = NSMenuItem(title: "Open Workshop", action: #selector(openWorkshop), keyEquivalent: "w")
+        workshopItem.target = self
+        menu.addItem(workshopItem)
+
+        let terminalsItem = NSMenuItem(title: "Open Terminals", action: #selector(openTerminals), keyEquivalent: "")
+        terminalsItem.target = self
+        menu.addItem(terminalsItem)
+
         let updateItem = NSMenuItem(title: "Check for Updates...", action: #selector(checkForUpdates), keyEquivalent: "")
         updateItem.target = self
         updateItem.isEnabled = updateController.canCheckForUpdates
@@ -222,6 +232,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func checkForUpdates() {
         updateController.checkForUpdates()
+    }
+
+    @objc private func openWorkshop() {
+        WorkshopPanel.shared.open()
+    }
+
+    @objc private func openTerminals() {
+        WorkshopPanel.shared.open(section: .logs)
     }
 
     private func updateStatusIcon() {
