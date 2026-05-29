@@ -695,7 +695,7 @@ final class EnvironmentSupervisor {
                 serviceStates[serviceID]?.phase = .starting
 
                 let cmd = mode
-                    ? "npm run dev -- --hostname 0.0.0.0"
+                    ? "npm run dev -- --hostname \(ip)"
                     : "npm run dev"
 
                 // When in LAN mode, override env vars so URLs point to the
