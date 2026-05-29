@@ -1078,7 +1078,7 @@ final class EnvironmentSupervisor {
         let lanServices: Set<String> = ["travel-portal", "universal-login"]
         guard lanServices.contains(serviceID) else { return definition }
 
-        let cmd = "npm run dev -- --hostname 0.0.0.0"
+        let cmd = "npm run dev -- --hostname \(ip)"
         var envOverrides = definition.env ?? [:]
 
         if serviceID == "universal-login" {
