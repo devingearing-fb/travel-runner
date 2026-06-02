@@ -62,7 +62,10 @@ final class EnvironmentSupervisor {
     private var dbSetupRunner: DbSetupRunner?
     private var debugTracker: DebugTracker?
     private var yalcWatcher: YalcWatcher?
+    private var gitBranchWatcher: GitBranchWatcher?
     private var yalcRelinkInProgress = false
+    private var isTogglingNetwork = false
+    private var stripeReconnectingSince: Date? = nil
     private var localSupabaseAnonKey: String?
     private var localSupabaseSigningKey: String?
 
@@ -141,6 +144,22 @@ final class EnvironmentSupervisor {
                 let watcher = YalcWatcher(travelDataDir: travelDataPath)
                 yalcWatcher = watcher
                 Task { await startYalcWatching(watcher: watcher) }
+            }
+
+            // Initialize git branch watcher for all repos with cwds
+            var repoMap: [String: String] = [:]
+            for service in config.services {
+                if let cwd = service.resolvedCwd {
+                    repoMap[service.id] = cwd
+                }
+            }
+            if let dataPath = config.paths?.travelData, !dataPath.isEmpty {
+                repoMap["fb-travel-data"] = NSString(string: dataPath).expandingTildeInPath as String
+            }
+            if !repoMap.isEmpty {
+                let watcher = GitBranchWatcher(repos: repoMap)
+                gitBranchWatcher = watcher
+                Task { await startGitBranchWatching(watcher: watcher) }
             }
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this
@@ -359,10 +378,12 @@ final class EnvironmentSupervisor {
                         let yalcStale = await MainActor.run { self.yalcStale }
                         let yalcAuto = await MainActor.run { self.autoRelinkYalc }
                         let dbMode = await MainActor.run { self.dbMode.rawValue }
+                        let branches = await MainActor.run { self.gitBranches }
                         let dict: [String: Any] = [
                             "health": health, "services": states, "lan": lan, "ip": ip,
                             "yalc": ["stale": yalcStale, "auto_relink": yalcAuto] as [String: Any],
-                            "db_mode": dbMode
+                            "db_mode": dbMode,
+                            "branches": branches
                         ]
                         if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
                            let str = String(data: data, encoding: .utf8) { return str }
@@ -645,10 +666,14 @@ final class EnvironmentSupervisor {
     }
 
     func toggleNetworkMode() {
+        guard !isTogglingNetwork else { return }
+        isTogglingNetwork = true
         networkMode.toggle()
         let mode = networkMode
 
         Task {
+            defer { isTogglingNetwork = false }
+
             if mode {
                 let (output, ok) = await shellOutput("ipconfig getifaddr en0")
                 localIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : nil
@@ -658,8 +683,6 @@ final class EnvironmentSupervisor {
 
             let ip = localIP ?? "127.0.0.1"
 
-            // Patch NEXT_PUBLIC_* vars in .env.local files — process env overrides
-            // don't propagate to client-side bundles, so we must edit the files.
             let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
             let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
 
@@ -681,94 +704,23 @@ final class EnvironmentSupervisor {
             }
 
             let servicesToRestart = ["travel-portal", "universal-login"]
-            let logStore = self.logStore
 
-            // Mark as stopping so handleTermination doesn't flag them as failed
             for serviceID in servicesToRestart {
                 serviceStates[serviceID]?.phase = .stopping
             }
 
             for serviceID in servicesToRestart {
-                guard let definition = graph?.nodes[serviceID] else { continue }
-
                 await processRunner.stop(serviceID: serviceID)
-                serviceStates[serviceID]?.phase = .starting
-
-                let cmd = mode
-                    ? "npm run dev -- --hostname \(ip)"
-                    : "npm run dev"
-
-                // When in LAN mode, override env vars so URLs point to the
-                // LAN IP instead of localhost. Process env overrides .env.local.
-                var envOverrides = definition.env ?? [:]
-                if mode {
-                    if serviceID == "universal-login" {
-                        envOverrides["NEXT_PUBLIC_SITE_URL"] = "http://\(ip):3000"
-                        envOverrides["NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL"] = "http://\(ip):3000"
-                        envOverrides["NEXT_PUBLIC_SUPABASE_URL"] = "http://\(ip):54321"
-                    }
-                    if serviceID == "travel-portal" {
-                        envOverrides["LOGIN_URL"] = "http://\(ip):3000/login/init"
-                        envOverrides["NEXT_PUBLIC_WEBAPP_URL"] = "http://\(ip):3002"
-                        envOverrides["NEXT_PUBLIC_SUPABASE_URL"] = "http://\(ip):54321"
-                    }
-                }
-
-                let modifiedDef = ServiceDefinition(
-                    id: definition.id,
-                    name: definition.name,
-                    cmd: cmd.components(separatedBy: " "),
-                    cwd: definition.cwd,
-                    probe: definition.probe,
-                    type: definition.type,
-                    restart: definition.restart,
-                    dependsOn: definition.dependsOn,
-                    env: envOverrides,
-                    phase: definition.phase,
-                    reuseIfRunning: definition.reuseIfRunning
-                )
-
-                let port = definition.probe?.port.map { String($0) } ?? ""
                 await logStore.append(
                     serviceID: serviceID,
-                    entry: LogEntry(stream: .stdout, text: "[travel-runner] Network mode \(mode ? "ON — http://\(ip):\(port)" : "OFF — localhost only")")
+                    entry: LogEntry(stream: .stdout, text: "[travel-runner] Network mode \(mode ? "ON — http://\(ip)" : "OFF — localhost only")")
                 )
-
+                serviceStates[serviceID]?.phase = .starting
                 do {
-                    let sid = serviceID
-                    let pid = try await processRunner.start(
-                        service: modifiedDef,
-                        onStdout: { lines in
-                            Task {
-                                let entries = lines.map { LogEntry(stream: .stdout, text: $0) }
-                                await logStore.appendBatch(serviceID: sid, entries: entries)
-                            }
-                        },
-                        onStderr: { lines in
-                            Task {
-                                let entries = lines.map { LogEntry(stream: .stderr, text: $0) }
-                                await logStore.appendBatch(serviceID: sid, entries: entries)
-                            }
-                        },
-                        onTermination: { [weak self] exitCode in
-                            Task { @MainActor in self?.handleTermination(serviceID: sid, exitCode: exitCode) }
-                        }
-                    )
-                    serviceStates[serviceID]?.pid = pid
+                    try await startService(serviceID)
                 } catch {
                     serviceStates[serviceID]?.phase = .failed
                     lastError = "Network mode restart failed for \(serviceID): \(error)"
-                }
-            }
-
-            // Wait for probes
-            for serviceID in servicesToRestart {
-                guard let definition = graph?.nodes[serviceID],
-                      let probeConfig = definition.probe else { continue }
-                let probe = ProbeFactory.makeProbe(for: probeConfig)
-                let ready = try? await waitForProbe(probe, timeout: probeConfig.resolvedTimeout)
-                if ready == true {
-                    serviceStates[serviceID]?.phase = .running
                 }
             }
 
@@ -794,6 +746,7 @@ final class EnvironmentSupervisor {
     }
 
     func restartService(_ serviceID: String) {
+        if serviceID == "stripe" { stripeReconnectingSince = nil }
         Task {
             serviceStates[serviceID]?.phase = .stopping
             await processRunner.stop(serviceID: serviceID)
@@ -952,6 +905,62 @@ final class EnvironmentSupervisor {
             }
 
             try? await Task.sleep(for: .seconds(5))
+        }
+    }
+
+    private func startGitBranchWatching(watcher: GitBranchWatcher) async {
+        _ = await watcher.check()
+        let initial = await watcher.branches
+        await MainActor.run { self.gitBranches = initial }
+
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(5))
+            let changed = await watcher.check()
+            let allBranches = await watcher.branches
+            await MainActor.run { self.gitBranches = allBranches }
+
+            guard !changed.isEmpty, health == .healthy else { continue }
+
+            for serviceID in changed {
+                let branchName = allBranches[serviceID] ?? "unknown"
+                let displayName = serviceStates[serviceID]?.definition.displayName ?? serviceID
+                await logStore.append(
+                    serviceID: serviceID,
+                    entry: LogEntry(stream: .stdout,
+                        text: "[travel-runner] Branch changed to '\(branchName)' — restarting \(displayName)")
+                )
+            }
+
+            if changed.contains("supabase") || changed.contains("travel-portal") {
+                if let cwd = serviceCwd("supabase") ?? serviceCwd("travel-portal") {
+                    if migrationTracker.migrationsChanged(portalCwd: cwd) {
+                        await MainActor.run {
+                            self.lastError = "Branch switch: new migrations detected — running db:reset..."
+                            self.dbResetRunning = true
+                        }
+                        let ok = await runDbReset(cwd: cwd)
+                        await MainActor.run {
+                            self.dbResetRunning = false
+                            if ok {
+                                self.lastError = nil
+                                self.migrationTracker.recordCurrentHash(portalCwd: cwd)
+                            } else {
+                                self.lastError = "db:reset failed after branch switch"
+                                self.migrationsBannerVisible = true
+                            }
+                        }
+                    }
+                }
+            }
+
+            if changed.contains("fb-travel-data") {
+                await MainActor.run { self.publishAndRetryYalc() }
+            }
+
+            let runningChanged = changed.filter { serviceStates[$0]?.phase == .running }
+            for serviceID in runningChanged {
+                restartService(serviceID)
+            }
         }
     }
 
@@ -1198,7 +1207,7 @@ final class EnvironmentSupervisor {
         let sid = serviceID
         let pid = try await processRunner.start(
             service: effectiveDefinition,
-            onStdout: { lines in
+            onStdout: { [weak self] lines in
                 Task {
                     let entries = lines.map { LogEntry(stream: .stdout, text: $0) }
                     await logStore.appendBatch(serviceID: sid, entries: entries)
@@ -1206,6 +1215,24 @@ final class EnvironmentSupervisor {
                         for line in lines {
                             if let captured = probe.feed(line: line), let name = artifactName {
                                 await secretStore.set(name, value: captured)
+                            }
+                        }
+                    }
+                    if sid == "stripe" {
+                        for line in lines {
+                            if line.contains("Session expired, reconnecting") {
+                                await MainActor.run {
+                                    if self?.stripeReconnectingSince == nil {
+                                        self?.stripeReconnectingSince = .now
+                                    }
+                                    if let since = self?.stripeReconnectingSince,
+                                       Date.now.timeIntervalSince(since) > 120 {
+                                        self?.stripeReconnectingSince = nil
+                                        self?.restartService("stripe")
+                                    }
+                                }
+                            } else if line.contains("-->") {
+                                await MainActor.run { self?.stripeReconnectingSince = nil }
                             }
                         }
                     }
@@ -1327,6 +1354,12 @@ final class EnvironmentSupervisor {
         Task {
             try? await Task.sleep(for: .seconds(delay))
             guard serviceStates[serviceID]?.phase == .failed else { return }
+
+            if serviceID == "stripe" {
+                let networkReady = await waitForNetwork(timeout: .seconds(15))
+                guard networkReady else { return }
+            }
+
             state.restartCount += 1
             restartService(serviceID)
         }
@@ -1379,6 +1412,33 @@ final class EnvironmentSupervisor {
                         trigger: "probe_timeout",
                         serviceID: serviceID,
                         summary: "\(state.definition.displayName) failed wake probe"
+                    )}
+                }
+            }
+
+            // Stripe's WebSocket is guaranteed stale after sleep — proactively restart
+            // rather than waiting for the CLI to detect the failure and crash.
+            if let stripeState = serviceStates["stripe"],
+               stripeState.phase == .running || stripeState.phase == .failed {
+                await logStore.append(
+                    serviceID: "stripe",
+                    entry: LogEntry(stream: .stdout, text: "[travel-runner] Restarting Stripe after wake — waiting for network...")
+                )
+
+                let networkReady = await waitForNetwork(timeout: .seconds(30))
+                if networkReady {
+                    stripeState.restartCount = 0
+                    stripeState.isCircuitBroken = false
+                    stripeState.failureTimestamps = []
+                    restartService("stripe")
+                } else {
+                    stripeState.phase = .failed
+                    lastError = "Stripe: network not available after wake"
+                    recalculateHealth()
+                    Task { await self.captureDebugIssue(
+                        trigger: "probe_timeout",
+                        serviceID: "stripe",
+                        summary: "Network not available 30s after wake — Stripe restart deferred"
                     )}
                 }
             }
@@ -1513,6 +1573,19 @@ final class EnvironmentSupervisor {
 
     private func isStripeAvailable() async -> Bool {
         await runShellCommand("which stripe >/dev/null 2>&1 && stripe config --list >/dev/null 2>&1")
+    }
+
+    private func canResolveHost(_ host: String) async -> Bool {
+        await runShellCommand("host \(host) >/dev/null 2>&1")
+    }
+
+    private func waitForNetwork(timeout: Duration = .seconds(30)) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if await canResolveHost("api.stripe.com") { return true }
+            try? await Task.sleep(for: .seconds(2))
+        }
+        return false
     }
 
     private func databaseHasAppTables(portalCwd: String) async -> Bool {
