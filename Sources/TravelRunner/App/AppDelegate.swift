@@ -5,7 +5,6 @@ import UserNotifications
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var panel: NSPanel!
     private var supervisor: EnvironmentSupervisor!
     private var iconTimer: Timer?
     private var rightClickMonitor: Any?
@@ -31,7 +30,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupNotifications()
         setupStatusItem()
-        setupPanel()
         setupGlobalHotkey()
     }
 
@@ -193,10 +191,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openItem.target = self
         menu.addItem(openItem)
 
-        let workshopItem = NSMenuItem(title: "Open Workshop", action: #selector(openWorkshop), keyEquivalent: "w")
-        workshopItem.target = self
-        menu.addItem(workshopItem)
-
         let terminalsItem = NSMenuItem(title: "Open Terminals", action: #selector(openTerminals), keyEquivalent: "")
         terminalsItem.target = self
         menu.addItem(terminalsItem)
@@ -218,12 +212,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openPanel() {
-        if !panel.isVisible {
-            positionPanelBelowStatusItem()
-            panel.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            supervisor.panelVisible = true
-        }
+        WorkshopPanel.shared.open()
+        NSApp.activate(ignoringOtherApps: true)
+        supervisor.panelVisible = true
     }
 
     @objc private func quitApp() {
@@ -234,12 +225,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateController.checkForUpdates()
     }
 
-    @objc private func openWorkshop() {
-        WorkshopPanel.shared.open()
-    }
-
     @objc private func openTerminals() {
         WorkshopPanel.shared.open(section: .logs)
+        NSApp.activate(ignoringOtherApps: true)
+        supervisor.panelVisible = true
     }
 
     private func updateStatusIcon() {
@@ -324,55 +313,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Panel
 
-    private func setupPanel() {
-        let content = MenuBarView().environment(supervisor)
-        let hostingView = NSHostingView(rootView: content)
-
-        panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 600),
-            styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
-        panel.title = "Travel Runner"
-        panel.titlebarAppearsTransparent = true
-        panel.titleVisibility = .hidden
-        panel.isFloatingPanel = true
-        panel.level = .floating
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        panel.isMovableByWindowBackground = true
-        panel.contentView = hostingView
-        panel.isReleasedWhenClosed = false
-        panel.minSize = NSSize(width: 420, height: 400)
-        panel.maxSize = NSSize(width: 900, height: 1200)
-        panel.orderOut(nil)
-    }
-
     @objc private func togglePanel() {
-        if panel.isVisible {
-            panel.orderOut(nil)
+        if WorkshopPanel.shared.isVisible {
+            WorkshopPanel.shared.close()
             supervisor.panelVisible = false
         } else {
-            positionPanelBelowStatusItem()
-            panel.makeKeyAndOrderFront(nil)
+            WorkshopPanel.shared.open()
             NSApp.activate(ignoringOtherApps: true)
             supervisor.panelVisible = true
         }
-    }
-
-    private func positionPanelBelowStatusItem() {
-        guard let button = statusItem.button,
-              let buttonWindow = button.window else { return }
-
-        let buttonRect = button.convert(button.bounds, to: nil)
-        let screenRect = buttonWindow.convertToScreen(buttonRect)
-
-        let panelWidth = panel.frame.width
-        let panelHeight = panel.frame.height
-
-        let x = screenRect.midX - panelWidth / 2
-        let y = screenRect.minY - panelHeight - 4
-
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
     }
 }

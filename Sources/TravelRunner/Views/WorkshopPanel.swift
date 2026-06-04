@@ -1,7 +1,13 @@
 import AppKit
 import SwiftUI
 
+final class KeyablePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 enum WorkshopSection: String, CaseIterable, Identifiable {
+    case status = "Status"
     case logs = "Terminals"
     case dbTools = "DB Tools"
     case settings = "Settings"
@@ -11,6 +17,7 @@ enum WorkshopSection: String, CaseIterable, Identifiable {
 
     var icon: String {
         switch self {
+        case .status: "heart.text.clipboard"
         case .logs: "terminal"
         case .dbTools: "cylinder.split.1x2"
         case .settings: "gearshape"
@@ -22,22 +29,27 @@ enum WorkshopSection: String, CaseIterable, Identifiable {
 @Observable
 @MainActor
 final class WorkshopNavigation {
-    var selectedSection: WorkshopSection = .logs
+    var selectedSection: WorkshopSection = .status
 }
 
 @MainActor
 final class WorkshopPanel {
     static let shared = WorkshopPanel()
 
-    private var panel: NSPanel?
+    private var panel: KeyablePanel?
     private var supervisor: EnvironmentSupervisor?
+    private var panelDelegate: PanelDelegate?
     let navigation = WorkshopNavigation()
+
+    var isVisible: Bool {
+        panel?.isVisible ?? false
+    }
 
     func configure(supervisor: EnvironmentSupervisor) {
         self.supervisor = supervisor
     }
 
-    func open(section: WorkshopSection = .logs) {
+    func open(section: WorkshopSection = .status) {
         navigation.selectedSection = section
         if let panel, panel.isVisible {
             panel.makeKeyAndOrderFront(nil)
@@ -61,23 +73,45 @@ final class WorkshopPanel {
 
         let hostingView = NSHostingView(rootView: workshopView)
 
-        let newPanel = NSPanel(
+        let delegate = PanelDelegate()
+        delegate.supervisor = supervisor
+        self.panelDelegate = delegate
+
+        let newPanel = KeyablePanel(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.titled, .closable, .resizable, .miniaturizable, .nonactivatingPanel],
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
-        newPanel.title = "Travel Runner — Workshop"
+        newPanel.title = "Travel Runner"
         newPanel.titlebarAppearsTransparent = false
         newPanel.isFloatingPanel = true
         newPanel.level = .floating
+        newPanel.hidesOnDeactivate = true
         newPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         newPanel.isMovableByWindowBackground = false
         newPanel.contentView = hostingView
         newPanel.isReleasedWhenClosed = false
-        newPanel.minSize = NSSize(width: 680, height: 480)
+        newPanel.minSize = NSSize(width: 700, height: 500)
         newPanel.maxSize = NSSize(width: 1400, height: 1000)
+        newPanel.delegate = delegate
 
         self.panel = newPanel
+    }
+}
+
+private final class PanelDelegate: NSObject, NSWindowDelegate {
+    weak var supervisor: EnvironmentSupervisor?
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        Task { @MainActor in
+            supervisor?.panelVisible = true
+        }
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        Task { @MainActor in
+            supervisor?.panelVisible = false
+        }
     }
 }

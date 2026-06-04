@@ -518,7 +518,7 @@ final class EnvironmentSupervisor {
         }
         if let rawPartner = config?.paths?.partnerPortal, !rawPartner.isEmpty {
             let partnerPath = NSString(string: rawPartner).expandingTildeInPath
-            let localEnvPath = (partnerPath as NSString).appendingPathComponent(".env.local.local")
+            let localEnvPath = (partnerPath as NSString).appendingPathComponent(".env.local.runner")
             if FileManager.default.fileExists(atPath: localEnvPath) {
                 let source = readEnvFile(localEnvPath)
                 let env = EnvCompatLayer(envFilePaths: [partnerPath + "/.env.local"])
@@ -702,8 +702,20 @@ final class EnvironmentSupervisor {
                 env.write(key: "NEXT_PUBLIC_SITE_URL", value: "http://\(host):3000")
                 env.write(key: "NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", value: "http://\(host):3000")
             }
+            if let rawPartner = config?.paths?.partnerPortal, !rawPartner.isEmpty {
+                let partnerPath = NSString(string: rawPartner).expandingTildeInPath
+                let baselinePath = (partnerPath as NSString).appendingPathComponent(".env.local.runner")
+                let source = readEnvFile(baselinePath)
+                let env = EnvCompatLayer(envFilePaths: [partnerPath + "/.env.local"])
+                for (key, value) in source {
+                    env.write(key: key, value: value.replacingOccurrences(of: "localhost", with: host))
+                }
+            }
 
-            let servicesToRestart = ["travel-portal", "universal-login"]
+            var servicesToRestart = ["travel-portal", "universal-login"]
+            if partnerPortalEnabled && serviceStates["partner-portal"] != nil {
+                servicesToRestart.append("partner-portal")
+            }
 
             for serviceID in servicesToRestart {
                 serviceStates[serviceID]?.phase = .stopping
@@ -855,7 +867,7 @@ final class EnvironmentSupervisor {
         guard let rawPartnerCwd = config?.paths?.partnerPortal, !rawPartnerCwd.isEmpty else { return }
         let partnerCwd = NSString(string: rawPartnerCwd).expandingTildeInPath
 
-        let localEnvPath = (partnerCwd as NSString).appendingPathComponent(".env.local.local")
+        let localEnvPath = (partnerCwd as NSString).appendingPathComponent(".env.local.runner")
         guard FileManager.default.fileExists(atPath: localEnvPath) else { return }
 
         if dbMode == .local {
@@ -1084,10 +1096,15 @@ final class EnvironmentSupervisor {
 
     private func lanAwareDefinition(for definition: ServiceDefinition, serviceID: String) -> ServiceDefinition {
         guard networkMode, let ip = localIP else { return definition }
-        let lanServices: Set<String> = ["travel-portal", "universal-login"]
+        let lanServices: Set<String> = ["travel-portal", "universal-login", "partner-portal"]
         guard lanServices.contains(serviceID) else { return definition }
 
-        let cmd = "npm run dev -- --hostname \(ip)"
+        let cmd: String
+        if serviceID == "partner-portal" {
+            cmd = "npm run dev -- -p 3001 --hostname \(ip)"
+        } else {
+            cmd = "npm run dev -- --hostname \(ip)"
+        }
         var envOverrides = definition.env ?? [:]
 
         if serviceID == "universal-login" {
@@ -1099,6 +1116,15 @@ final class EnvironmentSupervisor {
             envOverrides["LOGIN_URL"] = "http://\(ip):3000/login/init"
             envOverrides["NEXT_PUBLIC_WEBAPP_URL"] = "http://\(ip):3002"
             envOverrides["NEXT_PUBLIC_SUPABASE_URL"] = "http://\(ip):54321"
+        }
+        if serviceID == "partner-portal",
+           let rawPartner = config?.paths?.partnerPortal, !rawPartner.isEmpty {
+            let partnerPath = NSString(string: rawPartner).expandingTildeInPath
+            let baselinePath = (partnerPath as NSString).appendingPathComponent(".env.local.runner")
+            let source = readEnvFile(baselinePath)
+            for (key, value) in source where value.contains("localhost") {
+                envOverrides[key] = value.replacingOccurrences(of: "localhost", with: ip)
+            }
         }
 
         return ServiceDefinition(
@@ -1326,13 +1352,14 @@ final class EnvironmentSupervisor {
             }
 
             if state.definition.resolvedRestart == .onFailure && exitCode != 0 {
-                scheduleRestart(serviceID: serviceID)
+                let earlyExit = state.lastStarted.map { Date.now.timeIntervalSince($0) < 10 } ?? false
+                scheduleRestart(serviceID: serviceID, wasEarlyExit: earlyExit)
             }
             recalculateHealth()
         }
     }
 
-    private func scheduleRestart(serviceID: String) {
+    private func scheduleRestart(serviceID: String, wasEarlyExit: Bool = false) {
         guard let state = serviceStates[serviceID] else { return }
 
         let cutoff = Date.now.addingTimeInterval(-60)
@@ -1350,7 +1377,8 @@ final class EnvironmentSupervisor {
 
         guard state.restartCount < 5 else { return }
 
-        let delay = min(2.0 * pow(2.0, Double(state.restartCount)), 60.0)
+        let baseDelay = min(2.0 * pow(2.0, Double(state.restartCount)), 60.0)
+        let delay = (serviceID == "stripe" && wasEarlyExit) ? max(baseDelay, 15.0) : baseDelay
         Task {
             try? await Task.sleep(for: .seconds(delay))
             guard serviceStates[serviceID]?.phase == .failed else { return }
@@ -1575,14 +1603,14 @@ final class EnvironmentSupervisor {
         await runShellCommand("which stripe >/dev/null 2>&1 && stripe config --list >/dev/null 2>&1")
     }
 
-    private func canResolveHost(_ host: String) async -> Bool {
-        await runShellCommand("host \(host) >/dev/null 2>&1")
+    private func canReachHost(_ host: String) async -> Bool {
+        await runShellCommand("nc -z -w 2 \(host) 443 >/dev/null 2>&1")
     }
 
     private func waitForNetwork(timeout: Duration = .seconds(30)) async -> Bool {
         let deadline = ContinuousClock.now + timeout
         while ContinuousClock.now < deadline {
-            if await canResolveHost("api.stripe.com") { return true }
+            if await canReachHost("api.stripe.com") { return true }
             try? await Task.sleep(for: .seconds(2))
         }
         return false
@@ -1651,6 +1679,17 @@ final class EnvironmentSupervisor {
     }
 
     private func isPortBound(_ port: Int) -> Bool {
+        if isPortBoundOnAddress(port, address: UInt32(INADDR_LOOPBACK).bigEndian) { return true }
+        if let ip = localIP {
+            var lanAddr = in_addr()
+            if inet_pton(AF_INET, ip, &lanAddr) == 1 {
+                if isPortBoundOnAddress(port, address: lanAddr.s_addr) { return true }
+            }
+        }
+        return false
+    }
+
+    private func isPortBoundOnAddress(_ port: Int, address: UInt32) -> Bool {
         let sock = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard sock >= 0 else { return false }
         defer { Darwin.close(sock) }
@@ -1658,7 +1697,7 @@ final class EnvironmentSupervisor {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = UInt16(port).bigEndian
-        addr.sin_addr.s_addr = UInt32(INADDR_LOOPBACK).bigEndian
+        addr.sin_addr.s_addr = address
 
         let result = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {

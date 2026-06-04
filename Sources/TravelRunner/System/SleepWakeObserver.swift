@@ -4,6 +4,7 @@ import AppKit
 final class SleepWakeObserver {
     private var observation: (any NSObjectProtocol)?
     private let onWake: @MainActor () -> Void
+    private var lastWakeAt: Date?
 
     init(onWake: @escaping @MainActor () -> Void) {
         self.onWake = onWake
@@ -16,7 +17,11 @@ final class SleepWakeObserver {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.onWake()
+                guard let self else { return }
+                let now = Date.now
+                if let last = self.lastWakeAt, now.timeIntervalSince(last) < 5 { return }
+                self.lastWakeAt = now
+                self.onWake()
             }
         }
     }
