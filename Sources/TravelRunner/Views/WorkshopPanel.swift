@@ -85,9 +85,10 @@ final class WorkshopPanel {
         )
         newPanel.title = "Travel Runner"
         newPanel.titlebarAppearsTransparent = false
-        newPanel.isFloatingPanel = true
-        newPanel.level = .floating
-        newPanel.hidesOnDeactivate = true
+        newPanel.isFloatingPanel = false
+        newPanel.level = .normal
+        newPanel.hidesOnDeactivate = false
+        newPanel.becomesKeyOnlyIfNeeded = false
         newPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         newPanel.isMovableByWindowBackground = false
         newPanel.contentView = hostingView
