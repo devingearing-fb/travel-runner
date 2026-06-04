@@ -43,6 +43,8 @@ struct WorkshopView: View {
                         WorkshopSettingsView()
                     case .diagnostics:
                         WorkshopDiagnosticsView()
+                    case nil:
+                        WorkshopStatusView()
                     }
                 }
 

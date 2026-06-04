@@ -29,7 +29,7 @@ enum WorkshopSection: String, CaseIterable, Identifiable {
 @Observable
 @MainActor
 final class WorkshopNavigation {
-    var selectedSection: WorkshopSection = .status
+    var selectedSection: WorkshopSection? = .status
 }
 
 @MainActor
