@@ -13,7 +13,7 @@ enum WorkshopSection: String, CaseIterable, Identifiable {
     case settings = "Settings"
     case diagnostics = "Diagnostics"
 
-    var id: String { rawValue }
+    var id: Self { self }
 
     var icon: String {
         switch self {
