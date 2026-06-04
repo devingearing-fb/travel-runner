@@ -1127,12 +1127,25 @@ final class EnvironmentSupervisor {
             }
         }
 
+        var lanProbe = definition.probe
+        if let probe = lanProbe, probe.type == .tcp {
+            lanProbe = ProbeConfig(
+                type: probe.type,
+                port: probe.port,
+                host: ip,
+                url: probe.url,
+                pattern: probe.pattern,
+                artifact: probe.artifact,
+                timeout: probe.timeout
+            )
+        }
+
         return ServiceDefinition(
             id: definition.id,
             name: definition.name,
             cmd: cmd.components(separatedBy: " "),
             cwd: definition.cwd,
-            probe: definition.probe,
+            probe: lanProbe,
             type: definition.type,
             restart: definition.restart,
             dependsOn: definition.dependsOn,
@@ -1296,8 +1309,8 @@ final class EnvironmentSupervisor {
             }
         }
 
-        // Daemons: wait for probe
-        if let probeConfig = definition.probe {
+        // Daemons: wait for probe (use effectiveDefinition for LAN-aware host)
+        if let probeConfig = effectiveDefinition.probe {
             let probe: Probe = if let sp = capturedProbe { sp } else { ProbeFactory.makeProbe(for: probeConfig) }
             let timeout = probeConfig.resolvedTimeout
             let ready = try await waitForProbe(probe, timeout: timeout)
