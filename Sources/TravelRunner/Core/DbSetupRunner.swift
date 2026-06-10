@@ -141,7 +141,21 @@ actor DbSetupRunner {
                 }
             }
 
+            self.currentProcess = process
+
+            // Timeout watchdog — cancelled on normal exit so it doesn't linger
+            // for the full timeout after the process has already completed.
+            let watchdog = Task {
+                try? await Task.sleep(for: .seconds(timeout))
+                guard !Task.isCancelled else { return }
+                if guard_.claim() {
+                    process.terminate()
+                    continuation.resume(returning: (-1, true))
+                }
+            }
+
             process.terminationHandler = { proc in
+                watchdog.cancel()
                 pipe.fileHandleForReading.readabilityHandler = nil
                 if let remaining = lineBuffer.flush() {
                     let entry = LogEntry(stream: .stdout, text: remaining)
@@ -153,22 +167,14 @@ actor DbSetupRunner {
                 }
             }
 
-            self.currentProcess = process
-
             do {
                 try process.run()
             } catch {
-                continuation.resume(returning: (-1, false))
-                return
-            }
-
-            // Timeout watchdog
-            Task {
-                try? await Task.sleep(for: .seconds(timeout))
+                watchdog.cancel()
                 if guard_.claim() {
-                    process.terminate()
-                    continuation.resume(returning: (-1, true))
+                    continuation.resume(returning: (-1, false))
                 }
+                return
             }
         }
 

@@ -63,6 +63,8 @@ final class EnvironmentSupervisor {
     private var debugTracker: DebugTracker?
     private var yalcWatcher: YalcWatcher?
     private var gitBranchWatcher: GitBranchWatcher?
+    private var yalcWatcherTask: Task<Void, Never>?
+    private var gitWatcherTask: Task<Void, Never>?
     private var yalcRelinkInProgress = false
     private var isTogglingNetwork = false
     private var stripeReconnectingSince: Date? = nil
@@ -143,7 +145,8 @@ final class EnvironmentSupervisor {
             if let travelDataPath = config.paths?.travelData, !travelDataPath.isEmpty {
                 let watcher = YalcWatcher(travelDataDir: travelDataPath)
                 yalcWatcher = watcher
-                Task { await startYalcWatching(watcher: watcher) }
+                yalcWatcherTask?.cancel()
+                yalcWatcherTask = Task { await startYalcWatching(watcher: watcher) }
             }
 
             // Initialize git branch watcher for all repos with cwds
@@ -159,7 +162,8 @@ final class EnvironmentSupervisor {
             if !repoMap.isEmpty {
                 let watcher = GitBranchWatcher(repos: repoMap)
                 gitBranchWatcher = watcher
-                Task { await startGitBranchWatching(watcher: watcher) }
+                gitWatcherTask?.cancel()
+                gitWatcherTask = Task { await startGitBranchWatching(watcher: watcher) }
             }
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this
@@ -667,8 +671,16 @@ final class EnvironmentSupervisor {
 
     func toggleNetworkMode() {
         guard !isTogglingNetwork else { return }
-        isTogglingNetwork = true
         networkMode.toggle()
+        applyNetworkMode()
+    }
+
+    /// Applies the current `networkMode` to env files and restarts LAN services.
+    /// Re-detects the LAN IP on every call, so it is also used to recover when
+    /// the machine moves networks (stale IP causes EADDRNOTAVAIL on restart).
+    func applyNetworkMode() {
+        guard !isTogglingNetwork else { return }
+        isTogglingNetwork = true
         let mode = networkMode
 
         Task {
@@ -1398,7 +1410,29 @@ final class EnvironmentSupervisor {
 
             if serviceID == "stripe" {
                 let networkReady = await waitForNetwork(timeout: .seconds(15))
-                guard networkReady else { return }
+                guard networkReady else {
+                    // Network still down — count the attempt and reschedule with
+                    // backoff instead of abandoning the restart permanently.
+                    state.restartCount += 1
+                    scheduleRestart(serviceID: serviceID)
+                    return
+                }
+            }
+
+            // LAN services: if the machine moved networks, restarting with the
+            // stale IP fails with EADDRNOTAVAIL. Re-detect and re-apply instead.
+            if networkMode,
+               ["travel-portal", "universal-login", "partner-portal"].contains(serviceID) {
+                let (output, ok) = await shellOutput("ipconfig getifaddr en0")
+                let currentIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                if !currentIP.isEmpty, currentIP != localIP {
+                    await logStore.append(
+                        serviceID: serviceID,
+                        entry: LogEntry(stream: .stdout, text: "[travel-runner] LAN IP changed (\(localIP ?? "?") → \(currentIP)) — re-applying network mode")
+                    )
+                    applyNetworkMode()
+                    return
+                }
             }
 
             state.restartCount += 1
@@ -1440,11 +1474,40 @@ final class EnvironmentSupervisor {
         guard health == .healthy || health == .degraded else { return }
         Task {
             try? await Task.sleep(for: .seconds(3))
+
+            // LAN mode: the network may have changed during sleep. Probing or
+            // restarting against a stale IP causes false probe failures and
+            // EADDRNOTAVAIL crash loops — re-detect before doing anything.
+            if networkMode {
+                let (output, ok) = await shellOutput("ipconfig getifaddr en0")
+                let currentIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                if currentIP.isEmpty {
+                    await logStore.append(
+                        serviceID: "travel-portal",
+                        entry: LogEntry(stream: .stdout, text: "[travel-runner] No LAN IP after wake — switching back to localhost mode")
+                    )
+                    toggleNetworkMode()
+                    return
+                }
+                if currentIP != localIP {
+                    await logStore.append(
+                        serviceID: "travel-portal",
+                        entry: LogEntry(stream: .stdout, text: "[travel-runner] LAN IP changed after wake (\(localIP ?? "?") → \(currentIP)) — re-applying network mode")
+                    )
+                    applyNetworkMode()
+                    return
+                }
+            }
+
             for (serviceID, state) in serviceStates where state.phase == .running {
                 guard let probeConfig = state.definition.probe,
                       probeConfig.type != .stdoutRegex else { continue }
-                let probe = ProbeFactory.makeProbe(for: probeConfig)
-                let ok = await probe.check()
+                // Use the LAN-aware probe so we check the host the service is
+                // actually bound to, and allow a grace window — a single 2s
+                // check right after wake produces false failures.
+                let effectiveProbe = lanAwareDefinition(for: state.definition, serviceID: serviceID).probe ?? probeConfig
+                let probe = ProbeFactory.makeProbe(for: effectiveProbe)
+                let ok = (try? await waitForProbe(probe, timeout: .seconds(15), interval: .seconds(3))) ?? false
                 if !ok {
                     state.phase = .failed
                     recalculateHealth()
@@ -1473,9 +1536,12 @@ final class EnvironmentSupervisor {
                     stripeState.failureTimestamps = []
                     restartService("stripe")
                 } else {
+                    // Network still down — mark failed and let scheduleRestart
+                    // keep retrying with backoff instead of abandoning.
                     stripeState.phase = .failed
-                    lastError = "Stripe: network not available after wake"
+                    lastError = "Stripe: network not available after wake — will retry"
                     recalculateHealth()
+                    scheduleRestart(serviceID: "stripe")
                     Task { await self.captureDebugIssue(
                         trigger: "probe_timeout",
                         serviceID: "stripe",

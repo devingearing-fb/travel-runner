@@ -4,6 +4,51 @@
 
 ## Resolved
 
+### Wake probes failed all LAN services after every sleep/wake
+
+**Resolved:** 2026-06-10
+
+`handleWake()` probed services with the original probe config (host defaults to 127.0.0.1). In LAN mode services bind exclusively to the LAN IP, so every wake marked all three portals FAILED and restarted them — producing waves of probe-timeout debug issues.
+
+**Fix:**
+- `handleWake()` now uses `lanAwareDefinition().probe` so the probe targets the host the service is actually bound to
+- Probe checks get a 15-second grace window (retry every 3s) instead of a single 2s check 3 seconds after wake
+
+### Stale LAN IP after network change caused EADDRNOTAVAIL crash loops
+
+**Resolved:** 2026-06-10
+
+Moving the machine between networks (e.g., office → home WiFi) while LAN mode was on left `localIP` stale. Wake-triggered restarts passed the dead IP via `--hostname`, and Next.js failed with `EADDRNOTAVAIL`.
+
+**Fix:**
+- Extracted `applyNetworkMode()` from `toggleNetworkMode()` — re-detects the current LAN IP, rewrites env files, and restarts LAN services
+- `handleWake()` re-detects the IP before probing: if changed → re-apply network mode with the new IP; if no network → fall back to localhost mode
+- `scheduleRestart()` re-checks the IP before restarting LAN services and re-applies network mode if it changed
+
+### Stripe restart permanently abandoned when network not ready
+
+**Resolved:** 2026-06-10
+
+Both `handleWake()` (30s wait) and `scheduleRestart()` (15s wait) gave up permanently if the network wasn't ready, leaving Stripe FAILED until a manual restart.
+
+**Fix:** Both paths now schedule a retry with exponential backoff (capped by the existing restartCount < 5 guard) instead of abandoning.
+
+### Watcher tasks leaked on config reload
+
+**Resolved:** 2026-06-10
+
+`loadConfig()` spawned yalc/git watcher tasks without cancelling previous ones, so reconfiguring repos accumulated duplicate 5-second poll loops.
+
+**Fix:** Watcher tasks are stored and cancelled before new ones are spawned.
+
+### DbSetupRunner timeout watchdog lingered and could double-resume
+
+**Resolved:** 2026-06-10
+
+The timeout watchdog task slept for the full step timeout even after the process exited. Worse, if `process.run()` threw, the continuation was resumed without claiming the completion guard — the watchdog would later claim it, call `terminate()` on a never-launched process, and resume the continuation a second time.
+
+**Fix:** Watchdog is cancelled in the termination handler and on launch failure; the launch-failure path now claims the guard before resuming.
+
 ### Stripe CLI crash-loops after macOS sleep/wake
 
 **Resolved:** 2026-06-02
