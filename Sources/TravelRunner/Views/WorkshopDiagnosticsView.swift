@@ -71,6 +71,13 @@ struct WorkshopDiagnosticsView: View {
                             .foregroundStyle(.green)
                         Text("Active — \(supervisor.debugOpenIssueCount) open issue\(supervisor.debugOpenIssueCount == 1 ? "" : "s")")
                             .font(.caption)
+                        if supervisor.debugOpenIssueCount > 0 {
+                            Button("View Issues") {
+                                WorkshopPanel.shared.open(section: .issues)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                        }
                     }
                 } else {
                     Text("Debug tracking is not enabled")

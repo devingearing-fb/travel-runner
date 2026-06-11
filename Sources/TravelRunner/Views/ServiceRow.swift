@@ -8,12 +8,17 @@ struct ServiceRow: View {
     var onCascadeRestart: (() -> Void)? = nil
     var isStale: Bool = false
 
+    @Environment(EnvironmentSupervisor.self) var supervisor
     @State private var showLogs = false
     @State private var logEntries: [LogEntry] = []
     @State private var lastVersion: Int = 0
 
     private var showSubtitle: Bool {
         state.restartCount > 0 || state.isCircuitBroken || state.capturedArtifact != nil
+    }
+
+    private var isActionInFlight: Bool {
+        supervisor.actionsInFlight.contains(state.id)
     }
 
     var body: some View {
@@ -60,7 +65,9 @@ struct ServiceRow: View {
 
                 Spacer()
 
-                if state.phase == .running || state.phase == .failed {
+                if isActionInFlight {
+                    ProgressView().controlSize(.mini)
+                } else if state.phase == .running || state.phase == .failed {
                     Button(action: onRestart) {
                         Image(systemName: "arrow.clockwise")
                             .font(.caption2)

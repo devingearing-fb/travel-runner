@@ -25,6 +25,8 @@ final class EnvironmentSupervisor {
     var onServiceCrash: (@MainActor (String, Int32) -> Void)? = nil
     var debugTrackingEnabled = false
     var debugOpenIssueCount = 0
+    var actionsInFlight: Set<String> = []
+    var onActionFeedback: ((String, Bool) -> Void)?
     var gitBranches: [String: String] = [:]
     var yalcStale = false
     var autoRelinkYalc = UserDefaults.standard.bool(forKey: "autoRelinkYalc")
@@ -652,6 +654,9 @@ final class EnvironmentSupervisor {
             servicesToRestart.append("partner-portal")
         }
         Task {
+            actionsInFlight.insert("db-mode")
+            defer { actionsInFlight.remove("db-mode") }
+            var switchFailed = false
             for serviceID in servicesToRestart {
                 serviceStates[serviceID]?.phase = .stopping
             }
@@ -663,9 +668,15 @@ final class EnvironmentSupervisor {
                 } catch {
                     serviceStates[serviceID]?.phase = .failed
                     lastError = "DB mode switch failed for \(serviceID): \(error)"
+                    switchFailed = true
                 }
             }
             recalculateHealth()
+            if switchFailed {
+                onActionFeedback?("Database mode switch hit errors — check Status", false)
+            } else {
+                onActionFeedback?("Database mode: \(dbMode == .local ? "local" : "dev")", true)
+            }
         }
     }
 
@@ -684,7 +695,11 @@ final class EnvironmentSupervisor {
         let mode = networkMode
 
         Task {
-            defer { isTogglingNetwork = false }
+            actionsInFlight.insert("lan-mode")
+            defer {
+                isTogglingNetwork = false
+                actionsInFlight.remove("lan-mode")
+            }
 
             if mode {
                 let (output, ok) = await shellOutput("ipconfig getifaddr en0")
@@ -733,6 +748,7 @@ final class EnvironmentSupervisor {
                 serviceStates[serviceID]?.phase = .stopping
             }
 
+            var restartFailed = false
             for serviceID in servicesToRestart {
                 await processRunner.stop(serviceID: serviceID)
                 await logStore.append(
@@ -745,10 +761,16 @@ final class EnvironmentSupervisor {
                 } catch {
                     serviceStates[serviceID]?.phase = .failed
                     lastError = "Network mode restart failed for \(serviceID): \(error)"
+                    restartFailed = true
                 }
             }
 
             recalculateHealth()
+            if restartFailed {
+                onActionFeedback?("LAN mode toggle hit errors — check Status", false)
+            } else {
+                onActionFeedback?(mode ? "LAN mode on — \(ip)" : "LAN mode off — localhost only", true)
+            }
         }
     }
 
@@ -771,7 +793,10 @@ final class EnvironmentSupervisor {
 
     func restartService(_ serviceID: String) {
         if serviceID == "stripe" { stripeReconnectingSince = nil }
+        let name = serviceStates[serviceID]?.definition.displayName ?? serviceID
         Task {
+            actionsInFlight.insert(serviceID)
+            defer { actionsInFlight.remove(serviceID) }
             serviceStates[serviceID]?.phase = .stopping
             await processRunner.stop(serviceID: serviceID)
             serviceStates[serviceID]?.phase = .pending
@@ -781,10 +806,12 @@ final class EnvironmentSupervisor {
             try? await Task.sleep(for: .seconds(1))
             do {
                 try await startService(serviceID)
+                onActionFeedback?("\(name) restarted", true)
             } catch {
                 serviceStates[serviceID]?.phase = .failed
                 lastError = "\(error)"
                 recalculateHealth()
+                onActionFeedback?("\(name) restart failed", false)
             }
         }
     }
@@ -794,8 +821,11 @@ final class EnvironmentSupervisor {
         let dependents = graph.dependents(of: serviceID)
         let allAffected = dependents.union([serviceID])
         let topoOrder = graph.sortedIDs.filter { allAffected.contains($0) }
+        let name = serviceStates[serviceID]?.definition.displayName ?? serviceID
 
         Task {
+            for id in topoOrder { actionsInFlight.insert(id) }
+            defer { for id in topoOrder { actionsInFlight.remove(id) } }
             for id in topoOrder.reversed() {
                 serviceStates[id]?.phase = .stopping
                 await processRunner.stop(serviceID: id)
@@ -813,6 +843,7 @@ final class EnvironmentSupervisor {
                     serviceStates[id]?.phase = .failed
                     lastError = "Cascade restart failed at \(id): \(error)"
                     recalculateHealth()
+                    onActionFeedback?("Cascade restart failed at \(id)", false)
                     return
                 }
 
@@ -834,6 +865,7 @@ final class EnvironmentSupervisor {
                 }
             }
             recalculateHealth()
+            onActionFeedback?("\(name) restarted with dependents", true)
         }
     }
 
@@ -852,12 +884,16 @@ final class EnvironmentSupervisor {
 
         serviceStates["yalc-link"]?.phase = .starting
         Task {
+            actionsInFlight.insert("yalc-relink")
+            defer { actionsInFlight.remove("yalc-relink") }
             let ok = await runShellCommand("cd \"\(travelDataDir)\" && npm run build && yalc publish")
             if ok {
                 restartService("yalc-link")
+                onActionFeedback?("fb-travel-data published and relinked", true)
             } else {
                 serviceStates["yalc-link"]?.phase = .failed
                 lastError = "yalc publish failed — check fb-travel-data build"
+                onActionFeedback?("yalc publish failed — check fb-travel-data build", false)
             }
         }
     }
@@ -1612,6 +1648,35 @@ final class EnvironmentSupervisor {
         )
 
         debugOpenIssueCount = await tracker.openIssueCount()
+    }
+
+    func listDebugIssues(status: String = "open") async -> [DebugTracker.Issue] {
+        guard let tracker = debugTracker else { return [] }
+        return await tracker.listIssues(status: status)
+    }
+
+    func debugIssueLogs(id: String, status: String = "open") async -> [String: String] {
+        guard let tracker = debugTracker else { return [:] }
+        return await tracker.issueLogContents(id: id, status: status)
+    }
+
+    func debugIssueSnapshot(id: String, status: String = "open") async -> String? {
+        guard let tracker = debugTracker else { return nil }
+        return await tracker.issueStateSnapshot(id: id, status: status)
+    }
+
+    func debugIssueFolder(id: String, status: String = "open") async -> String? {
+        guard let tracker = debugTracker else { return nil }
+        return await tracker.issueFolderPath(id: id, status: status)
+    }
+
+    func closeDebugIssue(id: String, resolution: String) async -> Bool {
+        guard let tracker = debugTracker else { return false }
+        let ok = await tracker.closeIssue(id: id, resolution: resolution)
+        if ok {
+            debugOpenIssueCount = await tracker.openIssueCount()
+        }
+        return ok
     }
 
     // MARK: - Private: Helpers

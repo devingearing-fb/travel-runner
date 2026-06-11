@@ -62,6 +62,9 @@ struct SettingsPageView: View {
                         Label("Database", systemImage: "cylinder")
                             .font(.system(.caption, design: .monospaced))
                         Spacer()
+                        if supervisor.actionsInFlight.contains("db-mode") {
+                            ProgressView().controlSize(.small)
+                        }
                         Picker("", selection: Binding(
                             get: { supervisor.dbMode },
                             set: { _ in supervisor.toggleDatabaseMode() }
@@ -71,21 +74,29 @@ struct SettingsPageView: View {
                         }
                         .pickerStyle(.segmented)
                         .frame(width: 120)
+                        .disabled(supervisor.actionsInFlight.contains("db-mode"))
                     }
                 }
 
                 Divider().padding(.leading, 32)
 
                 settingsRow {
-                    Toggle(isOn: Binding(
-                        get: { supervisor.networkMode },
-                        set: { _ in supervisor.toggleNetworkMode() }
-                    )) {
-                        Label("LAN Mode", systemImage: "wifi")
-                            .font(.system(.caption, design: .monospaced))
+                    HStack {
+                        Toggle(isOn: Binding(
+                            get: { supervisor.networkMode },
+                            set: { _ in supervisor.toggleNetworkMode() }
+                        )) {
+                            Label("LAN Mode", systemImage: "wifi")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        .disabled(supervisor.actionsInFlight.contains("lan-mode"))
+
+                        if supervisor.actionsInFlight.contains("lan-mode") {
+                            ProgressView().controlSize(.small)
+                        }
                     }
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
                 }
 
                 if supervisor.networkMode, let ip = supervisor.localIP {
@@ -219,9 +230,18 @@ struct SettingsPageView: View {
                         Spacer()
                         if supervisor.debugTrackingEnabled {
                             let count = supervisor.debugOpenIssueCount
-                            Text(count > 0 ? "\(count) open issue\(count == 1 ? "" : "s")" : "Active")
+                            if count > 0 {
+                                Button("\(count) open issue\(count == 1 ? "" : "s")") {
+                                    WorkshopPanel.shared.open(section: .issues)
+                                }
+                                .buttonStyle(.borderless)
                                 .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(count > 0 ? .orange : .green)
+                                .foregroundStyle(.orange)
+                            } else {
+                                Text("Active")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.green)
+                            }
                         } else {
                             Text("Disabled")
                                 .font(.system(.caption2, design: .monospaced))

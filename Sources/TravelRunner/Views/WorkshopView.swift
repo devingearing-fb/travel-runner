@@ -3,6 +3,7 @@ import SwiftUI
 struct WorkshopView: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
     @Bindable var navigation: WorkshopNavigation
+    let toastCenter: ToastCenter
     @State private var showSetup = false
 
     private var isFirstRun: Bool {
@@ -17,39 +18,46 @@ struct WorkshopView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            if showSetup || isFirstRun {
-                SetupView(isFirstRun: isFirstRun) {
-                    showSetup = false
-                    supervisor.loadConfig()
-                }
-            } else {
-                WorkshopHeaderBar()
-
-                NavigationSplitView {
-                    List(WorkshopSection.allCases, selection: $navigation.selectedSection) { section in
-                        Label(section.rawValue, systemImage: section.icon)
+        ZStack {
+            VStack(spacing: 0) {
+                if showSetup || isFirstRun {
+                    SetupView(isFirstRun: isFirstRun) {
+                        showSetup = false
+                        supervisor.loadConfig()
                     }
-                    .navigationSplitViewColumnWidth(min: 140, ideal: 160, max: 200)
-                } detail: {
-                    switch navigation.selectedSection {
-                    case .status:
-                        WorkshopStatusView()
-                    case .logs:
-                        WorkshopLogsView()
-                    case .dbTools:
-                        WorkshopDbToolsView()
-                    case .settings:
-                        WorkshopSettingsView()
-                    case .diagnostics:
-                        WorkshopDiagnosticsView()
-                    case nil:
-                        WorkshopStatusView()
-                    }
-                }
+                } else {
+                    WorkshopHeaderBar()
 
-                DashboardFooter(selectedServiceID: nil)
+                    NavigationSplitView {
+                        List(WorkshopSection.allCases, selection: $navigation.selectedSection) { section in
+                            Label(section.rawValue, systemImage: section.icon)
+                                .badge(section == .issues ? supervisor.debugOpenIssueCount : 0)
+                        }
+                        .navigationSplitViewColumnWidth(min: 140, ideal: 160, max: 200)
+                    } detail: {
+                        switch navigation.selectedSection {
+                        case .status:
+                            WorkshopStatusView()
+                        case .issues:
+                            WorkshopIssuesView()
+                        case .logs:
+                            WorkshopLogsView()
+                        case .dbTools:
+                            WorkshopDbToolsView()
+                        case .settings:
+                            WorkshopSettingsView()
+                        case .diagnostics:
+                            WorkshopDiagnosticsView()
+                        case nil:
+                            WorkshopStatusView()
+                        }
+                    }
+
+                    DashboardFooter(selectedServiceID: nil)
+                }
             }
+
+            ToastOverlay(center: toastCenter)
         }
         .preferredColorScheme(.dark)
         .onChange(of: failedServiceCount) { old, new in

@@ -8,6 +8,7 @@ final class KeyablePanel: NSPanel {
 
 enum WorkshopSection: String, CaseIterable, Identifiable {
     case status = "Status"
+    case issues = "Issues"
     case logs = "Terminals"
     case dbTools = "DB Tools"
     case settings = "Settings"
@@ -18,6 +19,7 @@ enum WorkshopSection: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .status: "heart.text.clipboard"
+        case .issues: "ant"
         case .logs: "terminal"
         case .dbTools: "cylinder.split.1x2"
         case .settings: "gearshape"
@@ -40,6 +42,7 @@ final class WorkshopPanel {
     private var supervisor: EnvironmentSupervisor?
     private var panelDelegate: PanelDelegate?
     let navigation = WorkshopNavigation()
+    let toastCenter = ToastCenter()
 
     var isVisible: Bool {
         panel?.isVisible ?? false
@@ -47,6 +50,9 @@ final class WorkshopPanel {
 
     func configure(supervisor: EnvironmentSupervisor) {
         self.supervisor = supervisor
+        supervisor.onActionFeedback = { [weak toastCenter] message, success in
+            toastCenter?.show(message, style: success ? .success : .error)
+        }
     }
 
     func open(section: WorkshopSection = .status) {
@@ -68,7 +74,7 @@ final class WorkshopPanel {
         guard let supervisor else { return }
         if panel != nil { return }
 
-        let workshopView = WorkshopView(navigation: navigation)
+        let workshopView = WorkshopView(navigation: navigation, toastCenter: toastCenter)
             .environment(supervisor)
 
         let hostingView = NSHostingView(rootView: workshopView)

@@ -178,10 +178,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(.separator())
             let debugItem = NSMenuItem(
                 title: "\u{1F41C} \(supervisor.debugOpenIssueCount) open debug issue\(supervisor.debugOpenIssueCount == 1 ? "" : "s")",
-                action: nil,
+                action: #selector(openIssues),
                 keyEquivalent: ""
             )
-            debugItem.isEnabled = false
+            debugItem.target = self
             menu.addItem(debugItem)
         }
 
@@ -227,6 +227,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openTerminals() {
         WorkshopPanel.shared.open(section: .logs)
+        NSApp.activate(ignoringOtherApps: true)
+        supervisor.panelVisible = true
+    }
+
+    @objc private func openIssues() {
+        WorkshopPanel.shared.open(section: .issues)
         NSApp.activate(ignoringOtherApps: true)
         supervisor.panelVisible = true
     }

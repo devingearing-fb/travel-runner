@@ -74,7 +74,8 @@ struct WorkshopHeaderBar: View {
                     subtitle: supervisor.rootCauseDescription,
                     action: ("Retry", { supervisor.retryStartAll() })
                 )
-            } else if supervisor.migrationsBannerVisible {
+            }
+            if supervisor.migrationsBannerVisible {
                 alertBanner(
                     icon: "arrow.triangle.2.circlepath",
                     color: .orange,

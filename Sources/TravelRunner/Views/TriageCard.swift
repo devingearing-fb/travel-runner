@@ -8,7 +8,12 @@ struct TriageCard: View {
     var onClearCache: (() -> Void)? = nil
     var onPublishRetry: (() -> Void)? = nil
 
+    @Environment(EnvironmentSupervisor.self) var supervisor
     @State private var logTail: [LogEntry] = []
+
+    private var isActionInFlight: Bool {
+        supervisor.actionsInFlight.contains(state.id)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -93,7 +98,12 @@ struct TriageCard: View {
                         .controlSize(.mini)
                         .tint(.orange)
                 }
+
+                if isActionInFlight {
+                    ProgressView().controlSize(.mini)
+                }
             }
+            .disabled(isActionInFlight)
         }
         .padding(10)
         .background(Color.red.opacity(0.08))

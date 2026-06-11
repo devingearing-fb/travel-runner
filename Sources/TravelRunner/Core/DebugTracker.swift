@@ -306,6 +306,50 @@ actor DebugTracker {
         }.count
     }
 
+    func listIssues(status: String) -> [Issue] {
+        let dir = status == "closed" ? closedDir : openDir
+        guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
+        var results: [Issue] = []
+        for entry in entries.sorted(by: >) {
+            let issuePath = (dir as NSString)
+                .appendingPathComponent(entry)
+                .appending("/issue.json")
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: issuePath)),
+                  let issue = try? jsonDecoder.decode(Issue.self, from: data)
+            else { continue }
+            results.append(issue)
+        }
+        return results
+    }
+
+    /// Returns log file contents for an issue, keyed by filename.
+    func issueLogContents(id: String, status: String = "open") -> [String: String] {
+        let dir = status == "closed" ? closedDir : openDir
+        let folder = (dir as NSString).appendingPathComponent(id)
+        guard let files = try? fm.contentsOfDirectory(atPath: folder) else { return [:] }
+        var results: [String: String] = [:]
+        for file in files where file.hasPrefix("logs-") && file.hasSuffix(".txt") {
+            let path = (folder as NSString).appendingPathComponent(file)
+            if let content = try? String(contentsOfFile: path, encoding: .utf8) {
+                results[file] = content
+            }
+        }
+        return results
+    }
+
+    func issueStateSnapshot(id: String, status: String = "open") -> String? {
+        let dir = status == "closed" ? closedDir : openDir
+        let path = (dir as NSString)
+            .appendingPathComponent(id)
+            .appending("/state-snapshot.json")
+        return try? String(contentsOfFile: path, encoding: .utf8)
+    }
+
+    func issueFolderPath(id: String, status: String = "open") -> String {
+        let dir = status == "closed" ? closedDir : openDir
+        return (dir as NSString).appendingPathComponent(id)
+    }
+
     // MARK: - Private helpers
 
     private func normalizeError(_ message: String) -> String {
