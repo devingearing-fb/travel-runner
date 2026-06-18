@@ -24,6 +24,13 @@ struct DashboardFooter: View {
                     Text(label)
                         .font(.system(.caption2, design: .monospaced))
                         .lineLimit(1)
+
+                    if let sid = selectedServiceID ?? (supervisor.gitBranches.keys.contains("travel-portal") ? "travel-portal" : nil),
+                       let behind = supervisor.gitBehindCounts[sid], behind > 0 {
+                        Text("\(behind)\u{2193}")
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.blue)
+                    }
                 }
                 .foregroundStyle(.secondary)
             }

@@ -28,12 +28,33 @@ final class EnvironmentSupervisor {
     var actionsInFlight: Set<String> = []
     var onActionFeedback: ((String, Bool) -> Void)?
     var gitBranches: [String: String] = [:]
+    var gitBehindCounts: [String: Int] = [:]
+    var behindBannerDismissed = false
     var yalcStale = false
+    var npmStaleServices: Set<String> = []
     var autoRelinkYalc = UserDefaults.standard.bool(forKey: "autoRelinkYalc")
     var dbMode: DatabaseMode = .local
     var partnerPortalEnabled = UserDefaults.standard.bool(forKey: "partnerPortalEnabled")
 
     enum DatabaseMode: String, Sendable { case local, remote }
+
+    var totalBehindCount: Int {
+        var seen = Set<String>()
+        var total = 0
+        for (sid, count) in gitBehindCounts where count > 0 {
+            let path = config?.services.first(where: { $0.id == sid })?.resolvedCwd
+                ?? (sid == "fb-travel-data" ? config?.paths?.travelData.map { NSString(string: $0).expandingTildeInPath as String } : nil)
+                ?? sid
+            if seen.insert(path).inserted {
+                total += count
+            }
+        }
+        return total
+    }
+
+    func dismissBehindBanner() {
+        behindBannerDismissed = true
+    }
 
     var rootCauseDescription: String? {
         guard let rootID = rootCauseServiceID, let graph else { return nil }
@@ -65,8 +86,10 @@ final class EnvironmentSupervisor {
     private var debugTracker: DebugTracker?
     private var yalcWatcher: YalcWatcher?
     private var gitBranchWatcher: GitBranchWatcher?
+    private var dependencyWatcher: DependencyWatcher?
     private var yalcWatcherTask: Task<Void, Never>?
     private var gitWatcherTask: Task<Void, Never>?
+    private var depsWatcherTask: Task<Void, Never>?
     private var yalcRelinkInProgress = false
     private var isTogglingNetwork = false
     private var stripeReconnectingSince: Date? = nil
@@ -166,6 +189,20 @@ final class EnvironmentSupervisor {
                 gitBranchWatcher = watcher
                 gitWatcherTask?.cancel()
                 gitWatcherTask = Task { await startGitBranchWatching(watcher: watcher) }
+            }
+
+            // Initialize dependency (npm install) freshness watcher
+            var depsMap: [String: String] = [:]
+            for service in config.services {
+                if let cwd = service.resolvedCwd, service.resolvedType == .daemon {
+                    depsMap[service.id] = cwd
+                }
+            }
+            if !depsMap.isEmpty {
+                let depsWatcher = DependencyWatcher(repoPaths: depsMap)
+                dependencyWatcher = depsWatcher
+                depsWatcherTask?.cancel()
+                depsWatcherTask = Task { await startDepsWatching(watcher: depsWatcher) }
             }
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this
@@ -385,11 +422,15 @@ final class EnvironmentSupervisor {
                         let yalcAuto = await MainActor.run { self.autoRelinkYalc }
                         let dbMode = await MainActor.run { self.dbMode.rawValue }
                         let branches = await MainActor.run { self.gitBranches }
+                        let behind = await MainActor.run { self.gitBehindCounts }
+                        let npmStale = await MainActor.run { Array(self.npmStaleServices) }
                         let dict: [String: Any] = [
                             "health": health, "services": states, "lan": lan, "ip": ip,
                             "yalc": ["stale": yalcStale, "auto_relink": yalcAuto] as [String: Any],
                             "db_mode": dbMode,
-                            "branches": branches
+                            "branches": branches,
+                            "gitBehind": behind,
+                            "npmStale": npmStale
                         ]
                         if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
                            let str = String(data: data, encoding: .utf8) { return str }
@@ -968,16 +1009,38 @@ final class EnvironmentSupervisor {
         }
     }
 
+    private func startDepsWatching(watcher: DependencyWatcher) async {
+        while !Task.isCancelled {
+            let stale = await watcher.check()
+            await MainActor.run { self.npmStaleServices = stale }
+            try? await Task.sleep(for: .seconds(30))
+        }
+    }
+
     private func startGitBranchWatching(watcher: GitBranchWatcher) async {
         _ = await watcher.check()
+        await watcher.fetchAndCount(fetchInterval: 0)
         let initial = await watcher.branches
-        await MainActor.run { self.gitBranches = initial }
+        let initialBehind = await watcher.behindCounts
+        await MainActor.run {
+            self.gitBranches = initial
+            self.gitBehindCounts = initialBehind
+        }
 
         while !Task.isCancelled {
             try? await Task.sleep(for: .seconds(5))
             let changed = await watcher.check()
+            await watcher.fetchAndCount()
             let allBranches = await watcher.branches
-            await MainActor.run { self.gitBranches = allBranches }
+            let allBehind = await watcher.behindCounts
+            let prevBehind = await MainActor.run { self.gitBehindCounts }
+            await MainActor.run {
+                self.gitBranches = allBranches
+                if allBehind != prevBehind {
+                    self.gitBehindCounts = allBehind
+                    self.behindBannerDismissed = false
+                }
+            }
 
             guard !changed.isEmpty, health == .healthy else { continue }
 
@@ -1015,6 +1078,13 @@ final class EnvironmentSupervisor {
 
             if changed.contains("fb-travel-data") {
                 await MainActor.run { self.publishAndRetryYalc() }
+            }
+
+            await watcher.fetchAndCount(fetchInterval: 0)
+            let freshBehind = await watcher.behindCounts
+            await MainActor.run {
+                self.gitBehindCounts = freshBehind
+                self.behindBannerDismissed = false
             }
 
             let runningChanged = changed.filter { serviceStates[$0]?.phase == .running }

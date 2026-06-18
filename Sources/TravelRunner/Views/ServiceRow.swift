@@ -7,6 +7,8 @@ struct ServiceRow: View {
     var onPublishRetry: (() -> Void)? = nil
     var onCascadeRestart: (() -> Void)? = nil
     var isStale: Bool = false
+    var behindCount: Int = 0
+    var depsStale: Bool = false
 
     @Environment(EnvironmentSupervisor.self) var supervisor
     @State private var showLogs = false
@@ -45,6 +47,25 @@ struct ServiceRow: View {
 
                 if isStale {
                     Text("stale")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.orange, in: Capsule())
+                }
+
+                if behindCount > 0 {
+                    Text("\(behindCount) behind")
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.blue, in: Capsule())
+                        .contentTransition(.numericText())
+                }
+
+                if depsStale {
+                    Text("deps")
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 4)

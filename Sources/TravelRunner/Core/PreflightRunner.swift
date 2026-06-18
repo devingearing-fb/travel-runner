@@ -36,6 +36,7 @@ struct PreflightRunner: Sendable {
     func allChecks(for services: [ServiceDefinition]) -> [PreflightCheck] {
         var checks: [PreflightCheck] = [
             PreflightCheck(id: "docker", name: ContainerRuntime.detect().displayName),
+            PreflightCheck(id: "node-version", name: "Node.js \u{2265} 22"),
             PreflightCheck(id: "stripe-auth", name: "Stripe CLI Auth"),
             PreflightCheck(id: "yalc", name: "yalc CLI"),
         ]
@@ -81,6 +82,22 @@ struct PreflightRunner: Sendable {
                 }
             }
             return .failed(message: "\(runtime.displayName) not responding", fix: "Open \(runtime.appName) manually")
+
+        case "node-version":
+            let output = await shellOutput("node --version")
+            let version = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !version.isEmpty else {
+                return .failed(message: "Node.js not found", fix: "Install Node 22 via nvm or brew")
+            }
+            let majorStr = version.dropFirst().split(separator: ".").first ?? ""
+            let major = Int(majorStr) ?? 0
+            if major >= 22 {
+                return .passed(detail: version)
+            } else if major >= 18 {
+                return .warning(message: "\(version) — recommend v22+")
+            } else {
+                return .failed(message: "\(version) — require v18+", fix: "Install Node 22 via nvm or brew")
+            }
 
         case "stripe-auth":
             let hasStripe = await shellExitCode("which stripe >/dev/null 2>&1") == 0

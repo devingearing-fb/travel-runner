@@ -9,6 +9,8 @@ struct PhaseSection: View {
     let onPublishRetry: (() -> Void)?
     var dbResetRunning: Bool = false
     var isServiceStale: ((String) -> Bool)? = nil
+    var serviceBehindCount: ((String) -> Int)? = nil
+    var isServiceDepsStale: ((String) -> Bool)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -30,7 +32,9 @@ struct PhaseSection: View {
                     onRestart: { onRestart(state.id) },
                     onPublishRetry: state.id == "yalc-link" ? onPublishRetry : nil,
                     onCascadeRestart: onCascadeRestart.map { callback in { callback(state.id) } },
-                    isStale: isServiceStale?(state.id) ?? false
+                    isStale: isServiceStale?(state.id) ?? false,
+                    behindCount: serviceBehindCount?(state.id) ?? 0,
+                    depsStale: isServiceDepsStale?(state.id) ?? false
                 )
             }
         }

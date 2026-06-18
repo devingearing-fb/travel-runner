@@ -85,6 +85,16 @@ struct WorkshopHeaderBar: View {
                     onDismiss: { supervisor.dismissMigrationsBanner() }
                 )
             }
+            if supervisor.totalBehindCount > 0 && !supervisor.behindBannerDismissed {
+                alertBanner(
+                    icon: "arrow.down.circle.fill",
+                    color: .blue,
+                    text: "\(supervisor.totalBehindCount) commit\(supervisor.totalBehindCount == 1 ? "" : "s") behind remote",
+                    subtitle: nil,
+                    action: ("Dismiss", { supervisor.dismissBehindBanner() }),
+                    onDismiss: { supervisor.dismissBehindBanner() }
+                )
+            }
 
             Divider()
         }

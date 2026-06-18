@@ -79,7 +79,9 @@ struct WorkshopStatusView: View {
                             onCascadeRestart: { supervisor.restartCascade($0) },
                             onPublishRetry: group.phase == "GATEWAY" ? { supervisor.publishAndRetryYalc() } : nil,
                             dbResetRunning: supervisor.dbResetRunning,
-                            isServiceStale: { $0 == "yalc-link" && supervisor.yalcStale }
+                            isServiceStale: { $0 == "yalc-link" && supervisor.yalcStale },
+                            serviceBehindCount: { supervisor.gitBehindCounts[$0] ?? 0 },
+                            isServiceDepsStale: { supervisor.npmStaleServices.contains($0) }
                         )
                     }
                 }

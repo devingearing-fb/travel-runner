@@ -34,8 +34,15 @@ struct MigrationTracker: Sendable {
             return nil
         }
         let sorted = files.filter { $0.hasSuffix(".sql") }.sorted()
-        let combined = sorted.joined(separator: "\n")
-        let digest = SHA256.hash(data: Data(combined.utf8))
+        var hasher = SHA256()
+        for file in sorted {
+            hasher.update(data: Data(file.utf8))
+            let filePath = (migrationsDir as NSString).appendingPathComponent(file)
+            if let data = FileManager.default.contents(atPath: filePath) {
+                hasher.update(data: data)
+            }
+        }
+        let digest = hasher.finalize()
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 }
