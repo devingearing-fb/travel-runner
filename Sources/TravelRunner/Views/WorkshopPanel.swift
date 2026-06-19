@@ -4,6 +4,10 @@ import SwiftUI
 final class KeyablePanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+    override var toolbar: NSToolbar? {
+        get { nil }
+        set { }
+    }
 }
 
 enum WorkshopSection: String, CaseIterable, Identifiable {

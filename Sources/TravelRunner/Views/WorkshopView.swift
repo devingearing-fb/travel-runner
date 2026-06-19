@@ -52,6 +52,7 @@ struct WorkshopView: View {
                             WorkshopStatusView()
                         }
                     }
+                    .toolbar(removing: .sidebarToggle)
 
                     DashboardFooter(selectedServiceID: nil)
                 }
