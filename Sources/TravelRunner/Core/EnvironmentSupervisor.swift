@@ -352,6 +352,43 @@ final class EnvironmentSupervisor {
                         }
                     }
                 }
+
+                // After GATEWAY phase: if fb-travel-data build is stale, rebuild
+                // before starting the portal to prevent "Module not found" errors.
+                if phase == .gateway {
+                    if let watcher = self.yalcWatcher {
+                        let stale = await watcher.check()
+                        if stale {
+                            await MainActor.run {
+                                self.yalcStale = true
+                                self.lastError = "fb-travel-data build is stale — rebuilding before portal start..."
+                            }
+                            let ok = await self.buildAndPublishYalcSync()
+                            if ok {
+                                await MainActor.run {
+                                    self.serviceStates["yalc-link"]?.phase = .starting
+                                }
+                                await self.processRunner.stop(serviceID: "yalc-link")
+                                do {
+                                    try await self.startService("yalc-link")
+                                } catch {
+                                    await MainActor.run {
+                                        self.lastError = "yalc-link restart failed: \(error)"
+                                    }
+                                }
+                                let stillStale = await watcher.check()
+                                await MainActor.run {
+                                    self.yalcStale = stillStale
+                                    self.lastError = nil
+                                }
+                            } else {
+                                await MainActor.run {
+                                    self.lastError = "fb-travel-data rebuild failed — portal may have import errors"
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             await MainActor.run {
@@ -937,6 +974,14 @@ final class EnvironmentSupervisor {
                 onActionFeedback?("yalc publish failed — check fb-travel-data build", false)
             }
         }
+    }
+
+    private func buildAndPublishYalcSync() async -> Bool {
+        guard let travelDataDir = config?.paths?.travelData
+            .map({ NSString(string: $0).expandingTildeInPath }) else { return false }
+        return await runShellCommand(
+            "cd \"\(travelDataDir)\" && npm run build && yalc publish"
+        )
     }
 
     func setAutoRelinkYalc(_ enabled: Bool) {

@@ -106,7 +106,7 @@ final class DbSetupPipeline {
             DbSetupStep(id: "load-hotels", name: "Load Hotels",
                         command: "node scripts/db/load-hotels.mjs",
                         healthCheckCommand: "node scripts/db/load-hotels.mjs --verify",
-                        timeoutSeconds: 120, isOptional: true, stepNumber: 5),
+                        timeoutSeconds: 120, isOptional: false, stepNumber: 5),
             DbSetupStep(id: "copy-event-data", name: "Event Contracts",
                         command: "node scripts/db/copy-event-data.mjs",
                         healthCheckCommand: "node scripts/db/copy-event-data.mjs --verify",
