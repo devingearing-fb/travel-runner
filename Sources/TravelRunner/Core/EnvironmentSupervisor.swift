@@ -595,6 +595,7 @@ final class EnvironmentSupervisor {
             env.write(key: "NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", value: "http://localhost:3000")
             if let anonKey = localSupabaseAnonKey {
                 env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anonKey)
+                env.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anonKey)
             }
             if let signingKey = localSupabaseSigningKey {
                 env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
@@ -690,6 +691,7 @@ final class EnvironmentSupervisor {
             for (key, value) in remote {
                 env.write(key: key, value: value)
             }
+            env.write(key: "LOGIN_URL", value: "https://identity.fastbreaktravel-dev.ai/login/init")
 
             if let loginCwd {
                 let loginEnv = EnvCompatLayer(envFilePaths: [loginCwd + "/.env.local"])
@@ -697,6 +699,7 @@ final class EnvironmentSupervisor {
                 loginEnv.write(key: "AMATEUR_SUPABASE_URL", value: remoteUrl)
                 if let anonKey = remote["LOCAL_SUPABASE_ANON_KEY"] {
                     loginEnv.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anonKey)
+                    loginEnv.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anonKey)
                 }
                 if let signingKey = remote["LOCAL_SUPABASE_SIGNING_KEY"] {
                     loginEnv.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
@@ -711,11 +714,13 @@ final class EnvironmentSupervisor {
                 partnerEnv.write(key: "AMATEUR_SUPABASE_URL_DEV", value: remoteUrl)
                 if let anonKey = remote["LOCAL_SUPABASE_ANON_KEY"] {
                     partnerEnv.write(key: "AMATEUR_SUPABASE_ANON_KEY_DEV", value: anonKey)
+                    partnerEnv.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anonKey)
                 }
                 if let signingKey = remote["LOCAL_SUPABASE_SIGNING_KEY"] {
                     partnerEnv.write(key: "AMATEUR_SUPABASE_SIGNING_KEY_DEV", value: signingKey)
                 }
-                partnerEnv.write(key: "LOGIN_URL", value: "http://localhost:3000/login/init")
+                partnerEnv.write(key: "LOGIN_URL", value: "https://identity.fastbreaktravel-dev.ai/login/init")
+                partnerEnv.write(key: "UNIVERSAL_LOGIN_URL", value: "https://identity.fastbreaktravel-dev.ai/login/init")
                 partnerEnv.write(key: "NEXT_PUBLIC_WEBAPP_URL", value: "http://localhost:3001")
             }
 
@@ -1630,13 +1635,22 @@ final class EnvironmentSupervisor {
             // restarting against a stale IP causes false probe failures and
             // EADDRNOTAVAIL crash loops — re-detect before doing anything.
             if networkMode {
-                let (output, ok) = await shellOutput("ipconfig getifaddr en0")
-                let currentIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                // Wi-Fi can take 10-20s to associate after wake. A single check
+                // at +3s falsely concludes "no network" and drops to localhost
+                // while the user expects LAN mode to survive the commute.
+                var currentIP = ""
+                for _ in 0..<7 {
+                    let (output, ok) = await shellOutput("ipconfig getifaddr en0")
+                    currentIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                    if !currentIP.isEmpty { break }
+                    try? await Task.sleep(for: .seconds(3))
+                }
                 if currentIP.isEmpty {
                     await logStore.append(
                         serviceID: "travel-portal",
-                        entry: LogEntry(stream: .stdout, text: "[travel-runner] No LAN IP after wake — switching back to localhost mode")
+                        entry: LogEntry(stream: .stdout, text: "[travel-runner] No LAN IP ~20s after wake — switching back to localhost mode")
                     )
+                    await killWebServicePorts()
                     toggleNetworkMode()
                     return
                 }
@@ -1645,6 +1659,7 @@ final class EnvironmentSupervisor {
                         serviceID: "travel-portal",
                         entry: LogEntry(stream: .stdout, text: "[travel-runner] LAN IP changed after wake (\(localIP ?? "?") → \(currentIP)) — re-applying network mode")
                     )
+                    await killWebServicePorts()
                     applyNetworkMode()
                     return
                 }
@@ -1668,6 +1683,30 @@ final class EnvironmentSupervisor {
                         serviceID: serviceID,
                         summary: "\(state.definition.displayName) failed wake probe"
                     )}
+                } else if let healthPath = Self.wakeHealthPaths[serviceID],
+                          let port = probeConfig.port {
+                    // TCP answering isn't proof of health: an orphaned dev server
+                    // (parent killed during sleep) can hold the port and serve
+                    // 404s for every route while looking "running". Verify with
+                    // a real HTTP request against a route that must exist.
+                    let host = (networkMode ? localIP : nil) ?? "localhost"
+                    let healthy = await httpServesPages(host: host, port: port, path: healthPath)
+                    if !healthy {
+                        await logStore.append(
+                            serviceID: serviceID,
+                            entry: LogEntry(stream: .stderr, text: "[travel-runner] \(state.definition.displayName) answers TCP but fails HTTP check after wake — killing port \(port) and restarting")
+                        )
+                        state.phase = .failed
+                        recalculateHealth()
+                        await processRunner.stop(serviceID: serviceID)
+                        await killPortOccupants(port)
+                        scheduleRestart(serviceID: serviceID)
+                        Task { await self.captureDebugIssue(
+                            trigger: "probe_timeout",
+                            serviceID: serviceID,
+                            summary: "\(state.definition.displayName) served HTTP errors after wake (zombie server) — restarted"
+                        )}
+                    }
                 }
             }
 
@@ -1968,6 +2007,40 @@ final class EnvironmentSupervisor {
 
     private func killPortOccupants(_ port: Int) async {
         _ = await runShellCommand("lsof -ti :\(port) | xargs kill -9 2>/dev/null")
+    }
+
+    /// Routes that must respond on a healthy server. "/" is wrong for
+    /// universal-login, which legitimately 404s at root (app lives at /frontdoor).
+    static let wakeHealthPaths: [String: String] = [
+        "travel-portal": "/",
+        "universal-login": "/frontdoor",
+        "partner-portal": "/",
+    ]
+
+    /// True when the service returns a non-404, non-5xx response. Generous
+    /// timeout + one retry: Next dev servers compile routes on first request
+    /// after wake, which can take >10s and must not count as failure.
+    private func httpServesPages(host: String, port: Int, path: String) async -> Bool {
+        for attempt in 0..<2 {
+            if attempt > 0 { try? await Task.sleep(for: .seconds(3)) }
+            let (output, ok) = await shellOutput(
+                "curl -s -o /dev/null -w '%{http_code}' --max-time 20 http://\(host):\(port)\(path)"
+            )
+            guard ok, let code = Int(output.trimmingCharacters(in: .whitespacesAndNewlines)) else { continue }
+            if code >= 200 && code < 500 && code != 404 { return true }
+        }
+        return false
+    }
+
+    /// Kill anything holding the web service ports — including orphaned dev
+    /// servers whose npm parent died during sleep. Without this, the replacement
+    /// server silently binds port+1 while the zombie serves 404s on the real port.
+    private func killWebServicePorts() async {
+        for serviceID in Self.wakeHealthPaths.keys {
+            guard let port = serviceStates[serviceID]?.definition.probe?.port else { continue }
+            await processRunner.stop(serviceID: serviceID)
+            await killPortOccupants(port)
+        }
     }
 
     /// Kill any stale processes from a previous session before starting the DAG.

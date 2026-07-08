@@ -177,7 +177,9 @@ actor DebugTracker {
         let signature = sha256(signatureInput)
 
         let config = loadConfig()
-        let dedupWindow = config?.dedupWindowSeconds ?? 300
+        // 7 days: recurring crashes (e.g. daily wake/network races) should bump
+        // recurrence_count on the open issue, not file a new ticket each day.
+        let dedupWindow = config?.dedupWindowSeconds ?? 604_800
 
         // Dedup check
         if let existingId = findMatchingOpenIssue(signature: signature, dedupWindow: dedupWindow) {
