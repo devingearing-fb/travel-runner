@@ -18,12 +18,23 @@ private final class CompletionGuard: @unchecked Sendable {
 actor DbSetupRunner {
     private let portalCwd: String
     private let logStore: LogStore
+    private let seedScenarioID: String
     private var currentProcess: Process?
     private var cancelled = false
 
-    init(portalCwd: String, logStore: LogStore) {
+    init(portalCwd: String, logStore: LogStore, seedScenarioID: String) {
         self.portalCwd = portalCwd
         self.logStore = logStore
+        self.seedScenarioID = seedScenarioID
+    }
+
+    nonisolated static func environment(
+        parent: [String: String],
+        seedScenarioID: String
+    ) -> [String: String] {
+        var environment = parent
+        environment["TRAVEL_SEED_SCENARIO"] = seedScenarioID
+        return environment
     }
 
     func run(pipeline: DbSetupPipeline, from startStepId: String? = nil) async {
@@ -112,6 +123,10 @@ actor DbSetupRunner {
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-l", "-c", command]
             process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+            process.environment = Self.environment(
+                parent: ProcessInfo.processInfo.environment,
+                seedScenarioID: seedScenarioID
+            )
 
             let pipe = Pipe()
             process.standardOutput = pipe
@@ -343,6 +358,10 @@ actor DbSetupRunner {
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-l", "-c", command]
             process.currentDirectoryURL = URL(fileURLWithPath: portalCwd)
+            process.environment = Self.environment(
+                parent: ProcessInfo.processInfo.environment,
+                seedScenarioID: seedScenarioID
+            )
             process.standardOutput = FileHandle.nullDevice
             process.standardError = FileHandle.nullDevice
             process.terminationHandler = { proc in

@@ -51,13 +51,15 @@ final class EnvironmentChecker {
     let portalPath: String
     let loginPath: String
     let travelDataPath: String
+    let streamServicesPath: String
 
     private(set) var checks: [HealthCheck] = []
 
-    init(portalPath: String, loginPath: String, travelDataPath: String) {
+    init(portalPath: String, loginPath: String, travelDataPath: String, streamServicesPath: String) {
         self.portalPath = NSString(string: portalPath).expandingTildeInPath
         self.loginPath = NSString(string: loginPath).expandingTildeInPath
         self.travelDataPath = NSString(string: travelDataPath).expandingTildeInPath
+        self.streamServicesPath = NSString(string: streamServicesPath).expandingTildeInPath
     }
 
     var allRequiredPassing: Bool {
@@ -110,6 +112,11 @@ final class EnvironmentChecker {
                         checkCommand: "ls node_modules/",
                         checkDescription: "npm dependencies for universal-login",
                         checkPath: (loginPath as NSString).appendingPathComponent("node_modules")),
+            HealthCheck(id: "stream-modules", name: "Stream Services node_modules", section: .dependencies,
+                        fixLabel: "npm install",
+                        checkCommand: "ls node_modules/",
+                        checkDescription: "Pinned QStash CLI and stream-services dependencies",
+                        checkPath: (streamServicesPath as NSString).appendingPathComponent("node_modules")),
             HealthCheck(id: "td-built", name: "fb-travel-data built", section: .dependencies,
                         fixLabel: "npm run build",
                         checkCommand: "ls dist/",
@@ -223,6 +230,11 @@ final class EnvironmentChecker {
             let exists = FileManager.default.fileExists(atPath: path)
             return exists ? .passing("Installed") : .failing("Run npm install")
 
+        case "stream-modules":
+            let path = (streamServicesPath as NSString).appendingPathComponent("node_modules")
+            let exists = FileManager.default.fileExists(atPath: path)
+            return exists ? .passing("Installed") : .failing("Run npm install")
+
         case "td-built":
             let path = (travelDataPath as NSString).appendingPathComponent("dist")
             let exists = FileManager.default.fileExists(atPath: path)
@@ -316,6 +328,9 @@ final class EnvironmentChecker {
 
         case "login-modules":
             return await shellInDir(loginPath, "npm install")
+
+        case "stream-modules":
+            return await shellInDir(streamServicesPath, "npm install")
 
         case "td-built":
             return await shellInDir(travelDataPath, "npm run build")

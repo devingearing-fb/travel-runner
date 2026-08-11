@@ -7,6 +7,10 @@ struct DbSetupPipelineView: View {
     let onCancel: () -> Void
     let onDismiss: () -> Void
 
+    private var isActivelyRunning: Bool {
+        isRunning || pipeline.isRunning
+    }
+
     @State private var expandedStepID: String? = nil
 
     var body: some View {
@@ -28,17 +32,27 @@ struct DbSetupPipelineView: View {
     // MARK: - Header
 
     private var header: some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             headerStatusIcon
-            Text("Database Setup")
-                .font(.system(.callout, design: .monospaced))
-                .fontWeight(.medium)
-            Spacer()
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Database Setup")
+                    .font(.system(.callout, design: .monospaced))
+                    .fontWeight(.medium)
+                Text("Scenario: \(pipeline.seedScenario.name)  •  Profile: \(pipeline.profile)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 8)
+
             if let elapsed = pipeline.totalElapsed {
                 Text(formatElapsed(elapsed))
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
+
             Button {
                 onDismiss()
             } label: {
@@ -47,7 +61,14 @@ struct DbSetupPipelineView: View {
                     .foregroundStyle(.secondary)
             }
             .buttonStyle(.borderless)
-            .help("Dismiss")
+            .disabled(isActivelyRunning)
+            .help(isActivelyRunning ? "Database setup cannot be dismissed while running" : "Dismiss database setup")
+            .accessibilityLabel("Dismiss database setup")
+            .accessibilityHint(
+                isActivelyRunning
+                    ? "Unavailable while database setup is running"
+                    : "Removes the completed setup pipeline from view"
+            )
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -55,7 +76,7 @@ struct DbSetupPipelineView: View {
 
     @ViewBuilder
     private var headerStatusIcon: some View {
-        if isRunning {
+        if isActivelyRunning {
             ProgressView()
                 .controlSize(.small)
         } else if pipeline.allRequiredPassed {
@@ -74,7 +95,7 @@ struct DbSetupPipelineView: View {
 
     private var controls: some View {
         HStack(spacing: 8) {
-            if isRunning {
+            if isActivelyRunning {
                 Button("Cancel") { onCancel() }
                     .buttonStyle(.bordered)
                     .controlSize(.small)

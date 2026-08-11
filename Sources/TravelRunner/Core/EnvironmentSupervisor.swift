@@ -17,6 +17,14 @@ final class EnvironmentSupervisor {
     var migrationsBannerVisible = false
     var dbResetRunning = false
     var dbSetupPipeline: DbSetupPipeline? = nil
+    var dbSeedScenarios: [DbSeedScenario] = []
+    var selectedDbSeedScenarioID: String?
+    var dbSeedScenarioLoadError: String?
+
+    var selectedDbSeedScenario: DbSeedScenario? {
+        guard let selectedDbSeedScenarioID else { return nil }
+        return dbSeedScenarios.first { $0.id == selectedDbSeedScenarioID }
+    }
     var networkMode = false
     var localIP: String? = nil
     var panelVisible = false
@@ -79,6 +87,7 @@ final class EnvironmentSupervisor {
     private var startTask: Task<Void, any Error>?
     private var config: ServiceConfig?
     private var isShuttingDown = false
+    private let userDefaults: UserDefaults
     private var stdoutProbes: [String: StdoutProbe] = [:]
     private var observerRegistered = false
     private var phaseStartedAt: Date? = nil
@@ -95,6 +104,11 @@ final class EnvironmentSupervisor {
     private var stripeReconnectingSince: Date? = nil
     private var localSupabaseAnonKey: String?
     private var localSupabaseSigningKey: String?
+
+    init(userDefaults: UserDefaults = .standard) {
+        self.userDefaults = userDefaults
+        self.selectedDbSeedScenarioID = userDefaults.string(forKey: "dbSeedScenarioID")
+    }
 
     // MARK: - Types
 
@@ -133,6 +147,8 @@ final class EnvironmentSupervisor {
             for service in config.services {
                 serviceStates[service.id] = ServiceState(definition: service)
             }
+
+            reloadDbSeedScenarios()
 
             // Derive .env.local paths from services that have artifact probes
             let portalService = config.services.first { $0.id == "travel-portal" }
@@ -1144,33 +1160,98 @@ final class EnvironmentSupervisor {
         }
     }
 
+    func reloadDbSeedScenarios() {
+        guard let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd else {
+            dbSeedScenarios = []
+            dbSeedScenarioLoadError = "Cannot load seed scenarios because the Supabase service directory is unavailable."
+            return
+        }
+
+        let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
+        let savedID: String? = userDefaults.object(forKey: "dbSeedScenarioID") == nil
+            ? nil
+            : (userDefaults.string(forKey: "dbSeedScenarioID") ?? "")
+
+        do {
+            let catalog = try DbManifestLoader.loadSeedScenarios(from: manifestPath)
+            dbSeedScenarios = catalog.items
+            do {
+                let resolvedID = try DbSeedScenarioSelection.resolve(
+                    catalog: catalog,
+                    savedID: savedID
+                )
+                selectedDbSeedScenarioID = resolvedID
+                if savedID == nil {
+                    userDefaults.set(resolvedID, forKey: "dbSeedScenarioID")
+                }
+                dbSeedScenarioLoadError = nil
+            } catch {
+                selectedDbSeedScenarioID = savedID
+                dbSeedScenarioLoadError = error.localizedDescription
+            }
+        } catch {
+            dbSeedScenarios = []
+            selectedDbSeedScenarioID = savedID
+            dbSeedScenarioLoadError = "Seed scenarios cannot be loaded: \(error.localizedDescription)"
+        }
+    }
+
+    func selectDbSeedScenario(_ id: String) {
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return }
+        guard dbSeedScenarios.contains(where: { $0.id == id }) else {
+            dbSeedScenarioLoadError = "Seed scenario ‘\(id)’ is not available. Reload the current branch and choose an available scenario."
+            return
+        }
+        selectedDbSeedScenarioID = id
+        userDefaults.set(id, forKey: "dbSeedScenarioID")
+        dbSeedScenarioLoadError = nil
+    }
+
     func resetDatabase(profile: String = "reset") {
         runDbSetup(profile: profile)
     }
 
     func runDbSetup(from stepId: String? = nil, profile: String = "reset") {
-        guard dbSetupPipeline?.isRunning != true else { return }
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return }
         guard let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd else {
             lastError = "Cannot find supabase service cwd in config"
             return
         }
 
-        let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
-        let steps: [DbSetupStep]
-        if FileManager.default.fileExists(atPath: manifestPath) {
-            steps = DbManifestLoader.load(from: manifestPath, profile: profile)
+        let pipeline: DbSetupPipeline
+        if stepId != nil, let existingPipeline = dbSetupPipeline {
+            pipeline = existingPipeline
         } else {
-            steps = DbSetupPipeline.buildDefault()
+            reloadDbSeedScenarios()
+            guard let seedScenario = selectedDbSeedScenario else {
+                lastError = dbSeedScenarioLoadError
+                    ?? "Choose a valid seed scenario before resetting the database."
+                return
+            }
+
+            let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
+            let steps: [DbSetupStep]
+            if FileManager.default.fileExists(atPath: manifestPath) {
+                steps = DbManifestLoader.load(from: manifestPath, profile: profile)
+            } else {
+                steps = DbSetupPipeline.buildDefault()
+            }
+
+            let newPipeline = DbSetupPipeline(profile: profile, seedScenario: seedScenario)
+            newPipeline.steps = steps
+            dbSetupPipeline = newPipeline
+            pipeline = newPipeline
         }
 
-        let pipeline = DbSetupPipeline()
-        pipeline.steps = steps
-        dbSetupPipeline = pipeline
         dbResetRunning = true
         migrationsBannerVisible = false
         lastError = nil
 
-        let runner = DbSetupRunner(portalCwd: cwd, logStore: logStore)
+        let runner = DbSetupRunner(
+            portalCwd: cwd,
+            logStore: logStore,
+            seedScenarioID: pipeline.seedScenario.id
+        )
         dbSetupRunner = runner
 
         Task {
@@ -1193,8 +1274,20 @@ final class EnvironmentSupervisor {
     }
 
     func runDbSetupStep(_ stepId: String) {
-        guard let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd else { return }
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return }
+        guard let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd else {
+            lastError = "Cannot find supabase service cwd in config"
+            return
+        }
+
         if dbSetupPipeline == nil {
+            reloadDbSeedScenarios()
+            guard let seedScenario = selectedDbSeedScenario else {
+                lastError = dbSeedScenarioLoadError
+                    ?? "Choose a valid seed scenario before running database setup."
+                return
+            }
+
             let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
             let steps: [DbSetupStep]
             if FileManager.default.fileExists(atPath: manifestPath) {
@@ -1202,7 +1295,7 @@ final class EnvironmentSupervisor {
             } else {
                 steps = DbSetupPipeline.buildDefault()
             }
-            let pipeline = DbSetupPipeline()
+            let pipeline = DbSetupPipeline(profile: "full", seedScenario: seedScenario)
             pipeline.steps = steps
             dbSetupPipeline = pipeline
         }
@@ -1210,20 +1303,28 @@ final class EnvironmentSupervisor {
         guard let pipeline = dbSetupPipeline,
               let step = pipeline.steps.first(where: { $0.id == stepId }) else { return }
 
-        let runner = DbSetupRunner(portalCwd: cwd, logStore: logStore)
+        let runner = DbSetupRunner(
+            portalCwd: cwd,
+            logStore: logStore,
+            seedScenarioID: pipeline.seedScenario.id
+        )
         dbSetupRunner = runner
+        dbResetRunning = true
+        lastError = nil
 
         Task {
-            dbResetRunning = true
-            let _ = await runner.executeStepPublic(step)
+            let success = await runner.executeStepPublic(step)
             dbResetRunning = false
+            if !success {
+                lastError = "DB setup failed at \(step.name): \(step.errorMessage ?? "unknown error")"
+            }
         }
     }
 
     func dbSetupStatusJSON() -> String {
-        guard let pipeline = dbSetupPipeline else { return "{\"running\":false,\"steps\":[]}" }
+        let pipeline = dbSetupPipeline
         var steps: [[String: Any]] = []
-        for step in pipeline.steps {
+        for step in pipeline?.steps ?? [] {
             var dict: [String: Any] = [
                 "id": step.id,
                 "name": step.name,
@@ -1238,8 +1339,22 @@ final class EnvironmentSupervisor {
             if let label = step.progressLabel { dict["progress_label"] = label }
             steps.append(dict)
         }
+
+        func scenarioMetadata(_ scenario: DbSeedScenario?) -> Any {
+            guard let scenario else { return NSNull() }
+            return [
+                "id": scenario.id,
+                "name": scenario.name,
+                "description": scenario.description,
+                "fileSummary": scenario.fileSummary,
+            ]
+        }
+
         let result: [String: Any] = [
-            "running": pipeline.isRunning,
+            "running": pipeline?.isRunning ?? false,
+            "profile": pipeline.map { $0.profile as Any } ?? NSNull(),
+            "selectedSeedScenario": scenarioMetadata(selectedDbSeedScenario),
+            "activeSeedScenario": scenarioMetadata(pipeline?.seedScenario),
             "steps": steps,
         ]
         if let data = try? JSONSerialization.data(withJSONObject: result, options: [.sortedKeys]),
@@ -1261,6 +1376,40 @@ final class EnvironmentSupervisor {
     }
 
     // MARK: - Private: LAN-Aware Definition
+
+    private func streamAwareDefinition(
+        for definition: ServiceDefinition,
+        serviceID: String
+    ) -> ServiceDefinition {
+        guard serviceID == "stream-services",
+              let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd else {
+            return definition
+        }
+        let portalEnv = readEnvFile((portalCwd as NSString).appendingPathComponent(".env.local"))
+        var envOverrides = definition.env ?? [:]
+        if let value = portalEnv["LOCAL_SUPABASE_URL"] ?? portalEnv["NEXT_PUBLIC_SUPABASE_URL"] {
+            envOverrides["AMATEUR_SUPABASE_URL"] = value.replacingOccurrences(of: "localhost", with: "127.0.0.1")
+        }
+        if let value = portalEnv["LOCAL_SUPABASE_ANON_KEY"] ?? portalEnv["NEXT_PUBLIC_SUPABASE_ANON_KEY"] {
+            envOverrides["AMATEUR_SUPABASE_ANON_KEY"] = value
+        }
+        if let value = portalEnv["LOCAL_SUPABASE_SIGNING_KEY"] {
+            envOverrides["AMATEUR_SUPABASE_SIGNING_KEY"] = value
+        }
+        return ServiceDefinition(
+            id: definition.id,
+            name: definition.name,
+            cmd: definition.cmd,
+            cwd: definition.cwd,
+            probe: definition.probe,
+            type: definition.type,
+            restart: definition.restart,
+            dependsOn: definition.dependsOn,
+            env: envOverrides,
+            phase: definition.phase,
+            reuseIfRunning: definition.reuseIfRunning
+        )
+    }
 
     private func lanAwareDefinition(for definition: ServiceDefinition, serviceID: String) -> ServiceDefinition {
         guard networkMode, let ip = localIP else { return definition }
@@ -1409,7 +1558,8 @@ final class EnvironmentSupervisor {
         let secretStore = self.secretStore
         let artifactName = definition.probe?.artifact
         let capturedProbe = stdoutProbe
-        let effectiveDefinition = lanAwareDefinition(for: definition, serviceID: serviceID)
+        let streamDefinition = streamAwareDefinition(for: definition, serviceID: serviceID)
+        let effectiveDefinition = lanAwareDefinition(for: streamDefinition, serviceID: serviceID)
 
         let sid = serviceID
         let pid = try await processRunner.start(
@@ -1959,6 +2109,12 @@ final class EnvironmentSupervisor {
     }
 
     private func runDbReset(cwd: String) async -> Bool {
+        reloadDbSeedScenarios()
+        guard let seedScenario = selectedDbSeedScenario else {
+            lastError = dbSeedScenarioLoadError
+                ?? "Choose a valid seed scenario before resetting the database."
+            return false
+        }
         let logStore = self.logStore
         // Use db:setup --reset-only which runs migrations + seed + reloads cached hotel data.
         // Plain `npx supabase db reset` only does migrations + seed, skipping the hotel dump.
@@ -1967,6 +2123,10 @@ final class EnvironmentSupervisor {
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-l", "-c", "npm run db:setup -- --reset-only"]
             process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+            process.environment = DbSetupRunner.environment(
+                parent: ProcessInfo.processInfo.environment,
+                seedScenarioID: seedScenario.id
+            )
 
             let pipe = Pipe()
             process.standardOutput = pipe

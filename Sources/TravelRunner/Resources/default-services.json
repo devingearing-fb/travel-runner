@@ -1,6 +1,13 @@
 {
-  "version": 1,
+  "version": 2,
   "registry_port_range": [19999, 20009],
+  "paths": {
+    "travel_data": "~/Documents/Codebases/TRAVEL BOOKING/fb-travel-data",
+    "booking_portal": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
+    "universal_login": "~/Documents/Codebases/fb-amateur-universal-login",
+    "partner_portal": "~/Documents/Codebases/TRAVEL BOOKING/fb-amateur-travel-partner-portal",
+    "stream_services": "~/Documents/Codebases/stream-services"
+  },
   "services": [
     {
       "id": "supabase",
@@ -62,6 +69,93 @@
       "depends_on": ["universal-login"]
     },
     {
+      "id": "stream-services-install",
+      "name": "Stream Services Install",
+      "cmd": ["npm", "install", "--prefer-offline", "--no-audit", "--no-fund"],
+      "cwd": "~/Documents/Codebases/stream-services",
+      "type": "oneshot",
+      "restart": "never",
+      "phase": "stream",
+      "depends_on": ["supabase"]
+    },
+    {
+      "id": "stream-qstash",
+      "name": "Local QStash",
+      "cmd": ["npx", "--no-install", "qstash", "dev"],
+      "cwd": "~/Documents/Codebases/stream-services",
+      "probe": { "type": "tcp", "port": 8080, "timeout": 120 },
+      "restart": "on-failure",
+      "phase": "stream",
+      "depends_on": ["stream-services-install"]
+    },
+    {
+      "id": "stream-db-setup",
+      "name": "Stream CDC Database Setup",
+      "cmd": ["./local/runner-db-setup.sh"],
+      "cwd": "~/Documents/Codebases/stream-services",
+      "type": "oneshot",
+      "restart": "never",
+      "phase": "stream",
+      "depends_on": ["supabase", "capacity-overflow"]
+    },
+    {
+      "id": "stream-services",
+      "name": "Stream Services",
+      "cmd": ["npm", "run", "dev", "--", "-p", "3003"],
+      "cwd": "~/Documents/Codebases/stream-services",
+      "env": {
+        "PINO_PRETTY": "false",
+        "AMATEUR_QSTASH_URL": "http://127.0.0.1:8080",
+        "AMATEUR_QSTASH_TOKEN": "eyJVc2VySUQiOiJkZWZhdWx0VXNlciIsIlBhc3N3b3JkIjoiZGVmYXVsdFBhc3N3b3JkIn0=",
+        "AMATEUR_QSTASH_CURRENT_SIGNING_KEY": "sig_7kYjw48mhY7kAjqNGcy6cr29RJ6r",
+        "AMATEUR_QSTASH_NEXT_SIGNING_KEY": "sig_5ZB6DVzB1wjE8S6rZ7eenA8Pdnhs",
+        "AMATEUR_SEQUIN_CURRENT_SECRET": "local-dev-sequin-secret",
+        "TRAVEL_CACHE_APPLY_URL": "http://127.0.0.1:3002/api/cache/apply",
+        "CACHE_APPLY_SECRET_CURRENT": "p5-runner-local-current-secret"
+      },
+      "probe": { "type": "tcp", "port": 3003, "timeout": 180 },
+      "restart": "on-failure",
+      "phase": "stream",
+      "depends_on": ["stream-services-install", "stream-qstash", "stream-db-setup", "travel-portal"]
+    },
+    {
+      "id": "stream-qstash-wire",
+      "name": "QStash Worker Wiring",
+      "cmd": ["./local/qstash-setup.sh"],
+      "cwd": "~/Documents/Codebases/stream-services",
+      "env": { "STREAM_SERVICES_PORT": "3003" },
+      "type": "oneshot",
+      "restart": "never",
+      "phase": "stream",
+      "depends_on": ["stream-qstash", "stream-services"]
+    },
+    {
+      "id": "stream-sequin",
+      "name": "Local Sequin Cache CDC",
+      "cmd": ["./local/run-sequin.sh"],
+      "cwd": "~/Documents/Codebases/stream-services",
+      "probe": { "type": "tcp", "port": 7376, "timeout": 300 },
+      "restart": "on-failure",
+      "phase": "stream",
+      "depends_on": ["stream-db-setup", "stream-qstash-wire"]
+    },
+    {
+      "id": "cache-cdc-rehearsal",
+      "name": "Cache CDC Rehearsal",
+      "cmd": ["npm", "run", "test:cache-cdc:runner"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-load-test",
+      "env": {
+        "CACHE_CDC_STREAM_URL": "http://127.0.0.1:3003",
+        "CACHE_CDC_QSTASH_URL": "http://127.0.0.1:8080",
+        "CACHE_CDC_PORTAL_URL": "http://127.0.0.1:3002",
+        "TRAVEL_RUNNER_CONTROL_URL": "http://[::1]:19900"
+      },
+      "type": "oneshot",
+      "restart": "never",
+      "phase": "verification",
+      "depends_on": ["stream-sequin"]
+    },
+    {
       "id": "cache-apply-transport",
       "name": "Cache Apply Transport",
       "cmd": ["npm", "run", "test:cache-transport:runner"],
@@ -74,6 +168,64 @@
       "restart": "never",
       "phase": "verification",
       "depends_on": ["travel-portal"]
+    },
+    {
+      "id": "capacity-contention",
+      "name": "Capacity Contention E2E",
+      "cmd": [
+        "node",
+        "--env-file=../travel-booking-portal/.env.local",
+        "--import",
+        "tsx",
+        "scripts/blocking-contention-repro.ts"
+      ],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-load-test",
+      "type": "oneshot",
+      "restart": "never",
+      "phase": "verification",
+      "depends_on": ["cache-apply-transport"]
+    },
+    {
+      "id": "capacity-block-edit-race",
+      "name": "Capacity Block Edit Race",
+      "cmd": [
+        "node",
+        "--env-file=../travel-booking-portal/.env.local",
+        "--import",
+        "tsx",
+        "src/block-edit-race-orchestrator.ts"
+      ],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-load-test",
+      "type": "oneshot",
+      "restart": "never",
+      "phase": "verification",
+      "depends_on": ["capacity-contention"]
+    },
+    {
+      "id": "capacity-overflow",
+      "name": "Capacity Overflow E2E",
+      "cmd": [
+        "node",
+        "--env-file=../travel-booking-portal/.env.local",
+        "--import",
+        "tsx",
+        "scripts/overflow-display-audit.ts"
+      ],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-load-test",
+      "type": "oneshot",
+      "restart": "never",
+      "phase": "verification",
+      "depends_on": ["capacity-block-edit-race"]
+    },
+    {
+      "id": "cache-cutover-audit",
+      "name": "Cache Cutover Audit",
+      "cmd": ["npm", "run", "audit:p6"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-load-test",
+      "type": "oneshot",
+      "restart": "never",
+      "phase": "verification",
+      "depends_on": ["cache-apply-transport", "cache-cdc-rehearsal"]
     }
   ]
 }

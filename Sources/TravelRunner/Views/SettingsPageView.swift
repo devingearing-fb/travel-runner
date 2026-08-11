@@ -81,6 +81,35 @@ struct SettingsPageView: View {
                 Divider().padding(.leading, 32)
 
                 settingsRow {
+                    Button {
+                        WorkshopPanel.shared.open(section: .dbTools)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "cylinder.split.1x2")
+                            Text("Next reset: \(nextResetScenarioSummary)")
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(nextResetScenarioIsValid ? Color.primary : Color.orange)
+                                .multilineTextAlignment(.leading)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 8)
+                            Image(systemName: "chevron.right")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .help("Open DB Tools to choose the seed scenario for the next reset")
+                    .accessibilityLabel("Next reset seed scenario")
+                    .accessibilityValue(nextResetScenarioSummary)
+                    .accessibilityHint("Opens DB Tools to choose a seed scenario")
+                }
+
+                Divider().padding(.leading, 32)
+
+                settingsRow {
                     HStack {
                         Toggle(isOn: Binding(
                             get: { supervisor.networkMode },
@@ -190,6 +219,9 @@ struct SettingsPageView: View {
                 Divider().padding(.leading, 32)
                 pathRow(label: "Partner Portal", icon: "building.2",
                         path: expandedPath(config?.paths?.partnerPortal))
+                Divider().padding(.leading, 32)
+                pathRow(label: "Stream Services", icon: "arrow.triangle.branch",
+                        path: expandedPath(config?.paths?.streamServices))
             }
             .background(Color.secondary.opacity(0.06))
             .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -253,6 +285,24 @@ struct SettingsPageView: View {
             .background(Color.secondary.opacity(0.06))
             .clipShape(RoundedRectangle(cornerRadius: 8))
         }
+    }
+
+    private var nextResetScenarioSummary: String {
+        if supervisor.dbSeedScenarioLoadError == nil,
+           let scenario = supervisor.selectedDbSeedScenario {
+            return scenario.name
+        }
+        if let selectedID = supervisor.selectedDbSeedScenarioID {
+            return "Unavailable (\(selectedID))"
+        }
+        if supervisor.dbSeedScenarioLoadError != nil {
+            return "Catalog unavailable"
+        }
+        return "Select a scenario"
+    }
+
+    private var nextResetScenarioIsValid: Bool {
+        supervisor.dbSeedScenarioLoadError == nil && supervisor.selectedDbSeedScenario != nil
     }
 
     // MARK: - Helpers

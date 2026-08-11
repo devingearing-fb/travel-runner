@@ -63,10 +63,18 @@ final class DbSetupStep: Identifiable {
 @Observable
 @MainActor
 final class DbSetupPipeline {
+    nonisolated let profile: String
+    nonisolated let seedScenario: DbSeedScenario
+
     var steps: [DbSetupStep] = []
     var isRunning = false
     var startedAt: Date? = nil
     var completedAt: Date? = nil
+    init(profile: String, seedScenario: DbSeedScenario) {
+        self.profile = profile
+        self.seedScenario = seedScenario
+    }
+
 
     var currentStep: DbSetupStep? {
         steps.first { $0.status == .running || $0.status == .healthCheck }
@@ -99,14 +107,14 @@ final class DbSetupPipeline {
                         command: "node scripts/db/sync-migrations.mjs",
                         healthCheckCommand: "node scripts/db/sync-migrations.mjs --verify",
                         timeoutSeconds: 15, isOptional: false, stepNumber: 3),
-            DbSetupStep(id: "reset-database", name: "Apply Migrations",
+            DbSetupStep(id: "reset-database", name: "Reset & Seed Data",
                         command: "node scripts/db/reset-database.mjs",
                         healthCheckCommand: "node scripts/db/reset-database.mjs --verify",
                         timeoutSeconds: 180, isOptional: false, stepNumber: 4),
             DbSetupStep(id: "load-hotels", name: "Load Hotels",
                         command: "node scripts/db/load-hotels.mjs",
                         healthCheckCommand: "node scripts/db/load-hotels.mjs --verify",
-                        timeoutSeconds: 120, isOptional: false, stepNumber: 5),
+                        timeoutSeconds: 600, isOptional: false, stepNumber: 5),
             DbSetupStep(id: "copy-event-data", name: "Event Contracts",
                         command: "node scripts/db/copy-event-data.mjs",
                         healthCheckCommand: "node scripts/db/copy-event-data.mjs --verify",
