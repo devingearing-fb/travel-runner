@@ -1512,6 +1512,21 @@ final class EnvironmentSupervisor {
             return
         }
 
+        // Stripe is an optional local gateway. A stale/expired CLI session must
+        // degrade to "skipped", not enter the daemon crash loop (and emit a
+        // notification on every retry). The next manual/full start re-runs the
+        // credential probe and will enable Stripe again once `stripe login`
+        // succeeds.
+        if serviceID == "stripe", exitCode != 0 {
+            state.phase = .skipped
+            state.exitCode = exitCode
+            state.pid = nil
+            state.lastStopped = .now
+            state.failureTimestamps.removeAll()
+            recalculateHealth()
+            return
+        }
+
         if state.definition.resolvedType == .oneshot {
             state.phase = exitCode == 0 ? .completed : .failed
             state.exitCode = exitCode
@@ -1898,7 +1913,10 @@ final class EnvironmentSupervisor {
     }
 
     private func isStripeAvailable() async -> Bool {
-        await runShellCommand("which stripe >/dev/null 2>&1 && stripe config --list >/dev/null 2>&1")
+        // `stripe config --list` only proves that a credential is stored; it
+        // still exits zero for expired API keys. Exercise the authenticated API
+        // so invalid sessions are skipped before `stripe listen` can crash.
+        await runShellCommand("which stripe >/dev/null 2>&1 && stripe balance retrieve >/dev/null 2>&1")
     }
 
     private func canReachHost(_ host: String) async -> Bool {

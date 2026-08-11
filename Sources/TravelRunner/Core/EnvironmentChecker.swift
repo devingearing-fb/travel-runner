@@ -205,8 +205,8 @@ final class EnvironmentChecker {
             return ok ? .passing("Found") : .warning("Not installed — webhooks won't work")
 
         case "stripe-auth":
-            let ok = await shell("stripe config --list >/dev/null 2>&1")
-            return ok ? .passing("Authenticated") : .warning("Not authenticated — run: stripe login")
+            let ok = await shell("stripe balance retrieve >/dev/null 2>&1")
+            return ok ? .passing("Authenticated") : .warning("Session invalid or expired — run: stripe login")
 
         case "npmrc":
             let path = (portalPath as NSString).appendingPathComponent(".npmrc")

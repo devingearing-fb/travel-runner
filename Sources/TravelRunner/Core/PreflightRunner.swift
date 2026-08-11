@@ -102,10 +102,10 @@ struct PreflightRunner: Sendable {
         case "stripe-auth":
             let hasStripe = await shellExitCode("which stripe >/dev/null 2>&1") == 0
             if !hasStripe { return .warning(message: "Not installed — Stripe will be skipped") }
-            let ok = await shellExitCode("stripe config --list >/dev/null 2>&1") == 0
+            let ok = await shellExitCode("stripe balance retrieve >/dev/null 2>&1") == 0
             return ok
                 ? .passed(detail: "Authenticated")
-                : .warning(message: "Not authenticated — Stripe will be skipped")
+                : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
 
         case "yalc":
             let ok = await shellExitCode("which yalc") == 0
