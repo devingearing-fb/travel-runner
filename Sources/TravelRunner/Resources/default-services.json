@@ -15,8 +15,8 @@
     },
     {
       "id": "yalc-link",
-      "name": "yalc Link",
-      "cmd": ["yalc", "link", "@fastbreak-amateur/fb-travel-data"],
+      "name": "Shared Package Install",
+      "cmd": ["npm", "install", "--prefer-offline", "--no-audit", "--no-fund"],
       "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
       "type": "oneshot",
       "phase": "gateway",
@@ -50,11 +50,30 @@
       "name": "Travel Portal",
       "cmd": ["npm", "run", "dev"],
       "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
-      "env": { "PINO_PRETTY": "false" },
+      "env": {
+        "PINO_PRETTY": "false",
+        "CACHE_APPLY_MODE": "full",
+        "CACHE_APPLY_SECRET_CURRENT": "p5-runner-local-current-secret",
+        "CACHE_APPLY_RATE_LIMIT_PER_MINUTE": "2000"
+      },
       "probe": { "type": "tcp", "port": 3002 },
       "restart": "on-failure",
       "phase": "portal",
       "depends_on": ["universal-login"]
+    },
+    {
+      "id": "cache-apply-transport",
+      "name": "Cache Apply Transport",
+      "cmd": ["npm", "run", "test:cache-transport:runner"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-load-test",
+      "env": {
+        "CACHE_APPLY_BASE_URL": "http://127.0.0.1:3002",
+        "CACHE_APPLY_SECRET": "p5-runner-local-current-secret"
+      },
+      "type": "oneshot",
+      "restart": "never",
+      "phase": "verification",
+      "depends_on": ["travel-portal"]
     }
   ]
 }
