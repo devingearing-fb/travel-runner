@@ -97,7 +97,7 @@ final class Phase5TopologyTests: XCTestCase {
         let overflow = try XCTUnwrap(byID["capacity-overflow"])
         let audit = try XCTUnwrap(byID["cache-cutover-audit"])
 
-        XCTAssertEqual(qstash.cmd, ["npx", "--no-install", "qstash", "dev"])
+        XCTAssertEqual(qstash.cmd, ["./node_modules/.bin/qstash", "dev"])
         XCTAssertEqual(qstash.probe?.port, 8080)
         XCTAssertEqual(stream.probe?.port, 3003)
         XCTAssertEqual(sequin.probe?.port, 7376)
@@ -106,6 +106,15 @@ final class Phase5TopologyTests: XCTestCase {
         XCTAssertEqual(wire.resolvedType, .oneshot)
         XCTAssertEqual(rehearsal.cmd, ["npm", "run", "test:cache-cdc:runner"])
         XCTAssertEqual(dbSetup.dependsOn, ["supabase", "capacity-overflow"])
+        // Local CDC infrastructure is portal-owned; only production logic runs in stream-services.
+        XCTAssertEqual(dbSetup.cmd, ["./scripts/local-cdc/runner-db-setup.sh"])
+        XCTAssertTrue(dbSetup.env?["STREAM_SERVICES_DIR"]?.hasSuffix("stream-services") == true)
+        XCTAssertEqual(sequin.cmd, ["./scripts/local-cdc/run-sequin.sh"])
+        XCTAssertEqual(wire.cmd, ["./scripts/local-cdc/qstash-wire.sh"])
+        for infra in [qstash, dbSetup, wire, sequin] {
+            XCTAssertTrue(infra.resolvedCwd?.hasSuffix("travel-booking-portal") == true, infra.id)
+        }
+        XCTAssertTrue(stream.resolvedCwd?.hasSuffix("stream-services") == true)
         XCTAssertEqual(contention.dependsOn, ["cache-apply-transport"])
         XCTAssertEqual(blockEditRace.dependsOn, ["capacity-contention"])
         XCTAssertEqual(overflow.dependsOn, ["capacity-block-edit-race"])

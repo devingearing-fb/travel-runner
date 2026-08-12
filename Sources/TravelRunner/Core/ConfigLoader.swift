@@ -157,6 +157,7 @@ enum ConfigLoader {
         }
         services.append(contentsOf: canonicalStreamServices(
             streamPath: streamPath,
+            portalPath: portalPath,
             loadTestPath: loadTestPath,
             preCDCDependency: preCDCDependency
         ))
@@ -182,6 +183,7 @@ enum ConfigLoader {
 
     private static func canonicalStreamServices(
         streamPath: String,
+        portalPath: String,
         loadTestPath: String,
         preCDCDependency: String?
     ) -> [[String: Any]] {
@@ -202,18 +204,19 @@ enum ConfigLoader {
             [
                 "id": "stream-qstash",
                 "name": "Local QStash",
-                "cmd": ["npx", "--no-install", "qstash", "dev"],
-                "cwd": streamPath,
+                "cmd": ["./node_modules/.bin/qstash", "dev"],
+                "cwd": portalPath,
                 "probe": ["type": "tcp", "port": 8080, "timeout": 120],
                 "restart": "on-failure",
                 "phase": "stream",
-                "depends_on": ["stream-services-install"],
+                "depends_on": ["supabase"],
             ],
             [
                 "id": "stream-db-setup",
                 "name": "Stream CDC Database Setup",
-                "cmd": ["./local/runner-db-setup.sh"],
-                "cwd": streamPath,
+                "cmd": ["./scripts/local-cdc/runner-db-setup.sh"],
+                "cwd": portalPath,
+                "env": ["STREAM_SERVICES_DIR": streamPath],
                 "type": "oneshot",
                 "restart": "never",
                 "phase": "stream",
@@ -242,8 +245,8 @@ enum ConfigLoader {
             [
                 "id": "stream-qstash-wire",
                 "name": "QStash Worker Wiring",
-                "cmd": ["./local/qstash-setup.sh"],
-                "cwd": streamPath,
+                "cmd": ["./scripts/local-cdc/qstash-wire.sh"],
+                "cwd": portalPath,
                 "env": ["STREAM_SERVICES_PORT": "3003"],
                 "type": "oneshot",
                 "restart": "never",
@@ -253,8 +256,8 @@ enum ConfigLoader {
             [
                 "id": "stream-sequin",
                 "name": "Local Sequin Cache CDC",
-                "cmd": ["./local/run-sequin.sh"],
-                "cwd": streamPath,
+                "cmd": ["./scripts/local-cdc/run-sequin.sh"],
+                "cwd": portalPath,
                 "probe": ["type": "tcp", "port": 7376, "timeout": 300],
                 "restart": "on-failure",
                 "phase": "stream",

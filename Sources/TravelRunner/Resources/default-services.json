@@ -81,18 +81,19 @@
     {
       "id": "stream-qstash",
       "name": "Local QStash",
-      "cmd": ["npx", "--no-install", "qstash", "dev"],
-      "cwd": "~/Documents/Codebases/stream-services",
+      "cmd": ["./node_modules/.bin/qstash", "dev"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
       "probe": { "type": "tcp", "port": 8080, "timeout": 120 },
       "restart": "on-failure",
       "phase": "stream",
-      "depends_on": ["stream-services-install"]
+      "depends_on": ["supabase"]
     },
     {
       "id": "stream-db-setup",
       "name": "Stream CDC Database Setup",
-      "cmd": ["./local/runner-db-setup.sh"],
-      "cwd": "~/Documents/Codebases/stream-services",
+      "cmd": ["./scripts/local-cdc/runner-db-setup.sh"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
+      "env": { "STREAM_SERVICES_DIR": "~/Documents/Codebases/stream-services" },
       "type": "oneshot",
       "restart": "never",
       "phase": "stream",
@@ -121,8 +122,8 @@
     {
       "id": "stream-qstash-wire",
       "name": "QStash Worker Wiring",
-      "cmd": ["./local/qstash-setup.sh"],
-      "cwd": "~/Documents/Codebases/stream-services",
+      "cmd": ["./scripts/local-cdc/qstash-wire.sh"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
       "env": { "STREAM_SERVICES_PORT": "3003" },
       "type": "oneshot",
       "restart": "never",
@@ -132,8 +133,8 @@
     {
       "id": "stream-sequin",
       "name": "Local Sequin Cache CDC",
-      "cmd": ["./local/run-sequin.sh"],
-      "cwd": "~/Documents/Codebases/stream-services",
+      "cmd": ["./scripts/local-cdc/run-sequin.sh"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
       "probe": { "type": "tcp", "port": 7376, "timeout": 300 },
       "restart": "on-failure",
       "phase": "stream",

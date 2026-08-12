@@ -35,18 +35,23 @@ final class ConfigLoaderTests: XCTestCase {
         XCTAssertNotNil(byID["custom-local-tool"])
         XCTAssertEqual(byID["custom-local-tool"]?.dependsOn, ["supabase"])
 
-        let streamIDs = [
-            "stream-services-install",
-            "stream-qstash",
-            "stream-db-setup",
-            "stream-services",
-            "stream-qstash-wire",
-            "stream-sequin",
-        ]
-        for id in streamIDs {
+        // Production-logic services run in the org-owned stream-services checkout;
+        // local CDC infrastructure now lives in (and runs from) the booking portal.
+        let streamRepoIDs = ["stream-services-install", "stream-services"]
+        let portalInfraIDs = ["stream-qstash", "stream-db-setup", "stream-qstash-wire", "stream-sequin"]
+        for id in streamRepoIDs + portalInfraIDs {
             XCTAssertEqual(config.services.filter { $0.id == id }.count, 1, id)
-            XCTAssertEqual(byID[id]?.resolvedCwd, "/workspace/stream-services")
         }
+        for id in streamRepoIDs {
+            XCTAssertEqual(byID[id]?.resolvedCwd, "/workspace/stream-services", id)
+        }
+        for id in portalInfraIDs {
+            XCTAssertEqual(byID[id]?.resolvedCwd, "/workspace/travel-booking-portal", id)
+        }
+        XCTAssertEqual(byID["stream-db-setup"]?.cmd, ["./scripts/local-cdc/runner-db-setup.sh"])
+        XCTAssertEqual(byID["stream-db-setup"]?.env?["STREAM_SERVICES_DIR"], "/workspace/stream-services")
+        XCTAssertEqual(byID["stream-sequin"]?.cmd, ["./scripts/local-cdc/run-sequin.sh"])
+        XCTAssertEqual(byID["stream-qstash-wire"]?.cmd, ["./scripts/local-cdc/qstash-wire.sh"])
         XCTAssertEqual(config.services.filter { $0.id == "cache-cdc-rehearsal" }.count, 1)
         XCTAssertEqual(byID["cache-cdc-rehearsal"]?.resolvedCwd, "/workspace/travel-load-test")
         XCTAssertEqual(
@@ -83,7 +88,7 @@ final class ConfigLoaderTests: XCTestCase {
 
         XCTAssertEqual(once, twice)
         XCTAssertEqual(config.services.filter { $0.id == "stream-qstash" }.count, 1)
-        XCTAssertEqual(qstash.cmd, ["npx", "--no-install", "qstash", "dev"])
+        XCTAssertEqual(qstash.cmd, ["./node_modules/.bin/qstash", "dev"])
     }
 
     private func service(
