@@ -18,8 +18,9 @@ final class Phase5TopologyTests: XCTestCase {
 
         XCTAssertEqual(
             packageInstall.cmd,
-            ["npm", "install", "--prefer-offline", "--no-audit", "--no-fund"]
+            ["bash", "./scripts/yalc-link-consumers.sh"]
         )
+        XCTAssertTrue(packageInstall.resolvedCwd?.hasSuffix("fb-travel-data") == true)
 
         XCTAssertEqual(portal.env?["CACHE_APPLY_MODE"], "full")
         XCTAssertEqual(portal.env?["CACHE_APPLY_SECRET_CURRENT"], transport.env?["CACHE_APPLY_SECRET"])

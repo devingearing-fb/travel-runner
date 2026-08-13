@@ -22,9 +22,9 @@
     },
     {
       "id": "yalc-link",
-      "name": "Shared Package Install",
-      "cmd": ["npm", "install", "--prefer-offline", "--no-audit", "--no-fund"],
-      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal",
+      "name": "yalc publish + link fb-travel-data",
+      "cmd": ["bash", "./scripts/yalc-link-consumers.sh"],
+      "cwd": "~/Documents/Codebases/TRAVEL BOOKING/fb-travel-data",
       "type": "oneshot",
       "phase": "gateway",
       "depends_on": ["supabase"]

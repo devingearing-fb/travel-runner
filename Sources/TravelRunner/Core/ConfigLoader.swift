@@ -78,7 +78,9 @@ enum ConfigLoader {
 
         for index in services.indices {
             switch services[index]["id"] as? String {
-            case "supabase", "yalc-link", "travel-portal":
+            case "yalc-link":
+                services[index]["cwd"] = repos.travelData ?? ""
+            case "supabase", "travel-portal":
                 services[index]["cwd"] = portalPath
             case "universal-login":
                 services[index]["cwd"] = loginPath
