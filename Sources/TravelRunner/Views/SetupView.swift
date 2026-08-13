@@ -18,6 +18,7 @@ struct SetupView: View {
     @State private var universalLoginPath: String = ""
     @State private var travelDataPath: String = ""
     @State private var partnerPortalPath: String = ""
+    @State private var streamServicesPath: String = ""
     @State private var dropTargetHighlighted = false
     @State private var statusMessage: String? = nil
 
@@ -73,6 +74,7 @@ struct SetupView: View {
                     repoRow(role: .universalLogin, path: $universalLoginPath)
                     repoRow(role: .travelData, path: $travelDataPath)
                     repoRow(role: .partnerPortal, path: $partnerPortalPath)
+                    repoRow(role: .streamServices, path: $streamServicesPath)
 
                     if let msg = statusMessage {
                         HStack {
@@ -195,7 +197,7 @@ struct SetupView: View {
     // MARK: - Actions
 
     private var canProceed: Bool {
-        !bookingPortalPath.isEmpty && !universalLoginPath.isEmpty
+        !bookingPortalPath.isEmpty && !universalLoginPath.isEmpty && !streamServicesPath.isEmpty
     }
 
     private func goToStep2() {
@@ -203,7 +205,8 @@ struct SetupView: View {
         checker = EnvironmentChecker(
             portalPath: bookingPortalPath,
             loginPath: universalLoginPath,
-            travelDataPath: travelDataPath
+            travelDataPath: travelDataPath,
+            streamServicesPath: streamServicesPath
         )
         currentStep = .environment
     }
@@ -213,7 +216,8 @@ struct SetupView: View {
             bookingPortal: bookingPortalPath,
             universalLogin: universalLoginPath,
             travelData: travelDataPath.isEmpty ? nil : travelDataPath,
-            partnerPortal: partnerPortalPath.isEmpty ? nil : partnerPortalPath
+            partnerPortal: partnerPortalPath.isEmpty ? nil : partnerPortalPath,
+            streamServices: streamServicesPath.isEmpty ? nil : streamServicesPath
         )
         do {
             try ConfigLoader.generate(from: repos)
@@ -230,14 +234,17 @@ struct SetupView: View {
             if let p = paths.universalLogin, !p.isEmpty { universalLoginPath = p }
             if let p = paths.travelData, !p.isEmpty { travelDataPath = p }
             if let p = paths.partnerPortal, !p.isEmpty { partnerPortalPath = p }
+            if let p = paths.streamServices, !p.isEmpty { streamServicesPath = p }
         }
-        if bookingPortalPath.isEmpty || universalLoginPath.isEmpty {
+        if bookingPortalPath.isEmpty || universalLoginPath.isEmpty || streamServicesPath.isEmpty {
             for service in config.services {
                 switch service.id {
                 case "supabase", "travel-portal":
                     if let cwd = service.cwd, bookingPortalPath.isEmpty { bookingPortalPath = cwd }
                 case "universal-login":
                     if let cwd = service.cwd, universalLoginPath.isEmpty { universalLoginPath = cwd }
+                case "stream-services":
+                    if let cwd = service.cwd, streamServicesPath.isEmpty { streamServicesPath = cwd }
                 default: break
                 }
             }
@@ -263,11 +270,16 @@ struct SetupView: View {
             partnerPortalPath = p
             filled.append("Partner Portal")
         }
+        if let p = detected.streamServices, streamServicesPath.isEmpty {
+            streamServicesPath = p
+            filled.append("Stream Services")
+        }
 
         var missing: [String] = []
         if bookingPortalPath.isEmpty { missing.append("Booking Portal") }
         if universalLoginPath.isEmpty { missing.append("Universal Login") }
         if travelDataPath.isEmpty { missing.append("fb-travel-data") }
+        if streamServicesPath.isEmpty { missing.append("Stream Services") }
 
         if filled.isEmpty {
             statusMessage = "No new repos detected in this folder"

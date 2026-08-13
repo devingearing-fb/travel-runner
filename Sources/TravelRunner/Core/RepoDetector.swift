@@ -5,13 +5,14 @@ struct DetectedRepos: Sendable {
     var universalLogin: String?
     var travelData: String?
     var partnerPortal: String?
+    var streamServices: String?
 
     var allDetected: Bool {
-        bookingPortal != nil && universalLogin != nil && travelData != nil
+        bookingPortal != nil && universalLogin != nil && travelData != nil && streamServices != nil
     }
 
     var detectedCount: Int {
-        [bookingPortal, universalLogin, travelData].compactMap { $0 }.count
+        [bookingPortal, universalLogin, travelData, streamServices].compactMap { $0 }.count
     }
 }
 
@@ -55,7 +56,7 @@ enum RepoDetector {
         switch role {
         case .bookingPortal:
             return fm.fileExists(atPath: (expanded as NSString).appendingPathComponent("supabase/config.toml"))
-        case .universalLogin, .travelData, .partnerPortal:
+        case .universalLogin, .travelData, .partnerPortal, .streamServices:
             return fm.fileExists(atPath: (expanded as NSString).appendingPathComponent("package.json"))
         }
     }
@@ -104,6 +105,18 @@ enum RepoDetector {
                 }
             }
         }
+
+        // Stream services: package.json name is the stable repository identity.
+        if result.streamServices == nil {
+            let pkg = (path as NSString).appendingPathComponent("package.json")
+            if fm.fileExists(atPath: pkg),
+               let data = fm.contents(atPath: pkg),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let pkgName = json["name"] as? String,
+               pkgName == "fb-amateur-stream-services" {
+                result.streamServices = path
+            }
+        }
     }
 
     enum RepoRole: String, CaseIterable, Sendable {
@@ -111,6 +124,7 @@ enum RepoDetector {
         case universalLogin = "Universal Login"
         case travelData = "fb-travel-data"
         case partnerPortal = "Partner Portal"
+        case streamServices = "Stream Services"
 
         var description: String {
             switch self {
@@ -118,6 +132,7 @@ enum RepoDetector {
             case .universalLogin: "Auth gateway (port 3000)"
             case .travelData: "Shared domain package (yalc publish source)"
             case .partnerPortal: "Hotel partner portal (port 3001)"
+            case .streamServices: "CDC ingest and reaction worker (port 3003)"
             }
         }
 
@@ -127,6 +142,7 @@ enum RepoDetector {
             case .universalLogin: "person.badge.key"
             case .travelData: "shippingbox"
             case .partnerPortal: "building.2"
+            case .streamServices: "arrow.triangle.branch"
             }
         }
     }
