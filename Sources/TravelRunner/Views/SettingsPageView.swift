@@ -44,7 +44,10 @@ struct SettingsPageView: View {
 
             Spacer()
 
-            Color.clear.frame(width: 40)
+            // Balances the Back button's width so the title stays centered.
+            // Height must be pinned: a bare Color is fully flexible and would
+            // greedily split the window's vertical space with the ScrollView.
+            Color.clear.frame(width: 40, height: 1)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -169,6 +172,25 @@ struct SettingsPageView: View {
                             Label("Auto-relink fb-travel-data", systemImage: "arrow.triangle.2.circlepath")
                                 .font(.system(.caption, design: .monospaced))
                             Text("Rebuilds and relinks when source changes are detected")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                }
+
+                Divider().padding(.leading, 32)
+
+                settingsRow {
+                    Toggle(isOn: Binding(
+                        get: { supervisor.cacheVerificationEnabled },
+                        set: { supervisor.setCacheVerificationEnabled($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("Cache verification on start", systemImage: "checkmark.shield")
+                                .font(.system(.caption, design: .monospaced))
+                            Text("Runs the transport, contention, and cache audit checks once the environment is up")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                         }

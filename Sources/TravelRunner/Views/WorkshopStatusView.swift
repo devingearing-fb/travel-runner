@@ -19,12 +19,6 @@ struct WorkshopStatusView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
-                ServiceDotMinimap(
-                    serviceStates: supervisor.serviceStates,
-                    sortedIDs: supervisor.sortedServiceIDs
-                )
-                .padding(.horizontal, 4)
-
                 ForEach(failedServices) { state in
                     TriageCard(
                         state: state,

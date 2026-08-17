@@ -63,7 +63,7 @@
         "CACHE_APPLY_SECRET_CURRENT": "p5-runner-local-current-secret",
         "CACHE_APPLY_RATE_LIMIT_PER_MINUTE": "2000"
       },
-      "probe": { "type": "tcp", "port": 3002 },
+      "probe": { "type": "http", "url": "http://127.0.0.1:3002/api/health", "port": 3002, "timeout": 240 },
       "restart": "on-failure",
       "phase": "portal",
       "depends_on": ["universal-login"]

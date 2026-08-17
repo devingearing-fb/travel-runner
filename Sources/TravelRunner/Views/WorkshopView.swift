@@ -31,7 +31,8 @@ struct WorkshopView: View {
                     NavigationSplitView {
                         List(WorkshopSection.allCases, selection: $navigation.selectedSection) { section in
                             Label(section.rawValue, systemImage: section.icon)
-                                .badge(section == .issues ? supervisor.debugOpenIssueCount : 0)
+                                .badge(section == .issues ? supervisor.debugOpenIssueCount
+                                       : section == .status ? failedServiceCount : 0)
                         }
                         .navigationSplitViewColumnWidth(min: 140, ideal: 160, max: 200)
                     } detail: {
@@ -61,16 +62,6 @@ struct WorkshopView: View {
             ToastOverlay(center: toastCenter)
         }
         .preferredColorScheme(.dark)
-        .onChange(of: failedServiceCount) { old, new in
-            if new >= 2 {
-                navigation.selectedSection = .status
-            }
-        }
-        .onAppear {
-            if failedServiceCount >= 2 {
-                navigation.selectedSection = .status
-            }
-        }
     }
 }
 

@@ -36,6 +36,7 @@ enum WorkshopSection: String, CaseIterable, Identifiable {
 @MainActor
 final class WorkshopNavigation {
     var selectedSection: WorkshopSection? = .status
+    var selectedLogServiceID: String? = nil
 }
 
 @MainActor

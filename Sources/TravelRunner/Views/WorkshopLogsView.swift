@@ -2,7 +2,14 @@ import SwiftUI
 
 struct WorkshopLogsView: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
-    @State private var selectedServiceID: String?
+
+    // Selection lives on the shared navigation object so header chips can
+    // deep-link into a service's console.
+    private var navigation: WorkshopNavigation { WorkshopPanel.shared.navigation }
+
+    private var selectedServiceID: String? {
+        navigation.selectedLogServiceID
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -20,8 +27,8 @@ struct WorkshopLogsView: View {
             }
         }
         .onAppear {
-            if selectedServiceID == nil {
-                selectedServiceID = supervisor.sortedServiceIDs.first
+            if navigation.selectedLogServiceID == nil {
+                navigation.selectedLogServiceID = supervisor.sortedServiceIDs.first
             }
         }
     }
@@ -34,9 +41,13 @@ struct WorkshopLogsView: View {
                     let name = state?.definition.displayName ?? id
                     let isSelected = selectedServiceID == id
                     let color = state?.phase.color ?? .gray
+                    // A finished one-shot's console is historical output, not a
+                    // live process — dim it so daemon tabs stand out.
+                    let isQuietOneshot = state?.definition.resolvedType == .oneshot
+                        && (state?.phase == .completed || state?.phase == .skipped)
 
                     Button {
-                        selectedServiceID = id
+                        navigation.selectedLogServiceID = id
                     } label: {
                         HStack(spacing: 4) {
                             Circle()
@@ -45,6 +56,7 @@ struct WorkshopLogsView: View {
                             Text(name)
                                 .font(.system(.caption, design: .monospaced))
                                 .fontWeight(isSelected ? .bold : .regular)
+                                .foregroundStyle(isQuietOneshot && !isSelected ? .secondary : .primary)
                                 .lineLimit(1)
                         }
                         .padding(.horizontal, 10)

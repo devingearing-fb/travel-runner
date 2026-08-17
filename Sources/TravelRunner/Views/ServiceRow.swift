@@ -23,17 +23,38 @@ struct ServiceRow: View {
         supervisor.actionsInFlight.contains(state.id)
     }
 
+    private var canRerunOneshot: Bool {
+        state.definition.resolvedType == .oneshot
+            && (state.phase == .completed || state.phase == .skipped)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
-                Circle()
-                    .fill(state.phase.color)
-                    .frame(width: 7, height: 7)
+                if state.phase == .completed {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 8))
+                        .foregroundStyle(.green)
+                        .frame(width: 7)
+                } else {
+                    Circle()
+                        .fill(state.phase.color)
+                        .frame(width: 7, height: 7)
+                }
 
                 Text(state.definition.displayName)
                     .font(.system(.caption, design: .monospaced))
                     .fontWeight(.medium)
                     .lineLimit(1)
+
+                if state.definition.resolvedType == .oneshot {
+                    Text("one-shot")
+                        .font(.system(size: 8, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                        .padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.15), in: Capsule())
+                }
 
                 if let port = state.definition.probe?.port {
                     Text(":\(port)")
@@ -88,13 +109,13 @@ struct ServiceRow: View {
 
                 if isActionInFlight {
                     ProgressView().controlSize(.mini)
-                } else if state.phase == .running || state.phase == .failed {
+                } else if state.phase == .running || state.phase == .failed || canRerunOneshot {
                     Button(action: onRestart) {
                         Image(systemName: "arrow.clockwise")
                             .font(.caption2)
                     }
                     .buttonStyle(.borderless)
-                    .help("Restart")
+                    .help(canRerunOneshot && state.phase != .failed ? "Run again" : "Restart")
 
                     if let onCascadeRestart {
                         Button(action: onCascadeRestart) {

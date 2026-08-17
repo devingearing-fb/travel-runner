@@ -149,6 +149,17 @@ enum ConfigLoader {
         }
         for index in services.indices {
             switch services[index]["id"] as? String {
+            case "travel-portal":
+                // HTTP readiness gate: a TCP bind only proves the port listens,
+                // not that Next can serve — dependents (cache verification,
+                // stream wiring) used to start against a cold-compiling server.
+                // The port stays set so preflight/occupant-kill keep working.
+                services[index]["probe"] = [
+                    "type": "http",
+                    "url": "http://127.0.0.1:3002/api/health",
+                    "port": 3002,
+                    "timeout": 240,
+                ]
             case "capacity-contention":
                 services[index]["depends_on"] = ["cache-apply-transport"]
             case "cache-cutover-audit":

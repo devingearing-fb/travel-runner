@@ -26,7 +26,9 @@ struct WorkshopHeaderBar: View {
     }
 
     private var uptimeString: String? {
-        guard supervisor.health == .healthy || supervisor.health == .degraded else { return nil }
+        // Only meaningful when everything is up; next to a failure banner it
+        // reads as contradictory and competes for the little space row 2 has.
+        guard supervisor.health == .healthy else { return nil }
         guard let earliest = supervisor.sortedServiceIDs
             .compactMap({ supervisor.serviceStates[$0]?.lastStarted })
             .min() else { return nil }
@@ -84,14 +86,10 @@ struct WorkshopHeaderBar: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
 
-            // Row 2: Service badges + indicators
+            // Row 2: Phase chips + indicators
             if !supervisor.sortedServiceIDs.isEmpty {
                 HStack(spacing: 6) {
-                    ForEach(supervisor.sortedServiceIDs, id: \.self) { id in
-                        if let state = supervisor.serviceStates[id] {
-                            serviceBadge(id: id, state: state)
-                        }
-                    }
+                    ServicePhaseChips()
 
                     Spacer()
 
@@ -112,11 +110,13 @@ struct WorkshopHeaderBar: View {
                         Text(uptime)
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .fixedSize()
                             .help("Uptime since services started")
                     }
 
                     if totalRestarts > 0 {
-                        statusTag("\(totalRestarts)\u{21BB}", icon: nil, color: .orange)
+                        statusTag("\(totalRestarts)↻", icon: nil, color: .orange)
                             .help("\(totalRestarts) auto-restart\(totalRestarts == 1 ? "" : "s") since boot")
                     }
                 }
@@ -126,12 +126,15 @@ struct WorkshopHeaderBar: View {
 
             // Banners
             if let error = supervisor.lastError {
+                // When the primary header button is already Retry, the banner
+                // shows context only — one Retry affordance, not two.
+                let headerOffersRetry = supervisor.health == .degraded && supervisor.currentPhase == .idle
                 alertBanner(
                     icon: "exclamationmark.triangle.fill",
                     color: .red,
                     text: error,
                     subtitle: supervisor.rootCauseDescription,
-                    action: ("Retry", { supervisor.retryStartAll() })
+                    action: headerOffersRetry ? nil : ("Retry", { supervisor.retryStartAll() })
                 )
             }
             if supervisor.migrationsBannerVisible {
@@ -150,51 +153,12 @@ struct WorkshopHeaderBar: View {
                     color: .blue,
                     text: "\(supervisor.totalBehindCount) commit\(supervisor.totalBehindCount == 1 ? "" : "s") behind remote",
                     subtitle: nil,
-                    action: ("Dismiss", { supervisor.dismissBehindBanner() }),
+                    action: nil,
                     onDismiss: { supervisor.dismissBehindBanner() }
                 )
             }
 
             Divider()
-        }
-    }
-
-    // MARK: - Service badge
-
-    private func serviceBadge(id: String, state: ServiceState) -> some View {
-        let abbrev = Self.abbreviation(for: id)
-        let showRestart = state.restartCount > 0
-
-        return HStack(spacing: 3) {
-            Circle()
-                .fill(state.phase.color)
-                .frame(width: 6, height: 6)
-            Text(abbrev)
-                .font(.system(.caption2, design: .monospaced))
-                .fontWeight(.medium)
-            if showRestart {
-                Text("\(state.restartCount)")
-                    .font(.system(size: 8, design: .monospaced))
-                    .foregroundStyle(.orange)
-            }
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .background(state.phase.color.opacity(0.1))
-        .clipShape(RoundedRectangle(cornerRadius: 4))
-        .help("\(state.definition.displayName): \(state.phase.rawValue)"
-              + (state.restartCount > 0 ? " (\(state.restartCount) restart\(state.restartCount == 1 ? "" : "s"))" : ""))
-    }
-
-    private static func abbreviation(for serviceID: String) -> String {
-        switch serviceID {
-        case "supabase": "SB"
-        case "universal-login": "UL"
-        case "travel-portal": "TP"
-        case "stripe": "ST"
-        case "yalc-link": "YL"
-        case "partner-portal": "PP"
-        default: String(serviceID.prefix(2)).uppercased()
         }
     }
 
@@ -258,7 +222,7 @@ struct WorkshopHeaderBar: View {
         color: Color,
         text: String,
         subtitle: String?,
-        action: (label: String, handler: () -> Void),
+        action: (label: String, handler: () -> Void)?,
         onDismiss: (() -> Void)? = nil
     ) -> some View {
         HStack(spacing: 8) {
@@ -275,10 +239,12 @@ struct WorkshopHeaderBar: View {
                 }
             }
             Spacer()
-            Button(action.label) { action.handler() }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .tint(color)
+            if let action {
+                Button(action.label) { action.handler() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(color)
+            }
             if let onDismiss {
                 Button {
                     onDismiss()

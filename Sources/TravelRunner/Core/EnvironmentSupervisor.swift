@@ -43,6 +43,10 @@ final class EnvironmentSupervisor {
     var autoRelinkYalc = UserDefaults.standard.bool(forKey: "autoRelinkYalc")
     var dbMode: DatabaseMode = .local
     var partnerPortalEnabled = UserDefaults.standard.bool(forKey: "partnerPortalEnabled")
+    // Default ON: the P5 evidence chain keeps its current behavior unless the
+    // user opts out in Settings (the oneshots drive browsers and mutate the
+    // seed fixture, which is disruptive during everyday development).
+    var cacheVerificationEnabled = UserDefaults.standard.object(forKey: "cacheVerificationEnabled") as? Bool ?? true
 
     enum DatabaseMode: String, Sendable { case local, remote }
 
@@ -118,7 +122,35 @@ final class EnvironmentSupervisor {
         case ground = "GROUND"
         case gateway = "GATEWAY"
         case portal = "PORTAL"
+        case stream = "STREAM"
+        case verification = "VERIFICATION"
         case running = "RUNNING"
+
+        init?(configPhase: String) {
+            switch configPhase {
+            case "ground": self = .ground
+            case "gateway": self = .gateway
+            case "portal": self = .portal
+            case "stream": self = .stream
+            case "verification": self = .verification
+            default: return nil
+            }
+        }
+
+        /// Position in the startup sequence; used to pick a level's phase when a
+        /// DAG level mixes services from more than one phase.
+        var sortOrder: Int {
+            switch self {
+            case .idle: 0
+            case .preflight: 1
+            case .ground: 2
+            case .gateway: 3
+            case .portal: 4
+            case .stream: 5
+            case .verification: 6
+            case .running: 7
+            }
+        }
     }
 
     enum ServiceError: Error, CustomStringConvertible {
@@ -989,6 +1021,25 @@ final class EnvironmentSupervisor {
             if ok {
                 restartService("yalc-link")
                 onActionFeedback?("fb-travel-data published and relinked", true)
+
+                // Wait for the relink oneshot to finish swapping node_modules.
+                for _ in 0..<120 {
+                    try? await Task.sleep(for: .seconds(1))
+                    let p = serviceStates["yalc-link"]?.phase
+                    if p == .completed || p == .failed { break }
+                }
+
+                // A running portal keeps its compiled .next module graph against
+                // the old package — after a mid-session relink it serves phantom
+                // "not exported" errors until the cache is cleared. Bounce any
+                // running portal onto the fresh build automatically.
+                if serviceStates["yalc-link"]?.phase == .completed {
+                    for portalID in ["travel-portal", "partner-portal"]
+                    where serviceStates[portalID]?.phase == .running {
+                        clearCacheAndRestart(portalID)
+                        onActionFeedback?("\(serviceStates[portalID]?.definition.displayName ?? portalID) restarted on fresh fb-travel-data build", true)
+                    }
+                }
             } else {
                 serviceStates["yalc-link"]?.phase = .failed
                 lastError = "yalc publish failed — check fb-travel-data build"
@@ -1016,6 +1067,11 @@ final class EnvironmentSupervisor {
         if enabled {
             setupPartnerPortalEnv()
         }
+    }
+
+    func setCacheVerificationEnabled(_ enabled: Bool) {
+        cacheVerificationEnabled = enabled
+        userDefaults.set(enabled, forKey: "cacheVerificationEnabled")
     }
 
     private func setupPartnerPortalEnv() {
@@ -1455,6 +1511,21 @@ final class EnvironmentSupervisor {
                 artifact: probe.artifact,
                 timeout: probe.timeout
             )
+        } else if let probe = lanProbe, probe.type == .http, let url = probe.url {
+            // In LAN mode the server binds only the LAN IP — a loopback probe
+            // URL would refuse even though the service is up.
+            let lanURL = url
+                .replacingOccurrences(of: "127.0.0.1", with: ip)
+                .replacingOccurrences(of: "localhost", with: ip)
+            lanProbe = ProbeConfig(
+                type: probe.type,
+                port: probe.port,
+                host: probe.host,
+                url: lanURL,
+                pattern: probe.pattern,
+                artifact: probe.artifact,
+                timeout: probe.timeout
+            )
         }
 
         return ServiceDefinition(
@@ -1480,6 +1551,15 @@ final class EnvironmentSupervisor {
               let definition = graph?.nodes[serviceID] else { return }
 
         if serviceID == "partner-portal" && !partnerPortalEnabled {
+            await MainActor.run { state.phase = .skipped }
+            return
+        }
+
+        // Cache-verification oneshots are opt-in (Settings). They drive the
+        // local CDC evidence chain (transport sim, contention, audits) against
+        // the dev fixture — valuable for rehearsal, disruptive as an everyday
+        // startup tax.
+        if definition.phase == "verification", !cacheVerificationEnabled {
             await MainActor.run { state.phase = .skipped }
             return
         }
@@ -2000,23 +2080,31 @@ final class EnvironmentSupervisor {
 
     // MARK: - Private: Helpers
 
+    /// The config phase a service belongs to, from graph metadata with an ID-based
+    /// fallback for services whose node carries no phase string.
+    private func phaseForService(_ id: String) -> String? {
+        if let phase = graph?.nodes[id]?.phase { return phase }
+        if id == "supabase" || id == "db-reset" { return "ground" }
+        if id == "yalc-link" || id == "universal-login" || id == "stripe" { return "gateway" }
+        if id == "travel-portal" || id == "partner-portal" { return "portal" }
+        if id.hasPrefix("stream-") { return "stream" }
+        if id.hasPrefix("cache-") || id.hasPrefix("capacity-") { return "verification" }
+        return nil
+    }
+
     private func resolvePhase(for serviceIDs: [String]) -> StartupPhase {
+        // A DAG level can mix phases (e.g. stream-qstash starts at the same level as
+        // the gateway services); the earliest phase in startup order wins so the
+        // timeline reflects the leading edge of the level.
+        var earliest: StartupPhase? = nil
         for id in serviceIDs {
-            if let phase = graph?.nodes[id]?.phase {
-                switch phase {
-                case "ground": return .ground
-                case "gateway": return .gateway
-                case "portal": return .portal
-                default: break
-                }
+            guard let phaseName = phaseForService(id),
+                  let candidate = StartupPhase(configPhase: phaseName) else { continue }
+            if candidate.sortOrder < (earliest?.sortOrder ?? .max) {
+                earliest = candidate
             }
         }
-        // Fallback heuristic
-        let ids = Set(serviceIDs)
-        if ids.contains("supabase") || ids.contains("db-reset") { return .ground }
-        if ids.contains("yalc-link") || ids.contains("universal-login") || ids.contains("stripe") { return .gateway }
-        if ids.contains("travel-portal") { return .portal }
-        return .running
+        return earliest ?? .running
     }
 
     func serviceCwd(_ serviceID: String) -> String? {
@@ -2025,24 +2113,25 @@ final class EnvironmentSupervisor {
 
     /// Grouped services by phase for the UI
     func servicesByPhase() -> [(phase: String, services: [ServiceState])] {
-        let phases = ["ground", "gateway", "portal"]
+        let phases = ["ground", "gateway", "portal", "stream", "verification"]
         var groups: [(phase: String, services: [ServiceState])] = []
+        var matchedIDs = Set<String>()
 
         for phase in phases {
-            let ids = sortedServiceIDs.filter { id in
-                if let p = graph?.nodes[id]?.phase { return p == phase }
-                // Fallback
-                switch phase {
-                case "ground": return id == "supabase" || id == "db-reset"
-                case "gateway": return id == "yalc-link" || id == "universal-login" || id == "stripe"
-                case "portal": return id == "travel-portal" || id == "partner-portal"
-                default: return false
-                }
-            }
+            let ids = sortedServiceIDs.filter { phaseForService($0) == phase }
+            matchedIDs.formUnion(ids)
             let states = ids.compactMap { serviceStates[$0] }
             if !states.isEmpty {
                 groups.append((phase: phase.uppercased(), services: states))
             }
+        }
+
+        // Never silently drop a service whose phase is unrecognized.
+        let otherStates = sortedServiceIDs
+            .filter { !matchedIDs.contains($0) }
+            .compactMap { serviceStates[$0] }
+        if !otherStates.isEmpty {
+            groups.append((phase: "OTHER", services: otherStates))
         }
 
         return groups
