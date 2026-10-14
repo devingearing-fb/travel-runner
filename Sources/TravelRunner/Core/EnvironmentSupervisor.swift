@@ -82,7 +82,6 @@ final class EnvironmentSupervisor {
     private let migrationTracker = MigrationTracker()
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
-    private var envCompat: EnvCompatLayer?
     private var sleepWakeObserver: SleepWakeObserver?
     private var startTask: Task<Void, any Error>?
     private var config: ServiceConfig?
@@ -99,8 +98,8 @@ final class EnvironmentSupervisor {
     private var depsWatcherTask: Task<Void, Never>?
     private var isTogglingNetwork = false
     private var stripeReconnectingSince: Date? = nil
-    private var localSupabaseAnonKey: String?
-    private var localSupabaseSigningKey: String?
+    private var localSupabaseKeys: LocalSupabaseKeys?
+    private var stripeWebhookSecret: String?
 
     init(userDefaults: UserDefaults = .standard) {
         self.userDefaults = userDefaults
@@ -180,19 +179,13 @@ final class EnvironmentSupervisor {
 
             reloadDbSeedScenarios()
 
-            // Derive .env.local paths from services that have artifact probes
-            let portalService = config.services.first { $0.id == "travel-portal" }
-            let envPath = portalService?.cwd.map { $0 + "/.env.local" }
-                ?? "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal/.env.local"
-            envCompat = EnvCompatLayer(envFilePaths: [envPath])
-
-            // Register secret observer once
+            // Register secret observer once. It resolves paths at write time, so a
+            // config reload (new monorepo path) needs no new observer.
             if !observerRegistered {
                 observerRegistered = true
-                let envCompat = self.envCompat
                 Task {
-                    await secretStore.onChange { key, value in
-                        envCompat?.write(key: key, value: value)
+                    await secretStore.onChange { [weak self] key, value in
+                        Task { @MainActor in self?.recordArtifact(key, value: value) }
                     }
                 }
             }
@@ -202,9 +195,10 @@ final class EnvironmentSupervisor {
             }
             sleepWakeObserver?.startObserving()
 
-            // Always reset .env.local files to localhost on startup
-            resetEnvToLocalhost()
+            // Always reset .env.local files to localhost on startup. Keys from the
+            // last block first; the running stack's keys replace them after GROUND.
             cacheLocalSupabaseKeys()
+            resetEnvToLocalhost()
 
             // Start control API server
             startControlServer()
@@ -357,6 +351,8 @@ final class EnvironmentSupervisor {
                 // (e.g. fresh Docker volume with no tables applied).
                 if phase == .ground && !didMigrationCheck {
                     didMigrationCheck = true
+                    // Supabase is up: write its keys before any portal starts.
+                    await self.refreshLocalSupabaseKeys()
                     let portalCwd = config.services.first(where: { $0.id == "supabase" })?.resolvedCwd
                     if let cwd = portalCwd {
                         let migrationsChanged = !self.migrationTracker.hasEverRun()
@@ -574,49 +570,72 @@ final class EnvironmentSupervisor {
     }
 
     func resetEnvToLocalhost() {
-        let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
-        let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
-
-        if let cwd = portalCwd {
-            let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-            env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: "http://localhost:54321")
-            env.write(key: "LOCAL_SUPABASE_URL", value: "http://localhost:54321")
-            env.write(key: "NEXT_PUBLIC_WEBAPP_URL", value: "http://localhost:3002")
-            env.write(key: "LOGIN_URL", value: "http://localhost:3000/login/init")
-            env.write(key: "NEXT_PUBLIC_LOCAL_DEV", value: "true")
-            if let anonKey = localSupabaseAnonKey {
-                env.write(key: "LOCAL_SUPABASE_ANON_KEY", value: anonKey)
-            }
-            if let signingKey = localSupabaseSigningKey {
-                env.write(key: "LOCAL_SUPABASE_SIGNING_KEY", value: signingKey)
-            }
-        }
-        if let cwd = loginCwd {
-            let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-            env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: "http://localhost:54321")
-            env.write(key: "AMATEUR_SUPABASE_URL", value: "http://localhost:54321")
-            env.write(key: "NEXT_PUBLIC_SITE_URL", value: "http://localhost:3000")
-            env.write(key: "NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", value: "http://localhost:3000")
-            if let anonKey = localSupabaseAnonKey {
-                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anonKey)
-                env.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anonKey)
-            }
-            if let signingKey = localSupabaseSigningKey {
-                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
-            }
-        }
-        if let rawPartner = config?.paths?.partnerPortal, !rawPartner.isEmpty {
-            let partnerPath = NSString(string: rawPartner).expandingTildeInPath
-            let localEnvPath = (partnerPath as NSString).appendingPathComponent(".env.local.runner")
-            if FileManager.default.fileExists(atPath: localEnvPath) {
-                let source = readEnvFile(localEnvPath)
-                let env = EnvCompatLayer(envFilePaths: [partnerPath + "/.env.local"])
-                for (key, value) in source {
-                    env.write(key: key, value: value)
-                }
-            }
-        }
         dbMode = .local
+        writeAppEnv()
+    }
+
+    /// Writes the runner block into both apps' `.env.local` and the universal-login
+    /// env for the current database mode and network mode.
+    func writeAppEnv() {
+        let host = networkMode ? (localIP ?? "localhost") : "localhost"
+        let mode: RunnerEnv.Mode = dbMode == .local ? .local : .remote
+        for (app, serviceID) in [(RunnerEnv.App.booking, "travel-portal"), (.partner, "partner-portal")] {
+            guard let cwd = graph?.nodes[serviceID]?.resolvedCwd else { continue }
+            let values = RunnerEnv.values(
+                for: app, mode: mode, host: host, keys: localSupabaseKeys,
+                stripeWebhookSecret: stripeWebhookSecret
+            )
+            RunnerEnv.apply(path: (cwd as NSString).appendingPathComponent(".env.local"), app: app, values: values)
+        }
+        writeLoginEnv(host: host)
+    }
+
+    /// universal-login is an external repo; its `.env.local` keeps the key-by-key writes.
+    private func writeLoginEnv(host: String) {
+        guard let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd else { return }
+        let env = EnvCompatLayer(envFilePaths: [loginCwd + "/.env.local"])
+        env.write(key: "NEXT_PUBLIC_SITE_URL", value: "http://\(host):3000")
+        env.write(key: "NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", value: "http://\(host):3000")
+
+        if dbMode == .local {
+            env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: "http://\(host):54321")
+            env.write(key: "AMATEUR_SUPABASE_URL", value: "http://\(host):54321")
+            if let keys = localSupabaseKeys {
+                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: keys.anonKey)
+                env.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: keys.anonKey)
+                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: keys.jwtSecret)
+            }
+        } else if let doppler = dopplerBookingEnvPath,
+                  let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: doppler) {
+            // Hosted dev: the same project Doppler gives the booking portal.
+            env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: url)
+            env.write(key: "AMATEUR_SUPABASE_URL", value: url)
+            if let anon = RunnerEnv.value(of: "AMATEUR_SUPABASE_ANON_KEY", inFile: doppler) {
+                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anon)
+                env.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anon)
+            }
+            if let signing = RunnerEnv.value(of: "AMATEUR_SUPABASE_SIGNING_KEY", inFile: doppler) {
+                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signing)
+            }
+        }
+    }
+
+    /// `apps/booking-portal/.env` from `pnpm env:pull` (Doppler dev_booking).
+    private var dopplerBookingEnvPath: String? {
+        guard let cwd = graph?.nodes["travel-portal"]?.resolvedCwd else { return nil }
+        let path = (cwd as NSString).appendingPathComponent(".env")
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+    /// A secret captured from a service's output (the Stripe webhook secret).
+    private func recordArtifact(_ name: String, value: String) {
+        if name == "STRIPE_WEBHOOK_SECRET" {
+            guard stripeWebhookSecret != value else { return }
+            stripeWebhookSecret = value
+            writeAppEnv()
+        } else if let cwd = graph?.nodes["travel-portal"]?.resolvedCwd {
+            EnvCompatLayer(envFilePaths: [cwd + "/.env.local"]).write(key: name, value: value)
+        }
     }
 
     func clearCacheAndRestart(_ serviceID: String) {
@@ -646,31 +665,36 @@ final class EnvironmentSupervisor {
 
     // MARK: - Database Mode Toggle
 
+    /// Keys from the last runner block, so the env is right before Supabase reports in.
     private func cacheLocalSupabaseKeys() {
         guard let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd else { return }
         let envPath = (portalCwd as NSString).appendingPathComponent(".env.local")
-        guard let content = try? String(contentsOfFile: envPath, encoding: .utf8) else { return }
-        for line in content.components(separatedBy: "\n") {
-            if line.hasPrefix("LOCAL_SUPABASE_ANON_KEY=") {
-                localSupabaseAnonKey = String(line.dropFirst("LOCAL_SUPABASE_ANON_KEY=".count))
-            }
-            if line.hasPrefix("LOCAL_SUPABASE_SIGNING_KEY=") {
-                localSupabaseSigningKey = String(line.dropFirst("LOCAL_SUPABASE_SIGNING_KEY=".count))
-            }
-        }
+        guard let anon = RunnerEnv.value(of: "LOCAL_SUPABASE_ANON_KEY", inFile: envPath),
+              let secret = RunnerEnv.value(of: "LOCAL_SUPABASE_SIGNING_KEY", inFile: envPath) else { return }
+        let partnerEnv = graph?.nodes["partner-portal"]?.resolvedCwd.map { ($0 as NSString).appendingPathComponent(".env.local") }
+        localSupabaseKeys = LocalSupabaseKeys(
+            anonKey: anon,
+            serviceRoleKey: RunnerEnv.value(of: "SUPABASE_SERVICE_ROLE_KEY", inFile: envPath) ?? "",
+            jwtSecret: secret,
+            publishableKey: partnerEnv.flatMap { RunnerEnv.value(of: "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY", inFile: $0) }
+        )
+        stripeWebhookSecret = RunnerEnv.value(of: "STRIPE_WEBHOOK_SECRET", inFile: envPath)
     }
 
-    private func readEnvFile(_ path: String) -> [String: String] {
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
-        var vars: [String: String] = [:]
-        for line in content.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), let eqIdx = trimmed.firstIndex(of: "=") else { continue }
-            let key = String(trimmed[..<eqIdx])
-            let value = String(trimmed[trimmed.index(after: eqIdx)...])
-            vars[key] = value
+    /// Reads the keys of the running local stack and rewrites the env when they changed.
+    func refreshLocalSupabaseKeys() async {
+        guard let root = graph?.nodes["supabase"]?.resolvedCwd else { return }
+        let (output, ok) = await shellOutput("cd \(ShellQuote.quote(root)) && scripts/local-db.sh status -o env 2>/dev/null")
+        guard ok, let keys = LocalSupabaseKeys.parse(statusEnv: output) else {
+            await logStore.append(serviceID: "supabase", entry: LogEntry(
+                stream: .stderr, text: "[travel-runner] Could not read local Supabase keys (scripts/local-db.sh status -o env)"
+            ))
+            return
         }
-        return vars
+        if keys != localSupabaseKeys {
+            localSupabaseKeys = keys
+            writeAppEnv()
+        }
     }
 
     func toggleDatabaseMode() {
@@ -679,59 +703,18 @@ final class EnvironmentSupervisor {
             return
         }
 
-        let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
-        let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
-
         if dbMode == .local {
-            guard let cwd = portalCwd else { return }
-            let remotePath = (cwd as NSString).appendingPathComponent(".env.remote")
-            let remote = readEnvFile(remotePath)
-            guard let remoteUrl = remote["NEXT_PUBLIC_SUPABASE_URL"], !remoteUrl.isEmpty else {
-                lastError = ".env.remote not found or missing NEXT_PUBLIC_SUPABASE_URL — create it in the booking portal"
+            // Hosted dev comes from Doppler's .env; the runner block then stops
+            // overriding Supabase.
+            guard let doppler = dopplerBookingEnvPath,
+                  RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: doppler) != nil else {
+                lastError = "Hosted dev values are missing — run pnpm env:pull in the monorepo (Doppler), then switch again"
                 return
             }
-
-            let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-            for (key, value) in remote {
-                env.write(key: key, value: value)
-            }
-            env.write(key: "LOGIN_URL", value: "https://identity.fastbreaktravel-dev.ai/login/init")
-
-            if let loginCwd {
-                let loginEnv = EnvCompatLayer(envFilePaths: [loginCwd + "/.env.local"])
-                loginEnv.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: remoteUrl)
-                loginEnv.write(key: "AMATEUR_SUPABASE_URL", value: remoteUrl)
-                if let anonKey = remote["LOCAL_SUPABASE_ANON_KEY"] {
-                    loginEnv.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anonKey)
-                    loginEnv.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anonKey)
-                }
-                if let signingKey = remote["LOCAL_SUPABASE_SIGNING_KEY"] {
-                    loginEnv.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
-                }
-            }
-
-            if let rawPartner2 = config?.paths?.partnerPortal, !rawPartner2.isEmpty {
-                let partnerPath = NSString(string: rawPartner2).expandingTildeInPath
-                let partnerEnv = EnvCompatLayer(envFilePaths: [partnerPath + "/.env.local"])
-                partnerEnv.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: remoteUrl)
-                partnerEnv.write(key: "SUPABASE_URL", value: remoteUrl)
-                partnerEnv.write(key: "AMATEUR_SUPABASE_URL_DEV", value: remoteUrl)
-                if let anonKey = remote["LOCAL_SUPABASE_ANON_KEY"] {
-                    partnerEnv.write(key: "AMATEUR_SUPABASE_ANON_KEY_DEV", value: anonKey)
-                    partnerEnv.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anonKey)
-                }
-                if let signingKey = remote["LOCAL_SUPABASE_SIGNING_KEY"] {
-                    partnerEnv.write(key: "AMATEUR_SUPABASE_SIGNING_KEY_DEV", value: signingKey)
-                }
-                partnerEnv.write(key: "LOGIN_URL", value: "https://identity.fastbreaktravel-dev.ai/login/init")
-                partnerEnv.write(key: "UNIVERSAL_LOGIN_URL", value: "https://identity.fastbreaktravel-dev.ai/login/init")
-                partnerEnv.write(key: "NEXT_PUBLIC_WEBAPP_URL", value: "http://localhost:3001")
-            }
-
             dbMode = .remote
+            writeAppEnv()
         } else {
             resetEnvToLocalhost()
-            dbMode = .local
         }
 
         guard health != .stopped else { return }
@@ -796,35 +779,7 @@ final class EnvironmentSupervisor {
             }
 
             let ip = localIP ?? "127.0.0.1"
-
-            let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
-            let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
-
-            let host = mode ? ip : "localhost"
-
-            if let cwd = portalCwd {
-                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-                env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: "http://\(host):54321")
-                env.write(key: "LOCAL_SUPABASE_URL", value: "http://\(host):54321")
-                env.write(key: "NEXT_PUBLIC_WEBAPP_URL", value: "http://\(host):3002")
-                env.write(key: "LOGIN_URL", value: "http://\(host):3000/login/init")
-            }
-            if let cwd = loginCwd {
-                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-                env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: "http://\(host):54321")
-                env.write(key: "AMATEUR_SUPABASE_URL", value: "http://\(host):54321")
-                env.write(key: "NEXT_PUBLIC_SITE_URL", value: "http://\(host):3000")
-                env.write(key: "NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", value: "http://\(host):3000")
-            }
-            if let rawPartner = config?.paths?.partnerPortal, !rawPartner.isEmpty {
-                let partnerPath = NSString(string: rawPartner).expandingTildeInPath
-                let baselinePath = (partnerPath as NSString).appendingPathComponent(".env.local.runner")
-                let source = readEnvFile(baselinePath)
-                let env = EnvCompatLayer(envFilePaths: [partnerPath + "/.env.local"])
-                for (key, value) in source {
-                    env.write(key: key, value: value.replacingOccurrences(of: "localhost", with: host))
-                }
-            }
+            writeAppEnv()
 
             var servicesToRestart = ["travel-portal", "universal-login"]
             if isInProfile("partner-portal") {
@@ -1142,6 +1097,7 @@ final class EnvironmentSupervisor {
             if pipeline.allRequiredPassed {
                 migrationTracker.recordCurrentHash(portalCwd: cwd)
                 lastError = nil
+                await refreshLocalSupabaseKeys()
             } else if let failed = pipeline.firstFailed {
                 lastError = "DB setup failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
                 Task { await captureDebugIssue(
@@ -1248,21 +1204,14 @@ final class EnvironmentSupervisor {
         for definition: ServiceDefinition,
         serviceID: String
     ) -> ServiceDefinition {
-        guard serviceID == "stream-services",
-              let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd else {
+        // The local CDC chain always runs against the local stack.
+        guard serviceID == "stream-services", let keys = localSupabaseKeys else {
             return definition
         }
-        let portalEnv = readEnvFile((portalCwd as NSString).appendingPathComponent(".env.local"))
         var envOverrides = definition.env ?? [:]
-        if let value = portalEnv["LOCAL_SUPABASE_URL"] ?? portalEnv["NEXT_PUBLIC_SUPABASE_URL"] {
-            envOverrides["AMATEUR_SUPABASE_URL"] = value.replacingOccurrences(of: "localhost", with: "127.0.0.1")
-        }
-        if let value = portalEnv["LOCAL_SUPABASE_ANON_KEY"] ?? portalEnv["NEXT_PUBLIC_SUPABASE_ANON_KEY"] {
-            envOverrides["AMATEUR_SUPABASE_ANON_KEY"] = value
-        }
-        if let value = portalEnv["LOCAL_SUPABASE_SIGNING_KEY"] {
-            envOverrides["AMATEUR_SUPABASE_SIGNING_KEY"] = value
-        }
+        envOverrides["AMATEUR_SUPABASE_URL"] = "http://127.0.0.1:54321"
+        envOverrides["AMATEUR_SUPABASE_ANON_KEY"] = keys.anonKey
+        envOverrides["AMATEUR_SUPABASE_SIGNING_KEY"] = keys.jwtSecret
         return ServiceDefinition(
             id: definition.id,
             name: definition.name,
@@ -1294,23 +1243,14 @@ final class EnvironmentSupervisor {
         let cmd = Self.lanCommand(definition.cmd, ip: ip)
         var envOverrides = definition.env ?? [:]
 
+        // The portals get their LAN URLs from the runner block in .env.local
+        // (applyNetworkMode rewrites it before the restart). universal-login is an
+        // external repo, so it also gets them as process env.
         if serviceID == "universal-login" {
             envOverrides["NEXT_PUBLIC_SITE_URL"] = "http://\(ip):3000"
             envOverrides["NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL"] = "http://\(ip):3000"
-            envOverrides["NEXT_PUBLIC_SUPABASE_URL"] = "http://\(ip):54321"
-        }
-        if serviceID == "travel-portal" {
-            envOverrides["LOGIN_URL"] = "http://\(ip):3000/login/init"
-            envOverrides["NEXT_PUBLIC_WEBAPP_URL"] = "http://\(ip):3002"
-            envOverrides["NEXT_PUBLIC_SUPABASE_URL"] = "http://\(ip):54321"
-        }
-        if serviceID == "partner-portal",
-           let rawPartner = config?.paths?.partnerPortal, !rawPartner.isEmpty {
-            let partnerPath = NSString(string: rawPartner).expandingTildeInPath
-            let baselinePath = (partnerPath as NSString).appendingPathComponent(".env.local.runner")
-            let source = readEnvFile(baselinePath)
-            for (key, value) in source where value.contains("localhost") {
-                envOverrides[key] = value.replacingOccurrences(of: "localhost", with: ip)
+            if dbMode == .local {
+                envOverrides["NEXT_PUBLIC_SUPABASE_URL"] = "http://\(ip):54321"
             }
         }
 
@@ -1544,8 +1484,10 @@ final class EnvironmentSupervisor {
             // Brief wait for the async secretStore.set() Task to complete
             try? await Task.sleep(for: .milliseconds(200))
             if let value = await secretStore.get(name) {
-                envCompat?.write(key: name, value: value)
-                await MainActor.run { state.capturedArtifact = value }
+                await MainActor.run {
+                    recordArtifact(name, value: value)
+                    state.capturedArtifact = value
+                }
             }
         }
 
@@ -2027,6 +1969,7 @@ final class EnvironmentSupervisor {
         let runner = DbSetupRunner(portalCwd: cwd, logStore: logStore, seedScenarioID: pipeline.seedScenario.id)
         dbSetupRunner = runner
         await runner.run(pipeline: pipeline, from: nil)
+        if pipeline.allRequiredPassed { await refreshLocalSupabaseKeys() }
         if let failed = pipeline.firstFailed {
             lastError = "DB reset failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
         }
