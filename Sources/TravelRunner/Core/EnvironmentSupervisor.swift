@@ -1467,17 +1467,20 @@ final class EnvironmentSupervisor {
         )
     }
 
+    /// The service's own command with `--hostname <ip>` appended, so LAN mode keeps the
+    /// configured package manager and port. `npm run` needs `--` before script flags;
+    /// pnpm passes trailing flags to the script.
+    nonisolated static func lanCommand(_ cmd: [String], ip: String) -> [String] {
+        let needsSeparator = cmd.first == "npm" && cmd.dropFirst().first == "run" && !cmd.contains("--")
+        return cmd + (needsSeparator ? ["--"] : []) + ["--hostname", ip]
+    }
+
     private func lanAwareDefinition(for definition: ServiceDefinition, serviceID: String) -> ServiceDefinition {
         guard networkMode, let ip = localIP else { return definition }
         let lanServices: Set<String> = ["travel-portal", "universal-login", "partner-portal"]
         guard lanServices.contains(serviceID) else { return definition }
 
-        let cmd: String
-        if serviceID == "partner-portal" {
-            cmd = "npm run dev -- -p 3001 --hostname \(ip)"
-        } else {
-            cmd = "npm run dev -- --hostname \(ip)"
-        }
+        let cmd = Self.lanCommand(definition.cmd, ip: ip)
         var envOverrides = definition.env ?? [:]
 
         if serviceID == "universal-login" {
@@ -1531,7 +1534,7 @@ final class EnvironmentSupervisor {
         return ServiceDefinition(
             id: definition.id,
             name: definition.name,
-            cmd: cmd.components(separatedBy: " "),
+            cmd: cmd,
             cwd: definition.cwd,
             probe: lanProbe,
             type: definition.type,

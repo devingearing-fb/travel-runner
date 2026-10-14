@@ -19,7 +19,7 @@ actor ProcessRunner {
         }
 
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-l", "-c", service.cmd.joined(separator: " ")]
+        process.arguments = ["-l", "-c", ShellQuote.join(service.cmd)]
 
         var env = ProcessInfo.processInfo.environment
         if let overrides = service.env {
