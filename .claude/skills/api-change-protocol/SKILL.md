@@ -11,8 +11,8 @@ The travel-runner control API is documented in three places that must stay in sy
 | Location | Role | Path |
 |----------|------|------|
 | **travel-runner API skill** | Source of truth | `travel-runner/.claude/skills/travel-runner-api/SKILL.md` |
-| **booking-portal consumer skill** | Downstream copy for portal agents | `travel-booking-portal/.claude/skills/travel-runner-control/skill.md` |
-| **bug-report schema** | References API response shapes | `fb-travel-data/claude-issues/README.md` |
+| **booking-portal consumer skill** | Downstream copy for portal agents | `fb-travel-monolith/apps/booking-portal/.claude/skills/travel-runner-control/skill.md` |
+| **bug-report schema** | References API response shapes | `fb-travel-monolith/docs/claude-issues/README.md` |
 
 ## When this applies
 
@@ -20,7 +20,8 @@ Any time you make a change that affects the external contract:
 
 - Adding, removing, or renaming an endpoint in `ControlServer.swift`
 - Changing the response JSON shape from any endpoint
-- Adding a new service ID to the config schema or `ServiceGraph`
+- Adding a new service ID to `ServiceCatalog` (or the config schema / `ServiceGraph`)
+- Adding or changing a run profile (`RunProfile`)
 - Changing health status values or service phase names
 - Modifying the log entry format (stream/text structure, pino fields)
 
@@ -35,11 +36,11 @@ API change sync:
 - [ ] 1) Make the code change in ControlServer.swift (or related files)
 - [ ] 2) Update travel-runner/.claude/skills/travel-runner-api/SKILL.md
        - Endpoint table, response shapes, service ID table, diagnostic workflows
-- [ ] 3) Update travel-booking-portal/.claude/skills/travel-runner-control/skill.md
+- [ ] 3) Update fb-travel-monolith/apps/booking-portal/.claude/skills/travel-runner-control/skill.md
        - Mirror the endpoint changes in the "Available Commands" section
        - Update the "Service IDs" table if IDs changed
        - Update the "When to use" section if new endpoints enable new workflows
-- [ ] 4) If response shapes changed: update fb-travel-data/claude-issues/README.md
+- [ ] 4) If response shapes changed: update fb-travel-monolith/docs/claude-issues/README.md
        - The "environment" field references service IDs and phases
        - The "error_output" field examples should reflect actual log format
 - [ ] 5) Verify consistency: the three files should agree on endpoints, service IDs, and response shapes
@@ -63,7 +64,7 @@ This is a practical quick-reference for agents working in the portal. It should 
 - "When to use" patterns matching current capabilities
 - Bug reporting instructions (bottom section)
 
-### fb-travel-data bug-report schema
+### fb-travel-monolith bug-report schema (docs/claude-issues)
 
 The `environment.service` field enum and severity definitions should reflect current service IDs and failure modes. If you add a new service, add it to the valid `service_id` values.
 
