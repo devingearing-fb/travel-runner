@@ -149,11 +149,14 @@ final class EnvironmentSupervisor {
     enum ServiceError: Error, CustomStringConvertible {
         case oneshotFailed(String)
         case probeTimeout(String, seconds: Int)
+        case portHeldByOtherStack(port: Int, container: String)
 
         var description: String {
             switch self {
             case .oneshotFailed(let id): "'\(id)' exited with non-zero status"
             case .probeTimeout(let id, let s): "'\(id)' health probe timed out after \(s)s"
+            case .portHeldByOtherStack(let port, let container):
+                "Port \(port) is held by another Supabase stack (\(container)) — stop it, then start again"
             }
         }
     }
@@ -1117,23 +1120,7 @@ final class EnvironmentSupervisor {
         if stepId != nil, let existingPipeline = dbSetupPipeline {
             pipeline = existingPipeline
         } else {
-            reloadDbSeedScenarios()
-            guard let seedScenario = selectedDbSeedScenario else {
-                lastError = dbSeedScenarioLoadError
-                    ?? "Choose a valid seed scenario before resetting the database."
-                return
-            }
-
-            let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
-            let steps: [DbSetupStep]
-            if FileManager.default.fileExists(atPath: manifestPath) {
-                steps = DbManifestLoader.load(from: manifestPath, profile: profile)
-            } else {
-                steps = DbSetupPipeline.buildDefault()
-            }
-
-            let newPipeline = DbSetupPipeline(profile: profile, seedScenario: seedScenario)
-            newPipeline.steps = steps
+            guard let newPipeline = makeDbSetupPipeline(cwd: cwd, profile: profile) else { return }
             dbSetupPipeline = newPipeline
             pipeline = newPipeline
         }
@@ -1176,22 +1163,7 @@ final class EnvironmentSupervisor {
         }
 
         if dbSetupPipeline == nil {
-            reloadDbSeedScenarios()
-            guard let seedScenario = selectedDbSeedScenario else {
-                lastError = dbSeedScenarioLoadError
-                    ?? "Choose a valid seed scenario before running database setup."
-                return
-            }
-
-            let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
-            let steps: [DbSetupStep]
-            if FileManager.default.fileExists(atPath: manifestPath) {
-                steps = DbManifestLoader.load(from: manifestPath, profile: "full")
-            } else {
-                steps = DbSetupPipeline.buildDefault()
-            }
-            let pipeline = DbSetupPipeline(profile: "full", seedScenario: seedScenario)
-            pipeline.steps = steps
+            guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "full") else { return }
             dbSetupPipeline = pipeline
         }
 
@@ -1404,6 +1376,18 @@ final class EnvironmentSupervisor {
         // If the port is already bound, skip starting and mark as running.
         if definition.shouldReuseIfRunning, let port = definition.probe?.port {
             if isPortBound(port) {
+                // Only reuse the monorepo's own database. Another checkout's stack (the
+                // old travel-booking-portal one, say) on the same port is a different DB.
+                if serviceID == "supabase", let root = definition.resolvedCwd {
+                    let expected = SupabaseProject.dbContainerName(root: root)
+                    if let occupant = await Self.containerPublishing(port: port), occupant != expected {
+                        await logStore.append(serviceID: serviceID, entry: LogEntry(
+                            stream: .stderr,
+                            text: "[travel-runner] Port \(port) is held by \(occupant), not \(expected). Stop that stack (npx supabase stop in its checkout, or: docker stop $(docker ps -q --filter name=_\(occupant.replacingOccurrences(of: "supabase_db_", with: ""))$)) and start again."
+                        ))
+                        throw ServiceError.portHeldByOtherStack(port: port, container: occupant)
+                    }
+                }
                 await MainActor.run {
                     state.phase = .running
                     state.lastStarted = .now
@@ -2007,10 +1991,11 @@ final class EnvironmentSupervisor {
         return false
     }
 
+    /// Whether the local database has the travel tables. A fresh Docker volume has
+    /// none, and then the startup check runs a reset.
     private func databaseHasAppTables(portalCwd: String) async -> Bool {
-        let projectId = URL(fileURLWithPath: portalCwd).lastPathComponent
-        let container = "supabase_db_\(projectId)"
-        let query = "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'"
+        let container = SupabaseProject.dbContainerName(root: portalCwd)
+        let query = "SELECT count(*) FROM pg_tables WHERE schemaname = 'fb_travel'"
         let command = "docker exec \(container) psql -U postgres -d postgres -tAc \"\(query)\" 2>/dev/null"
         return await withCheckedContinuation { continuation in
             let process = Process()
@@ -2033,49 +2018,54 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// Automatic reset (first run, changed migrations, empty database, branch switch):
+    /// the manifest's `reset` profile with the selected seed scenario, shown in the
+    /// DB setup panel like a manual reset.
     private func runDbReset(cwd: String) async -> Bool {
+        guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "reset") else { return false }
+        dbSetupPipeline = pipeline
+        let runner = DbSetupRunner(portalCwd: cwd, logStore: logStore, seedScenarioID: pipeline.seedScenario.id)
+        dbSetupRunner = runner
+        await runner.run(pipeline: pipeline, from: nil)
+        if let failed = pipeline.firstFailed {
+            lastError = "DB reset failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
+        }
+        return pipeline.allRequiredPassed
+    }
+
+    /// A pipeline for the manifest profile with the selected seed scenario, or nil (and
+    /// `lastError` set) when no valid scenario is selected.
+    private func makeDbSetupPipeline(cwd: String, profile: String) -> DbSetupPipeline? {
         reloadDbSeedScenarios()
         guard let seedScenario = selectedDbSeedScenario else {
             lastError = dbSeedScenarioLoadError
                 ?? "Choose a valid seed scenario before resetting the database."
-            return false
+            return nil
         }
-        let logStore = self.logStore
-        // Use db:setup --reset-only which runs migrations + seed + reloads cached hotel data.
-        // Plain `npx supabase db reset` only does migrations + seed, skipping the hotel dump.
-        return await withCheckedContinuation { continuation in
+        let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
+        let steps = FileManager.default.fileExists(atPath: manifestPath)
+            ? DbManifestLoader.load(from: manifestPath, profile: profile)
+            : DbSetupPipeline.buildDefault()
+        let pipeline = DbSetupPipeline(profile: profile, seedScenario: seedScenario)
+        pipeline.steps = steps
+        return pipeline
+    }
+
+    /// Name of the Docker container that publishes this host port, if any.
+    nonisolated static func containerPublishing(port: Int) async -> String? {
+        await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", "npm run db:setup -- --reset-only"]
-            process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-            process.environment = DbSetupRunner.environment(
-                parent: ProcessInfo.processInfo.environment,
-                seedScenarioID: seedScenario.id
-            )
-
+            process.arguments = ["-l", "-c", "docker ps --filter publish=\(port) --format '{{.Names}}'"]
             let pipe = Pipe()
             process.standardOutput = pipe
-            process.standardError = pipe
-            let lineBuffer = TerminalLineBuffer()
-
-            pipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                for line in lineBuffer.feed(text) {
-                    Task {
-                        await logStore.append(serviceID: "db-reset", entry: LogEntry(stream: .stdout, text: line))
-                    }
-                }
-            }
-
+            process.standardError = FileHandle.nullDevice
             process.terminationHandler = { proc in
-                pipe.fileHandleForReading.readabilityHandler = nil
-                if let remaining = lineBuffer.flush() {
-                    Task { await logStore.append(serviceID: "db-reset", entry: LogEntry(stream: .stdout, text: remaining)) }
-                }
-                continuation.resume(returning: proc.terminationStatus == 0)
+                let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                let name = output.split(separator: "\n").first.map(String.init)
+                continuation.resume(returning: proc.terminationStatus == 0 ? name : nil)
             }
-            do { try process.run() } catch { continuation.resume(returning: false) }
+            do { try process.run() } catch { continuation.resume(returning: nil) }
         }
     }
 
