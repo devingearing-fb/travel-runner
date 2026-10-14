@@ -38,15 +38,13 @@ final class EnvironmentSupervisor {
     var gitBranches: [String: String] = [:]
     var gitBehindCounts: [String: Int] = [:]
     var behindBannerDismissed = false
-    var yalcStale = false
     var npmStaleServices: Set<String> = []
-    var autoRelinkYalc = UserDefaults.standard.bool(forKey: "autoRelinkYalc")
     var dbMode: DatabaseMode = .local
-    var partnerPortalEnabled = UserDefaults.standard.bool(forKey: "partnerPortalEnabled")
-    // Default ON: the P5 evidence chain keeps its current behavior unless the
-    // user opts out in Settings (the oneshots drive browsers and mutate the
-    // seed fixture, which is disruptive during everyday development).
-    var cacheVerificationEnabled = UserDefaults.standard.object(forKey: "cacheVerificationEnabled") as? Bool ?? true
+    /// Which part of the graph start-all brings up (stored in services.json).
+    var profile: RunProfile = .both
+    private(set) var profileMembers: Set<String> = []
+
+    func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
     enum DatabaseMode: String, Sendable { case local, remote }
 
@@ -54,9 +52,7 @@ final class EnvironmentSupervisor {
         var seen = Set<String>()
         var total = 0
         for (sid, count) in gitBehindCounts where count > 0 {
-            let path = config?.services.first(where: { $0.id == sid })?.resolvedCwd
-                ?? (sid == "fb-travel-data" ? config?.paths?.travelData.map { NSString(string: $0).expandingTildeInPath as String } : nil)
-                ?? sid
+            let path = config?.services.first(where: { $0.id == sid })?.resolvedCwd ?? sid
             if seen.insert(path).inserted {
                 total += count
             }
@@ -97,13 +93,10 @@ final class EnvironmentSupervisor {
     private var phaseStartedAt: Date? = nil
     private var dbSetupRunner: DbSetupRunner?
     private var debugTracker: DebugTracker?
-    private var yalcWatcher: YalcWatcher?
     private var gitBranchWatcher: GitBranchWatcher?
     private var dependencyWatcher: DependencyWatcher?
-    private var yalcWatcherTask: Task<Void, Never>?
     private var gitWatcherTask: Task<Void, Never>?
     private var depsWatcherTask: Task<Void, Never>?
-    private var yalcRelinkInProgress = false
     private var isTogglingNetwork = false
     private var stripeReconnectingSince: Date? = nil
     private var localSupabaseAnonKey: String?
@@ -175,6 +168,8 @@ final class EnvironmentSupervisor {
             let graph = try ServiceGraph(services: config.services)
             self.graph = graph
             self.sortedServiceIDs = graph.sortedIDs
+            self.profile = config.resolvedProfile
+            self.profileMembers = config.resolvedProfile.members(of: config.services)
 
             for service in config.services {
                 serviceStates[service.id] = ServiceState(definition: service)
@@ -214,23 +209,12 @@ final class EnvironmentSupervisor {
             // Initialize debug tracking (opt-in via ~/Desktop/debug-tracking/config.json)
             Task { await initDebugTracking() }
 
-            // Initialize yalc staleness watcher
-            if let travelDataPath = config.paths?.travelData, !travelDataPath.isEmpty {
-                let watcher = YalcWatcher(travelDataDir: travelDataPath)
-                yalcWatcher = watcher
-                yalcWatcherTask?.cancel()
-                yalcWatcherTask = Task { await startYalcWatching(watcher: watcher) }
-            }
-
             // Initialize git branch watcher for all repos with cwds
             var repoMap: [String: String] = [:]
             for service in config.services {
                 if let cwd = service.resolvedCwd {
                     repoMap[service.id] = cwd
                 }
-            }
-            if let dataPath = config.paths?.travelData, !dataPath.isEmpty {
-                repoMap["fb-travel-data"] = NSString(string: dataPath).expandingTildeInPath as String
             }
             if !repoMap.isEmpty {
                 let watcher = GitBranchWatcher(repos: repoMap)
@@ -254,6 +238,8 @@ final class EnvironmentSupervisor {
             }
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this
+        } catch ConfigLoader.ConfigError.monorepoNotFound {
+            // Old three-repo config with no monorepo nearby — setup wizard will handle this
         } catch {
             lastError = "Config load failed: \(error)"
             print("[Supervisor] \(lastError!)")
@@ -401,42 +387,6 @@ final class EnvironmentSupervisor {
                     }
                 }
 
-                // After GATEWAY phase: if fb-travel-data build is stale, rebuild
-                // before starting the portal to prevent "Module not found" errors.
-                if phase == .gateway {
-                    if let watcher = self.yalcWatcher {
-                        let stale = await watcher.check()
-                        if stale {
-                            await MainActor.run {
-                                self.yalcStale = true
-                                self.lastError = "fb-travel-data build is stale — rebuilding before portal start..."
-                            }
-                            let ok = await self.buildAndPublishYalcSync()
-                            if ok {
-                                await MainActor.run {
-                                    self.serviceStates["yalc-link"]?.phase = .starting
-                                }
-                                await self.processRunner.stop(serviceID: "yalc-link")
-                                do {
-                                    try await self.startService("yalc-link")
-                                } catch {
-                                    await MainActor.run {
-                                        self.lastError = "yalc-link restart failed: \(error)"
-                                    }
-                                }
-                                let stillStale = await watcher.check()
-                                await MainActor.run {
-                                    self.yalcStale = stillStale
-                                    self.lastError = nil
-                                }
-                            } else {
-                                await MainActor.run {
-                                    self.lastError = "fb-travel-data rebuild failed — portal may have import errors"
-                                }
-                            }
-                        }
-                    }
-                }
             }
 
             await MainActor.run {
@@ -503,15 +453,14 @@ final class EnvironmentSupervisor {
                         let health = await MainActor.run { self.health.rawValue }
                         let lan = await MainActor.run { self.networkMode }
                         let ip = await MainActor.run { self.localIP ?? "none" }
-                        let yalcStale = await MainActor.run { self.yalcStale }
-                        let yalcAuto = await MainActor.run { self.autoRelinkYalc }
+                        let profile = await MainActor.run { self.profile.rawValue }
                         let dbMode = await MainActor.run { self.dbMode.rawValue }
                         let branches = await MainActor.run { self.gitBranches }
                         let behind = await MainActor.run { self.gitBehindCounts }
                         let npmStale = await MainActor.run { Array(self.npmStaleServices) }
                         let dict: [String: Any] = [
                             "health": health, "services": states, "lan": lan, "ip": ip,
-                            "yalc": ["stale": yalcStale, "auto_relink": yalcAuto] as [String: Any],
+                            "profile": profile,
                             "db_mode": dbMode,
                             "branches": branches,
                             "gitBehind": behind,
@@ -595,21 +544,25 @@ final class EnvironmentSupervisor {
                         }
                         return ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"issue not found\"}"
                     },
-                    yalcRelink: { [weak self] in
-                        await MainActor.run { self?.publishAndRetryYalc() }
-                    },
-                    yalcToggleAuto: { [weak self] in
-                        await MainActor.run {
-                            guard let self else { return }
-                            self.setAutoRelinkYalc(!self.autoRelinkYalc)
-                        }
-                    },
-                    yalcStatus: { [weak self] in
-                        guard let self else { return "{}" }
-                        return await self.yalcStatusJSON()
-                    },
                     toggleDbMode: { [weak self] in
                         await MainActor.run { self?.toggleDatabaseMode() }
+                    },
+                    getProfile: { [weak self] in
+                        guard let self else { return "{}" }
+                        let (name, members) = await MainActor.run { (self.profile.rawValue, self.profileMembers.sorted()) }
+                        let dict: [String: Any] = [
+                            "profile": name,
+                            "services": members,
+                            "available": RunProfile.allCases.map(\.rawValue),
+                        ]
+                        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+                           let str = String(data: data, encoding: .utf8) { return str }
+                        return "{}"
+                    },
+                    setProfile: { [weak self] name in
+                        guard let profile = RunProfile(rawValue: name) else { return false }
+                        await MainActor.run { self?.setProfile(profile) }
+                        return true
                     }
                 ),
                 logStore: logStore
@@ -781,7 +734,7 @@ final class EnvironmentSupervisor {
         guard health != .stopped else { return }
 
         var servicesToRestart = ["travel-portal", "universal-login"]
-        if partnerPortalEnabled && serviceStates["partner-portal"] != nil {
+        if isInProfile("partner-portal") {
             servicesToRestart.append("partner-portal")
         }
         Task {
@@ -871,7 +824,7 @@ final class EnvironmentSupervisor {
             }
 
             var servicesToRestart = ["travel-portal", "universal-login"]
-            if partnerPortalEnabled && serviceStates["partner-portal"] != nil {
+            if isInProfile("partner-portal") {
                 servicesToRestart.append("partner-portal")
             }
 
@@ -1007,128 +960,18 @@ final class EnvironmentSupervisor {
         startAll()
     }
 
-    func publishAndRetryYalc() {
-        guard let travelDataDir = config?.paths?.travelData.map({ NSString(string: $0).expandingTildeInPath }) else {
-            lastError = "fb-travel-data path not configured — open Settings"
+    /// Switches the profile and saves it to services.json. Running services outside the
+    /// new profile keep running until the next stop; start-all uses the new profile.
+    func setProfile(_ newProfile: RunProfile) {
+        do {
+            try ConfigLoader.saveProfile(newProfile)
+        } catch {
+            lastError = "Could not save profile: \(error)"
             return
         }
-
-        serviceStates["yalc-link"]?.phase = .starting
-        Task {
-            actionsInFlight.insert("yalc-relink")
-            defer { actionsInFlight.remove("yalc-relink") }
-            let ok = await runShellCommand("cd \"\(travelDataDir)\" && npm run build && yalc publish")
-            if ok {
-                restartService("yalc-link")
-                onActionFeedback?("fb-travel-data published and relinked", true)
-
-                // Wait for the relink oneshot to finish swapping node_modules.
-                for _ in 0..<120 {
-                    try? await Task.sleep(for: .seconds(1))
-                    let p = serviceStates["yalc-link"]?.phase
-                    if p == .completed || p == .failed { break }
-                }
-
-                // A running portal keeps its compiled .next module graph against
-                // the old package — after a mid-session relink it serves phantom
-                // "not exported" errors until the cache is cleared. Bounce any
-                // running portal onto the fresh build automatically.
-                if serviceStates["yalc-link"]?.phase == .completed {
-                    for portalID in ["travel-portal", "partner-portal"]
-                    where serviceStates[portalID]?.phase == .running {
-                        clearCacheAndRestart(portalID)
-                        onActionFeedback?("\(serviceStates[portalID]?.definition.displayName ?? portalID) restarted on fresh fb-travel-data build", true)
-                    }
-                }
-            } else {
-                serviceStates["yalc-link"]?.phase = .failed
-                lastError = "yalc publish failed — check fb-travel-data build"
-                onActionFeedback?("yalc publish failed — check fb-travel-data build", false)
-            }
-        }
-    }
-
-    private func buildAndPublishYalcSync() async -> Bool {
-        guard let travelDataDir = config?.paths?.travelData
-            .map({ NSString(string: $0).expandingTildeInPath }) else { return false }
-        return await runShellCommand(
-            "cd \"\(travelDataDir)\" && npm run build && yalc publish"
-        )
-    }
-
-    func setAutoRelinkYalc(_ enabled: Bool) {
-        autoRelinkYalc = enabled
-        UserDefaults.standard.set(enabled, forKey: "autoRelinkYalc")
-    }
-
-    func setPartnerPortalEnabled(_ enabled: Bool) {
-        partnerPortalEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: "partnerPortalEnabled")
-        if enabled {
-            setupPartnerPortalEnv()
-        }
-    }
-
-    func setCacheVerificationEnabled(_ enabled: Bool) {
-        cacheVerificationEnabled = enabled
-        userDefaults.set(enabled, forKey: "cacheVerificationEnabled")
-    }
-
-    private func setupPartnerPortalEnv() {
-        guard let rawPartnerCwd = config?.paths?.partnerPortal, !rawPartnerCwd.isEmpty else { return }
-        let partnerCwd = NSString(string: rawPartnerCwd).expandingTildeInPath
-
-        let localEnvPath = (partnerCwd as NSString).appendingPathComponent(".env.local.runner")
-        guard FileManager.default.fileExists(atPath: localEnvPath) else { return }
-
-        if dbMode == .local {
-            let source = readEnvFile(localEnvPath)
-            let env = EnvCompatLayer(envFilePaths: [partnerCwd + "/.env.local"])
-            for (key, value) in source {
-                env.write(key: key, value: value)
-            }
-        }
-    }
-
-    func yalcStatusJSON() async -> String {
-        guard let watcher = yalcWatcher else { return "{\"configured\":false}" }
-        let stale = await watcher.isStale
-        let autoRelink = autoRelinkYalc
-        let srcMtime = await watcher.sourceModifiedAt
-        let distMtime = await watcher.lastBuiltAt
-
-        var dict: [String: Any] = [
-            "configured": true,
-            "stale": stale,
-            "auto_relink": autoRelink,
-        ]
-        if let src = srcMtime { dict["source_modified"] = ISO8601DateFormatter().string(from: src) }
-        if let dist = distMtime { dict["last_built"] = ISO8601DateFormatter().string(from: dist) }
-
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
-           let str = String(data: data, encoding: .utf8) { return str }
-        return "{}"
-    }
-
-    private func startYalcWatching(watcher: YalcWatcher) async {
-        while !Task.isCancelled {
-            let stale = await watcher.check()
-            await MainActor.run { self.yalcStale = stale }
-
-            if stale && autoRelinkYalc && !yalcRelinkInProgress && health == .healthy {
-                let settled = await watcher.sourceSettled
-                if settled {
-                    await MainActor.run {
-                        self.yalcRelinkInProgress = true
-                        self.publishAndRetryYalc()
-                    }
-                    try? await Task.sleep(for: .seconds(10))
-                    await MainActor.run { self.yalcRelinkInProgress = false }
-                }
-            }
-
-            try? await Task.sleep(for: .seconds(5))
-        }
+        profile = newProfile
+        profileMembers = newProfile.members(of: config?.services ?? [])
+        onActionFeedback?("Profile: \(newProfile.displayName)", true)
     }
 
     private func startDepsWatching(watcher: DependencyWatcher) async {
@@ -1196,10 +1039,6 @@ final class EnvironmentSupervisor {
                         }
                     }
                 }
-            }
-
-            if changed.contains("fb-travel-data") {
-                await MainActor.run { self.publishAndRetryYalc() }
             }
 
             await watcher.fetchAndCount(fetchInterval: 0)
@@ -1553,16 +1392,10 @@ final class EnvironmentSupervisor {
         guard let state = serviceStates[serviceID],
               let definition = graph?.nodes[serviceID] else { return }
 
-        if serviceID == "partner-portal" && !partnerPortalEnabled {
-            await MainActor.run { state.phase = .skipped }
-            return
-        }
-
-        // Cache-verification oneshots are opt-in (Settings). They drive the
-        // local CDC evidence chain (transport sim, contention, audits) against
-        // the dev fixture — valuable for rehearsal, disruptive as an everyday
-        // startup tax.
-        if definition.phase == "verification", !cacheVerificationEnabled {
+        // Services outside the active profile are skipped. The verification
+        // oneshots drive the local CDC evidence chain against the dev fixture, so
+        // they run only in the full profile.
+        if !isInProfile(serviceID) {
             await MainActor.run { state.phase = .skipped }
             return
         }
@@ -2088,7 +1921,7 @@ final class EnvironmentSupervisor {
     private func phaseForService(_ id: String) -> String? {
         if let phase = graph?.nodes[id]?.phase { return phase }
         if id == "supabase" || id == "db-reset" { return "ground" }
-        if id == "yalc-link" || id == "universal-login" || id == "stripe" { return "gateway" }
+        if id == "universal-login" || id == "stripe" { return "gateway" }
         if id == "travel-portal" || id == "partner-portal" { return "portal" }
         if id.hasPrefix("stream-") { return "stream" }
         if id.hasPrefix("cache-") || id.hasPrefix("capacity-") { return "verification" }

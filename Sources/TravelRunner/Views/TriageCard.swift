@@ -6,7 +6,6 @@ struct TriageCard: View {
     let onRestart: () -> Void
     let onCascadeRestart: () -> Void
     var onClearCache: (() -> Void)? = nil
-    var onPublishRetry: (() -> Void)? = nil
 
     @Environment(EnvironmentSupervisor.self) var supervisor
     @State private var logTail: [LogEntry] = []
@@ -90,13 +89,6 @@ struct TriageCard: View {
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
                     .tint(.orange)
-                }
-
-                if let onPublishRetry {
-                    Button("Publish & Retry", action: onPublishRetry)
-                        .buttonStyle(.bordered)
-                        .controlSize(.mini)
-                        .tint(.orange)
                 }
 
                 if isActionInFlight {

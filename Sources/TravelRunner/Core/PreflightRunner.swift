@@ -38,7 +38,6 @@ struct PreflightRunner: Sendable {
             PreflightCheck(id: "docker", name: ContainerRuntime.detect().displayName),
             PreflightCheck(id: "node-version", name: "Node.js \u{2265} 22"),
             PreflightCheck(id: "stripe-auth", name: "Stripe CLI Auth"),
-            PreflightCheck(id: "yalc", name: "yalc CLI"),
         ]
 
         if let portalCwd = services.first(where: { $0.id == "travel-portal" })?.resolvedCwd {
@@ -106,12 +105,6 @@ struct PreflightRunner: Sendable {
             return ok
                 ? .passed(detail: "Authenticated")
                 : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
-
-        case "yalc":
-            let ok = await shellExitCode("which yalc") == 0
-            return ok
-                ? .passed(detail: "Found")
-                : .failed(message: "Not installed", fix: "Run: npm i -g yalc")
 
         case "env-diff":
             let cwd = check.metadata["cwd"] ?? ""

@@ -6,9 +6,7 @@ struct PhaseSection: View {
     let logStore: LogStore
     let onRestart: (String) -> Void
     let onCascadeRestart: ((String) -> Void)?
-    let onPublishRetry: (() -> Void)?
     var dbResetRunning: Bool = false
-    var isServiceStale: ((String) -> Bool)? = nil
     var serviceBehindCount: ((String) -> Int)? = nil
     var isServiceDepsStale: ((String) -> Bool)? = nil
 
@@ -26,9 +24,7 @@ struct PhaseSection: View {
                         state: state,
                         logStore: logStore,
                         onRestart: { onRestart(state.id) },
-                        onPublishRetry: state.id == "yalc-link" ? onPublishRetry : nil,
                         onCascadeRestart: onCascadeRestart.map { callback in { callback(state.id) } },
-                        isStale: isServiceStale?(state.id) ?? false,
                         behindCount: serviceBehindCount?(state.id) ?? 0,
                         depsStale: isServiceDepsStale?(state.id) ?? false
                     )

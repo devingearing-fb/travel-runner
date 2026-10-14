@@ -135,7 +135,7 @@ if [ -f "AppIcon.icns" ]; then
     cp AppIcon.icns "$APP_BUNDLE/Contents/Resources/"
 fi
 
-# Copy SPM resource bundle (contains default-services.json)
+# Copy the SPM resource bundle, if the target declares resources
 RESOURCE_BUNDLE=".build/release/${APP_NAME}_${APP_NAME}.bundle"
 if [ -d "$RESOURCE_BUNDLE" ]; then
     cp -R "$RESOURCE_BUNDLE" "$APP_BUNDLE/Contents/Resources/"

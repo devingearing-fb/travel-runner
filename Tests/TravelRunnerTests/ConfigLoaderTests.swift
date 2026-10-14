@@ -3,108 +3,101 @@ import XCTest
 @testable import TravelRunner
 
 final class ConfigLoaderTests: XCTestCase {
-    func testVersionOneConfigUpgradePreservesCustomServicesAndAddsCanonicalCDCChain() throws {
-        let versionOne: [String: Any] = [
-            "version": 1,
+    private let monorepo = "/work/TRAVEL BOOKING/fb-travel-monolith"
+
+    func testVersionTwoConfigUpgradesToMonorepoAndKeepsCustomServices() throws {
+        let versionTwo: [String: Any] = [
+            "version": 2,
             "registry_port_range": [19999, 20009],
             "paths": [
-                "booking_portal": "/workspace/travel-booking-portal",
-                "universal_login": "/workspace/universal-login",
+                "booking_portal": "/work/TRAVEL BOOKING/travel-booking-portal",
+                "travel_data": "/work/TRAVEL BOOKING/fb-travel-data",
+                "partner_portal": "/work/TRAVEL BOOKING/fb-amateur-travel-partner-portal",
+                "universal_login": "/work/fb-amateur-universal-login",
+                "stream_services": "/work/stream-services",
             ],
             "services": [
                 service(id: "supabase"),
-                service(id: "travel-portal"),
-                service(id: "cache-apply-transport", cwd: "/workspace/travel-load-test", type: "oneshot", dependsOn: ["travel-portal"]),
-                service(id: "cache-cutover-audit", cwd: "/workspace/travel-load-test", type: "oneshot", dependsOn: ["cache-apply-transport"]),
-                service(id: "capacity-contention", type: "oneshot", dependsOn: ["cache-cutover-audit"]),
-                service(id: "capacity-block-edit-race", type: "oneshot", dependsOn: ["capacity-contention"]),
-                service(id: "capacity-overflow", type: "oneshot", dependsOn: ["capacity-block-edit-race"]),
+                service(id: "yalc-link"),
+                service(id: "travel-portal", dependsOn: ["stripe"]),
+                service(id: "cache-apply-transport", cwd: "/work/TRAVEL BOOKING/travel-load-test"),
                 service(id: "custom-local-tool", dependsOn: ["supabase"]),
             ],
         ]
-        let original = try JSONSerialization.data(withJSONObject: versionOne)
+        var searchedFrom: String?
         let upgraded = try ConfigLoader.upgradedData(
-            original,
-            streamServicesPath: "/workspace/stream-services"
+            JSONSerialization.data(withJSONObject: versionTwo),
+            findMonorepo: { path in
+                searchedFrom = path
+                return self.monorepo
+            }
         )
         let config = try JSONDecoder().decode(ServiceConfig.self, from: upgraded)
         let byID = Dictionary(uniqueKeysWithValues: config.services.map { ($0.id, $0) })
 
-        XCTAssertEqual(config.version, 2)
-        XCTAssertEqual(config.paths?.streamServices, "/workspace/stream-services")
-        XCTAssertNotNil(byID["custom-local-tool"])
+        XCTAssertEqual(searchedFrom, "/work/TRAVEL BOOKING/travel-booking-portal")
+        XCTAssertEqual(config.version, 3)
+        XCTAssertEqual(config.paths, RepoPaths(
+            monorepo: monorepo,
+            universalLogin: "/work/fb-amateur-universal-login",
+            streamServices: "/work/stream-services",
+            loadTest: "/work/TRAVEL BOOKING/travel-load-test"
+        ))
+        XCTAssertEqual(config.resolvedProfile, .both)
+        XCTAssertNil(byID["yalc-link"])
         XCTAssertEqual(byID["custom-local-tool"]?.dependsOn, ["supabase"])
-
-        // Production-logic services run in the org-owned stream-services checkout;
-        // local CDC infrastructure now lives in (and runs from) the booking portal.
-        let streamRepoIDs = ["stream-services-install", "stream-services"]
-        let portalInfraIDs = ["stream-qstash", "stream-db-setup", "stream-qstash-wire", "stream-sequin"]
-        for id in streamRepoIDs + portalInfraIDs {
-            XCTAssertEqual(config.services.filter { $0.id == id }.count, 1, id)
-        }
-        for id in streamRepoIDs {
-            XCTAssertEqual(byID[id]?.resolvedCwd, "/workspace/stream-services", id)
-        }
-        for id in portalInfraIDs {
-            XCTAssertEqual(byID[id]?.resolvedCwd, "/workspace/travel-booking-portal", id)
-        }
-        XCTAssertEqual(byID["stream-db-setup"]?.cmd, ["./scripts/local-cdc/runner-db-setup.sh"])
-        XCTAssertEqual(byID["stream-db-setup"]?.env?["STREAM_SERVICES_DIR"], "/workspace/stream-services")
-        XCTAssertEqual(byID["stream-sequin"]?.cmd, ["./scripts/local-cdc/run-sequin.sh"])
-        XCTAssertEqual(byID["stream-qstash-wire"]?.cmd, ["./scripts/local-cdc/qstash-wire.sh"])
-        XCTAssertEqual(config.services.filter { $0.id == "cache-cdc-rehearsal" }.count, 1)
-        XCTAssertEqual(byID["cache-cdc-rehearsal"]?.resolvedCwd, "/workspace/travel-load-test")
-        XCTAssertEqual(
-            byID["cache-cdc-rehearsal"]?.env?["TRAVEL_RUNNER_CONTROL_URL"],
-            "http://[::1]:19900"
-        )
-        XCTAssertEqual(
-            Set(try XCTUnwrap(byID["cache-cutover-audit"]).dependsOn),
-            Set(["cache-apply-transport", "cache-cdc-rehearsal"])
-        )
-        XCTAssertEqual(byID["capacity-contention"]?.dependsOn, ["cache-apply-transport"])
-        XCTAssertEqual(
-            byID["stream-db-setup"]?.dependsOn,
-            ["supabase", "capacity-overflow"]
-        )
+        XCTAssertEqual(byID["travel-portal"]?.resolvedCwd, monorepo + "/apps/booking-portal")
+        XCTAssertEqual(Set(ServiceCatalog.canonicalIDs).subtracting(byID.keys), [])
         XCTAssertNoThrow(try ServiceGraph(services: config.services))
     }
 
-    func testConfigUpgradeIsStableAndReplacesStaleCanonicalNodes() throws {
-        let root: [String: Any] = [
-            "version": 1,
-            "registry_port_range": [19999, 20009],
-            "services": [
-                service(id: "supabase"),
-                service(id: "travel-portal"),
-                service(id: "stream-qstash", cmd: ["stale"]),
-            ],
+    func testOldConfigWithoutMonorepoNeedsSetup() throws {
+        let versionTwo: [String: Any] = [
+            "version": 2,
+            "paths": ["booking_portal": "/work/travel-booking-portal"],
+            "services": [service(id: "supabase")],
         ]
-        let input = try JSONSerialization.data(withJSONObject: root)
-        let once = try ConfigLoader.upgradedData(input, streamServicesPath: "/workspace/stream-services")
-        let twice = try ConfigLoader.upgradedData(once, streamServicesPath: "/workspace/stream-services")
+        XCTAssertThrowsError(
+            try ConfigLoader.upgradedData(JSONSerialization.data(withJSONObject: versionTwo), findMonorepo: { _ in nil })
+        ) { error in
+            guard case ConfigLoader.ConfigError.monorepoNotFound = error else {
+                return XCTFail("unexpected error \(error)")
+            }
+        }
+    }
+
+    func testUpgradeIsStableAndRebuildsCanonicalServices() throws {
+        let root: [String: Any] = [
+            "version": 3,
+            "paths": ["monorepo": monorepo, "universal_login": "/work/login"],
+            "profile": "partner",
+            "services": [service(id: "stream-qstash", cmd: ["stale"])],
+        ]
+        let once = try ConfigLoader.upgradedData(JSONSerialization.data(withJSONObject: root), findMonorepo: { _ in nil })
+        let twice = try ConfigLoader.upgradedData(once, findMonorepo: { _ in nil })
         let config = try JSONDecoder().decode(ServiceConfig.self, from: twice)
-        let qstash = try XCTUnwrap(config.services.first { $0.id == "stream-qstash" })
 
         XCTAssertEqual(once, twice)
+        XCTAssertEqual(config.resolvedProfile, .partner)
         XCTAssertEqual(config.services.filter { $0.id == "stream-qstash" }.count, 1)
-        XCTAssertEqual(qstash.cmd, ["./node_modules/.bin/qstash", "dev"])
+        XCTAssertEqual(config.services.first { $0.id == "stream-qstash" }?.cmd, ["./node_modules/.bin/qstash", "dev"])
+    }
+
+    func testUnknownProfileFallsBackToBoth() throws {
+        let root: [String: Any] = ["paths": ["monorepo": monorepo], "profile": "everything", "services": []]
+        let config = try JSONDecoder().decode(
+            ServiceConfig.self,
+            from: ConfigLoader.upgradedData(JSONSerialization.data(withJSONObject: root), findMonorepo: { _ in nil })
+        )
+        XCTAssertEqual(config.resolvedProfile, .both)
     }
 
     private func service(
         id: String,
         cmd: [String] = ["true"],
-        cwd: String = "/workspace",
-        type: String? = nil,
+        cwd: String = "/work",
         dependsOn: [String] = []
     ) -> [String: Any] {
-        var value: [String: Any] = [
-            "id": id,
-            "cmd": cmd,
-            "cwd": cwd,
-            "depends_on": dependsOn,
-        ]
-        if let type { value["type"] = type }
-        return value
+        ["id": id, "cmd": cmd, "cwd": cwd, "depends_on": dependsOn]
     }
 }

@@ -93,10 +93,6 @@ struct WorkshopHeaderBar: View {
 
                     Spacer()
 
-                    if supervisor.yalcStale {
-                        statusTag("STALE", icon: "arrow.triangle.2.circlepath", color: .yellow)
-                    }
-
                     if supervisor.dbResetRunning {
                         HStack(spacing: 4) {
                             ProgressView().controlSize(.mini)

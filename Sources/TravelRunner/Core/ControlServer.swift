@@ -23,10 +23,10 @@ actor ControlServer {
         let debugListIssues: @Sendable () async -> String
         let debugCapture: @Sendable (String) async -> String
         let debugCloseIssue: @Sendable (String, String?) async -> String
-        let yalcRelink: @Sendable () async -> Void
-        let yalcToggleAuto: @Sendable () async -> Void
-        let yalcStatus: @Sendable () async -> String
         let toggleDbMode: @Sendable () async -> Void
+        let getProfile: @Sendable () async -> String
+        /// Returns false when the name is not a known profile.
+        let setProfile: @Sendable (String) async -> Bool
     }
 
     func start(actions: Actions, logStore: LogStore) async throws {
@@ -172,18 +172,19 @@ actor ControlServer {
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
 
-        await server.appendRoute("GET /api/yalc/status") { _ in
-            let json = await actions.yalcStatus()
+        await server.appendRoute("GET /api/profile") { _ in
+            let json = await actions.getProfile()
             return HTTPResponse(statusCode: .ok, headers: [.contentType: "application/json"], body: Data(json.utf8))
         }
 
-        await server.appendRoute("POST /api/yalc/relink") { _ in
-            await actions.yalcRelink()
-            return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
-        }
-
-        await server.appendRoute("POST /api/yalc/toggle-auto") { _ in
-            await actions.yalcToggleAuto()
+        await server.appendRoute("POST /api/profile/*") { request in
+            let parts = request.path.split(separator: "/")
+            guard parts.count >= 3 else {
+                return HTTPResponse(statusCode: .badRequest, body: Data("Usage: /api/profile/{booking|partner|both|full}".utf8))
+            }
+            guard await actions.setProfile(String(parts[2])) else {
+                return HTTPResponse(statusCode: .badRequest, body: Data("{\"ok\":false,\"error\":\"unknown profile\"}".utf8))
+            }
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
 

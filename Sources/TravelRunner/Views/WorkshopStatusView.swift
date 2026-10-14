@@ -25,10 +25,8 @@ struct WorkshopStatusView: View {
                         logStore: supervisor.logStore,
                         onRestart: { supervisor.restartService(state.id) },
                         onCascadeRestart: { supervisor.restartCascade(state.id) },
-                        onClearCache: state.id == "travel-portal"
-                            ? { supervisor.clearCacheAndRestart(state.id) } : nil,
-                        onPublishRetry: state.id == "yalc-link"
-                            ? { supervisor.publishAndRetryYalc() } : nil
+                        onClearCache: ["travel-portal", "partner-portal"].contains(state.id)
+                            ? { supervisor.clearCacheAndRestart(state.id) } : nil
                     )
                     .transition(.opacity)
                 }
@@ -71,9 +69,7 @@ struct WorkshopStatusView: View {
                             logStore: supervisor.logStore,
                             onRestart: { supervisor.restartService($0) },
                             onCascadeRestart: { supervisor.restartCascade($0) },
-                            onPublishRetry: group.phase == "GATEWAY" ? { supervisor.publishAndRetryYalc() } : nil,
                             dbResetRunning: supervisor.dbResetRunning,
-                            isServiceStale: { $0 == "yalc-link" && supervisor.yalcStale },
                             serviceBehindCount: { supervisor.gitBehindCounts[$0] ?? 0 },
                             isServiceDepsStale: { supervisor.npmStaleServices.contains($0) }
                         )
