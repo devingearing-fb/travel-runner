@@ -40,11 +40,12 @@ struct PreflightRunner: Sendable {
             PreflightCheck(id: "stripe-auth", name: "Stripe CLI Auth"),
         ]
 
-        if let portalCwd = services.first(where: { $0.id == "travel-portal" })?.resolvedCwd {
+        for (serviceID, label) in [("travel-portal", "Booking"), ("partner-portal", "Partner")] {
+            guard let cwd = services.first(where: { $0.id == serviceID })?.resolvedCwd else { continue }
             checks.append(PreflightCheck(
-                id: "env-diff",
-                name: "Env variables",
-                metadata: ["cwd": portalCwd]
+                id: "env-diff-\(serviceID)",
+                name: "\(label) env variables",
+                metadata: ["cwd": cwd]
             ))
         }
 
@@ -106,20 +107,23 @@ struct PreflightRunner: Sendable {
                 ? .passed(detail: "Authenticated")
                 : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
 
-        case "env-diff":
+        case let id where id.hasPrefix("env-diff"):
+            // Shared values come from Doppler (.env, via pnpm env:pull); .env.local holds
+            // only the runner's local overrides. Next.js reads both.
             let cwd = check.metadata["cwd"] ?? ""
             let examplePath = (cwd as NSString).appendingPathComponent(".env.example")
+            let dopplerPath = (cwd as NSString).appendingPathComponent(".env")
             let localPath = (cwd as NSString).appendingPathComponent(".env.local")
 
             guard FileManager.default.fileExists(atPath: examplePath) else {
                 return .passed(detail: "No .env.example")
             }
-            guard FileManager.default.fileExists(atPath: localPath) else {
-                return .warning(message: "No .env.local — copy from .env.example")
+            guard FileManager.default.fileExists(atPath: dopplerPath) else {
+                return .warning(message: "No .env — run pnpm env:pull in the monorepo (needs doppler login)")
             }
 
             let requiredKeys = extractRequiredEnvKeys(from: examplePath)
-            let localKeys = extractEnvKeys(from: localPath)
+            let localKeys = extractEnvKeys(from: dopplerPath).union(extractEnvKeys(from: localPath))
             let missing = requiredKeys.subtracting(localKeys)
 
             if missing.isEmpty {

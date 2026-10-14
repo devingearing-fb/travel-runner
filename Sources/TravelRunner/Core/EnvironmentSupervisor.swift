@@ -52,7 +52,8 @@ final class EnvironmentSupervisor {
         var seen = Set<String>()
         var total = 0
         for (sid, count) in gitBehindCounts where count > 0 {
-            let path = config?.services.first(where: { $0.id == sid })?.resolvedCwd ?? sid
+            // Count each repository once: in the monorepo several services share one.
+            let path = gitRepoRoots[sid] ?? config?.services.first(where: { $0.id == sid })?.resolvedCwd ?? sid
             if seen.insert(path).inserted {
                 total += count
             }
@@ -93,6 +94,7 @@ final class EnvironmentSupervisor {
     private var dbSetupRunner: DbSetupRunner?
     private var debugTracker: DebugTracker?
     private var gitBranchWatcher: GitBranchWatcher?
+    private var gitRepoRoots: [String: String] = [:]
     private var dependencyWatcher: DependencyWatcher?
     private var gitWatcherTask: Task<Void, Never>?
     private var depsWatcherTask: Task<Void, Never>?
@@ -216,6 +218,7 @@ final class EnvironmentSupervisor {
             if !repoMap.isEmpty {
                 let watcher = GitBranchWatcher(repos: repoMap)
                 gitBranchWatcher = watcher
+                gitRepoRoots = watcher.repoRoots
                 gitWatcherTask?.cancel()
                 gitWatcherTask = Task { await startGitBranchWatching(watcher: watcher) }
             }
@@ -264,7 +267,8 @@ final class EnvironmentSupervisor {
             // Preflight
             if !skipPreflight {
                 self.currentPhase = .preflight
-                let checks = self.preflightRunner.allChecks(for: config.services)
+                let profileServices = config.services.filter { self.isInProfile($0.id) }
+                let checks = self.preflightRunner.allChecks(for: profileServices)
                 await MainActor.run { self.preflightChecks = checks }
 
                 var allPassed = true

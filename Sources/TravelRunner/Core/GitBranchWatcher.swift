@@ -1,111 +1,77 @@
 import Foundation
 
+/// Tracks the branch and the commits-behind count of each service's git repository.
+/// Services are grouped by repository root: in the monorepo, supabase, both portals and
+/// the local CDC scripts share one repository, so it is read and fetched once.
 actor GitBranchWatcher {
-    private let repos: [String: String]
+    /// serviceID → repository root (`git rev-parse --show-toplevel`); services outside git are absent.
+    nonisolated let repoRoots: [String: String]
     private(set) var branches: [String: String] = [:]
     private(set) var changedServices: Set<String> = []
     private(set) var behindCounts: [String: Int] = [:]
+    private var branchByRoot: [String: String] = [:]
     private var lastFetchedAt: [String: Date] = [:]
 
     init(repos: [String: String]) {
-        self.repos = repos
+        var roots: [String: String] = [:]
+        var cache: [String: String?] = [:]
+        for (serviceID, path) in repos {
+            let root = cache[path] ?? Self.git(["rev-parse", "--show-toplevel"], in: path)
+            cache[path] = root
+            if let root { roots[serviceID] = root }
+        }
+        self.repoRoots = roots
+    }
+
+    private var servicesByRoot: [String: [String]] {
+        Dictionary(grouping: repoRoots.keys, by: { repoRoots[$0]! })
     }
 
     @discardableResult
     func check() -> Set<String> {
         var changed = Set<String>()
-        for (serviceID, path) in repos {
-            let branch = readBranch(at: path)
-            if let prev = branches[serviceID], prev != branch {
-                changed.insert(serviceID)
-                lastFetchedAt[path] = nil
+        for (root, serviceIDs) in servicesByRoot {
+            // --abbrev-ref resolves HEAD in worktrees too (.git is a file there).
+            guard let ref = Self.git(["rev-parse", "--abbrev-ref", "HEAD"], in: root) else { continue }
+            let branch = ref == "HEAD"
+                ? String((Self.git(["rev-parse", "HEAD"], in: root) ?? "").prefix(8))
+                : ref
+            if let previous = branchByRoot[root], previous != branch {
+                changed.formUnion(serviceIDs)
+                lastFetchedAt[root] = nil
             }
-            if let branch {
-                branches[serviceID] = branch
-            }
-            behindCounts[serviceID] = countBehind(at: path)
+            branchByRoot[root] = branch
+            for serviceID in serviceIDs { branches[serviceID] = branch }
         }
         changedServices = changed
         return changed
     }
 
     func fetchAndCount(fetchInterval: TimeInterval = 120) async {
-        let uniquePaths = deduplicatedPaths()
-
-        for (path, serviceIDs) in uniquePaths {
-            let needsFetch: Bool
-            if let last = lastFetchedAt[path] {
-                needsFetch = Date.now.timeIntervalSince(last) >= fetchInterval
-            } else {
-                needsFetch = true
-            }
-
+        for (root, serviceIDs) in servicesByRoot {
+            let needsFetch = lastFetchedAt[root].map { Date.now.timeIntervalSince($0) >= fetchInterval } ?? true
             if needsFetch {
-                await shellRun("cd \"\(path)\" && git fetch --quiet 2>/dev/null")
-                lastFetchedAt[path] = .now
+                _ = Self.git(["fetch", "--quiet"], in: root)
+                lastFetchedAt[root] = .now
             }
-
-            let count = countBehind(at: path)
-            for sid in serviceIDs {
-                behindCounts[sid] = count
-            }
+            let count = Int(Self.git(["rev-list", "HEAD..@{upstream}", "--count"], in: root) ?? "") ?? 0
+            for serviceID in serviceIDs { behindCounts[serviceID] = count }
         }
     }
 
-    private func deduplicatedPaths() -> [String: [String]] {
-        var map: [String: [String]] = [:]
-        for (serviceID, path) in repos {
-            map[path, default: []].append(serviceID)
-        }
-        return map
-    }
-
-    private func countBehind(at repoPath: String) -> Int {
-        let headPath = (repoPath as NSString).appendingPathComponent(".git/HEAD")
-        guard let content = try? String(contentsOfFile: headPath, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines) else { return 0 }
-        guard content.hasPrefix("ref: refs/heads/") else { return 0 }
-
+    /// Runs git in `directory`; trimmed stdout on success, nil on failure.
+    private static func git(_ arguments: [String], in directory: String) -> String? {
         let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", directory] + arguments
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-c", "cd \"\(repoPath)\" && git rev-list HEAD..@{upstream} --count 2>/dev/null"]
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return 0
-        }
+        do { try process.run() } catch { return nil }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
-        return Int(output) ?? 0
-    }
-
-    private func readBranch(at repoPath: String) -> String? {
-        let headPath = (repoPath as NSString).appendingPathComponent(".git/HEAD")
-        guard let content = try? String(contentsOfFile: headPath, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines) else { return nil }
-        let prefix = "ref: refs/heads/"
-        if content.hasPrefix(prefix) {
-            return String(content.dropFirst(prefix.count))
-        }
-        return String(content.prefix(8))
-    }
-
-    @discardableResult
-    private func shellRun(_ command: String) async -> Bool {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-c", command]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { proc in
-                continuation.resume(returning: proc.terminationStatus == 0)
-            }
-            do { try process.run() } catch { continuation.resume(returning: false) }
-        }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        let output = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+        return output.isEmpty ? nil : output
     }
 }
