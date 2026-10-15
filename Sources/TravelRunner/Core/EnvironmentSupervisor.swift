@@ -724,7 +724,7 @@ final class EnvironmentSupervisor {
             }
             guard lacking.isEmpty else {
                 let files = lacking.map { $0 == "travel-portal" ? "apps/booking-portal/.env" : "apps/partner-portal/.env" }
-                lastError = "Hosted dev values are missing from \(files.joined(separator: " and ")) — import the shared file (Health → App env files), then switch again"
+                lastError = "Hosted dev values are missing from \(files.joined(separator: " and ")) — import the shared file (Settings → Reconfigure Repos… → Environment Check), then switch again"
                 return
             }
             dbMode = .remote

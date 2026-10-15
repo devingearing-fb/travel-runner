@@ -240,7 +240,7 @@ curl -s -X POST http://localhost:19900/api/toggle-db-mode
 
 Switching to remote needs the hosted dev values in the shared `.env` of each profile app (`apps/booking-portal/.env`, and `apps/partner-portal/.env` when partner runs); without them the switch is refused. `pnpm env:check` at the monorepo root shows what is missing. Check the result in the `db_mode` field of `/api/status`.
 
-**Env layout:** each app's shared dev values are in the monolith at `apps/<app>/.env`: a teammate's copy (Health → **Import…**) or `pnpm env:pull` with Doppler access. The runner never stores them. The runner owns a marked block at the end of each app's `.env.local`, between `# >>> travel-runner: managed block, rewritten on start and on mode changes` and `# <<< travel-runner`. Local mode overrides Supabase (including `AMATEUR_SUPABASE_*`), app URLs and the login URL; remote mode leaves Supabase to the shared `.env`.
+**Env layout:** each app's shared dev values are in the monolith at `apps/<app>/.env`: a teammate's copy (Settings → Reconfigure Repos… → Environment Check → **Import…**) or `pnpm env:pull` with Doppler access. The runner never stores them. The runner owns a marked block at the end of each app's `.env.local`, between `# >>> travel-runner: managed block, rewritten on start and on mode changes` and `# <<< travel-runner`. Local mode overrides Supabase (including `AMATEUR_SUPABASE_*`), app URLs and the login URL; remote mode leaves Supabase to the shared `.env`.
 
 ### POST /api/db-reset
 
