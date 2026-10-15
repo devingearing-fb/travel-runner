@@ -303,14 +303,14 @@ actor DbSetupRunner {
                     .map(String.init) ?? "unknown"
                 if combined.contains("violates foreign key") {
                     return ("Migration \(filename): FK constraint violation",
-                            "Pull latest fb-travel-data and retry")
+                            "Pull the latest monorepo and fb-amateur-backend, then retry")
                 }
                 if combined.contains("already exists") {
                     return ("Migration \(filename): object already exists",
-                            "Run npx supabase stop && npx supabase start for a clean slate")
+                            "Run pnpm db:stop && pnpm db:start at the monorepo root for a clean slate")
                 }
                 return ("Migration \(filename) failed",
-                        "Check migration file for errors. Pull latest fb-travel-data.")
+                        "Check the migration file for errors (supabase/migrations or the backend baseline).")
             }
             if combined.contains("could not connect") {
                 return ("Database connection refused",
@@ -330,13 +330,13 @@ actor DbSetupRunner {
             }
             if combined.contains("401") || combined.contains("403") {
                 return ("Authentication failed",
-                        "Check JWT secret in .env.local")
+                        "Check the remote Supabase credentials used by copy-remote-data.py")
             }
 
         case "start-supabase":
             if combined.contains("port") && combined.contains("already in use") {
                 return ("Port already in use",
-                        "Another Supabase instance may be running. Run npx supabase stop first.")
+                        "Another Supabase instance may be running. Stop it (old checkouts: npx supabase stop; monorepo: pnpm db:stop) first.")
             }
 
         default:

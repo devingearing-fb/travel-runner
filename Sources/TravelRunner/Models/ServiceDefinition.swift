@@ -5,28 +5,41 @@ struct ServiceConfig: Codable, Sendable {
     let registryPortRange: [Int]
     let services: [ServiceDefinition]
     let paths: RepoPaths?
+    let profile: RunProfile?
 
     enum CodingKeys: String, CodingKey {
         case version
         case registryPortRange = "registry_port_range"
         case services
         case paths
+        case profile
     }
+
+    var resolvedProfile: RunProfile { profile ?? .both }
 }
 
-struct RepoPaths: Codable, Sendable {
-    let travelData: String?
-    let bookingPortal: String?
-    let universalLogin: String?
-    let partnerPortal: String?
-    let streamServices: String?
+/// Repo locations. The app and package directories live inside the monorepo and are
+/// derived from it; only repos outside the monorepo are configured.
+struct RepoPaths: Codable, Sendable, Equatable {
+    var monorepo: String?
+    var universalLogin: String?
+    var streamServices: String?
+    var loadTest: String?
 
     enum CodingKeys: String, CodingKey {
-        case travelData = "travel_data"
-        case bookingPortal = "booking_portal"
+        case monorepo
         case universalLogin = "universal_login"
-        case partnerPortal = "partner_portal"
         case streamServices = "stream_services"
+        case loadTest = "load_test"
+    }
+
+    var bookingPortal: String? { inMonorepo("apps/booking-portal") }
+    var partnerPortal: String? { inMonorepo("apps/partner-portal") }
+    var travelData: String? { inMonorepo("packages/travel-data") }
+
+    private func inMonorepo(_ relative: String) -> String? {
+        guard let monorepo, !monorepo.isEmpty else { return nil }
+        return (NSString(string: monorepo).expandingTildeInPath as NSString).appendingPathComponent(relative)
     }
 }
 

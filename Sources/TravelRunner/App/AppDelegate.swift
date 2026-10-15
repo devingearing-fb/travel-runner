@@ -63,8 +63,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             kill(pid, SIGKILL)
         }
 
-        // Phase 4: Kill by known service ports as a fallback
-        killProcessesOnPorts([3000, 3002, 54322])
+        // Phase 4: Kill by known service ports as a fallback. Only the Node dev servers:
+        // Docker-published ports (Supabase 54322, Sequin 7376) are held by the container
+        // runtime itself (OrbStack / Docker Desktop), and Supabase persists between sessions.
+        killProcessesOnPorts([3000, 3002, 3003, 3006, 8080])
     }
 
     private func collectDescendants(of pid: pid_t, into result: inout Set<pid_t>) {

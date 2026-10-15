@@ -4,9 +4,7 @@ struct ServiceRow: View {
     let state: ServiceState
     let logStore: LogStore
     let onRestart: () -> Void
-    var onPublishRetry: (() -> Void)? = nil
     var onCascadeRestart: (() -> Void)? = nil
-    var isStale: Bool = false
     var behindCount: Int = 0
     var depsStale: Bool = false
 
@@ -65,15 +63,6 @@ struct ServiceRow: View {
                 Text(state.phase.rawValue)
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(state.phase == .failed ? .red : .secondary)
-
-                if isStale {
-                    Text("stale")
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Color.orange, in: Capsule())
-                }
 
                 if behindCount > 0 {
                     Text("\(behindCount) behind")
@@ -156,13 +145,6 @@ struct ServiceRow: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-            }
-
-            if state.phase == .failed, let retry = onPublishRetry {
-                Button("Publish & Retry") { retry() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                    .tint(.orange)
             }
 
             if showLogs {

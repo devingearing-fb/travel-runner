@@ -37,7 +37,7 @@ Both `handleWake()` (30s wait) and `scheduleRestart()` (15s wait) gave up perman
 
 **Resolved:** 2026-06-10
 
-`loadConfig()` spawned yalc/git watcher tasks without cancelling previous ones, so reconfiguring repos accumulated duplicate 5-second poll loops.
+`loadConfig()` spawned watcher tasks (git, and the since-removed yalc watcher) without cancelling previous ones, so reconfiguring repos accumulated duplicate 5-second poll loops.
 
 **Fix:** Watcher tasks are stored and cancelled before new ones are spawned.
 

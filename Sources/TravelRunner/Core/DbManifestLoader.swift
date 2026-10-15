@@ -2,6 +2,8 @@ import CoreFoundation
 import Foundation
 
 enum DbManifestLoader {
+    static let supportedSeedScenarioVersions: Set<Int> = [3, 4]
+
     @MainActor
     static func load(from manifestPath: String, profile: String) -> [DbSetupStep] {
         guard let data = FileManager.default.contents(atPath: manifestPath),
@@ -67,7 +69,8 @@ enum DbManifestLoader {
                 "version must be an integer when seedScenarios is present"
             )
         }
-        guard version == 3 else {
+        // Version 4 (the monorepo) changed the steps, not the seed scenario section.
+        guard supportedSeedScenarioVersions.contains(version) else {
             throw SeedScenarioError.unsupportedVersion(version)
         }
         guard let section = manifest["seedScenarios"] as? [String: Any],
@@ -123,7 +126,7 @@ enum DbManifestLoader {
             case .malformedMetadata(let reason):
                 return "Seed scenario metadata is malformed: \(reason)"
             case .unsupportedVersion(let version):
-                return "Seed scenario folders require manifest version 3, but found version \(version)."
+                return "Seed scenario folders require manifest version 3 or 4, but found version \(version)."
             case .invalidDirectory(let path, let reason):
                 return "Seed scenario directory ‘\(path)’ is invalid: \(reason)."
             case .invalidDescriptor(let scenario, let reason):

@@ -93,6 +93,7 @@ final class DbSetupPipeline {
         return (completedAt ?? .now).timeIntervalSince(start)
     }
 
+    /// Fallback when the monorepo has no scripts/db/manifest.json: the manifest v4 steps.
     static func buildDefault() -> [DbSetupStep] {
         [
             DbSetupStep(id: "check-prerequisites", name: "Prerequisites",
@@ -103,26 +104,22 @@ final class DbSetupPipeline {
                         command: "node scripts/db/start-supabase.mjs",
                         healthCheckCommand: "node scripts/db/start-supabase.mjs --verify",
                         timeoutSeconds: 300, isOptional: false, stepNumber: 2),
-            DbSetupStep(id: "sync-migrations", name: "Sync Migrations",
-                        command: "node scripts/db/sync-migrations.mjs",
-                        healthCheckCommand: "node scripts/db/sync-migrations.mjs --verify",
-                        timeoutSeconds: 15, isOptional: false, stepNumber: 3),
             DbSetupStep(id: "reset-database", name: "Reset & Seed Data",
                         command: "node scripts/db/reset-database.mjs",
                         healthCheckCommand: "node scripts/db/reset-database.mjs --verify",
-                        timeoutSeconds: 180, isOptional: false, stepNumber: 4),
+                        timeoutSeconds: 180, isOptional: false, stepNumber: 3),
             DbSetupStep(id: "load-hotels", name: "Load Hotels",
                         command: "node scripts/db/load-hotels.mjs",
                         healthCheckCommand: "node scripts/db/load-hotels.mjs --verify",
-                        timeoutSeconds: 600, isOptional: false, stepNumber: 5),
+                        timeoutSeconds: 600, isOptional: false, stepNumber: 4),
             DbSetupStep(id: "copy-event-data", name: "Event Contracts",
                         command: "node scripts/db/copy-event-data.mjs",
                         healthCheckCommand: "node scripts/db/copy-event-data.mjs --verify",
-                        timeoutSeconds: 90, isOptional: true, stepNumber: 6),
+                        timeoutSeconds: 90, isOptional: true, stepNumber: 5),
             DbSetupStep(id: "verify-data", name: "Verify Data",
                         command: "node scripts/db/verify-data.mjs",
                         healthCheckCommand: nil,
-                        timeoutSeconds: 30, isOptional: false, stepNumber: 7),
+                        timeoutSeconds: 30, isOptional: false, stepNumber: 6),
         ]
     }
 }

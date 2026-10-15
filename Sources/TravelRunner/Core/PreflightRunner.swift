@@ -38,14 +38,14 @@ struct PreflightRunner: Sendable {
             PreflightCheck(id: "docker", name: ContainerRuntime.detect().displayName),
             PreflightCheck(id: "node-version", name: "Node.js \u{2265} 22"),
             PreflightCheck(id: "stripe-auth", name: "Stripe CLI Auth"),
-            PreflightCheck(id: "yalc", name: "yalc CLI"),
         ]
 
-        if let portalCwd = services.first(where: { $0.id == "travel-portal" })?.resolvedCwd {
+        for (serviceID, label) in [("travel-portal", "Booking"), ("partner-portal", "Partner")] {
+            guard let cwd = services.first(where: { $0.id == serviceID })?.resolvedCwd else { continue }
             checks.append(PreflightCheck(
-                id: "env-diff",
-                name: "Env variables",
-                metadata: ["cwd": portalCwd]
+                id: "env-diff-\(serviceID)",
+                name: "\(label) env variables",
+                metadata: ["cwd": cwd]
             ))
         }
 
@@ -107,34 +107,18 @@ struct PreflightRunner: Sendable {
                 ? .passed(detail: "Authenticated")
                 : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
 
-        case "yalc":
-            let ok = await shellExitCode("which yalc") == 0
-            return ok
-                ? .passed(detail: "Found")
-                : .failed(message: "Not installed", fix: "Run: npm i -g yalc")
-
-        case "env-diff":
+        case let id where id.hasPrefix("env-diff"):
+            // The monolith's scripts/env-check.mjs checks the app's shared .env (a teammate's
+            // copy or pnpm env:pull) and the blank .env.local keys that would hide it. A missing
+            // or stale file warns: local mode still runs, and remote mode refuses to switch.
             let cwd = check.metadata["cwd"] ?? ""
-            let examplePath = (cwd as NSString).appendingPathComponent(".env.example")
-            let localPath = (cwd as NSString).appendingPathComponent(".env.local")
-
-            guard FileManager.default.fileExists(atPath: examplePath) else {
-                return .passed(detail: "No .env.example")
-            }
-            guard FileManager.default.fileExists(atPath: localPath) else {
-                return .warning(message: "No .env.local — copy from .env.example")
-            }
-
-            let requiredKeys = extractRequiredEnvKeys(from: examplePath)
-            let localKeys = extractEnvKeys(from: localPath)
-            let missing = requiredKeys.subtracting(localKeys)
-
-            if missing.isEmpty {
-                return .passed(detail: "\(localKeys.count) keys configured")
-            } else {
-                let sorted = missing.sorted().prefix(5).joined(separator: ", ")
-                let suffix = missing.count > 5 ? " (+\(missing.count - 5) more)" : ""
-                return .warning(message: "Missing: \(sorted)\(suffix)")
+            let app: SharedEnvFiles.App = id == "env-diff-partner-portal" ? .partner : .booking
+            let monorepo = ((cwd as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+            let output = await shellOutput(SharedEnvFiles.command(monorepo: monorepo, app: app))
+            switch SharedEnvFiles.status(SharedEnvFiles.decode(output, app: app)) {
+            case .passing(let detail): return .passed(detail: detail)
+            case .warning(let message), .failing(let message): return .warning(message: message)
+            case .pending, .fixing: return .warning(message: "Not checked")
             }
 
         default:
@@ -185,37 +169,6 @@ struct PreflightRunner: Sendable {
                 continuation.resume(returning: -1)
             }
         }
-    }
-
-    private func extractRequiredEnvKeys(from path: String) -> Set<String> {
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
-        var keys = Set<String>()
-        for line in content.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
-            if let eqIndex = trimmed.firstIndex(of: "=") {
-                let key = String(trimmed[trimmed.startIndex..<eqIndex]).trimmingCharacters(in: .whitespaces)
-                let value = String(trimmed[trimmed.index(after: eqIndex)...]).trimmingCharacters(in: .whitespaces)
-                if !key.isEmpty && value.isEmpty {
-                    keys.insert(key)
-                }
-            }
-        }
-        return keys
-    }
-
-    private func extractEnvKeys(from path: String) -> Set<String> {
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
-        var keys = Set<String>()
-        for line in content.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
-            if let eqIndex = trimmed.firstIndex(of: "=") {
-                let key = String(trimmed[trimmed.startIndex..<eqIndex]).trimmingCharacters(in: .whitespaces)
-                if !key.isEmpty { keys.insert(key) }
-            }
-        }
-        return keys
     }
 
     private func shellOutput(_ command: String) async -> String {

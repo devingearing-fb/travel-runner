@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 enum CheckSection: String, Sendable, CaseIterable {
@@ -48,17 +49,18 @@ final class HealthCheck: Identifiable {
 @Observable
 @MainActor
 final class EnvironmentChecker {
-    let portalPath: String
+    let monorepoPath: String
     let loginPath: String
-    let travelDataPath: String
     let streamServicesPath: String
+
+    private var bookingPath: String { (monorepoPath as NSString).appendingPathComponent("apps/booking-portal") }
+    private var partnerPath: String { (monorepoPath as NSString).appendingPathComponent("apps/partner-portal") }
 
     private(set) var checks: [HealthCheck] = []
 
-    init(portalPath: String, loginPath: String, travelDataPath: String, streamServicesPath: String) {
-        self.portalPath = NSString(string: portalPath).expandingTildeInPath
+    init(monorepoPath: String, loginPath: String, streamServicesPath: String) {
+        self.monorepoPath = NSString(string: monorepoPath).expandingTildeInPath
         self.loginPath = NSString(string: loginPath).expandingTildeInPath
-        self.travelDataPath = NSString(string: travelDataPath).expandingTildeInPath
         self.streamServicesPath = NSString(string: streamServicesPath).expandingTildeInPath
     }
 
@@ -80,14 +82,17 @@ final class EnvironmentChecker {
             HealthCheck(id: "node", name: "Node.js 22+", section: .prerequisites,
                         checkCommand: "node --version",
                         checkDescription: "Next.js 16 requires Node.js 22 or higher"),
+            HealthCheck(id: "pnpm", name: "pnpm 10", section: .prerequisites,
+                        fixLabel: "brew install pnpm",
+                        checkCommand: "pnpm --version",
+                        checkDescription: "The monorepo pins pnpm 10 (packageManager in package.json)"),
             HealthCheck(id: "python-jwt", name: "Python 3 + PyJWT", section: .prerequisites,
                         fixLabel: "pip3 install pyjwt",
                         checkCommand: "python3 -c 'import jwt'",
                         checkDescription: "Required by the contract data copy script (copy-remote-data.py)"),
-            HealthCheck(id: "yalc", name: "yalc CLI", section: .prerequisites,
-                        fixLabel: "npm i -g yalc",
-                        checkCommand: "which yalc",
-                        checkDescription: "Local package linking (replaces npm link which breaks Turbopack)"),
+            HealthCheck(id: "registry-auth", name: "GitHub Packages auth", section: .prerequisites,
+                        checkCommand: "grep //npm.pkg.github.com/:_authToken ~/.npmrc",
+                        checkDescription: "User-level token for @fastbreak-amateur packages. Set it once with: pnpm config set --location=user \"//npm.pkg.github.com/:_authToken\" <token>"),
             HealthCheck(id: "stripe-cli", name: "Stripe CLI", section: .prerequisites,
                         isRequired: false,
                         checkCommand: "which stripe",
@@ -96,44 +101,39 @@ final class EnvironmentChecker {
                         isRequired: false, fixLabel: "stripe login",
                         checkCommand: "stripe config --list",
                         checkDescription: "Optional — Stripe CLI must be authenticated to forward webhook events"),
-            HealthCheck(id: "npmrc", name: ".npmrc (GitHub Packages)", section: .prerequisites,
-                        checkCommand: "cat .npmrc",
-                        checkDescription: "Auth token for @fastbreak-amateur scoped packages on GitHub Packages",
-                        checkPath: (portalPath as NSString).appendingPathComponent(".npmrc")),
 
             // Dependencies
-            HealthCheck(id: "portal-modules", name: "Portal node_modules", section: .dependencies,
-                        fixLabel: "npm install",
-                        checkCommand: "ls node_modules/",
-                        checkDescription: "npm dependencies for travel-booking-portal",
-                        checkPath: (portalPath as NSString).appendingPathComponent("node_modules")),
+            HealthCheck(id: "workspace-modules", name: "Monorepo dependencies", section: .dependencies,
+                        fixLabel: "pnpm install",
+                        checkCommand: "ls node_modules/.modules.yaml",
+                        checkDescription: "One pnpm install at the monorepo root covers both apps and travel-data",
+                        checkPath: (monorepoPath as NSString).appendingPathComponent("node_modules/.modules.yaml")),
             HealthCheck(id: "login-modules", name: "Login node_modules", section: .dependencies,
                         fixLabel: "npm install",
                         checkCommand: "ls node_modules/",
                         checkDescription: "npm dependencies for universal-login",
                         checkPath: (loginPath as NSString).appendingPathComponent("node_modules")),
             HealthCheck(id: "stream-modules", name: "Stream Services node_modules", section: .dependencies,
-                        fixLabel: "npm install",
+                        isRequired: false, fixLabel: "npm install",
                         checkCommand: "ls node_modules/",
-                        checkDescription: "Pinned QStash CLI and stream-services dependencies",
+                        checkDescription: "Only for the full profile — pinned QStash CLI and stream-services dependencies",
                         checkPath: (streamServicesPath as NSString).appendingPathComponent("node_modules")),
-            HealthCheck(id: "td-built", name: "fb-travel-data built", section: .dependencies,
-                        fixLabel: "npm run build",
-                        checkCommand: "ls dist/",
-                        checkDescription: "fb-travel-data must be built (tsup → dist/) before yalc publish",
-                        checkPath: (travelDataPath as NSString).appendingPathComponent("dist")),
 
             // Supabase & Database
-            HealthCheck(id: "migration-link", name: "Migration symlink", section: .supabase,
-                        fixLabel: "Create Symlink",
-                        checkCommand: "readlink supabase/migrations",
-                        checkDescription: "Portal's supabase/migrations/ must symlink to fb-travel-data/supabase/migrations/",
-                        checkPath: (portalPath as NSString).appendingPathComponent("supabase/migrations")),
-            HealthCheck(id: "portal-env", name: "Portal .env.local", section: .supabase,
-                        fixLabel: "Run db:setup",
-                        checkCommand: "grep LOCAL_SUPABASE_ANON_KEY .env.local",
-                        checkDescription: "Must contain Supabase anon key, service role key, JWT secret, and login URL. Created by npm run db:setup.",
-                        checkPath: (portalPath as NSString).appendingPathComponent(".env.local")),
+            HealthCheck(id: "booking-env", name: "Booking .env (shared values)", section: .supabase,
+                        isRequired: false, fixLabel: "Import…",
+                        checkCommand: "pnpm env:check",
+                        checkDescription: "apps/booking-portal/.env holds the shared dev values (Stripe, HotelPlanner, hosted Supabase…). Get it from a teammate and import it, or run pnpm env:pull with Doppler access. The runner writes local overrides into .env.local on top of it.",
+                        checkPath: (bookingPath as NSString).appendingPathComponent(".env")),
+            HealthCheck(id: "partner-env", name: "Partner .env (shared values)", section: .supabase,
+                        isRequired: false, fixLabel: "Import…",
+                        checkCommand: "pnpm env:check",
+                        checkDescription: "apps/partner-portal/.env holds the shared dev values. Get it from a teammate and import it, or run pnpm env:pull with Doppler access.",
+                        checkPath: (partnerPath as NSString).appendingPathComponent(".env")),
+            HealthCheck(id: "backend-baseline", name: "Backend migration baseline", section: .supabase,
+                        isRequired: false,
+                        checkCommand: "ls ../fb-amateur-backend .backend-baseline",
+                        checkDescription: "scripts/local-db.sh replays fb-amateur-backend's migrations. It uses a checkout beside the monorepo, or clones one into .backend-baseline/ on the first reset."),
             HealthCheck(id: "login-env", name: "Login .env.local", section: .supabase,
                         fixLabel: "Create from template",
                         checkCommand: "grep ALLOW_LOCALHOST_REDIRECTS .env.local",
@@ -143,14 +143,14 @@ final class EnvironmentChecker {
                         isRequired: false, fixLabel: "Run db:setup",
                         checkCommand: "ls data/travel_organizations.sql",
                         checkDescription: "~200K hotel records cached locally. First db:setup pulls from remote (~3-5 min). Reused on subsequent runs.",
-                        checkPath: (portalPath as NSString).appendingPathComponent("data/travel_organizations.sql")),
+                        checkPath: (monorepoPath as NSString).appendingPathComponent("data/travel_organizations.sql")),
 
             // Optional
             HealthCheck(id: "sb-linked", name: "Supabase project linked", section: .optional,
                         isRequired: false, fixLabel: "Link Project",
                         checkCommand: "cat supabase/.temp/project-ref",
-                        checkDescription: "Links to remote Supabase project (ulpkcpnqrqgepwytyodd). Only needed for db:sync, drift detection, and pulling remote schema changes.",
-                        checkPath: (portalPath as NSString).appendingPathComponent("supabase/.temp/project-ref")),
+                        checkDescription: "Links to the remote Supabase project. Only needed for drift detection and pulling remote schema changes.",
+                        checkPath: (monorepoPath as NSString).appendingPathComponent("supabase/.temp/project-ref")),
         ]
     }
 
@@ -172,7 +172,11 @@ final class EnvironmentChecker {
         guard let check = checks.first(where: { $0.id == checkID }) else { return }
         check.status = .fixing
 
-        let success = await runFix(checkID)
+        guard let success = await runFix(checkID) else {
+            // Cancelled: nothing changed.
+            check.status = await runCheck(checkID)
+            return
+        }
         if success {
             let newStatus = await runCheck(checkID)
             check.status = newStatus
@@ -182,6 +186,10 @@ final class EnvironmentChecker {
     }
 
     // MARK: - Check implementations
+
+    private func exists(_ path: String) -> Bool {
+        FileManager.default.fileExists(atPath: path)
+    }
 
     private func runCheck(_ id: String) async -> CheckStatus {
         switch id {
@@ -199,13 +207,19 @@ final class EnvironmentChecker {
             }
             return .failing("v\(version) — need 22+")
 
+        case "pnpm":
+            let (output, ok) = await shellOutput("pnpm --version")
+            if !ok { return .failing("Not installed") }
+            let version = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return version.hasPrefix("10.") ? .passing("v\(version)") : .failing("v\(version) — need 10.x")
+
         case "python-jwt":
             let ok = await shell("python3 -c 'import jwt' 2>/dev/null")
             return ok ? .passing("Installed") : .failing("Run: pip3 install pyjwt")
 
-        case "yalc":
-            let ok = await shell("which yalc >/dev/null 2>&1")
-            return ok ? .passing("Found") : .failing("Not installed")
+        case "registry-auth":
+            let ok = await shell("grep -q '^//npm.pkg.github.com/:_authToken=.' ~/.npmrc 2>/dev/null")
+            return ok ? .passing("Configured") : .failing("No token in ~/.npmrc — see the description")
 
         case "stripe-cli":
             let ok = await shell("which stripe >/dev/null 2>&1")
@@ -215,67 +229,33 @@ final class EnvironmentChecker {
             let ok = await shell("stripe balance retrieve >/dev/null 2>&1")
             return ok ? .passing("Authenticated") : .warning("Session invalid or expired — run: stripe login")
 
-        case "npmrc":
-            let path = (portalPath as NSString).appendingPathComponent(".npmrc")
-            let exists = FileManager.default.fileExists(atPath: path)
-            return exists ? .passing("Found") : .failing("Missing — copy from partner-portal")
-
-        case "portal-modules":
-            let path = (portalPath as NSString).appendingPathComponent("node_modules")
-            let exists = FileManager.default.fileExists(atPath: path)
-            return exists ? .passing("Installed") : .failing("Run npm install")
+        case "workspace-modules":
+            let path = (monorepoPath as NSString).appendingPathComponent("node_modules/.modules.yaml")
+            return exists(path) ? .passing("Installed") : .failing("Run pnpm install at the monorepo root")
 
         case "login-modules":
             let path = (loginPath as NSString).appendingPathComponent("node_modules")
-            let exists = FileManager.default.fileExists(atPath: path)
-            return exists ? .passing("Installed") : .failing("Run npm install")
+            return exists(path) ? .passing("Installed") : .failing("Run npm install")
 
         case "stream-modules":
             let path = (streamServicesPath as NSString).appendingPathComponent("node_modules")
-            let exists = FileManager.default.fileExists(atPath: path)
-            return exists ? .passing("Installed") : .failing("Run npm install")
+            return exists(path) ? .passing("Installed") : .warning("Run npm install (full profile only)")
 
-        case "td-built":
-            let path = (travelDataPath as NSString).appendingPathComponent("dist")
-            let exists = FileManager.default.fileExists(atPath: path)
-            return exists ? .passing("Built") : .failing("Run npm run build")
+        case "booking-env", "partner-env":
+            let app: SharedEnvFiles.App = id == "booking-env" ? .booking : .partner
+            let (output, _) = await shellOutput(SharedEnvFiles.command(monorepo: monorepoPath, app: app))
+            return SharedEnvFiles.status(SharedEnvFiles.decode(output, app: app))
 
-        case "migration-link":
-            let linkPath = (portalPath as NSString).appendingPathComponent("supabase/migrations")
-            let fm = FileManager.default
-            // Use attributesOfItem (lstat) which does NOT follow symlinks
-            guard let attrs = try? fm.attributesOfItem(atPath: linkPath) else {
-                return .failing("Missing — supabase/migrations/ does not exist")
-            }
-            let fileType = attrs[.type] as? FileAttributeType
-            if fileType == .typeSymbolicLink {
-                if let dest = try? fm.destinationOfSymbolicLink(atPath: linkPath) {
-                    if dest.contains("fb-travel-data") {
-                        return .passing("Symlink → fb-travel-data")
-                    }
-                    return .warning("Symlink exists but points to: \(dest)")
-                }
-                return .passing("Symlink exists")
-            }
-            if fileType == .typeDirectory {
-                return .warning("Real directory (not a symlink) — changes won't sync from fb-travel-data")
-            }
-            return .failing("Missing")
-
-        case "portal-env":
-            let path = (portalPath as NSString).appendingPathComponent(".env.local")
-            guard FileManager.default.fileExists(atPath: path) else {
-                return .failing("Missing")
-            }
-            if let content = try? String(contentsOfFile: path, encoding: .utf8),
-               content.contains("LOCAL_SUPABASE_ANON_KEY=ey") {
-                return .passing("Configured")
-            }
-            return .warning("Exists but missing Supabase keys")
+        case "backend-baseline":
+            let sibling = ((monorepoPath as NSString).deletingLastPathComponent as NSString)
+                .appendingPathComponent("fb-amateur-backend")
+            if exists(sibling) { return .passing("Sibling checkout") }
+            let clone = (monorepoPath as NSString).appendingPathComponent(".backend-baseline")
+            return exists(clone) ? .passing(".backend-baseline/") : .warning("Cloned on the first DB reset")
 
         case "login-env":
             let path = (loginPath as NSString).appendingPathComponent(".env.local")
-            guard FileManager.default.fileExists(atPath: path) else {
+            guard exists(path) else {
                 return .failing("Missing")
             }
             if let content = try? String(contentsOfFile: path, encoding: .utf8),
@@ -285,14 +265,12 @@ final class EnvironmentChecker {
             return .warning("Exists but may be incomplete")
 
         case "hotel-data":
-            let path = (portalPath as NSString).appendingPathComponent("data/travel_organizations.sql")
-            let exists = FileManager.default.fileExists(atPath: path)
-            return exists ? .passing("Cached") : .warning("Not cached — will be slow on first db:setup")
+            let path = (monorepoPath as NSString).appendingPathComponent("data/travel_organizations.sql")
+            return exists(path) ? .passing("Cached") : .warning("Not cached — will be slow on first db:setup")
 
         case "sb-linked":
-            let path = (portalPath as NSString).appendingPathComponent("supabase/.temp/project-ref")
-            let exists = FileManager.default.fileExists(atPath: path)
-            return exists ? .passing("Linked") : .warning("Not linked — needed for remote sync only")
+            let path = (monorepoPath as NSString).appendingPathComponent("supabase/.temp/project-ref")
+            return exists(path) ? .passing("Linked") : .warning("Not linked — needed for remote sync only")
 
         default:
             return .passing("OK")
@@ -301,7 +279,8 @@ final class EnvironmentChecker {
 
     // MARK: - Fix implementations
 
-    private func runFix(_ id: String) async -> Bool {
+    /// nil when the developer cancelled and nothing changed.
+    private func runFix(_ id: String) async -> Bool? {
         switch id {
         case "docker":
             let runtime = ContainerRuntime.detect()
@@ -312,19 +291,19 @@ final class EnvironmentChecker {
             }
             return false
 
+        case "pnpm":
+            return await shell("brew install pnpm")
+
         case "python-jwt":
             return await shell("pip3 install pyjwt")
-
-        case "yalc":
-            return await shell("npm i -g yalc")
 
         case "stripe-auth":
             // Can't run interactive login from here — open terminal
             _ = await shell("open -a Terminal")
             return false
 
-        case "portal-modules":
-            return await shellInDir(portalPath, "npm install")
+        case "workspace-modules":
+            return await shellInDir(monorepoPath, "pnpm install")
 
         case "login-modules":
             return await shellInDir(loginPath, "npm install")
@@ -332,27 +311,21 @@ final class EnvironmentChecker {
         case "stream-modules":
             return await shellInDir(streamServicesPath, "npm install")
 
-        case "td-built":
-            return await shellInDir(travelDataPath, "npm run build")
+        case "booking-env":
+            return await importSharedEnv(.booking)
 
-        case "migration-link":
-            let target = (travelDataPath as NSString).appendingPathComponent("supabase/migrations")
-            let link = (portalPath as NSString).appendingPathComponent("supabase/migrations")
-            _ = await shell("rm -rf '\(link)'")
-            return await shell("ln -s '\(target)' '\(link)'")
-
-        case "portal-env":
-            return await shellInDir(portalPath, "npm run db:setup -- --skip-hotels")
+        case "partner-env":
+            return await importSharedEnv(.partner)
 
         case "login-env":
             return createLoginEnvLocal()
 
         case "hotel-data":
-            return await shellInDir(portalPath, "npm run db:setup -- --reset-only")
+            return await shellInDir(monorepoPath, "pnpm db:setup:reset")
 
         case "sb-linked":
-            let script = (portalPath as NSString).appendingPathComponent("scripts/setup/link-project.sh")
-            return await shell("bash '\(script)'")
+            let script = (monorepoPath as NSString).appendingPathComponent("scripts/setup/link-project.sh")
+            return await shellInDir(monorepoPath, "bash \(ShellQuote.quote(script))")
 
         default:
             return false
@@ -361,20 +334,58 @@ final class EnvironmentChecker {
 
     // MARK: - Helpers
 
-    private func createLoginEnvLocal() -> Bool {
-        let anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0"
-        let jwtSecret = "super-secret-jwt-token-with-at-least-32-characters-long"
+    /// Copies a shared `.env` the developer picks into the monolith, after the monolith's
+    /// env-check confirms it is this app's file. The runner keeps no copy.
+    private func importSharedEnv(_ app: SharedEnvFiles.App) async -> Bool? {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.message = "Choose the \(app.label.lowercased()) portal .env a teammate sent you (their \(app.directory)/.env)"
+        panel.level = .floating
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let source = panel.url else { return nil }
 
+        let (output, _) = await shellOutput(SharedEnvFiles.command(monorepo: monorepoPath, app: app, file: source.path))
+        let alert = NSAlert()
+        alert.window.level = .floating
+        guard let report = SharedEnvFiles.decode(output, app: app) else {
+            alert.messageText = "Could not check the file"
+            alert.informativeText = "\(SharedEnvFiles.script) did not run. Pull the latest monorepo dev and try again."
+            alert.runModal()
+            return false
+        }
+        let target = ((monorepoPath as NSString).appendingPathComponent(app.directory) as NSString).appendingPathComponent(".env")
+        let prompt = SharedEnvFiles.importPrompt(report, app: app, replacing: exists(target))
+        alert.messageText = prompt.title
+        alert.informativeText = prompt.message
+        guard prompt.acceptable else {
+            alert.runModal()
+            return nil
+        }
+        alert.addButton(withTitle: "Import")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        do {
+            let data = try Data(contentsOf: source)
+            try data.write(to: URL(fileURLWithPath: target), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// The login's non-Supabase local values. The runner adds the local stack's Supabase keys
+    /// (from scripts/local-db.sh status) when it starts the login, so none are written here.
+    private func createLoginEnvLocal() -> Bool {
         let content = """
-        NEXT_PUBLIC_SUPABASE_URL=http://localhost:54321
-        NEXT_PUBLIC_SUPABASE_ANON_KEY=\(anonKey)
         NEXT_PUBLIC_SITE_URL=http://localhost:3000
         NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL=http://localhost:3000
-        AMATEUR_SUPABASE_URL=http://localhost:54321
-        AMATEUR_SUPABASE_ANON_KEY=\(anonKey)
-        AMATEUR_SUPABASE_SIGNING_KEY=\(jwtSecret)
         ALLOW_LOCALHOST_REDIRECTS=true
         EMAIL_CONFIRMATION_REQUIRED=false
+
         """
 
         let path = (loginPath as NSString).appendingPathComponent(".env.local")
@@ -416,6 +427,6 @@ final class EnvironmentChecker {
     }
 
     private func shellInDir(_ dir: String, _ command: String) async -> Bool {
-        await shell("cd '\(dir)' && \(command)")
+        await shell("cd \(ShellQuote.quote(dir)) && \(command)")
     }
 }

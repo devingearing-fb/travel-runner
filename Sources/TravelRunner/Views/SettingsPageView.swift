@@ -145,77 +145,23 @@ struct SettingsPageView: View {
                 Divider().padding(.leading, 32)
 
                 settingsRow {
-                    Toggle(isOn: Binding(
-                        get: { supervisor.partnerPortalEnabled },
-                        set: { supervisor.setPartnerPortalEnabled($0) }
-                    )) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Label("Partner Portal", systemImage: "building.2")
-                                .font(.system(.caption, design: .monospaced))
-                            Text("Run partner portal on port 3001 sharing the same database")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Label("Profile", systemImage: "square.stack.3d.up")
+                            .font(.system(.caption, design: .monospaced))
+                        Picker("Profile", selection: Binding(
+                            get: { supervisor.profile },
+                            set: { supervisor.setProfile($0) }
+                        )) {
+                            ForEach(RunProfile.allCases, id: \.self) { profile in
+                                Text(profile.displayName).tag(profile)
+                            }
                         }
+                        .labelsHidden()
+                        .controlSize(.small)
+                        Text("Services Start All brings up. Booking + Partner runs both portals (3002, 3006). Full adds the CDC stack and cache verification.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                }
-
-                Divider().padding(.leading, 32)
-
-                settingsRow {
-                    Toggle(isOn: Binding(
-                        get: { supervisor.autoRelinkYalc },
-                        set: { supervisor.setAutoRelinkYalc($0) }
-                    )) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Label("Auto-relink fb-travel-data", systemImage: "arrow.triangle.2.circlepath")
-                                .font(.system(.caption, design: .monospaced))
-                            Text("Rebuilds and relinks when source changes are detected")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                }
-
-                Divider().padding(.leading, 32)
-
-                settingsRow {
-                    Toggle(isOn: Binding(
-                        get: { supervisor.cacheVerificationEnabled },
-                        set: { supervisor.setCacheVerificationEnabled($0) }
-                    )) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Label("Cache verification on start", systemImage: "checkmark.shield")
-                                .font(.system(.caption, design: .monospaced))
-                            Text("Runs the transport, contention, and cache audit checks once the environment is up")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                }
-
-                if supervisor.yalcStale {
-                    HStack(spacing: 4) {
-                        Spacer()
-                        Text("stale")
-                            .font(.system(size: 9, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(Color.orange, in: Capsule())
-                        Button("Relink Now") {
-                            supervisor.publishAndRetryYalc()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.mini)
-                        .padding(.trailing, 8)
-                    }
-                    .padding(.bottom, 4)
                 }
             }
             .background(Color.secondary.opacity(0.06))

@@ -14,11 +14,10 @@ struct SetupView: View {
     @State private var currentStep: SetupStep = .paths
     @State private var checker: EnvironmentChecker?
 
-    @State private var bookingPortalPath: String = ""
+    @State private var monorepoPath: String = ""
     @State private var universalLoginPath: String = ""
-    @State private var travelDataPath: String = ""
-    @State private var partnerPortalPath: String = ""
     @State private var streamServicesPath: String = ""
+    @State private var loadTestPath: String = ""
     @State private var dropTargetHighlighted = false
     @State private var statusMessage: String? = nil
 
@@ -70,11 +69,10 @@ struct SetupView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     dropZone
 
-                    repoRow(role: .bookingPortal, path: $bookingPortalPath)
+                    repoRow(role: .monorepo, path: $monorepoPath)
                     repoRow(role: .universalLogin, path: $universalLoginPath)
-                    repoRow(role: .travelData, path: $travelDataPath)
-                    repoRow(role: .partnerPortal, path: $partnerPortalPath)
                     repoRow(role: .streamServices, path: $streamServicesPath)
+                    repoRow(role: .loadTest, path: $loadTestPath)
 
                     if let msg = statusMessage {
                         HStack {
@@ -123,7 +121,7 @@ struct SetupView: View {
             Image(systemName: "folder.badge.plus")
                 .font(.system(size: 28))
                 .foregroundStyle(dropTargetHighlighted ? .blue : .secondary)
-            Text("Drop your Codebases folder here")
+            Text("Drop your Codebases folder (or the monorepo) here")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Text("Auto-detects repos inside the folder")
@@ -162,9 +160,16 @@ struct SetupView: View {
                     .foregroundStyle(.blue)
                     .frame(width: 20)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(role.rawValue)
-                        .font(.system(.callout, design: .monospaced))
-                        .fontWeight(.medium)
+                    HStack(spacing: 4) {
+                        Text(role.rawValue)
+                            .font(.system(.callout, design: .monospaced))
+                            .fontWeight(.medium)
+                        if !role.isRequired {
+                            Text("optional")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
                     Text(role.description)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -197,94 +202,71 @@ struct SetupView: View {
     // MARK: - Actions
 
     private var canProceed: Bool {
-        !bookingPortalPath.isEmpty && !universalLoginPath.isEmpty && !streamServicesPath.isEmpty
+        RepoDetector.validate(path: monorepoPath, role: .monorepo) && !universalLoginPath.isEmpty
     }
 
     private func goToStep2() {
         savePaths()
         checker = EnvironmentChecker(
-            portalPath: bookingPortalPath,
+            monorepoPath: monorepoPath,
             loginPath: universalLoginPath,
-            travelDataPath: travelDataPath,
             streamServicesPath: streamServicesPath
         )
         currentStep = .environment
     }
 
     private func savePaths() {
-        let repos = DetectedRepos(
-            bookingPortal: bookingPortalPath,
+        let paths = RepoPaths(
+            monorepo: monorepoPath,
             universalLogin: universalLoginPath,
-            travelData: travelDataPath.isEmpty ? nil : travelDataPath,
-            partnerPortal: partnerPortalPath.isEmpty ? nil : partnerPortalPath,
-            streamServices: streamServicesPath.isEmpty ? nil : streamServicesPath
+            streamServices: streamServicesPath.isEmpty ? nil : streamServicesPath,
+            loadTest: loadTestPath.isEmpty ? nil : loadTestPath
         )
         do {
-            try ConfigLoader.generate(from: repos)
+            try ConfigLoader.generate(paths: paths)
             statusMessage = "Saved"
         } catch {
-            statusMessage = "Error: \(error.localizedDescription)"
+            statusMessage = "Error: \(error)"
         }
     }
 
     private func loadExistingPaths() {
-        guard !ConfigLoader.isFirstRun, let config = try? ConfigLoader.load() else { return }
-        if let paths = config.paths {
-            if let p = paths.bookingPortal, !p.isEmpty { bookingPortalPath = p }
-            if let p = paths.universalLogin, !p.isEmpty { universalLoginPath = p }
-            if let p = paths.travelData, !p.isEmpty { travelDataPath = p }
-            if let p = paths.partnerPortal, !p.isEmpty { partnerPortalPath = p }
-            if let p = paths.streamServices, !p.isEmpty { streamServicesPath = p }
-        }
-        if bookingPortalPath.isEmpty || universalLoginPath.isEmpty || streamServicesPath.isEmpty {
-            for service in config.services {
-                switch service.id {
-                case "supabase", "travel-portal":
-                    if let cwd = service.cwd, bookingPortalPath.isEmpty { bookingPortalPath = cwd }
-                case "universal-login":
-                    if let cwd = service.cwd, universalLoginPath.isEmpty { universalLoginPath = cwd }
-                case "stream-services":
-                    if let cwd = service.cwd, streamServicesPath.isEmpty { streamServicesPath = cwd }
-                default: break
-                }
-            }
-        }
+        guard !ConfigLoader.isFirstRun else { return }
+        let paths = ConfigLoader.existingPaths()
+        if let p = paths.monorepo, !p.isEmpty { monorepoPath = p }
+        if let p = paths.universalLogin, !p.isEmpty { universalLoginPath = p }
+        if let p = paths.streamServices, !p.isEmpty { streamServicesPath = p }
+        if let p = paths.loadTest, !p.isEmpty { loadTestPath = p }
     }
 
     private func applyDetected(_ detected: DetectedRepos) {
         var filled: [String] = []
 
-        if let p = detected.bookingPortal, bookingPortalPath.isEmpty {
-            bookingPortalPath = p
-            filled.append("Booking Portal")
+        if let p = detected.monorepo, monorepoPath.isEmpty || !RepoDetector.validate(path: monorepoPath, role: .monorepo) {
+            monorepoPath = p
+            filled.append("Monorepo")
         }
         if let p = detected.universalLogin, universalLoginPath.isEmpty {
             universalLoginPath = p
             filled.append("Universal Login")
         }
-        if let p = detected.travelData, travelDataPath.isEmpty {
-            travelDataPath = p
-            filled.append("fb-travel-data")
-        }
-        if let p = detected.partnerPortal, partnerPortalPath.isEmpty {
-            partnerPortalPath = p
-            filled.append("Partner Portal")
-        }
         if let p = detected.streamServices, streamServicesPath.isEmpty {
             streamServicesPath = p
             filled.append("Stream Services")
         }
+        if let p = detected.loadTest, loadTestPath.isEmpty {
+            loadTestPath = p
+            filled.append("Travel Load Test")
+        }
 
         var missing: [String] = []
-        if bookingPortalPath.isEmpty { missing.append("Booking Portal") }
+        if monorepoPath.isEmpty { missing.append("Monorepo") }
         if universalLoginPath.isEmpty { missing.append("Universal Login") }
-        if travelDataPath.isEmpty { missing.append("fb-travel-data") }
-        if streamServicesPath.isEmpty { missing.append("Stream Services") }
 
         if filled.isEmpty {
             statusMessage = "No new repos detected in this folder"
         } else if missing.isEmpty {
-            statusMessage = "All repos configured"
+            statusMessage = "Found \(filled.joined(separator: ", "))"
         } else {
             statusMessage = "Found \(filled.joined(separator: ", ")) — still need \(missing.joined(separator: ", "))"
         }

@@ -38,15 +38,13 @@ final class EnvironmentSupervisor {
     var gitBranches: [String: String] = [:]
     var gitBehindCounts: [String: Int] = [:]
     var behindBannerDismissed = false
-    var yalcStale = false
     var npmStaleServices: Set<String> = []
-    var autoRelinkYalc = UserDefaults.standard.bool(forKey: "autoRelinkYalc")
     var dbMode: DatabaseMode = .local
-    var partnerPortalEnabled = UserDefaults.standard.bool(forKey: "partnerPortalEnabled")
-    // Default ON: the P5 evidence chain keeps its current behavior unless the
-    // user opts out in Settings (the oneshots drive browsers and mutate the
-    // seed fixture, which is disruptive during everyday development).
-    var cacheVerificationEnabled = UserDefaults.standard.object(forKey: "cacheVerificationEnabled") as? Bool ?? true
+    /// Which part of the graph start-all brings up (stored in services.json).
+    var profile: RunProfile = .both
+    private(set) var profileMembers: Set<String> = []
+
+    func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
     enum DatabaseMode: String, Sendable { case local, remote }
 
@@ -54,9 +52,8 @@ final class EnvironmentSupervisor {
         var seen = Set<String>()
         var total = 0
         for (sid, count) in gitBehindCounts where count > 0 {
-            let path = config?.services.first(where: { $0.id == sid })?.resolvedCwd
-                ?? (sid == "fb-travel-data" ? config?.paths?.travelData.map { NSString(string: $0).expandingTildeInPath as String } : nil)
-                ?? sid
+            // Count each repository once: in the monorepo several services share one.
+            let path = gitRepoRoots[sid] ?? config?.services.first(where: { $0.id == sid })?.resolvedCwd ?? sid
             if seen.insert(path).inserted {
                 total += count
             }
@@ -86,7 +83,6 @@ final class EnvironmentSupervisor {
     private let migrationTracker = MigrationTracker()
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
-    private var envCompat: EnvCompatLayer?
     private var sleepWakeObserver: SleepWakeObserver?
     private var startTask: Task<Void, any Error>?
     private var config: ServiceConfig?
@@ -97,17 +93,15 @@ final class EnvironmentSupervisor {
     private var phaseStartedAt: Date? = nil
     private var dbSetupRunner: DbSetupRunner?
     private var debugTracker: DebugTracker?
-    private var yalcWatcher: YalcWatcher?
     private var gitBranchWatcher: GitBranchWatcher?
+    private var gitRepoRoots: [String: String] = [:]
     private var dependencyWatcher: DependencyWatcher?
-    private var yalcWatcherTask: Task<Void, Never>?
     private var gitWatcherTask: Task<Void, Never>?
     private var depsWatcherTask: Task<Void, Never>?
-    private var yalcRelinkInProgress = false
     private var isTogglingNetwork = false
     private var stripeReconnectingSince: Date? = nil
-    private var localSupabaseAnonKey: String?
-    private var localSupabaseSigningKey: String?
+    private var localSupabaseKeys: LocalSupabaseKeys?
+    private var stripeWebhookSecret: String?
 
     init(userDefaults: UserDefaults = .standard) {
         self.userDefaults = userDefaults
@@ -156,11 +150,14 @@ final class EnvironmentSupervisor {
     enum ServiceError: Error, CustomStringConvertible {
         case oneshotFailed(String)
         case probeTimeout(String, seconds: Int)
+        case portHeldByOtherStack(port: Int, container: String)
 
         var description: String {
             switch self {
             case .oneshotFailed(let id): "'\(id)' exited with non-zero status"
             case .probeTimeout(let id, let s): "'\(id)' health probe timed out after \(s)s"
+            case .portHeldByOtherStack(let port, let container):
+                "Port \(port) is held by another Supabase stack (\(container)) — stop it, then start again"
             }
         }
     }
@@ -175,6 +172,8 @@ final class EnvironmentSupervisor {
             let graph = try ServiceGraph(services: config.services)
             self.graph = graph
             self.sortedServiceIDs = graph.sortedIDs
+            self.profile = config.resolvedProfile
+            self.profileMembers = config.resolvedProfile.members(of: config.services)
 
             for service in config.services {
                 serviceStates[service.id] = ServiceState(definition: service)
@@ -182,19 +181,13 @@ final class EnvironmentSupervisor {
 
             reloadDbSeedScenarios()
 
-            // Derive .env.local paths from services that have artifact probes
-            let portalService = config.services.first { $0.id == "travel-portal" }
-            let envPath = portalService?.cwd.map { $0 + "/.env.local" }
-                ?? "~/Documents/Codebases/TRAVEL BOOKING/travel-booking-portal/.env.local"
-            envCompat = EnvCompatLayer(envFilePaths: [envPath])
-
-            // Register secret observer once
+            // Register secret observer once. It resolves paths at write time, so a
+            // config reload (new monorepo path) needs no new observer.
             if !observerRegistered {
                 observerRegistered = true
-                let envCompat = self.envCompat
                 Task {
-                    await secretStore.onChange { key, value in
-                        envCompat?.write(key: key, value: value)
+                    await secretStore.onChange { [weak self] key, value in
+                        Task { @MainActor in self?.recordArtifact(key, value: value) }
                     }
                 }
             }
@@ -204,23 +197,16 @@ final class EnvironmentSupervisor {
             }
             sleepWakeObserver?.startObserving()
 
-            // Always reset .env.local files to localhost on startup
-            resetEnvToLocalhost()
+            // Always reset .env.local files to localhost on startup. Keys from the
+            // last block first; the running stack's keys replace them after GROUND.
             cacheLocalSupabaseKeys()
+            resetEnvToLocalhost()
 
             // Start control API server
             startControlServer()
 
             // Initialize debug tracking (opt-in via ~/Desktop/debug-tracking/config.json)
             Task { await initDebugTracking() }
-
-            // Initialize yalc staleness watcher
-            if let travelDataPath = config.paths?.travelData, !travelDataPath.isEmpty {
-                let watcher = YalcWatcher(travelDataDir: travelDataPath)
-                yalcWatcher = watcher
-                yalcWatcherTask?.cancel()
-                yalcWatcherTask = Task { await startYalcWatching(watcher: watcher) }
-            }
 
             // Initialize git branch watcher for all repos with cwds
             var repoMap: [String: String] = [:]
@@ -229,12 +215,10 @@ final class EnvironmentSupervisor {
                     repoMap[service.id] = cwd
                 }
             }
-            if let dataPath = config.paths?.travelData, !dataPath.isEmpty {
-                repoMap["fb-travel-data"] = NSString(string: dataPath).expandingTildeInPath as String
-            }
             if !repoMap.isEmpty {
                 let watcher = GitBranchWatcher(repos: repoMap)
                 gitBranchWatcher = watcher
+                gitRepoRoots = watcher.repoRoots
                 gitWatcherTask?.cancel()
                 gitWatcherTask = Task { await startGitBranchWatching(watcher: watcher) }
             }
@@ -254,6 +238,8 @@ final class EnvironmentSupervisor {
             }
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this
+        } catch ConfigLoader.ConfigError.monorepoNotFound {
+            // Old three-repo config with no monorepo nearby — setup wizard will handle this
         } catch {
             lastError = "Config load failed: \(error)"
             print("[Supervisor] \(lastError!)")
@@ -281,7 +267,8 @@ final class EnvironmentSupervisor {
             // Preflight
             if !skipPreflight {
                 self.currentPhase = .preflight
-                let checks = self.preflightRunner.allChecks(for: config.services)
+                let profileServices = config.services.filter { self.isInProfile($0.id) }
+                let checks = self.preflightRunner.allChecks(for: profileServices)
                 await MainActor.run { self.preflightChecks = checks }
 
                 var allPassed = true
@@ -368,6 +355,8 @@ final class EnvironmentSupervisor {
                 // (e.g. fresh Docker volume with no tables applied).
                 if phase == .ground && !didMigrationCheck {
                     didMigrationCheck = true
+                    // Supabase is up: write its keys before any portal starts.
+                    await self.refreshLocalSupabaseKeys()
                     let portalCwd = config.services.first(where: { $0.id == "supabase" })?.resolvedCwd
                     if let cwd = portalCwd {
                         let migrationsChanged = !self.migrationTracker.hasEverRun()
@@ -401,42 +390,6 @@ final class EnvironmentSupervisor {
                     }
                 }
 
-                // After GATEWAY phase: if fb-travel-data build is stale, rebuild
-                // before starting the portal to prevent "Module not found" errors.
-                if phase == .gateway {
-                    if let watcher = self.yalcWatcher {
-                        let stale = await watcher.check()
-                        if stale {
-                            await MainActor.run {
-                                self.yalcStale = true
-                                self.lastError = "fb-travel-data build is stale — rebuilding before portal start..."
-                            }
-                            let ok = await self.buildAndPublishYalcSync()
-                            if ok {
-                                await MainActor.run {
-                                    self.serviceStates["yalc-link"]?.phase = .starting
-                                }
-                                await self.processRunner.stop(serviceID: "yalc-link")
-                                do {
-                                    try await self.startService("yalc-link")
-                                } catch {
-                                    await MainActor.run {
-                                        self.lastError = "yalc-link restart failed: \(error)"
-                                    }
-                                }
-                                let stillStale = await watcher.check()
-                                await MainActor.run {
-                                    self.yalcStale = stillStale
-                                    self.lastError = nil
-                                }
-                            } else {
-                                await MainActor.run {
-                                    self.lastError = "fb-travel-data rebuild failed — portal may have import errors"
-                                }
-                            }
-                        }
-                    }
-                }
             }
 
             await MainActor.run {
@@ -503,15 +456,14 @@ final class EnvironmentSupervisor {
                         let health = await MainActor.run { self.health.rawValue }
                         let lan = await MainActor.run { self.networkMode }
                         let ip = await MainActor.run { self.localIP ?? "none" }
-                        let yalcStale = await MainActor.run { self.yalcStale }
-                        let yalcAuto = await MainActor.run { self.autoRelinkYalc }
+                        let profile = await MainActor.run { self.profile.rawValue }
                         let dbMode = await MainActor.run { self.dbMode.rawValue }
                         let branches = await MainActor.run { self.gitBranches }
                         let behind = await MainActor.run { self.gitBehindCounts }
                         let npmStale = await MainActor.run { Array(self.npmStaleServices) }
                         let dict: [String: Any] = [
                             "health": health, "services": states, "lan": lan, "ip": ip,
-                            "yalc": ["stale": yalcStale, "auto_relink": yalcAuto] as [String: Any],
+                            "profile": profile,
                             "db_mode": dbMode,
                             "branches": branches,
                             "gitBehind": behind,
@@ -595,21 +547,25 @@ final class EnvironmentSupervisor {
                         }
                         return ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"issue not found\"}"
                     },
-                    yalcRelink: { [weak self] in
-                        await MainActor.run { self?.publishAndRetryYalc() }
-                    },
-                    yalcToggleAuto: { [weak self] in
-                        await MainActor.run {
-                            guard let self else { return }
-                            self.setAutoRelinkYalc(!self.autoRelinkYalc)
-                        }
-                    },
-                    yalcStatus: { [weak self] in
-                        guard let self else { return "{}" }
-                        return await self.yalcStatusJSON()
-                    },
                     toggleDbMode: { [weak self] in
                         await MainActor.run { self?.toggleDatabaseMode() }
+                    },
+                    getProfile: { [weak self] in
+                        guard let self else { return "{}" }
+                        let (name, members) = await MainActor.run { (self.profile.rawValue, self.profileMembers.sorted()) }
+                        let dict: [String: Any] = [
+                            "profile": name,
+                            "services": members,
+                            "available": RunProfile.allCases.map(\.rawValue),
+                        ]
+                        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+                           let str = String(data: data, encoding: .utf8) { return str }
+                        return "{}"
+                    },
+                    setProfile: { [weak self] name in
+                        guard let profile = RunProfile(rawValue: name) else { return false }
+                        await MainActor.run { self?.setProfile(profile) }
+                        return true
                     }
                 ),
                 logStore: logStore
@@ -618,49 +574,78 @@ final class EnvironmentSupervisor {
     }
 
     func resetEnvToLocalhost() {
-        let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
-        let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
-
-        if let cwd = portalCwd {
-            let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-            env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: "http://localhost:54321")
-            env.write(key: "LOCAL_SUPABASE_URL", value: "http://localhost:54321")
-            env.write(key: "NEXT_PUBLIC_WEBAPP_URL", value: "http://localhost:3002")
-            env.write(key: "LOGIN_URL", value: "http://localhost:3000/login/init")
-            env.write(key: "NEXT_PUBLIC_LOCAL_DEV", value: "true")
-            if let anonKey = localSupabaseAnonKey {
-                env.write(key: "LOCAL_SUPABASE_ANON_KEY", value: anonKey)
-            }
-            if let signingKey = localSupabaseSigningKey {
-                env.write(key: "LOCAL_SUPABASE_SIGNING_KEY", value: signingKey)
-            }
-        }
-        if let cwd = loginCwd {
-            let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-            env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: "http://localhost:54321")
-            env.write(key: "AMATEUR_SUPABASE_URL", value: "http://localhost:54321")
-            env.write(key: "NEXT_PUBLIC_SITE_URL", value: "http://localhost:3000")
-            env.write(key: "NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", value: "http://localhost:3000")
-            if let anonKey = localSupabaseAnonKey {
-                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anonKey)
-                env.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anonKey)
-            }
-            if let signingKey = localSupabaseSigningKey {
-                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
-            }
-        }
-        if let rawPartner = config?.paths?.partnerPortal, !rawPartner.isEmpty {
-            let partnerPath = NSString(string: rawPartner).expandingTildeInPath
-            let localEnvPath = (partnerPath as NSString).appendingPathComponent(".env.local.runner")
-            if FileManager.default.fileExists(atPath: localEnvPath) {
-                let source = readEnvFile(localEnvPath)
-                let env = EnvCompatLayer(envFilePaths: [partnerPath + "/.env.local"])
-                for (key, value) in source {
-                    env.write(key: key, value: value)
-                }
-            }
-        }
         dbMode = .local
+        writeAppEnv()
+    }
+
+    /// Writes the runner block into both apps' `.env.local` and the universal-login
+    /// env for the current database mode and network mode.
+    func writeAppEnv() {
+        let host = networkMode ? (localIP ?? "localhost") : "localhost"
+        let mode: RunnerEnv.Mode = dbMode == .local ? .local : .remote
+        var hostedLoginURL: String?
+        if mode == .remote, let booking = sharedEnvPath("travel-portal"), let partner = sharedEnvPath("partner-portal") {
+            hostedLoginURL = RunnerEnv.hostedLoginURL(bookingEnv: booking, partnerEnv: partner)
+        }
+        for (app, serviceID) in [(RunnerEnv.App.booking, "travel-portal"), (.partner, "partner-portal")] {
+            guard let cwd = graph?.nodes[serviceID]?.resolvedCwd else { continue }
+            let values = RunnerEnv.values(
+                for: app, mode: mode, host: host, keys: localSupabaseKeys,
+                stripeWebhookSecret: stripeWebhookSecret,
+                hostedLoginURL: app == .booking ? hostedLoginURL : nil
+            )
+            RunnerEnv.apply(path: (cwd as NSString).appendingPathComponent(".env.local"), app: app, values: values)
+        }
+        writeLoginEnv(host: host)
+    }
+
+    /// universal-login is an external repo; its `.env.local` keeps the key-by-key writes.
+    private func writeLoginEnv(host: String) {
+        guard let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd else { return }
+        let env = EnvCompatLayer(envFilePaths: [loginCwd + "/.env.local"])
+        env.write(key: "NEXT_PUBLIC_SITE_URL", value: "http://\(host):3000")
+        env.write(key: "NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", value: "http://\(host):3000")
+
+        if dbMode == .local {
+            env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: "http://\(host):54321")
+            env.write(key: "AMATEUR_SUPABASE_URL", value: "http://\(host):54321")
+            if let keys = localSupabaseKeys {
+                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: keys.anonKey)
+                env.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: keys.anonKey)
+                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: keys.jwtSecret)
+            }
+        } else if let shared = sharedEnvPath("travel-portal"),
+                  let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: shared) {
+            // Hosted dev: the same project the booking portal's shared .env uses.
+            env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: url)
+            env.write(key: "AMATEUR_SUPABASE_URL", value: url)
+            if let anon = RunnerEnv.value(of: "AMATEUR_SUPABASE_ANON_KEY", inFile: shared) {
+                env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anon)
+                env.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anon)
+            }
+            if let signing = RunnerEnv.value(of: "AMATEUR_SUPABASE_SIGNING_KEY", inFile: shared) {
+                env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signing)
+            }
+        }
+    }
+
+    /// The app's shared dev values in the monolith (`apps/<app>/.env`), when the file exists.
+    /// It is a teammate's copy or `pnpm env:pull` output; the runner only reads it.
+    private func sharedEnvPath(_ serviceID: String) -> String? {
+        guard let cwd = graph?.nodes[serviceID]?.resolvedCwd else { return nil }
+        let path = (cwd as NSString).appendingPathComponent(".env")
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
+    /// A secret captured from a service's output (the Stripe webhook secret).
+    private func recordArtifact(_ name: String, value: String) {
+        if name == "STRIPE_WEBHOOK_SECRET" {
+            guard stripeWebhookSecret != value else { return }
+            stripeWebhookSecret = value
+            writeAppEnv()
+        } else if let cwd = graph?.nodes["travel-portal"]?.resolvedCwd {
+            EnvCompatLayer(envFilePaths: [cwd + "/.env.local"]).write(key: name, value: value)
+        }
     }
 
     func clearCacheAndRestart(_ serviceID: String) {
@@ -690,31 +675,36 @@ final class EnvironmentSupervisor {
 
     // MARK: - Database Mode Toggle
 
+    /// Keys from the last runner block, so the env is right before Supabase reports in.
     private func cacheLocalSupabaseKeys() {
         guard let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd else { return }
         let envPath = (portalCwd as NSString).appendingPathComponent(".env.local")
-        guard let content = try? String(contentsOfFile: envPath, encoding: .utf8) else { return }
-        for line in content.components(separatedBy: "\n") {
-            if line.hasPrefix("LOCAL_SUPABASE_ANON_KEY=") {
-                localSupabaseAnonKey = String(line.dropFirst("LOCAL_SUPABASE_ANON_KEY=".count))
-            }
-            if line.hasPrefix("LOCAL_SUPABASE_SIGNING_KEY=") {
-                localSupabaseSigningKey = String(line.dropFirst("LOCAL_SUPABASE_SIGNING_KEY=".count))
-            }
-        }
+        guard let anon = RunnerEnv.value(of: "LOCAL_SUPABASE_ANON_KEY", inFile: envPath),
+              let secret = RunnerEnv.value(of: "LOCAL_SUPABASE_SIGNING_KEY", inFile: envPath) else { return }
+        let partnerEnv = graph?.nodes["partner-portal"]?.resolvedCwd.map { ($0 as NSString).appendingPathComponent(".env.local") }
+        localSupabaseKeys = LocalSupabaseKeys(
+            anonKey: anon,
+            serviceRoleKey: RunnerEnv.value(of: "SUPABASE_SERVICE_ROLE_KEY", inFile: envPath) ?? "",
+            jwtSecret: secret,
+            publishableKey: partnerEnv.flatMap { RunnerEnv.value(of: "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY", inFile: $0) }
+        )
+        stripeWebhookSecret = RunnerEnv.value(of: "STRIPE_WEBHOOK_SECRET", inFile: envPath)
     }
 
-    private func readEnvFile(_ path: String) -> [String: String] {
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [:] }
-        var vars: [String: String] = [:]
-        for line in content.components(separatedBy: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("#"), let eqIdx = trimmed.firstIndex(of: "=") else { continue }
-            let key = String(trimmed[..<eqIdx])
-            let value = String(trimmed[trimmed.index(after: eqIdx)...])
-            vars[key] = value
+    /// Reads the keys of the running local stack and rewrites the env when they changed.
+    func refreshLocalSupabaseKeys() async {
+        guard let root = graph?.nodes["supabase"]?.resolvedCwd else { return }
+        let (output, ok) = await shellOutput("cd \(ShellQuote.quote(root)) && scripts/local-db.sh status -o env 2>/dev/null")
+        guard ok, let keys = LocalSupabaseKeys.parse(statusEnv: output) else {
+            await logStore.append(serviceID: "supabase", entry: LogEntry(
+                stream: .stderr, text: "[travel-runner] Could not read local Supabase keys (scripts/local-db.sh status -o env)"
+            ))
+            return
         }
-        return vars
+        if keys != localSupabaseKeys {
+            localSupabaseKeys = keys
+            writeAppEnv()
+        }
     }
 
     func toggleDatabaseMode() {
@@ -723,65 +713,30 @@ final class EnvironmentSupervisor {
             return
         }
 
-        let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
-        let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
-
         if dbMode == .local {
-            guard let cwd = portalCwd else { return }
-            let remotePath = (cwd as NSString).appendingPathComponent(".env.remote")
-            let remote = readEnvFile(remotePath)
-            guard let remoteUrl = remote["NEXT_PUBLIC_SUPABASE_URL"], !remoteUrl.isEmpty else {
-                lastError = ".env.remote not found or missing NEXT_PUBLIC_SUPABASE_URL — create it in the booking portal"
+            // Hosted dev comes from each app's shared .env; the runner block then stops
+            // overriding Supabase.
+            let apps = ["travel-portal"] + (isInProfile("partner-portal") ? ["partner-portal"] : [])
+            let lacking = apps.filter { serviceID in
+                guard let shared = sharedEnvPath(serviceID),
+                      let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: shared) else { return true }
+                return url.isEmpty
+            }
+            guard lacking.isEmpty else {
+                let files = lacking.map { $0 == "travel-portal" ? "apps/booking-portal/.env" : "apps/partner-portal/.env" }
+                lastError = "Hosted dev values are missing from \(files.joined(separator: " and ")) — import the shared file (Settings → Reconfigure Repos… → Environment Check), then switch again"
                 return
             }
-
-            let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-            for (key, value) in remote {
-                env.write(key: key, value: value)
-            }
-            env.write(key: "LOGIN_URL", value: "https://identity.fastbreaktravel-dev.ai/login/init")
-
-            if let loginCwd {
-                let loginEnv = EnvCompatLayer(envFilePaths: [loginCwd + "/.env.local"])
-                loginEnv.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: remoteUrl)
-                loginEnv.write(key: "AMATEUR_SUPABASE_URL", value: remoteUrl)
-                if let anonKey = remote["LOCAL_SUPABASE_ANON_KEY"] {
-                    loginEnv.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anonKey)
-                    loginEnv.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anonKey)
-                }
-                if let signingKey = remote["LOCAL_SUPABASE_SIGNING_KEY"] {
-                    loginEnv.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signingKey)
-                }
-            }
-
-            if let rawPartner2 = config?.paths?.partnerPortal, !rawPartner2.isEmpty {
-                let partnerPath = NSString(string: rawPartner2).expandingTildeInPath
-                let partnerEnv = EnvCompatLayer(envFilePaths: [partnerPath + "/.env.local"])
-                partnerEnv.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: remoteUrl)
-                partnerEnv.write(key: "SUPABASE_URL", value: remoteUrl)
-                partnerEnv.write(key: "AMATEUR_SUPABASE_URL_DEV", value: remoteUrl)
-                if let anonKey = remote["LOCAL_SUPABASE_ANON_KEY"] {
-                    partnerEnv.write(key: "AMATEUR_SUPABASE_ANON_KEY_DEV", value: anonKey)
-                    partnerEnv.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anonKey)
-                }
-                if let signingKey = remote["LOCAL_SUPABASE_SIGNING_KEY"] {
-                    partnerEnv.write(key: "AMATEUR_SUPABASE_SIGNING_KEY_DEV", value: signingKey)
-                }
-                partnerEnv.write(key: "LOGIN_URL", value: "https://identity.fastbreaktravel-dev.ai/login/init")
-                partnerEnv.write(key: "UNIVERSAL_LOGIN_URL", value: "https://identity.fastbreaktravel-dev.ai/login/init")
-                partnerEnv.write(key: "NEXT_PUBLIC_WEBAPP_URL", value: "http://localhost:3001")
-            }
-
             dbMode = .remote
+            writeAppEnv()
         } else {
             resetEnvToLocalhost()
-            dbMode = .local
         }
 
         guard health != .stopped else { return }
 
         var servicesToRestart = ["travel-portal", "universal-login"]
-        if partnerPortalEnabled && serviceStates["partner-portal"] != nil {
+        if isInProfile("partner-portal") {
             servicesToRestart.append("partner-portal")
         }
         Task {
@@ -840,38 +795,10 @@ final class EnvironmentSupervisor {
             }
 
             let ip = localIP ?? "127.0.0.1"
-
-            let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd
-            let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd
-
-            let host = mode ? ip : "localhost"
-
-            if let cwd = portalCwd {
-                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-                env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: "http://\(host):54321")
-                env.write(key: "LOCAL_SUPABASE_URL", value: "http://\(host):54321")
-                env.write(key: "NEXT_PUBLIC_WEBAPP_URL", value: "http://\(host):3002")
-                env.write(key: "LOGIN_URL", value: "http://\(host):3000/login/init")
-            }
-            if let cwd = loginCwd {
-                let env = EnvCompatLayer(envFilePaths: [cwd + "/.env.local"])
-                env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: "http://\(host):54321")
-                env.write(key: "AMATEUR_SUPABASE_URL", value: "http://\(host):54321")
-                env.write(key: "NEXT_PUBLIC_SITE_URL", value: "http://\(host):3000")
-                env.write(key: "NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", value: "http://\(host):3000")
-            }
-            if let rawPartner = config?.paths?.partnerPortal, !rawPartner.isEmpty {
-                let partnerPath = NSString(string: rawPartner).expandingTildeInPath
-                let baselinePath = (partnerPath as NSString).appendingPathComponent(".env.local.runner")
-                let source = readEnvFile(baselinePath)
-                let env = EnvCompatLayer(envFilePaths: [partnerPath + "/.env.local"])
-                for (key, value) in source {
-                    env.write(key: key, value: value.replacingOccurrences(of: "localhost", with: host))
-                }
-            }
+            writeAppEnv()
 
             var servicesToRestart = ["travel-portal", "universal-login"]
-            if partnerPortalEnabled && serviceStates["partner-portal"] != nil {
+            if isInProfile("partner-portal") {
                 servicesToRestart.append("partner-portal")
             }
 
@@ -1007,128 +934,18 @@ final class EnvironmentSupervisor {
         startAll()
     }
 
-    func publishAndRetryYalc() {
-        guard let travelDataDir = config?.paths?.travelData.map({ NSString(string: $0).expandingTildeInPath }) else {
-            lastError = "fb-travel-data path not configured — open Settings"
+    /// Switches the profile and saves it to services.json. Running services outside the
+    /// new profile keep running until the next stop; start-all uses the new profile.
+    func setProfile(_ newProfile: RunProfile) {
+        do {
+            try ConfigLoader.saveProfile(newProfile)
+        } catch {
+            lastError = "Could not save profile: \(error)"
             return
         }
-
-        serviceStates["yalc-link"]?.phase = .starting
-        Task {
-            actionsInFlight.insert("yalc-relink")
-            defer { actionsInFlight.remove("yalc-relink") }
-            let ok = await runShellCommand("cd \"\(travelDataDir)\" && npm run build && yalc publish")
-            if ok {
-                restartService("yalc-link")
-                onActionFeedback?("fb-travel-data published and relinked", true)
-
-                // Wait for the relink oneshot to finish swapping node_modules.
-                for _ in 0..<120 {
-                    try? await Task.sleep(for: .seconds(1))
-                    let p = serviceStates["yalc-link"]?.phase
-                    if p == .completed || p == .failed { break }
-                }
-
-                // A running portal keeps its compiled .next module graph against
-                // the old package — after a mid-session relink it serves phantom
-                // "not exported" errors until the cache is cleared. Bounce any
-                // running portal onto the fresh build automatically.
-                if serviceStates["yalc-link"]?.phase == .completed {
-                    for portalID in ["travel-portal", "partner-portal"]
-                    where serviceStates[portalID]?.phase == .running {
-                        clearCacheAndRestart(portalID)
-                        onActionFeedback?("\(serviceStates[portalID]?.definition.displayName ?? portalID) restarted on fresh fb-travel-data build", true)
-                    }
-                }
-            } else {
-                serviceStates["yalc-link"]?.phase = .failed
-                lastError = "yalc publish failed — check fb-travel-data build"
-                onActionFeedback?("yalc publish failed — check fb-travel-data build", false)
-            }
-        }
-    }
-
-    private func buildAndPublishYalcSync() async -> Bool {
-        guard let travelDataDir = config?.paths?.travelData
-            .map({ NSString(string: $0).expandingTildeInPath }) else { return false }
-        return await runShellCommand(
-            "cd \"\(travelDataDir)\" && npm run build && yalc publish"
-        )
-    }
-
-    func setAutoRelinkYalc(_ enabled: Bool) {
-        autoRelinkYalc = enabled
-        UserDefaults.standard.set(enabled, forKey: "autoRelinkYalc")
-    }
-
-    func setPartnerPortalEnabled(_ enabled: Bool) {
-        partnerPortalEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: "partnerPortalEnabled")
-        if enabled {
-            setupPartnerPortalEnv()
-        }
-    }
-
-    func setCacheVerificationEnabled(_ enabled: Bool) {
-        cacheVerificationEnabled = enabled
-        userDefaults.set(enabled, forKey: "cacheVerificationEnabled")
-    }
-
-    private func setupPartnerPortalEnv() {
-        guard let rawPartnerCwd = config?.paths?.partnerPortal, !rawPartnerCwd.isEmpty else { return }
-        let partnerCwd = NSString(string: rawPartnerCwd).expandingTildeInPath
-
-        let localEnvPath = (partnerCwd as NSString).appendingPathComponent(".env.local.runner")
-        guard FileManager.default.fileExists(atPath: localEnvPath) else { return }
-
-        if dbMode == .local {
-            let source = readEnvFile(localEnvPath)
-            let env = EnvCompatLayer(envFilePaths: [partnerCwd + "/.env.local"])
-            for (key, value) in source {
-                env.write(key: key, value: value)
-            }
-        }
-    }
-
-    func yalcStatusJSON() async -> String {
-        guard let watcher = yalcWatcher else { return "{\"configured\":false}" }
-        let stale = await watcher.isStale
-        let autoRelink = autoRelinkYalc
-        let srcMtime = await watcher.sourceModifiedAt
-        let distMtime = await watcher.lastBuiltAt
-
-        var dict: [String: Any] = [
-            "configured": true,
-            "stale": stale,
-            "auto_relink": autoRelink,
-        ]
-        if let src = srcMtime { dict["source_modified"] = ISO8601DateFormatter().string(from: src) }
-        if let dist = distMtime { dict["last_built"] = ISO8601DateFormatter().string(from: dist) }
-
-        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
-           let str = String(data: data, encoding: .utf8) { return str }
-        return "{}"
-    }
-
-    private func startYalcWatching(watcher: YalcWatcher) async {
-        while !Task.isCancelled {
-            let stale = await watcher.check()
-            await MainActor.run { self.yalcStale = stale }
-
-            if stale && autoRelinkYalc && !yalcRelinkInProgress && health == .healthy {
-                let settled = await watcher.sourceSettled
-                if settled {
-                    await MainActor.run {
-                        self.yalcRelinkInProgress = true
-                        self.publishAndRetryYalc()
-                    }
-                    try? await Task.sleep(for: .seconds(10))
-                    await MainActor.run { self.yalcRelinkInProgress = false }
-                }
-            }
-
-            try? await Task.sleep(for: .seconds(5))
-        }
+        profile = newProfile
+        profileMembers = newProfile.members(of: config?.services ?? [])
+        onActionFeedback?("Profile: \(newProfile.displayName)", true)
     }
 
     private func startDepsWatching(watcher: DependencyWatcher) async {
@@ -1196,10 +1013,6 @@ final class EnvironmentSupervisor {
                         }
                     }
                 }
-            }
-
-            if changed.contains("fb-travel-data") {
-                await MainActor.run { self.publishAndRetryYalc() }
             }
 
             await watcher.fetchAndCount(fetchInterval: 0)
@@ -1278,23 +1091,7 @@ final class EnvironmentSupervisor {
         if stepId != nil, let existingPipeline = dbSetupPipeline {
             pipeline = existingPipeline
         } else {
-            reloadDbSeedScenarios()
-            guard let seedScenario = selectedDbSeedScenario else {
-                lastError = dbSeedScenarioLoadError
-                    ?? "Choose a valid seed scenario before resetting the database."
-                return
-            }
-
-            let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
-            let steps: [DbSetupStep]
-            if FileManager.default.fileExists(atPath: manifestPath) {
-                steps = DbManifestLoader.load(from: manifestPath, profile: profile)
-            } else {
-                steps = DbSetupPipeline.buildDefault()
-            }
-
-            let newPipeline = DbSetupPipeline(profile: profile, seedScenario: seedScenario)
-            newPipeline.steps = steps
+            guard let newPipeline = makeDbSetupPipeline(cwd: cwd, profile: profile) else { return }
             dbSetupPipeline = newPipeline
             pipeline = newPipeline
         }
@@ -1316,6 +1113,7 @@ final class EnvironmentSupervisor {
             if pipeline.allRequiredPassed {
                 migrationTracker.recordCurrentHash(portalCwd: cwd)
                 lastError = nil
+                await refreshLocalSupabaseKeys()
             } else if let failed = pipeline.firstFailed {
                 lastError = "DB setup failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
                 Task { await captureDebugIssue(
@@ -1337,22 +1135,7 @@ final class EnvironmentSupervisor {
         }
 
         if dbSetupPipeline == nil {
-            reloadDbSeedScenarios()
-            guard let seedScenario = selectedDbSeedScenario else {
-                lastError = dbSeedScenarioLoadError
-                    ?? "Choose a valid seed scenario before running database setup."
-                return
-            }
-
-            let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
-            let steps: [DbSetupStep]
-            if FileManager.default.fileExists(atPath: manifestPath) {
-                steps = DbManifestLoader.load(from: manifestPath, profile: "full")
-            } else {
-                steps = DbSetupPipeline.buildDefault()
-            }
-            let pipeline = DbSetupPipeline(profile: "full", seedScenario: seedScenario)
-            pipeline.steps = steps
+            guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "full") else { return }
             dbSetupPipeline = pipeline
         }
 
@@ -1437,21 +1220,14 @@ final class EnvironmentSupervisor {
         for definition: ServiceDefinition,
         serviceID: String
     ) -> ServiceDefinition {
-        guard serviceID == "stream-services",
-              let portalCwd = graph?.nodes["travel-portal"]?.resolvedCwd else {
+        // The local CDC chain always runs against the local stack.
+        guard serviceID == "stream-services", let keys = localSupabaseKeys else {
             return definition
         }
-        let portalEnv = readEnvFile((portalCwd as NSString).appendingPathComponent(".env.local"))
         var envOverrides = definition.env ?? [:]
-        if let value = portalEnv["LOCAL_SUPABASE_URL"] ?? portalEnv["NEXT_PUBLIC_SUPABASE_URL"] {
-            envOverrides["AMATEUR_SUPABASE_URL"] = value.replacingOccurrences(of: "localhost", with: "127.0.0.1")
-        }
-        if let value = portalEnv["LOCAL_SUPABASE_ANON_KEY"] ?? portalEnv["NEXT_PUBLIC_SUPABASE_ANON_KEY"] {
-            envOverrides["AMATEUR_SUPABASE_ANON_KEY"] = value
-        }
-        if let value = portalEnv["LOCAL_SUPABASE_SIGNING_KEY"] {
-            envOverrides["AMATEUR_SUPABASE_SIGNING_KEY"] = value
-        }
+        envOverrides["AMATEUR_SUPABASE_URL"] = "http://127.0.0.1:54321"
+        envOverrides["AMATEUR_SUPABASE_ANON_KEY"] = keys.anonKey
+        envOverrides["AMATEUR_SUPABASE_SIGNING_KEY"] = keys.jwtSecret
         return ServiceDefinition(
             id: definition.id,
             name: definition.name,
@@ -1467,36 +1243,30 @@ final class EnvironmentSupervisor {
         )
     }
 
+    /// The service's own command with `--hostname <ip>` appended, so LAN mode keeps the
+    /// configured package manager and port. `npm run` needs `--` before script flags;
+    /// pnpm passes trailing flags to the script.
+    nonisolated static func lanCommand(_ cmd: [String], ip: String) -> [String] {
+        let needsSeparator = cmd.first == "npm" && cmd.dropFirst().first == "run" && !cmd.contains("--")
+        return cmd + (needsSeparator ? ["--"] : []) + ["--hostname", ip]
+    }
+
     private func lanAwareDefinition(for definition: ServiceDefinition, serviceID: String) -> ServiceDefinition {
         guard networkMode, let ip = localIP else { return definition }
         let lanServices: Set<String> = ["travel-portal", "universal-login", "partner-portal"]
         guard lanServices.contains(serviceID) else { return definition }
 
-        let cmd: String
-        if serviceID == "partner-portal" {
-            cmd = "npm run dev -- -p 3001 --hostname \(ip)"
-        } else {
-            cmd = "npm run dev -- --hostname \(ip)"
-        }
+        let cmd = Self.lanCommand(definition.cmd, ip: ip)
         var envOverrides = definition.env ?? [:]
 
+        // The portals get their LAN URLs from the runner block in .env.local
+        // (applyNetworkMode rewrites it before the restart). universal-login is an
+        // external repo, so it also gets them as process env.
         if serviceID == "universal-login" {
             envOverrides["NEXT_PUBLIC_SITE_URL"] = "http://\(ip):3000"
             envOverrides["NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL"] = "http://\(ip):3000"
-            envOverrides["NEXT_PUBLIC_SUPABASE_URL"] = "http://\(ip):54321"
-        }
-        if serviceID == "travel-portal" {
-            envOverrides["LOGIN_URL"] = "http://\(ip):3000/login/init"
-            envOverrides["NEXT_PUBLIC_WEBAPP_URL"] = "http://\(ip):3002"
-            envOverrides["NEXT_PUBLIC_SUPABASE_URL"] = "http://\(ip):54321"
-        }
-        if serviceID == "partner-portal",
-           let rawPartner = config?.paths?.partnerPortal, !rawPartner.isEmpty {
-            let partnerPath = NSString(string: rawPartner).expandingTildeInPath
-            let baselinePath = (partnerPath as NSString).appendingPathComponent(".env.local.runner")
-            let source = readEnvFile(baselinePath)
-            for (key, value) in source where value.contains("localhost") {
-                envOverrides[key] = value.replacingOccurrences(of: "localhost", with: ip)
+            if dbMode == .local {
+                envOverrides["NEXT_PUBLIC_SUPABASE_URL"] = "http://\(ip):54321"
             }
         }
 
@@ -1531,7 +1301,7 @@ final class EnvironmentSupervisor {
         return ServiceDefinition(
             id: definition.id,
             name: definition.name,
-            cmd: cmd.components(separatedBy: " "),
+            cmd: cmd,
             cwd: definition.cwd,
             probe: lanProbe,
             type: definition.type,
@@ -1550,16 +1320,10 @@ final class EnvironmentSupervisor {
         guard let state = serviceStates[serviceID],
               let definition = graph?.nodes[serviceID] else { return }
 
-        if serviceID == "partner-portal" && !partnerPortalEnabled {
-            await MainActor.run { state.phase = .skipped }
-            return
-        }
-
-        // Cache-verification oneshots are opt-in (Settings). They drive the
-        // local CDC evidence chain (transport sim, contention, audits) against
-        // the dev fixture — valuable for rehearsal, disruptive as an everyday
-        // startup tax.
-        if definition.phase == "verification", !cacheVerificationEnabled {
+        // Services outside the active profile are skipped. The verification
+        // oneshots drive the local CDC evidence chain against the dev fixture, so
+        // they run only in the full profile.
+        if !isInProfile(serviceID) {
             await MainActor.run { state.phase = .skipped }
             return
         }
@@ -1568,6 +1332,18 @@ final class EnvironmentSupervisor {
         // If the port is already bound, skip starting and mark as running.
         if definition.shouldReuseIfRunning, let port = definition.probe?.port {
             if isPortBound(port) {
+                // Only reuse the monorepo's own database. Another checkout's stack (the
+                // old travel-booking-portal one, say) on the same port is a different DB.
+                if serviceID == "supabase", let root = definition.resolvedCwd {
+                    let expected = SupabaseProject.dbContainerName(root: root)
+                    if let occupant = await Self.containerPublishing(port: port), occupant != expected {
+                        await logStore.append(serviceID: serviceID, entry: LogEntry(
+                            stream: .stderr,
+                            text: "[travel-runner] Port \(port) is held by \(occupant), not \(expected). Stop that stack (npx supabase stop in its checkout, or: docker stop $(docker ps -q --filter name=_\(occupant.replacingOccurrences(of: "supabase_db_", with: ""))$)) and start again."
+                        ))
+                        throw ServiceError.portHeldByOtherStack(port: port, container: occupant)
+                    }
+                }
                 await MainActor.run {
                     state.phase = .running
                     state.lastStarted = .now
@@ -1724,8 +1500,10 @@ final class EnvironmentSupervisor {
             // Brief wait for the async secretStore.set() Task to complete
             try? await Task.sleep(for: .milliseconds(200))
             if let value = await secretStore.get(name) {
-                envCompat?.write(key: name, value: value)
-                await MainActor.run { state.capturedArtifact = value }
+                await MainActor.run {
+                    recordArtifact(name, value: value)
+                    state.capturedArtifact = value
+                }
             }
         }
 
@@ -2085,7 +1863,7 @@ final class EnvironmentSupervisor {
     private func phaseForService(_ id: String) -> String? {
         if let phase = graph?.nodes[id]?.phase { return phase }
         if id == "supabase" || id == "db-reset" { return "ground" }
-        if id == "yalc-link" || id == "universal-login" || id == "stripe" { return "gateway" }
+        if id == "universal-login" || id == "stripe" { return "gateway" }
         if id == "travel-portal" || id == "partner-portal" { return "portal" }
         if id.hasPrefix("stream-") { return "stream" }
         if id.hasPrefix("cache-") || id.hasPrefix("capacity-") { return "verification" }
@@ -2171,10 +1949,11 @@ final class EnvironmentSupervisor {
         return false
     }
 
+    /// Whether the local database has the travel tables. A fresh Docker volume has
+    /// none, and then the startup check runs a reset.
     private func databaseHasAppTables(portalCwd: String) async -> Bool {
-        let projectId = URL(fileURLWithPath: portalCwd).lastPathComponent
-        let container = "supabase_db_\(projectId)"
-        let query = "SELECT count(*) FROM pg_tables WHERE schemaname = 'public'"
+        let container = SupabaseProject.dbContainerName(root: portalCwd)
+        let query = "SELECT count(*) FROM pg_tables WHERE schemaname = 'fb_travel'"
         let command = "docker exec \(container) psql -U postgres -d postgres -tAc \"\(query)\" 2>/dev/null"
         return await withCheckedContinuation { continuation in
             let process = Process()
@@ -2197,49 +1976,55 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// Automatic reset (first run, changed migrations, empty database, branch switch):
+    /// the manifest's `reset` profile with the selected seed scenario, shown in the
+    /// DB setup panel like a manual reset.
     private func runDbReset(cwd: String) async -> Bool {
+        guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "reset") else { return false }
+        dbSetupPipeline = pipeline
+        let runner = DbSetupRunner(portalCwd: cwd, logStore: logStore, seedScenarioID: pipeline.seedScenario.id)
+        dbSetupRunner = runner
+        await runner.run(pipeline: pipeline, from: nil)
+        if pipeline.allRequiredPassed { await refreshLocalSupabaseKeys() }
+        if let failed = pipeline.firstFailed {
+            lastError = "DB reset failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
+        }
+        return pipeline.allRequiredPassed
+    }
+
+    /// A pipeline for the manifest profile with the selected seed scenario, or nil (and
+    /// `lastError` set) when no valid scenario is selected.
+    private func makeDbSetupPipeline(cwd: String, profile: String) -> DbSetupPipeline? {
         reloadDbSeedScenarios()
         guard let seedScenario = selectedDbSeedScenario else {
             lastError = dbSeedScenarioLoadError
                 ?? "Choose a valid seed scenario before resetting the database."
-            return false
+            return nil
         }
-        let logStore = self.logStore
-        // Use db:setup --reset-only which runs migrations + seed + reloads cached hotel data.
-        // Plain `npx supabase db reset` only does migrations + seed, skipping the hotel dump.
-        return await withCheckedContinuation { continuation in
+        let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
+        let steps = FileManager.default.fileExists(atPath: manifestPath)
+            ? DbManifestLoader.load(from: manifestPath, profile: profile)
+            : DbSetupPipeline.buildDefault()
+        let pipeline = DbSetupPipeline(profile: profile, seedScenario: seedScenario)
+        pipeline.steps = steps
+        return pipeline
+    }
+
+    /// Name of the Docker container that publishes this host port, if any.
+    nonisolated static func containerPublishing(port: Int) async -> String? {
+        await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", "npm run db:setup -- --reset-only"]
-            process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-            process.environment = DbSetupRunner.environment(
-                parent: ProcessInfo.processInfo.environment,
-                seedScenarioID: seedScenario.id
-            )
-
+            process.arguments = ["-l", "-c", "docker ps --filter publish=\(port) --format '{{.Names}}'"]
             let pipe = Pipe()
             process.standardOutput = pipe
-            process.standardError = pipe
-            let lineBuffer = TerminalLineBuffer()
-
-            pipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                for line in lineBuffer.feed(text) {
-                    Task {
-                        await logStore.append(serviceID: "db-reset", entry: LogEntry(stream: .stdout, text: line))
-                    }
-                }
-            }
-
+            process.standardError = FileHandle.nullDevice
             process.terminationHandler = { proc in
-                pipe.fileHandleForReading.readabilityHandler = nil
-                if let remaining = lineBuffer.flush() {
-                    Task { await logStore.append(serviceID: "db-reset", entry: LogEntry(stream: .stdout, text: remaining)) }
-                }
-                continuation.resume(returning: proc.terminationStatus == 0)
+                let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                let name = output.split(separator: "\n").first.map(String.init)
+                continuation.resume(returning: proc.terminationStatus == 0 ? name : nil)
             }
-            do { try process.run() } catch { continuation.resume(returning: false) }
+            do { try process.run() } catch { continuation.resume(returning: nil) }
         }
     }
 
