@@ -108,30 +108,17 @@ struct PreflightRunner: Sendable {
                 : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
 
         case let id where id.hasPrefix("env-diff"):
-            // Shared values come from Doppler (.env, via pnpm env:pull); .env.local holds
-            // only the runner's local overrides. Next.js reads both.
+            // The monolith's scripts/env-check.mjs checks the app's shared .env (a teammate's
+            // copy or pnpm env:pull) and the blank .env.local keys that would hide it. A missing
+            // or stale file warns: local mode still runs, and remote mode refuses to switch.
             let cwd = check.metadata["cwd"] ?? ""
-            let examplePath = (cwd as NSString).appendingPathComponent(".env.example")
-            let dopplerPath = (cwd as NSString).appendingPathComponent(".env")
-            let localPath = (cwd as NSString).appendingPathComponent(".env.local")
-
-            guard FileManager.default.fileExists(atPath: examplePath) else {
-                return .passed(detail: "No .env.example")
-            }
-            guard FileManager.default.fileExists(atPath: dopplerPath) else {
-                return .warning(message: "No .env — run pnpm env:pull in the monorepo (needs doppler login)")
-            }
-
-            let requiredKeys = extractRequiredEnvKeys(from: examplePath)
-            let localKeys = extractEnvKeys(from: dopplerPath).union(extractEnvKeys(from: localPath))
-            let missing = requiredKeys.subtracting(localKeys)
-
-            if missing.isEmpty {
-                return .passed(detail: "\(localKeys.count) keys configured")
-            } else {
-                let sorted = missing.sorted().prefix(5).joined(separator: ", ")
-                let suffix = missing.count > 5 ? " (+\(missing.count - 5) more)" : ""
-                return .warning(message: "Missing: \(sorted)\(suffix)")
+            let app: SharedEnvFiles.App = id == "env-diff-partner-portal" ? .partner : .booking
+            let monorepo = ((cwd as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
+            let output = await shellOutput(SharedEnvFiles.command(monorepo: monorepo, app: app))
+            switch SharedEnvFiles.status(SharedEnvFiles.decode(output, app: app)) {
+            case .passing(let detail): return .passed(detail: detail)
+            case .warning(let message), .failing(let message): return .warning(message: message)
+            case .pending, .fixing: return .warning(message: "Not checked")
             }
 
         default:
@@ -182,37 +169,6 @@ struct PreflightRunner: Sendable {
                 continuation.resume(returning: -1)
             }
         }
-    }
-
-    private func extractRequiredEnvKeys(from path: String) -> Set<String> {
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
-        var keys = Set<String>()
-        for line in content.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
-            if let eqIndex = trimmed.firstIndex(of: "=") {
-                let key = String(trimmed[trimmed.startIndex..<eqIndex]).trimmingCharacters(in: .whitespaces)
-                let value = String(trimmed[trimmed.index(after: eqIndex)...]).trimmingCharacters(in: .whitespaces)
-                if !key.isEmpty && value.isEmpty {
-                    keys.insert(key)
-                }
-            }
-        }
-        return keys
-    }
-
-    private func extractEnvKeys(from path: String) -> Set<String> {
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
-        var keys = Set<String>()
-        for line in content.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard !trimmed.isEmpty, !trimmed.hasPrefix("#") else { continue }
-            if let eqIndex = trimmed.firstIndex(of: "=") {
-                let key = String(trimmed[trimmed.startIndex..<eqIndex]).trimmingCharacters(in: .whitespaces)
-                if !key.isEmpty { keys.insert(key) }
-            }
-        }
-        return keys
     }
 
     private func shellOutput(_ command: String) async -> String {

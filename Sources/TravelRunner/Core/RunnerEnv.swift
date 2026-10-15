@@ -30,20 +30,18 @@ struct LocalSupabaseKeys: Sendable, Equatable {
 
 /// The runner's block in each app's `.env.local`.
 ///
-/// Doppler's `pnpm env:pull` writes the shared dev values to `apps/<app>/.env`, and Next.js
-/// loads `.env.local` over it. The runner owns a marked block at the end of `.env.local` with
-/// the machine-specific values. Local mode overrides every Doppler value that points at hosted
-/// dev, including `AMATEUR_SUPABASE_*`: booking only copies `LOCAL_SUPABASE_*` into those when
-/// they are unset, and Doppler sets them. Remote mode leaves Supabase to Doppler's `.env`.
+/// Each app's shared dev values live in the monolith at `apps/<app>/.env` (a teammate's copy, or
+/// `pnpm env:pull` from Doppler); the runner never holds them. Next.js loads `.env.local` over
+/// `.env`. The runner owns a marked block at the end of `.env.local` with the machine-specific
+/// values. Local mode overrides every shared value that points at hosted dev, including
+/// `AMATEUR_SUPABASE_*`: booking only copies `LOCAL_SUPABASE_*` into those when they are unset,
+/// and the shared `.env` sets them. Remote mode leaves Supabase to the shared `.env`.
 enum RunnerEnv {
     enum App: String, Sendable { case booking, partner }
     enum Mode: Sendable { case local, remote }
 
     static let beginMarker = "# >>> travel-runner: managed block, rewritten on start and on mode changes"
     static let endMarker = "# <<< travel-runner"
-
-    /// Hosted dev login used in remote mode when Doppler does not set one.
-    static let remoteLoginURL = "https://identity.fastbreaktravel-dev.ai/login/init"
 
     /// Every key the runner may write for an app, in any mode. Lines for these keys outside
     /// the block are removed, so the block is their only source in `.env.local`.
@@ -73,12 +71,15 @@ enum RunnerEnv {
 
     /// The block's values, in write order. `host` is `localhost` or the LAN IP.
     /// Local mode without keys (stack not up yet) writes only the non-Supabase values.
+    /// `hostedLoginURL` is booking's login in remote mode (see `hostedLoginURL(bookingEnv:partnerEnv:)`);
+    /// nil leaves the shared `.env` value.
     static func values(
         for app: App,
         mode: Mode,
         host: String,
         keys: LocalSupabaseKeys?,
-        stripeWebhookSecret: String?
+        stripeWebhookSecret: String?,
+        hostedLoginURL: String? = nil
     ) -> [(String, String)] {
         let supabaseURL = "http://\(host):54321"
         let loginURL = "http://\(host):3000/login/init"
@@ -114,8 +115,12 @@ enum RunnerEnv {
             values += [
                 ("NEXT_PUBLIC_WEBAPP_URL", "http://\(host):3002"),
                 ("NEXT_PUBLIC_TRAVEL_PARTNER_PORTAL_URL", "http://\(host):3006"),
-                ("LOGIN_URL", mode == .local ? loginURL : remoteLoginURL),
             ]
+            if mode == .local {
+                values.append(("LOGIN_URL", loginURL))
+            } else if let hostedLoginURL {
+                values.append(("LOGIN_URL", hostedLoginURL))
+            }
             if mode == .local { values.append(("NEXT_PUBLIC_LOCAL_DEV", "true")) }
             if let stripeWebhookSecret { values.append(("STRIPE_WEBHOOK_SECRET", stripeWebhookSecret)) }
         case .partner:
@@ -124,12 +129,21 @@ enum RunnerEnv {
                 ("NEXT_PUBLIC_VGS_EXPORT_BASE_URL", "http://\(host):3006"),
                 ("NEXT_PUBLIC_TRAVEL_BOOKING_PORTAL_URL", "http://\(host):3002"),
             ]
-            // Remote mode keeps Doppler's hosted login (dev_partner sets both).
+            // Remote mode keeps the hosted login from partner's shared .env (it sets both).
             if mode == .local {
                 values += [("LOGIN_URL", loginURL), ("UNIVERSAL_LOGIN_URL", loginURL)]
             }
         }
         return values
+    }
+
+    /// The hosted login booking needs in remote mode, from the monolith's shared files.
+    /// nil when booking's own `.env` sets `LOGIN_URL` (that value applies) or when neither does.
+    /// The dev Doppler config sets it only for partner, so booking borrows partner's value.
+    static func hostedLoginURL(bookingEnv: String, partnerEnv: String) -> String? {
+        if let own = value(of: "LOGIN_URL", inFile: bookingEnv), !own.isEmpty { return nil }
+        guard let partner = value(of: "LOGIN_URL", inFile: partnerEnv), !partner.isEmpty else { return nil }
+        return partner
     }
 
     /// `existing` with the old block and stray managed keys removed and the new block appended.

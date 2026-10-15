@@ -83,7 +83,7 @@ curl -s -X POST http://localhost:19900/api/toggle-lan
 ```
 
 ### POST /api/toggle-db-mode
-Toggle between local Supabase (localhost:54321) and the hosted dev database. Rewrites the runner-managed block (`# >>> travel-runner: managed block, rewritten on start and on mode changes` … `# <<< travel-runner`) at the end of each app's `.env.local` and restarts the portals + login. Switching to remote needs `apps/booking-portal/.env` from `pnpm env:pull` (Doppler).
+Toggle between local Supabase (localhost:54321) and the hosted dev database. Rewrites the runner-managed block (`# >>> travel-runner: managed block, rewritten on start and on mode changes` … `# <<< travel-runner`) at the end of each app's `.env.local` and restarts the portals + login. Switching to remote needs the shared `.env` of each profile app (`pnpm env:check` in the monolith).
 ```bash
 curl -s -X POST http://localhost:19900/api/toggle-db-mode
 ```

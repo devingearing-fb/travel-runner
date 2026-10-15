@@ -15,13 +15,13 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 - **One-click startup**: Starts the selected profile in dependency order — `booking` (Supabase, Universal Login, Stripe, booking portal on :3002), `partner` (Supabase, Universal Login, partner portal on :3006), `both` (default), or `full` (adds cache verification, stream-services, QStash, and Sequin; experimental)
 - **Health monitoring**: Color-coded status dot in the menu bar (green/amber/red/gray)
 - **Stripe secret injection**: Captures `whsec_` from Stripe CLI stdout, writes to the runner block in `apps/booking-portal/.env.local` + serves via HTTP registry
-- **Env management**: Doppler (`pnpm env:pull`) writes shared dev values to `apps/<app>/.env`; the runner owns a marked block at the end of each app's `.env.local` (`# >>> travel-runner: managed block, ...` to `# <<< travel-runner`) with local Supabase, URL and login overrides
+- **Env management**: each app's shared dev values live in the monolith at `apps/<app>/.env` (a teammate's copy, brought in with **Import…** on the Health checks, or `pnpm env:pull` with Doppler access); the runner never holds them. `pnpm env:check` in the monolith says whether a copy is complete. The runner owns a marked block at the end of each app's `.env.local` (`# >>> travel-runner: managed block, ...` to `# <<< travel-runner`) with local Supabase, URL and login overrides
 - **Migration detection**: Auto-runs the DB reset (`scripts/db/manifest.json` `reset` profile) on first run, when pending migrations change or a new fb-amateur-backend baseline commit lands, on an empty database, and on a branch switch
 - **Shared code**: `packages/travel-data` hot-reloads into both apps — nothing to build or link
 - **Console tabs**: Live logs for Stripe, Booking Portal, and Universal Login with Pino JSON formatting
 - **Crash recovery**: Auto-restarts failed services with exponential backoff
 - **LAN mode**: Toggle to make all services accessible from other devices (mobile testing); rewrites both apps' runner blocks
-- **Database mode**: Toggle between local Supabase and hosted dev (needs `apps/booking-portal/.env` from `pnpm env:pull`)
+- **Database mode**: Toggle between local Supabase and hosted dev (needs each profile app's shared `.env`)
 - **Sleep/wake**: Re-probes services after macOS wake
 
 ## Control API

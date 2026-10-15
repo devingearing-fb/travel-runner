@@ -583,11 +583,16 @@ final class EnvironmentSupervisor {
     func writeAppEnv() {
         let host = networkMode ? (localIP ?? "localhost") : "localhost"
         let mode: RunnerEnv.Mode = dbMode == .local ? .local : .remote
+        var hostedLoginURL: String?
+        if mode == .remote, let booking = sharedEnvPath("travel-portal"), let partner = sharedEnvPath("partner-portal") {
+            hostedLoginURL = RunnerEnv.hostedLoginURL(bookingEnv: booking, partnerEnv: partner)
+        }
         for (app, serviceID) in [(RunnerEnv.App.booking, "travel-portal"), (.partner, "partner-portal")] {
             guard let cwd = graph?.nodes[serviceID]?.resolvedCwd else { continue }
             let values = RunnerEnv.values(
                 for: app, mode: mode, host: host, keys: localSupabaseKeys,
-                stripeWebhookSecret: stripeWebhookSecret
+                stripeWebhookSecret: stripeWebhookSecret,
+                hostedLoginURL: app == .booking ? hostedLoginURL : nil
             )
             RunnerEnv.apply(path: (cwd as NSString).appendingPathComponent(".env.local"), app: app, values: values)
         }
@@ -609,24 +614,25 @@ final class EnvironmentSupervisor {
                 env.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: keys.anonKey)
                 env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: keys.jwtSecret)
             }
-        } else if let doppler = dopplerBookingEnvPath,
-                  let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: doppler) {
-            // Hosted dev: the same project Doppler gives the booking portal.
+        } else if let shared = sharedEnvPath("travel-portal"),
+                  let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: shared) {
+            // Hosted dev: the same project the booking portal's shared .env uses.
             env.write(key: "NEXT_PUBLIC_SUPABASE_URL", value: url)
             env.write(key: "AMATEUR_SUPABASE_URL", value: url)
-            if let anon = RunnerEnv.value(of: "AMATEUR_SUPABASE_ANON_KEY", inFile: doppler) {
+            if let anon = RunnerEnv.value(of: "AMATEUR_SUPABASE_ANON_KEY", inFile: shared) {
                 env.write(key: "AMATEUR_SUPABASE_ANON_KEY", value: anon)
                 env.write(key: "NEXT_PUBLIC_SUPABASE_ANON_KEY", value: anon)
             }
-            if let signing = RunnerEnv.value(of: "AMATEUR_SUPABASE_SIGNING_KEY", inFile: doppler) {
+            if let signing = RunnerEnv.value(of: "AMATEUR_SUPABASE_SIGNING_KEY", inFile: shared) {
                 env.write(key: "AMATEUR_SUPABASE_SIGNING_KEY", value: signing)
             }
         }
     }
 
-    /// `apps/booking-portal/.env` from `pnpm env:pull` (Doppler dev_booking).
-    private var dopplerBookingEnvPath: String? {
-        guard let cwd = graph?.nodes["travel-portal"]?.resolvedCwd else { return nil }
+    /// The app's shared dev values in the monolith (`apps/<app>/.env`), when the file exists.
+    /// It is a teammate's copy or `pnpm env:pull` output; the runner only reads it.
+    private func sharedEnvPath(_ serviceID: String) -> String? {
+        guard let cwd = graph?.nodes[serviceID]?.resolvedCwd else { return nil }
         let path = (cwd as NSString).appendingPathComponent(".env")
         return FileManager.default.fileExists(atPath: path) ? path : nil
     }
@@ -708,11 +714,17 @@ final class EnvironmentSupervisor {
         }
 
         if dbMode == .local {
-            // Hosted dev comes from Doppler's .env; the runner block then stops
+            // Hosted dev comes from each app's shared .env; the runner block then stops
             // overriding Supabase.
-            guard let doppler = dopplerBookingEnvPath,
-                  RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: doppler) != nil else {
-                lastError = "Hosted dev values are missing — run pnpm env:pull in the monorepo (Doppler), then switch again"
+            let apps = ["travel-portal"] + (isInProfile("partner-portal") ? ["partner-portal"] : [])
+            let lacking = apps.filter { serviceID in
+                guard let shared = sharedEnvPath(serviceID),
+                      let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: shared) else { return true }
+                return url.isEmpty
+            }
+            guard lacking.isEmpty else {
+                let files = lacking.map { $0 == "travel-portal" ? "apps/booking-portal/.env" : "apps/partner-portal/.env" }
+                lastError = "Hosted dev values are missing from \(files.joined(separator: " and ")) — import the shared file (Health → App env files), then switch again"
                 return
             }
             dbMode = .remote

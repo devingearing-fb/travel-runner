@@ -52,7 +52,7 @@ curl -s http://localhost:19900/api/status | python3 -m json.tool
 ```
 
 - `profile`: the active run profile (`booking`, `partner`, `both`, `full`) — see `/api/profile`
-- `db_mode`: `local` (local Supabase) or `remote` (hosted dev via Doppler) — see `/api/toggle-db-mode`
+- `db_mode`: `local` (local Supabase) or `remote` (hosted dev, from the apps' shared `.env` files) — see `/api/toggle-db-mode`
 - `ip` is `"none"` when LAN mode is off; `pid` is `"nil"` when the service has no process
 - `branches` / `gitBehind`: current git branch and commits-behind count per service repo; `npmStale`: service IDs whose dependencies need a reinstall
 
@@ -238,9 +238,9 @@ Toggles between local Supabase (localhost:54321) and the hosted dev database. Re
 curl -s -X POST http://localhost:19900/api/toggle-db-mode
 ```
 
-Switching to remote needs the hosted dev values in `apps/booking-portal/.env`, written by Doppler with `pnpm env:pull` at the monorepo root; without them the switch is refused. Check the result in the `db_mode` field of `/api/status`.
+Switching to remote needs the hosted dev values in the shared `.env` of each profile app (`apps/booking-portal/.env`, and `apps/partner-portal/.env` when partner runs); without them the switch is refused. `pnpm env:check` at the monorepo root shows what is missing. Check the result in the `db_mode` field of `/api/status`.
 
-**Env layout:** Doppler (`pnpm env:pull`) writes shared dev values to `apps/<app>/.env`. The runner owns a marked block at the end of each app's `.env.local`, between `# >>> travel-runner: managed block, rewritten on start and on mode changes` and `# <<< travel-runner`. Local mode overrides Supabase (including `AMATEUR_SUPABASE_*`), app URLs and the login URL; remote mode leaves Supabase to Doppler's `.env`.
+**Env layout:** each app's shared dev values are in the monolith at `apps/<app>/.env`: a teammate's copy (Health → **Import…**) or `pnpm env:pull` with Doppler access. The runner never stores them. The runner owns a marked block at the end of each app's `.env.local`, between `# >>> travel-runner: managed block, rewritten on start and on mode changes` and `# <<< travel-runner`. Local mode overrides Supabase (including `AMATEUR_SUPABASE_*`), app URLs and the login URL; remote mode leaves Supabase to the shared `.env`.
 
 ### POST /api/db-reset
 

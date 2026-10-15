@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 
 enum CheckSection: String, Sendable, CaseIterable {
@@ -100,10 +101,6 @@ final class EnvironmentChecker {
                         isRequired: false, fixLabel: "stripe login",
                         checkCommand: "stripe config --list",
                         checkDescription: "Optional — Stripe CLI must be authenticated to forward webhook events"),
-            HealthCheck(id: "doppler", name: "Doppler CLI", section: .prerequisites,
-                        isRequired: false,
-                        checkCommand: "doppler me",
-                        checkDescription: "Pulls the shared dev values into apps/*/.env (pnpm env:pull). Log in once with: doppler login"),
 
             // Dependencies
             HealthCheck(id: "workspace-modules", name: "Monorepo dependencies", section: .dependencies,
@@ -123,11 +120,16 @@ final class EnvironmentChecker {
                         checkPath: (streamServicesPath as NSString).appendingPathComponent("node_modules")),
 
             // Supabase & Database
-            HealthCheck(id: "app-env", name: "App .env files (Doppler)", section: .supabase,
-                        isRequired: false, fixLabel: "pnpm env:pull",
-                        checkCommand: "ls apps/booking-portal/.env apps/partner-portal/.env",
-                        checkDescription: "Shared dev values from Doppler. travel-runner writes the local overrides into .env.local on top of them.",
+            HealthCheck(id: "booking-env", name: "Booking .env (shared values)", section: .supabase,
+                        isRequired: false, fixLabel: "Import…",
+                        checkCommand: "pnpm env:check",
+                        checkDescription: "apps/booking-portal/.env holds the shared dev values (Stripe, HotelPlanner, hosted Supabase…). Get it from a teammate and import it, or run pnpm env:pull with Doppler access. The runner writes local overrides into .env.local on top of it.",
                         checkPath: (bookingPath as NSString).appendingPathComponent(".env")),
+            HealthCheck(id: "partner-env", name: "Partner .env (shared values)", section: .supabase,
+                        isRequired: false, fixLabel: "Import…",
+                        checkCommand: "pnpm env:check",
+                        checkDescription: "apps/partner-portal/.env holds the shared dev values. Get it from a teammate and import it, or run pnpm env:pull with Doppler access.",
+                        checkPath: (partnerPath as NSString).appendingPathComponent(".env")),
             HealthCheck(id: "backend-baseline", name: "Backend migration baseline", section: .supabase,
                         isRequired: false,
                         checkCommand: "ls ../fb-amateur-backend .backend-baseline",
@@ -170,7 +172,11 @@ final class EnvironmentChecker {
         guard let check = checks.first(where: { $0.id == checkID }) else { return }
         check.status = .fixing
 
-        let success = await runFix(checkID)
+        guard let success = await runFix(checkID) else {
+            // Cancelled: nothing changed.
+            check.status = await runCheck(checkID)
+            return
+        }
         if success {
             let newStatus = await runCheck(checkID)
             check.status = newStatus
@@ -223,11 +229,6 @@ final class EnvironmentChecker {
             let ok = await shell("stripe balance retrieve >/dev/null 2>&1")
             return ok ? .passing("Authenticated") : .warning("Session invalid or expired — run: stripe login")
 
-        case "doppler":
-            if !(await shell("which doppler >/dev/null 2>&1")) { return .warning("Not installed — brew install dopplerhq/cli/doppler") }
-            let ok = await shell("doppler me >/dev/null 2>&1")
-            return ok ? .passing("Logged in") : .warning("Not logged in — run: doppler login")
-
         case "workspace-modules":
             let path = (monorepoPath as NSString).appendingPathComponent("node_modules/.modules.yaml")
             return exists(path) ? .passing("Installed") : .failing("Run pnpm install at the monorepo root")
@@ -240,11 +241,10 @@ final class EnvironmentChecker {
             let path = (streamServicesPath as NSString).appendingPathComponent("node_modules")
             return exists(path) ? .passing("Installed") : .warning("Run npm install (full profile only)")
 
-        case "app-env":
-            let missing = [bookingPath, partnerPath]
-                .filter { !exists(($0 as NSString).appendingPathComponent(".env")) }
-                .map { ($0 as NSString).lastPathComponent }
-            return missing.isEmpty ? .passing("Pulled") : .warning("Missing for \(missing.joined(separator: ", ")) — run pnpm env:pull")
+        case "booking-env", "partner-env":
+            let app: SharedEnvFiles.App = id == "booking-env" ? .booking : .partner
+            let (output, _) = await shellOutput(SharedEnvFiles.command(monorepo: monorepoPath, app: app))
+            return SharedEnvFiles.status(SharedEnvFiles.decode(output, app: app))
 
         case "backend-baseline":
             let sibling = ((monorepoPath as NSString).deletingLastPathComponent as NSString)
@@ -279,7 +279,8 @@ final class EnvironmentChecker {
 
     // MARK: - Fix implementations
 
-    private func runFix(_ id: String) async -> Bool {
+    /// nil when the developer cancelled and nothing changed.
+    private func runFix(_ id: String) async -> Bool? {
         switch id {
         case "docker":
             let runtime = ContainerRuntime.detect()
@@ -310,8 +311,11 @@ final class EnvironmentChecker {
         case "stream-modules":
             return await shellInDir(streamServicesPath, "npm install")
 
-        case "app-env":
-            return await shellInDir(monorepoPath, "pnpm env:pull")
+        case "booking-env":
+            return await importSharedEnv(.booking)
+
+        case "partner-env":
+            return await importSharedEnv(.partner)
 
         case "login-env":
             return createLoginEnvLocal()
@@ -330,20 +334,58 @@ final class EnvironmentChecker {
 
     // MARK: - Helpers
 
-    private func createLoginEnvLocal() -> Bool {
-        let anonKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZS1kZW1vIiwicm9sZSI6ImFub24iLCJleHAiOjE5ODM4MTI5OTZ9.CRXP1A7WOeoJeXxjNni43kdQwgnWNReilDMblYTn_I0"
-        let jwtSecret = "super-secret-jwt-token-with-at-least-32-characters-long"
+    /// Copies a shared `.env` the developer picks into the monolith, after the monolith's
+    /// env-check confirms it is this app's file. The runner keeps no copy.
+    private func importSharedEnv(_ app: SharedEnvFiles.App) async -> Bool? {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.message = "Choose the \(app.label.lowercased()) portal .env a teammate sent you (their \(app.directory)/.env)"
+        panel.level = .floating
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let source = panel.url else { return nil }
 
+        let (output, _) = await shellOutput(SharedEnvFiles.command(monorepo: monorepoPath, app: app, file: source.path))
+        let alert = NSAlert()
+        alert.window.level = .floating
+        guard let report = SharedEnvFiles.decode(output, app: app) else {
+            alert.messageText = "Could not check the file"
+            alert.informativeText = "\(SharedEnvFiles.script) did not run. Pull the latest monorepo dev and try again."
+            alert.runModal()
+            return false
+        }
+        let target = ((monorepoPath as NSString).appendingPathComponent(app.directory) as NSString).appendingPathComponent(".env")
+        let prompt = SharedEnvFiles.importPrompt(report, app: app, replacing: exists(target))
+        alert.messageText = prompt.title
+        alert.informativeText = prompt.message
+        guard prompt.acceptable else {
+            alert.runModal()
+            return nil
+        }
+        alert.addButton(withTitle: "Import")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        do {
+            let data = try Data(contentsOf: source)
+            try data.write(to: URL(fileURLWithPath: target), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// The login's non-Supabase local values. The runner adds the local stack's Supabase keys
+    /// (from scripts/local-db.sh status) when it starts the login, so none are written here.
+    private func createLoginEnvLocal() -> Bool {
         let content = """
-        NEXT_PUBLIC_SUPABASE_URL=http://localhost:54321
-        NEXT_PUBLIC_SUPABASE_ANON_KEY=\(anonKey)
         NEXT_PUBLIC_SITE_URL=http://localhost:3000
         NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL=http://localhost:3000
-        AMATEUR_SUPABASE_URL=http://localhost:54321
-        AMATEUR_SUPABASE_ANON_KEY=\(anonKey)
-        AMATEUR_SUPABASE_SIGNING_KEY=\(jwtSecret)
         ALLOW_LOCALHOST_REDIRECTS=true
         EMAIL_CONFIRMATION_REQUIRED=false
+
         """
 
         let path = (loginPath as NSString).appendingPathComponent(".env.local")
