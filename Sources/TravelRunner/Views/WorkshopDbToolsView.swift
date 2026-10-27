@@ -72,7 +72,7 @@ struct WorkshopDbToolsView: View {
                         .accessibilityHint(resetAccessibilityHint)
 
                         if supervisor.migrationsBannerVisible {
-                            Label("Migrations changed", systemImage: "exclamationmark.triangle.fill")
+                            Label("Migrations not applied", systemImage: "exclamationmark.triangle.fill")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                         }

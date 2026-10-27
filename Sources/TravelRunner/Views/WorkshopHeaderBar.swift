@@ -137,8 +137,9 @@ struct WorkshopHeaderBar: View {
                 alertBanner(
                     icon: "arrow.triangle.2.circlepath",
                     color: .orange,
-                    text: "Migrations changed since last db:reset",
-                    subtitle: nil,
+                    text: "Local database is missing \(supervisor.pendingMigrations.count) migration\(supervisor.pendingMigrations.count == 1 ? "" : "s")",
+                    subtitle: supervisor.pendingMigrations.prefix(3).joined(separator: ", ")
+                        + (supervisor.pendingMigrations.count > 3 ? " …" : ""),
                     action: ("Reset DB", { supervisor.resetDatabase() }),
                     onDismiss: { supervisor.dismissMigrationsBanner() }
                 )

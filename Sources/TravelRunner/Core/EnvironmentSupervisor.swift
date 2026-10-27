@@ -14,7 +14,10 @@ final class EnvironmentSupervisor {
     var sortedServiceIDs: [String] = []
     var lastError: String? = nil
     var startupBeganAt: Date? = nil
-    var migrationsBannerVisible = false
+    /// Migrations the local database has not applied (from the last check).
+    var pendingMigrations: [String] = []
+    var migrationsBannerDismissed = false
+    var migrationsBannerVisible: Bool { !pendingMigrations.isEmpty && !migrationsBannerDismissed }
     var dbResetRunning = false
     var dbSetupPipeline: DbSetupPipeline? = nil
     var dbSeedScenarios: [DbSeedScenario] = []
@@ -80,7 +83,6 @@ final class EnvironmentSupervisor {
     private var graph: ServiceGraph?
     private let processRunner = ProcessRunner()
     private let preflightRunner = PreflightRunner()
-    private let migrationTracker = MigrationTracker()
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
     private var sleepWakeObserver: SleepWakeObserver?
@@ -359,18 +361,12 @@ final class EnvironmentSupervisor {
                     await self.refreshLocalSupabaseKeys()
                     let portalCwd = config.services.first(where: { $0.id == "supabase" })?.resolvedCwd
                     if let cwd = portalCwd {
-                        let migrationsChanged = !self.migrationTracker.hasEverRun()
-                            || self.migrationTracker.migrationsChanged(portalCwd: cwd)
-                        var dbEmpty = false
-                        if !migrationsChanged {
-                            let hasTables = await self.databaseHasAppTables(portalCwd: cwd)
-                            dbEmpty = !hasTables
-                        }
-                        let needsReset = migrationsChanged || dbEmpty
-                        if needsReset {
+                        let dbEmpty = !(await self.databaseHasAppTables(portalCwd: cwd))
+                        let missing = dbEmpty ? [] : (await self.missingMigrations(cwd: cwd) ?? [])
+                        if dbEmpty || !missing.isEmpty {
                             let reason = dbEmpty
                                 ? "Empty database detected — running db:reset..."
-                                : "New migrations detected — running db:reset..."
+                                : "\(missing.count) new migration\(missing.count == 1 ? "" : "s") — running db:reset..."
                             await MainActor.run {
                                 self.lastError = reason
                                 self.dbResetRunning = true
@@ -380,13 +376,12 @@ final class EnvironmentSupervisor {
                                 self.dbResetRunning = false
                                 if ok {
                                     self.lastError = nil
-                                    self.migrationTracker.recordCurrentHash(portalCwd: cwd)
                                 } else {
                                     self.lastError = "db:reset failed — expand logs or click Reset DB to retry"
-                                    self.migrationsBannerVisible = true
                                 }
                             }
                         }
+                        await self.refreshPendingMigrations(cwd: cwd)
                     }
                 }
 
@@ -915,10 +910,10 @@ final class EnvironmentSupervisor {
                         dbResetRunning = false
                         if ok {
                             lastError = nil
-                            migrationTracker.recordCurrentHash(portalCwd: cwd)
                         } else {
                             lastError = "db:reset failed — check logs"
                         }
+                        await refreshPendingMigrations(cwd: cwd)
                     }
                 }
             }
@@ -995,7 +990,7 @@ final class EnvironmentSupervisor {
 
             if changed.contains("supabase") || changed.contains("travel-portal") {
                 if let cwd = serviceCwd("supabase") ?? serviceCwd("travel-portal") {
-                    if migrationTracker.migrationsChanged(portalCwd: cwd) {
+                    if let missing = await missingMigrations(cwd: cwd), !missing.isEmpty {
                         await MainActor.run {
                             self.lastError = "Branch switch: new migrations detected — running db:reset..."
                             self.dbResetRunning = true
@@ -1005,13 +1000,12 @@ final class EnvironmentSupervisor {
                             self.dbResetRunning = false
                             if ok {
                                 self.lastError = nil
-                                self.migrationTracker.recordCurrentHash(portalCwd: cwd)
                             } else {
                                 self.lastError = "db:reset failed after branch switch"
-                                self.migrationsBannerVisible = true
                             }
                         }
                     }
+                    await refreshPendingMigrations(cwd: cwd)
                 }
             }
 
@@ -1097,7 +1091,6 @@ final class EnvironmentSupervisor {
         }
 
         dbResetRunning = true
-        migrationsBannerVisible = false
         lastError = nil
 
         let runner = DbSetupRunner(
@@ -1110,8 +1103,8 @@ final class EnvironmentSupervisor {
         Task {
             await runner.run(pipeline: pipeline, from: stepId)
             dbResetRunning = false
+            await refreshPendingMigrations(cwd: cwd)
             if pipeline.allRequiredPassed {
-                migrationTracker.recordCurrentHash(portalCwd: cwd)
                 lastError = nil
                 await refreshLocalSupabaseKeys()
             } else if let failed = pipeline.firstFailed {
@@ -1211,7 +1204,17 @@ final class EnvironmentSupervisor {
     }
 
     func dismissMigrationsBanner() {
-        migrationsBannerVisible = false
+        migrationsBannerDismissed = true
+    }
+
+    /// Reads which migrations the database lacks, for the banner. A new set shows the
+    /// banner again after a dismiss.
+    func refreshPendingMigrations(cwd: String) async {
+        let missing = await missingMigrations(cwd: cwd) ?? []
+        await MainActor.run {
+            if missing != self.pendingMigrations { self.migrationsBannerDismissed = false }
+            self.pendingMigrations = missing
+        }
     }
 
     // MARK: - Private: LAN-Aware Definition
@@ -1952,9 +1955,23 @@ final class EnvironmentSupervisor {
     /// Whether the local database has the travel tables. A fresh Docker volume has
     /// none, and then the startup check runs a reset.
     private func databaseHasAppTables(portalCwd: String) async -> Bool {
-        let container = SupabaseProject.dbContainerName(root: portalCwd)
-        let query = "SELECT count(*) FROM pg_tables WHERE schemaname = 'fb_travel'"
-        let command = "docker exec \(container) psql -U postgres -d postgres -tAc \"\(query)\" 2>/dev/null"
+        let output = await queryDatabase(cwd: portalCwd, sql: "SELECT count(*) FROM pg_tables WHERE schemaname = 'fb_travel'")
+        return (Int(output ?? "") ?? 0) > 0
+    }
+
+    /// Migrations the local database has not applied, oldest first; nil when that
+    /// cannot be read (database down, no backend baseline checkout).
+    private func missingMigrations(cwd: String) async -> [String]? {
+        guard let expected = MigrationTracker.expectedVersions(root: cwd),
+              let output = await queryDatabase(cwd: cwd, sql: "SELECT version FROM supabase_migrations.schema_migrations")
+        else { return nil }
+        return MigrationTracker.missing(expected: expected, applied: MigrationTracker.parseVersions(output))
+    }
+
+    /// One query against the local database (`psql -tA`), or nil when it fails.
+    private func queryDatabase(cwd: String, sql: String) async -> String? {
+        let container = SupabaseProject.dbContainerName(root: cwd)
+        let command = ShellQuote.join(["docker", "exec", container, "psql", "-U", "postgres", "-d", "postgres", "-tAc", sql]) + " 2>/dev/null"
         return await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -1963,20 +1980,19 @@ final class EnvironmentSupervisor {
             process.standardOutput = pipe
             process.standardError = FileHandle.nullDevice
             process.terminationHandler = { proc in
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 guard proc.terminationStatus == 0 else {
-                    continuation.resume(returning: false)
+                    continuation.resume(returning: nil)
                     return
                 }
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
-                let count = Int(output) ?? 0
-                continuation.resume(returning: count > 0)
+                let output = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                continuation.resume(returning: output)
             }
-            do { try process.run() } catch { continuation.resume(returning: false) }
+            do { try process.run() } catch { continuation.resume(returning: nil) }
         }
     }
 
-    /// Automatic reset (first run, changed migrations, empty database, branch switch):
+    /// Automatic reset (empty database, migrations the database lacks, branch switch):
     /// the manifest's `reset` profile with the selected seed scenario, shown in the
     /// DB setup panel like a manual reset.
     private func runDbReset(cwd: String) async -> Bool {

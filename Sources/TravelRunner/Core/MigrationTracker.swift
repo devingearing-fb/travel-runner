@@ -1,85 +1,64 @@
 import Foundation
-import CryptoKit
 
-/// Detects when the local database needs a reset. The monorepo replays the
-/// fb-amateur-backend baseline plus its own pending migrations, so the hash covers
-/// both: the pending `supabase/migrations/*.sql` files and the baseline commit.
-struct MigrationTracker: Sendable {
-    private let hashPath: String
-
-    init(configDir: String = ConfigLoader.configDir) {
-        self.hashPath = (configDir as NSString).appendingPathComponent("migration-hash.txt")
-    }
-
-    func migrationsChanged(portalCwd: String) -> Bool {
-        let currentHash = computeHash(root: portalCwd)
-        guard let currentHash else { return true }
-
-        guard let storedHash = try? String(contentsOfFile: hashPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) else {
-            return true
-        }
-
-        return currentHash != storedHash
-    }
-
-    func recordCurrentHash(portalCwd: String) {
-        guard let hash = computeHash(root: portalCwd) else { return }
-        try? hash.write(toFile: hashPath, atomically: true, encoding: .utf8)
-    }
-
-    func hasEverRun() -> Bool {
-        FileManager.default.fileExists(atPath: hashPath)
-    }
-
-    func computeHash(root: String) -> String? {
-        let migrationsDir = (root as NSString).appendingPathComponent("supabase/migrations")
-        guard let files = try? FileManager.default.contentsOfDirectory(atPath: migrationsDir) else {
-            return nil
-        }
-        var hasher = SHA256()
-        hasher.update(data: Data("monorepo-v1".utf8))
-        for file in files.filter({ $0.hasSuffix(".sql") }).sorted() {
-            hasher.update(data: Data(file.utf8))
-            let filePath = (migrationsDir as NSString).appendingPathComponent(file)
-            if let data = FileManager.default.contents(atPath: filePath) {
-                hasher.update(data: data)
+/// Finds the migrations the local database has not applied. The monorepo replays the
+/// fb-amateur-backend baseline plus its own pending `supabase/migrations/*.sql`, so the
+/// expected versions are the files of both; the applied versions come from the database
+/// (`supabase_migrations.schema_migrations`).
+///
+/// The database is the record, not a hash file: a reset outside the runner
+/// (`pnpm db:reset`) or another runner build cannot make it stale, so a database that
+/// is up to date is never reset again.
+enum MigrationTracker {
+    /// Migration versions (the timestamp before the first `_`) the database should have,
+    /// or nil when the backend baseline checkout is not there.
+    static func expectedVersions(
+        root: String,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Set<String>? {
+        guard let backend = backendBaselineDir(root: root, environment: environment) else { return nil }
+        let dirs = [
+            (backend as NSString).appendingPathComponent("supabase/migrations"),
+            (root as NSString).appendingPathComponent("supabase/migrations"),
+        ]
+        var versions = Set<String>()
+        for dir in dirs {
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
+            for file in files where file.hasSuffix(".sql") {
+                if let version = file.split(separator: "_", maxSplits: 1).first, !version.isEmpty {
+                    versions.insert(String(version))
+                }
             }
         }
-        hasher.update(data: Data("baseline:\(Self.backendBaselineSHA(root: root) ?? "none")".utf8))
-        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return versions
     }
 
-    /// The backend commit `scripts/local-db.sh` replays, read locally (no fetch), in the
-    /// script's resolution order. `.backend-baseline/` only moves during a reset, so its
-    /// HEAD is the baseline the database was last built from.
-    static func backendBaselineSHA(
+    /// Expected versions the database has not applied, oldest first.
+    static func missing(expected: Set<String>, applied: Set<String>) -> [String] {
+        expected.subtracting(applied).sorted()
+    }
+
+    /// The backend checkout `scripts/local-db.sh` replays, in the script's resolution
+    /// order. `.backend-baseline/` only moves during a reset, so it is the baseline the
+    /// database was last built from.
+    static func backendBaselineDir(
         root: String,
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String? {
         let fm = FileManager.default
         var candidates: [String] = []
         if let dir = environment["FB_AMATEUR_BACKEND_DIR"], !dir.isEmpty { candidates.append(dir) }
-        let sibling = ((root as NSString).deletingLastPathComponent as NSString).appendingPathComponent("fb-amateur-backend")
-        if fm.fileExists(atPath: (sibling as NSString).appendingPathComponent("supabase/migrations")) {
-            candidates.append(sibling)
-        }
+        candidates.append(((root as NSString).deletingLastPathComponent as NSString).appendingPathComponent("fb-amateur-backend"))
         candidates.append((root as NSString).appendingPathComponent(".backend-baseline"))
-
-        guard let dir = candidates.first(where: { fm.fileExists(atPath: ($0 as NSString).appendingPathComponent(".git")) }) else {
-            return nil
+        return candidates.first {
+            fm.fileExists(atPath: ($0 as NSString).appendingPathComponent("supabase/migrations"))
         }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = ["-C", dir, "rev-parse", "HEAD"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        do { try process.run() } catch { return nil }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else { return nil }
-        let sha = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return sha.isEmpty ? nil : sha
+    }
+
+    /// Parses `psql -tA` output: one version per line.
+    static func parseVersions(_ output: String) -> Set<String> {
+        Set(output.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty })
     }
 }
 

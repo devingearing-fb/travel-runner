@@ -5,7 +5,6 @@ import XCTest
 final class MigrationTrackerTests: XCTestCase {
     private var container: URL!
     private var root: URL!
-    private var tracker: MigrationTracker!
 
     override func setUpWithError() throws {
         container = FileManager.default.temporaryDirectory
@@ -16,46 +15,46 @@ final class MigrationTrackerTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try Data("# pending only".utf8).write(to: root.appendingPathComponent("supabase/migrations/README.md"))
-        tracker = MigrationTracker(configDir: container.path)
     }
 
     override func tearDownWithError() throws {
         try? FileManager.default.removeItem(at: container)
     }
 
-    func testEmptyPendingDirectoryIsStableAfterRecording() {
-        XCTAssertTrue(tracker.migrationsChanged(portalCwd: root.path))
-        tracker.recordCurrentHash(portalCwd: root.path)
-        XCTAssertFalse(tracker.migrationsChanged(portalCwd: root.path))
+    func testNoBaselineCheckoutMeansUnknown() {
+        XCTAssertNil(MigrationTracker.expectedVersions(root: root.path, environment: [:]))
     }
 
-    func testNewPendingMigrationChangesTheHash() throws {
-        tracker.recordCurrentHash(portalCwd: root.path)
-        try Data("select 1;".utf8).write(to: root.appendingPathComponent("supabase/migrations/20261014000000_change.sql"))
-        XCTAssertTrue(tracker.migrationsChanged(portalCwd: root.path))
+    func testExpectedVersionsAreBaselinePlusPending() throws {
+        try migration(in: root.appendingPathComponent(".backend-baseline"), "20260101000000_base.sql")
+        try migration(in: root, "20261014000000_change.sql")
+        XCTAssertEqual(
+            MigrationTracker.expectedVersions(root: root.path, environment: [:]),
+            ["20260101000000", "20261014000000"]
+        )
     }
 
-    func testNewBackendBaselineCommitChangesTheHash() throws {
-        let baseline = root.appendingPathComponent(".backend-baseline")
-        try git(["init", "-q", baseline.path])
-        try git(["-C", baseline.path, "commit", "-q", "--allow-empty", "-m", "one"])
-        tracker.recordCurrentHash(portalCwd: root.path)
-        XCTAssertFalse(tracker.migrationsChanged(portalCwd: root.path))
+    func testAnUpToDateDatabaseMissesNothing() throws {
+        try migration(in: root.appendingPathComponent(".backend-baseline"), "20260101000000_base.sql")
+        let expected = try XCTUnwrap(MigrationTracker.expectedVersions(root: root.path, environment: [:]))
+        let applied = MigrationTracker.parseVersions("20260101000000\n20250101000000\n")
+        XCTAssertEqual(MigrationTracker.missing(expected: expected, applied: applied), [])
+    }
 
-        try git(["-C", baseline.path, "commit", "-q", "--allow-empty", "-m", "two"])
-        XCTAssertTrue(tracker.migrationsChanged(portalCwd: root.path))
+    func testANewPendingMigrationIsMissing() throws {
+        try migration(in: root.appendingPathComponent(".backend-baseline"), "20260101000000_base.sql")
+        try migration(in: root, "20261014000000_change.sql")
+        let expected = try XCTUnwrap(MigrationTracker.expectedVersions(root: root.path, environment: [:]))
+        let applied = MigrationTracker.parseVersions("20260101000000")
+        XCTAssertEqual(MigrationTracker.missing(expected: expected, applied: applied), ["20261014000000"])
     }
 
     func testSiblingBackendCheckoutWinsOverManagedClone() throws {
         let sibling = container.appendingPathComponent("TRAVEL BOOKING/fb-amateur-backend")
-        try FileManager.default.createDirectory(
-            at: sibling.appendingPathComponent("supabase/migrations"),
-            withIntermediateDirectories: true
-        )
-        try git(["init", "-q", sibling.path])
-        try git(["-C", sibling.path, "commit", "-q", "--allow-empty", "-m", "sibling"])
-        let siblingSHA = try git(["-C", sibling.path, "rev-parse", "HEAD"])
-        XCTAssertEqual(MigrationTracker.backendBaselineSHA(root: root.path, environment: [:]), siblingSHA)
+        try migration(in: sibling, "20260202000000_sibling.sql")
+        try migration(in: root.appendingPathComponent(".backend-baseline"), "20260101000000_base.sql")
+        XCTAssertEqual(MigrationTracker.backendBaselineDir(root: root.path, environment: [:]), sibling.path)
+        XCTAssertEqual(MigrationTracker.expectedVersions(root: root.path, environment: [:]), ["20260202000000"])
     }
 
     func testContainerNameComesFromProjectID() throws {
@@ -73,21 +72,9 @@ final class MigrationTrackerTests: XCTestCase {
         XCTAssertEqual(SupabaseProject.dbContainerName(root: root.path), "supabase_db_fb-travel-monolith")
     }
 
-    @discardableResult
-    private func git(_ arguments: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.environment = ProcessInfo.processInfo.environment.merging([
-            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-        ]) { $1 }
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        try process.run()
-        process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0, arguments.joined(separator: " "))
-        return String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+    private func migration(in checkout: URL, _ name: String) throws {
+        let dir = checkout.appendingPathComponent("supabase/migrations")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data("select 1;".utf8).write(to: dir.appendingPathComponent(name))
     }
 }
