@@ -61,7 +61,7 @@ final class SharedEnvFilesTests: XCTestCase {
             .deletingLastPathComponent().appendingPathComponent("fb-travel-monolith").path
         try XCTSkipUnless(FileManager.default.fileExists(atPath: (monorepo as NSString).appendingPathComponent(SharedEnvFiles.script)))
         let candidate = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).env")
-        try "ALGOLIA_APP_ID=x\nSTATSIG_SERVER_KEY=y\n".write(to: candidate, atomically: true, encoding: .utf8)
+        try "LITEAPI_API_KEY=x\nSTATSIG_SERVER_KEY=y\n".write(to: candidate, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: candidate) }
 
         let process = Process()
@@ -76,6 +76,6 @@ final class SharedEnvFilesTests: XCTestCase {
         let parsed = try XCTUnwrap(SharedEnvFiles.decode(output, app: .booking))
         XCTAssertTrue(parsed.exists)
         XCTAssertFalse(parsed.ok)
-        XCTAssertEqual(parsed.shared - parsed.missing.count, 1, "only ALGOLIA_APP_ID is a shared booking key")
+        XCTAssertEqual(parsed.shared - parsed.missing.count, 1, "only LITEAPI_API_KEY is a shared booking key")
     }
 }
