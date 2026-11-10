@@ -294,6 +294,9 @@ private struct IssueDetailView: View {
                 infoRow("Trigger", issue.trigger)
                 infoRow("Service", issue.serviceId ?? "—")
                 infoRow("Error", issue.errorMessage)
+                if let cause = issue.likelyCause {
+                    infoRow("Likely cause", cause)
+                }
                 infoRow("Signature", issue.errorSignature)
                 infoRow("Created", issue.createdAt)
                 infoRow("Updated", issue.updatedAt)

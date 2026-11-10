@@ -33,6 +33,8 @@ final class ServiceState {
     var pid: Int32? = nil
     var exitCode: Int32? = nil
     var lastStarted: Date? = nil
+    /// When the current process passed its probe; nil while it starts.
+    var readyAt: Date? = nil
     var lastStopped: Date? = nil
     var restartCount: Int = 0
     var capturedArtifact: String? = nil

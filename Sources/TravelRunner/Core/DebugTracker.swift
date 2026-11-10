@@ -57,6 +57,9 @@ actor DebugTracker {
         var serviceId: String?
         var errorSignature: String
         var errorMessage: String
+        /// The line of the service's output that best explains the failure. Issues
+        /// from before this field have none.
+        var likelyCause: String?
         var createdAt: String
         var updatedAt: String
         var resolvedAt: String?
@@ -69,6 +72,7 @@ actor DebugTracker {
             case serviceId = "service_id"
             case errorSignature = "error_signature"
             case errorMessage = "error_message"
+            case likelyCause = "likely_cause"
             case createdAt = "created_at"
             case updatedAt = "updated_at"
             case resolvedAt = "resolved_at"
@@ -167,6 +171,7 @@ actor DebugTracker {
         errorMessage: String,
         severity: String = "error",
         category: String = "runtime",
+        likelyCause: String? = nil,
         logEntries: [LogEntry] = [],
         stateSnapshots: [ServiceStateSnapshot] = []
     ) -> String? {
@@ -197,7 +202,9 @@ actor DebugTracker {
 
         // Build issue
         let iso = isoString(now)
-        let summary = buildSummary(trigger: trigger, serviceId: serviceId, errorMessage: errorMessage)
+        let summary = buildSummary(
+            trigger: trigger, serviceId: serviceId, errorMessage: errorMessage, likelyCause: likelyCause
+        )
         let issue = Issue(
             id: folderId,
             summary: summary,
@@ -208,6 +215,7 @@ actor DebugTracker {
             serviceId: serviceId,
             errorSignature: signature,
             errorMessage: errorMessage,
+            likelyCause: likelyCause,
             createdAt: iso,
             updatedAt: iso,
             resolvedAt: nil,
@@ -450,13 +458,13 @@ actor DebugTracker {
     }
 
     private func redactLine(_ line: String) -> String {
+        Self.isSecretLine(line) ? "[REDACTED]" : line
+    }
+
+    /// True for a line that can hold a credential. Such a line never goes into an issue.
+    static func isSecretLine(_ line: String) -> Bool {
         let upper = line.uppercased()
-        for pattern in Self.secretPatterns {
-            if upper.contains(pattern) {
-                return "[REDACTED]"
-            }
-        }
-        return line
+        return secretPatterns.contains { upper.contains($0) }
     }
 
     private func makeSlug(trigger: String, serviceId: String?) -> String {
@@ -486,10 +494,11 @@ actor DebugTracker {
         return f.date(from: string)
     }
 
-    private func buildSummary(trigger: String, serviceId: String?, errorMessage: String) -> String {
+    private func buildSummary(trigger: String, serviceId: String?, errorMessage: String, likelyCause: String?) -> String {
         let svc = serviceId ?? "unknown"
         let truncated = errorMessage.prefix(120)
-        return "\(trigger) [\(svc)]: \(truncated)"
+        guard let likelyCause, !likelyCause.isEmpty else { return "\(trigger) [\(svc)]: \(truncated)" }
+        return "\(trigger) [\(svc)]: \(truncated) — \(likelyCause.prefix(160))"
     }
 
     private func ensureDirectory(_ path: String) {

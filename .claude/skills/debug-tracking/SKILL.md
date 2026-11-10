@@ -57,6 +57,10 @@ curl -s http://localhost:19900/api/debug/issues | python3 -m json.tool
 
 The ID is `yyyyMMdd'T'HHmmss` (local time) + `_` + the trigger (underscores as dashes) + `-<service_id>` when there is one. `service_id` is `""` when the issue has no service (e.g. manual captures). A repeat of the same error within the dedup window (7 days by default) bumps `recurrence_count` on the open issue instead of creating a new one.
 
+When the service's output shows why it failed, `summary` ends with ` — <likely cause>`, for example `service_crash [travel-portal]: Travel Portal exited with code 1 — Error: listen EADDRINUSE: address already in use :::3002`. The same text is in `likely_cause` in `issue.json`. The cause is not part of the dedup signature.
+
+`dedup_window_seconds` in `config.json` overrides the 7-day default. A config file from before July 2026 can still have `300`; remove the key to get the default.
+
 ### POST /api/debug/issues
 
 Create a manual issue. Use for bugs that auto-capture doesn't catch (logic errors, cross-service issues, subtle regressions). The only body field is `description`; it defaults to `"Manual capture via API"` when missing.
@@ -89,14 +93,28 @@ Each issue records what captured it in its `trigger` field (and in its ID). Auto
 
 | Trigger | Auto-captured | Description |
 |----------|---------------|-------------|
-| `service_crash` | yes | Process exited non-zero or received fatal signal |
-| `circuit_breaker` | yes | Circuit breaker tripped after repeated failures |
+| `service_crash` | yes | A daemon exited non-zero, or a fault signal ended it (SIGSEGV, SIGABRT) |
+| `circuit_breaker` | yes | Auto-restart stopped: 3 failures in 60 seconds, or 5 restarts in one series did not bring the service back |
 | `db_setup_failure` | yes | Supabase migration or seed failure during startup |
 | `preflight_failure` | yes | Preflight check failed (port conflict, missing dep) |
 | `probe_timeout` | yes | Health probe exceeded timeout without response |
 | `manual` | no | Created via `POST /api/debug/issues` — logic bugs, cross-service problems |
 
 The stored `severity` and `category` fields are currently always `"error"` and `"runtime"`; use `trigger` to tell issues apart, and use the severity guide below when describing an issue.
+
+### What is not captured
+
+These are not failures of the service, so they make no issue and no crash notification:
+
+- **A stop by the runner itself**: a restart, a LAN or database mode switch, wake recovery, stop-all.
+- **A stop signal from outside the runner**: `kill <pid>`, a script that frees the port, Ctrl-C (SIGTERM, SIGINT, SIGKILL, SIGHUP, SIGQUIT; the shell shows these as exit 143, 130, 137, 129, 131). The runner restarts the service and writes `[travel-runner] <name> was stopped from outside Travel Runner (SIGTERM)` to its log.
+
+### What the runner does after a failure
+
+- It restarts a failed daemon after 2, 4, 8, 16, 32 seconds. A manual restart starts the series again.
+- Three failures in 60 seconds stop the restarts (`circuit_breaker`). The service stays FAILED until a manual restart.
+- Exit 126 or 127 (the shell could not run the command, for example a script that the current branch does not have) is not restarted.
+- When the output shows `Cannot connect to the Docker daemon`, the runner opens OrbStack or Docker Desktop and waits for it before the restart.
 
 ## Severity guide
 
@@ -125,7 +143,7 @@ The stored `severity` and `category` fields are currently always `"error"` and `
 ### "Something is broken"
 
 1. `GET /api/debug/issues` — check for auto-captured open issues first
-2. If found, read `~/Desktop/debug-tracking/open/{id}/issue.json` for pre-captured context (error message, trigger, recurrence) and `state-snapshot.json` for service states
+2. If found, read `~/Desktop/debug-tracking/open/{id}/issue.json` for pre-captured context (error message, `likely_cause`, trigger, recurrence) and `state-snapshot.json` for service states
 3. Review the captured logs: `logs-{service_id}.txt` and `logs-all.txt` in the same folder
 4. If no issue found, fall back to `GET /api/status` and `GET /api/logs/{serviceId}` via the travel-runner-api skill
 
@@ -151,7 +169,7 @@ Issues live at `~/Desktop/debug-tracking/open/` and `~/Desktop/debug-tracking/cl
   config.json             # enabled flag, auto_capture toggles, log_lines, dedup_window_seconds
   open/
     20260510T143200_service-crash-travel-portal/
-      issue.json            # Full issue metadata (error_message, trigger, recurrence, resolution)
+      issue.json            # Full issue metadata (error_message, likely_cause, trigger, recurrence, resolution)
       logs-travel-portal.txt  # Last lines of the failing service's log (secrets redacted)
       logs-all.txt          # Combined recent logs of the captured services
       state-snapshot.json   # Service states at time of capture

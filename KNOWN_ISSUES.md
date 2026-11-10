@@ -4,6 +4,79 @@
 
 ## Resolved
 
+### Two requests for one service started two processes (EADDRINUSE)
+
+**Resolved:** 2026-11-10
+
+Restart, clear-cache-restart, the LAN and database mode switches, the restart after a crash and wake recovery each ran as a separate task. Two of them for one service (two API calls, or a crash restart and a manual restart) each started a process. The second failed with `EADDRINUSE` or "Another next dev server is already running", and the runner recorded a crash.
+
+**Fix:**
+- The stop and the start of one service hold a lock for that service (`KeyedLock`). Requests wait in order.
+- A second identical request that would also wait is dropped.
+- The wait for the health probe holds no lock, so a process that fails while it starts is restarted at once.
+
+### The circuit breaker never tripped
+
+**Resolved:** 2026-11-10
+
+The automatic restart called `restartService()`, which clears the failure history. The count of failures in 60 seconds was 1 each time, so the breaker did not trip and the backoff stayed at 2 seconds. A service that could not start was restarted without end (41 times for Sequin, 32 times for Supabase).
+
+**Fix:**
+- The automatic restart keeps the failure history. A manual restart clears it.
+- Three failures in 60 seconds stop the restarts. Five restarts in one series stop them too.
+- A service that ran for two minutes before it failed starts a new series.
+
+### A stop by the runner, or a kill from outside, was recorded as a crash
+
+**Resolved:** 2026-11-10
+
+`handleTermination()` used the service's phase to tell a deliberate stop from a crash. The wake recovery stopped services without the `stopping` phase. A process that needed SIGKILL ended after the phase had changed. Both gave issues such as "exited with code 143" and "exited with code 9", and a second restart. A `kill` from a script gave the same issue.
+
+**Fix:**
+- `ProcessRunner.stop()` marks the launch that it stops. The mark stays with that process, so a late exit cannot fail the process that started after it.
+- `stop()` returns when the process tree is gone. It does not wait a fixed two seconds.
+- A stop signal from outside (SIGTERM, SIGINT, SIGKILL, SIGHUP, SIGQUIT) restarts the service with a log line. It makes no crash notification and no debug issue.
+
+### A command that the branch does not have was restarted
+
+**Resolved:** 2026-11-10
+
+Exit 126 and 127 mean that the shell could not run the command, for example `./scripts/local-cdc/run-sequin.sh` on a branch without that script. The runner restarted it each time.
+
+**Fix:** There is no automatic restart for exit 126 or 127. The error names the command.
+
+### Supabase showed STOPPED after a cold start
+
+**Resolved:** 2026-11-10
+
+`pnpm db:start` ends with code 0 when the stack is up. The runner read the exit as "Supabase stopped", and the health stayed at STARTING.
+
+**Fix:** A launcher of a reused service that ends with code 0 leaves the service running while its port is bound.
+
+### Port cleanup also killed the clients of the port
+
+**Resolved:** 2026-11-10
+
+`lsof -ti :PORT | xargs kill -9` matches each process with a socket on the port. That includes a browser with a page open, and the Stripe CLI while it forwards to the portal.
+
+**Fix:** Port cleanup kills only the process that listens: `lsof -ti TCP:PORT -sTCP:LISTEN`.
+
+### A stopped container runtime gave a crash loop
+
+**Resolved:** 2026-11-10
+
+With OrbStack or Docker Desktop closed, `supabase start` and the Sequin script failed with "Cannot connect to the Docker daemon" on each restart.
+
+**Fix:** When the output shows that message, the runner opens the runtime and waits for it before the restart. If the runtime does not come up, the restarts stop and the error says to open it.
+
+### Two wake notifications ran two recovery passes
+
+**Resolved:** 2026-11-10
+
+macOS can send two wake notifications a little more than five seconds apart. Each ran a full pass, and both restarted a service that failed its probe.
+
+**Fix:** One pass runs at a time. A notification that comes more than 30 seconds into a pass (the machine slept again) runs one more pass afterward.
+
 ### Wake probes failed all LAN services after every sleep/wake
 
 **Resolved:** 2026-06-10

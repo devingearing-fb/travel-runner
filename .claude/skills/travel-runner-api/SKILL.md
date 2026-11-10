@@ -359,6 +359,8 @@ curl -s http://localhost:19900/api/debug/issues | python3 -m json.tool
 ]
 ```
 
+When the service's output shows the cause, `summary` ends with ` — <likely cause>` (for example `… exited with code 1 — Error: listen EADDRINUSE: address already in use :::3002`).
+
 ### POST /api/debug/issues
 
 Manually capture a debug issue. The system auto-captures most errors, but use this for issues the auto-capture missed. The only body field is `description`. Response: `{"ok":true}` (capture is async; the ID is not returned).
@@ -420,7 +422,10 @@ Shared code in `packages/travel-data` hot-reloads into both apps; there is nothi
 1. `GET /api/status` — identify which service has phase FAILED
 2. `GET /api/logs/{serviceId}?lines=100` — read the last output before crash
 3. `POST /api/restart/{serviceId}` — attempt restart
-4. If it fails again, check for port conflicts (`lsof -ti :PORT`)
+4. If it fails again, check for port conflicts (`lsof -ti TCP:PORT -sTCP:LISTEN`; plain `lsof -ti :PORT` also lists the clients of the port, such as a browser — do not kill those)
+5. A service with "crash-looping" stopped its automatic restarts after 3 failures in 60 seconds. Fix the cause in its log, then `POST /api/restart/{serviceId}`
+
+Requests for one service run one at a time. A restart that arrives while another runs waits for it; a second identical request that would also wait is dropped.
 
 ### "Partner portal is showing errors"
 

@@ -14,6 +14,10 @@ set -euo pipefail
 # Usage:
 #   ./release.sh 0.2.0             Build + sign + notarize + release
 #   ./release.sh 0.2.0 --draft     Same but creates a draft release
+#
+# The script first makes sure that the release can finish (signing identity, notary
+# access, GitHub access, a clean tree that is on the remote), then runs the tests.
+# SKIP_TESTS=1 skips the tests.
 # ────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -42,6 +46,51 @@ echo "  ╔═══════════════════════
 echo "  ║   travel-runner release v$VERSION"
 echo "  ╚════════════════════════════════════╝"
 echo ""
+
+# ── 0. Checks ───────────────────────────────────────────────────────────────
+# Each one fails before the build. A failure after the notarization leaves a
+# version that cannot be released again under the same number.
+echo "  [0/7] Checking that the release can finish..."
+
+fail() {
+    echo "  ✗ $1"
+    exit 1
+}
+
+security find-identity -v -p codesigning | grep -q "$DEVELOPER_ID" \
+    || fail "Signing identity $DEVELOPER_ID is not in the keychain"
+
+# Apple returns 403 here when a program agreement waits for the account holder.
+NOTARY_CHECK=$(xcrun notarytool history --keychain-profile "$NOTARIZE_PROFILE" 2>&1) \
+    || fail "Notary service refused the '$NOTARIZE_PROFILE' credentials: $NOTARY_CHECK
+    For 'A required agreement is missing or has expired': the account holder must accept
+    the agreement at https://developer.apple.com/account. It can take five minutes to apply."
+
+[ "$(gh api "repos/$GITHUB_REPO" --jq .permissions.push 2>/dev/null)" = "true" ] \
+    || fail "The active gh account cannot release to $GITHUB_REPO (gh auth switch --user <owner>)"
+
+gh release view "v${VERSION}" --repo "$GITHUB_REPO" >/dev/null 2>&1 \
+    && fail "v${VERSION} is already released. Use the next version number."
+
+[ -z "$(git status --porcelain)" ] || fail "The working tree has changes. Commit them first."
+
+# The tag must be the commit of this build, and that commit must be on the remote.
+RELEASE_COMMIT=$(git rev-parse HEAD)
+git fetch --quiet origin
+git branch -r --contains "$RELEASE_COMMIT" | grep -q . \
+    || fail "Commit ${RELEASE_COMMIT:0:7} is not on the remote. Push it first."
+
+if [ "${SKIP_TESTS:-0}" != "1" ]; then
+    echo "  Running tests..."
+    TEST_LOG=$(mktemp)
+    if ! swift test >"$TEST_LOG" 2>&1; then
+        grep -E "error:|failed" "$TEST_LOG" | head -20 || true
+        rm -f "$TEST_LOG"
+        fail "Tests failed. Fix them, or set SKIP_TESTS=1 to release without them."
+    fi
+    rm -f "$TEST_LOG"
+fi
+echo "  ✓ Ready to release"
 
 # ── 1. Build ────────────────────────────────────────────────────────────────
 echo "  [1/7] Building release binary..."
@@ -173,9 +222,24 @@ if [ -n "$SPARKLE_SIGN" ] && [ -x "$SPARKLE_SIGN" ]; then
     EDDSA_SIGNATURE=$(echo "$SIGNATURE" | grep -o 'edSignature="[^"]*"' | sed 's/edSignature="//;s/"//' || echo "")
     LENGTH=$(echo "$SIGNATURE" | grep -o 'length="[^"]*"' | sed 's/length="//;s/"//' || stat -f%z "$ZIP_NAME")
 else
-    echo "  ⚠ sign_update not found — appcast signature will be empty"
     EDDSA_SIGNATURE=""
     LENGTH=$(stat -f%z "$ZIP_NAME")
+fi
+
+# An appcast with no signature, or a wrong one, makes Sparkle refuse the update on
+# every installed copy. Stop before the release exists.
+SPARKLE_KEYS=$(find .build/artifacts -name "generate_keys" -type f 2>/dev/null | head -1)
+if [ -n "$SPARKLE_KEYS" ] && [ "$("$SPARKLE_KEYS" -p 2>/dev/null)" != "$EDDSA_PUBLIC_KEY" ]; then
+    echo "  ✗ The Sparkle key in the keychain is not the key in the app (SUPublicEDKey)"
+    exit 1
+fi
+if [ -z "$EDDSA_SIGNATURE" ]; then
+    echo "  ✗ No Sparkle signature for $ZIP_NAME (sign_update: ${SIGNATURE:-not found})"
+    exit 1
+fi
+if ! "$SPARKLE_SIGN" --verify "$ZIP_NAME" "$EDDSA_SIGNATURE" >/dev/null 2>&1; then
+    echo "  ✗ The Sparkle signature does not match $ZIP_NAME"
+    exit 1
 fi
 
 DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/download/v${VERSION}/${ZIP_NAME}"
@@ -215,6 +279,7 @@ gh release create "v${VERSION}" \
     appcast.xml \
     --repo "$GITHUB_REPO" \
     --title "Travel Runner v${VERSION}" \
+    --target "$RELEASE_COMMIT" \
     --generate-notes \
     $DRAFT_FLAG
 

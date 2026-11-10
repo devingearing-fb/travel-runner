@@ -71,15 +71,11 @@ struct PreflightRunner: Sendable {
         switch check.id {
         case "docker":
             let runtime = ContainerRuntime.detect()
-            if await shellExitCode("docker ps >/dev/null 2>&1") == 0 {
+            if await ContainerRuntime.isResponding() {
                 return .passed(detail: runtime.displayName)
             }
-            _ = await shellExitCode("open -a '\(runtime.appName)'")
-            for _ in 0..<10 {
-                try? await Task.sleep(for: .seconds(2))
-                if await shellExitCode("docker ps >/dev/null 2>&1") == 0 {
-                    return .passed(detail: "\(runtime.displayName) — auto-started")
-                }
+            if await ContainerRuntime.ensureRunning() {
+                return .passed(detail: "\(runtime.displayName) — auto-started")
             }
             return .failed(message: "\(runtime.displayName) not responding", fix: "Open \(runtime.appName) manually")
 
@@ -138,7 +134,7 @@ struct PreflightRunner: Sendable {
                         fix: "kill \(pid)"
                     )
                 }
-                return .failed(message: "Port \(port) in use", fix: "lsof -ti :\(port) | xargs kill")
+                return .failed(message: "Port \(port) in use", fix: "lsof -ti TCP:\(port) -sTCP:LISTEN | xargs kill")
             }
 
             if check.id.hasPrefix("dir-") {

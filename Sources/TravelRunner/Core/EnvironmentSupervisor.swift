@@ -104,6 +104,17 @@ final class EnvironmentSupervisor {
     private var stripeReconnectingSince: Date? = nil
     private var localSupabaseKeys: LocalSupabaseKeys?
     private var stripeWebhookSecret: String?
+    /// The stop and start of one service run one at a time (see `KeyedLock`).
+    private let lifecycle = KeyedLock()
+    /// Services with a manual restart (or a cache clear) that waits for its turn.
+    /// A second request of the same kind adds nothing while one waits.
+    private var queuedRestarts: Set<String> = []
+    private var queuedCacheClears: Set<String> = []
+    private var actionCounts: [String: Int] = [:]
+    private var isHandlingWake = false
+    private var networkReapplyPending = false
+    private var wakePassStartedAt: Date?
+    private var wakePending = false
 
     init(userDefaults: UserDefaults = .standard) {
         self.userDefaults = userDefaults
@@ -152,12 +163,23 @@ final class EnvironmentSupervisor {
     enum ServiceError: Error, CustomStringConvertible {
         case oneshotFailed(String)
         case probeTimeout(String, seconds: Int)
+        case exitedDuringStartup(String)
+        /// The supervisor stopped the automatic restarts; the text says why.
+        case autoRestartStopped(String)
+        case commandNotRunnable(name: String, command: String, code: Int32)
+        case localKeysMissing(name: String, envFile: String)
         case portHeldByOtherStack(port: Int, container: String)
 
         var description: String {
             switch self {
             case .oneshotFailed(let id): "'\(id)' exited with non-zero status"
             case .probeTimeout(let id, let s): "'\(id)' health probe timed out after \(s)s"
+            case .exitedDuringStartup(let id): "'\(id)' exited before it was ready — see its log"
+            case .autoRestartStopped(let reason): reason
+            case .commandNotRunnable(let name, let command, let code):
+                "\(name) cannot start: the shell could not run \(command) (exit \(code)). Does the current branch have it? Restart \(name) after the fix."
+            case .localKeysMissing(let name, let envFile):
+                "\(name) was not started: the keys of the local Supabase stack could not be read (scripts/local-db.sh status -o env). Without them it would use the hosted dev values in \(envFile). Restart Supabase, then restart \(name)."
             case .portHeldByOtherStack(let port, let container):
                 "Port \(port) is held by another Supabase stack (\(container)) — stop it, then start again"
             }
@@ -248,10 +270,26 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// Loads a service graph without the app's side effects: no config file, control
+    /// server, env files, or watchers. The lifecycle tests use it with small services.
+    func loadServices(_ services: [ServiceDefinition], profile: RunProfile = .full) throws {
+        let graph = try ServiceGraph(services: services)
+        self.graph = graph
+        self.sortedServiceIDs = graph.sortedIDs
+        self.profile = profile
+        self.profileMembers = profile.members(of: services)
+        self.serviceStates = [:]
+        for service in services {
+            serviceStates[service.id] = ServiceState(definition: service)
+        }
+    }
+
     // MARK: - Start / Stop
 
     func startAll(skipPreflight: Bool = false) {
         guard startTask == nil, let graph, let config else { return }
+        // A start that a person asks for begins a new failure series for each service.
+        for serviceID in serviceStates.keys { clearFailureHistory(serviceID) }
         health = .starting
         lastError = nil
         startupBeganAt = .now
@@ -644,27 +682,27 @@ final class EnvironmentSupervisor {
     }
 
     func clearCacheAndRestart(_ serviceID: String) {
-        guard let cwd = config?.services.first(where: { $0.id == serviceID })?.resolvedCwd else {
+        guard let cwd = serviceCwd(serviceID) else {
             lastError = "No cwd found for \(serviceID)"
             return
         }
+        guard queuedCacheClears.insert(serviceID).inserted else { return }
         Task {
-            serviceStates[serviceID]?.phase = .stopping
-            await processRunner.stop(serviceID: serviceID)
-            serviceStates[serviceID]?.phase = .starting
-
-            let nextCachePath = (cwd as NSString).appendingPathComponent(".next")
-            try? FileManager.default.removeItem(atPath: nextCachePath)
-            await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: "[travel-runner] Cleared .next cache"))
-
-            try? await Task.sleep(for: .seconds(1))
+            beginAction(serviceID)
+            defer { endAction(serviceID) }
             do {
-                try await startService(serviceID)
+                try await replaceProcess(serviceID, prepare: {
+                    self.queuedCacheClears.remove(serviceID)
+                    let nextCachePath = (cwd as NSString).appendingPathComponent(".next")
+                    try? FileManager.default.removeItem(atPath: nextCachePath)
+                    await self.logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: "[travel-runner] Cleared .next cache"))
+                    try? await Task.sleep(for: .seconds(1))
+                })
             } catch {
                 serviceStates[serviceID]?.phase = .failed
                 lastError = "\(error)"
-                recalculateHealth()
             }
+            recalculateHealth()
         }
     }
 
@@ -735,17 +773,15 @@ final class EnvironmentSupervisor {
             servicesToRestart.append("partner-portal")
         }
         Task {
-            actionsInFlight.insert("db-mode")
-            defer { actionsInFlight.remove("db-mode") }
+            beginAction("db-mode")
+            defer { endAction("db-mode") }
             var switchFailed = false
             for serviceID in servicesToRestart {
                 serviceStates[serviceID]?.phase = .stopping
             }
             for serviceID in servicesToRestart {
-                await processRunner.stop(serviceID: serviceID)
-                serviceStates[serviceID]?.phase = .starting
                 do {
-                    try await startService(serviceID)
+                    try await replaceProcess(serviceID)
                 } catch {
                     serviceStates[serviceID]?.phase = .failed
                     lastError = "DB mode switch failed for \(serviceID): \(error)"
@@ -771,15 +807,24 @@ final class EnvironmentSupervisor {
     /// Re-detects the LAN IP on every call, so it is also used to recover when
     /// the machine moves networks (stale IP causes EADDRNOTAVAIL on restart).
     func applyNetworkMode() {
-        guard !isTogglingNetwork else { return }
+        guard !isTogglingNetwork else {
+            // Wake recovery stops the web services and then asks for this. If the
+            // request were dropped, they would stay down. Run it after the current one.
+            networkReapplyPending = true
+            return
+        }
         isTogglingNetwork = true
         let mode = networkMode
 
         Task {
-            actionsInFlight.insert("lan-mode")
+            beginAction("lan-mode")
             defer {
                 isTogglingNetwork = false
-                actionsInFlight.remove("lan-mode")
+                endAction("lan-mode")
+                if networkReapplyPending {
+                    networkReapplyPending = false
+                    applyNetworkMode()
+                }
             }
 
             if mode {
@@ -803,14 +848,13 @@ final class EnvironmentSupervisor {
 
             var restartFailed = false
             for serviceID in servicesToRestart {
-                await processRunner.stop(serviceID: serviceID)
-                await logStore.append(
-                    serviceID: serviceID,
-                    entry: LogEntry(stream: .stdout, text: "[travel-runner] Network mode \(mode ? "ON — http://\(ip)" : "OFF — localhost only")")
-                )
-                serviceStates[serviceID]?.phase = .starting
                 do {
-                    try await startService(serviceID)
+                    try await replaceProcess(serviceID, prepare: {
+                        await self.logStore.append(
+                            serviceID: serviceID,
+                            entry: LogEntry(stream: .stdout, text: "[travel-runner] Network mode \(mode ? "ON — http://\(ip)" : "OFF — localhost only")")
+                        )
+                    })
                 } catch {
                     serviceStates[serviceID]?.phase = .failed
                     lastError = "Network mode restart failed for \(serviceID): \(error)"
@@ -844,28 +888,97 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// A restart that a person or the API asks for. It clears the failure history:
+    /// the circuit breaker and the backoff start again.
     func restartService(_ serviceID: String) {
         if serviceID == "stripe" { stripeReconnectingSince = nil }
+        guard queuedRestarts.insert(serviceID).inserted else { return }
         let name = serviceStates[serviceID]?.definition.displayName ?? serviceID
         Task {
-            actionsInFlight.insert(serviceID)
-            defer { actionsInFlight.remove(serviceID) }
-            serviceStates[serviceID]?.phase = .stopping
-            await processRunner.stop(serviceID: serviceID)
-            serviceStates[serviceID]?.phase = .pending
-            serviceStates[serviceID]?.restartCount = 0
-            serviceStates[serviceID]?.isCircuitBroken = false
-            serviceStates[serviceID]?.failureTimestamps = []
-            try? await Task.sleep(for: .seconds(1))
+            beginAction(serviceID)
+            defer { endAction(serviceID) }
             do {
-                try await startService(serviceID)
+                try await replaceProcess(serviceID, stoppedPhase: .pending, prepare: {
+                    self.queuedRestarts.remove(serviceID)
+                    try? await Task.sleep(for: .seconds(1))
+                })
                 onActionFeedback?("\(name) restarted", true)
             } catch {
                 serviceStates[serviceID]?.phase = .failed
                 lastError = "\(error)"
-                recalculateHealth()
                 onActionFeedback?("\(name) restart failed", false)
             }
+            recalculateHealth()
+        }
+    }
+
+    /// A restart that the supervisor starts by itself after a failure. It keeps the
+    /// failure history, so the circuit breaker and the backoff see the whole series.
+    private func autoRestart(_ serviceID: String) async {
+        do {
+            try await replaceProcess(serviceID, stoppedPhase: .pending, keepsFailureHistory: true, onlyIf: {
+                // A manual restart or a mode switch can bring the service back first.
+                guard let state = self.serviceStates[serviceID],
+                      state.phase == .failed, !state.isCircuitBroken else { return false }
+                state.restartCount += 1
+                return true
+            })
+        } catch {
+            serviceStates[serviceID]?.phase = .failed
+            lastError = "\(error)"
+        }
+        recalculateHealth()
+    }
+
+    private func clearFailureHistory(_ serviceID: String) {
+        serviceStates[serviceID]?.restartCount = 0
+        serviceStates[serviceID]?.isCircuitBroken = false
+        serviceStates[serviceID]?.failureTimestamps = []
+    }
+
+    /// Stops the service's process and starts a new one. The stop and the start hold
+    /// the service's lock, so two requests cannot start two processes that fight for
+    /// the port. `prepare` runs between them. The wait for readiness holds no lock: a
+    /// process that fails while it starts can be restarted at once.
+    /// Returns false when `onlyIf` said no.
+    @discardableResult
+    private func replaceProcess(
+        _ serviceID: String,
+        stoppedPhase: ServicePhase = .starting,
+        keepsFailureHistory: Bool = false,
+        onlyIf condition: (@MainActor () -> Bool)? = nil,
+        prepare: (@MainActor () async -> Void)? = nil
+    ) async throws -> Bool {
+        var replaced = false
+        let launch = try await lifecycle.withLock(serviceID) { () -> ServiceLaunch? in
+            if let condition, !condition() { return nil }
+            replaced = true
+            // Only the automatic restart keeps the history. Each deliberate restart
+            // (manual, cache clear, mode switch) starts a new series; if it did not,
+            // a tripped breaker would block the automatic restart from then on.
+            if !keepsFailureHistory { clearFailureHistory(serviceID) }
+            serviceStates[serviceID]?.phase = .stopping
+            await processRunner.stop(serviceID: serviceID)
+            serviceStates[serviceID]?.phase = stoppedPhase
+            await prepare?()
+            return try await spawnService(serviceID)
+        }
+        if let launch { try await awaitReady(serviceID, launch) }
+        return replaced
+    }
+
+    private func beginAction(_ key: String) {
+        actionCounts[key, default: 0] += 1
+        actionsInFlight.insert(key)
+    }
+
+    private func endAction(_ key: String) {
+        let remaining = (actionCounts[key] ?? 1) - 1
+        if remaining <= 0 {
+            actionCounts.removeValue(forKey: key)
+            actionsInFlight.remove(key)
+        } else {
+            actionCounts[key] = remaining
         }
     }
 
@@ -877,19 +990,19 @@ final class EnvironmentSupervisor {
         let name = serviceStates[serviceID]?.definition.displayName ?? serviceID
 
         Task {
-            for id in topoOrder { actionsInFlight.insert(id) }
-            defer { for id in topoOrder { actionsInFlight.remove(id) } }
+            for id in topoOrder { beginAction(id) }
+            defer { for id in topoOrder { endAction(id) } }
             for id in topoOrder.reversed() {
-                serviceStates[id]?.phase = .stopping
-                await processRunner.stop(serviceID: id)
-                serviceStates[id]?.phase = .stopped
+                await lifecycle.withLock(id) {
+                    serviceStates[id]?.phase = .stopping
+                    await processRunner.stop(serviceID: id)
+                    serviceStates[id]?.phase = .stopped
+                }
             }
 
             for id in topoOrder {
                 serviceStates[id]?.phase = .starting
-                serviceStates[id]?.restartCount = 0
-                serviceStates[id]?.isCircuitBroken = false
-                serviceStates[id]?.failureTimestamps = []
+                clearFailureHistory(id)
                 do {
                     try await startService(id)
                 } catch {
@@ -1318,17 +1431,45 @@ final class EnvironmentSupervisor {
 
     // MARK: - Private: Service Lifecycle
 
+    /// The apps whose `.env.local` gets the local stack's keys, with their shared env file.
+    private static let localKeyApps: [String: String] = [
+        "travel-portal": "apps/booking-portal/.env",
+        "partner-portal": "apps/partner-portal/.env",
+    ]
+
+    /// What `awaitReady` needs to know about the process that `spawnService` started.
+    private struct ServiceLaunch {
+        let pid: Int32
+        let definition: ServiceDefinition
+        let stdoutProbe: StdoutProbe?
+        let artifactName: String?
+    }
+
+    /// Starts one service and waits until it is ready.
     private func startService(_ serviceID: String) async throws {
-        guard !isShuttingDown, health != .stopped else { return }
+        let launch = try await lifecycle.withLock(serviceID) { try await spawnService(serviceID) }
+        if let launch { try await awaitReady(serviceID, launch) }
+    }
+
+    /// Starts the service's process. The caller holds the service's lock. Returns nil
+    /// when there is no process to wait for: the service is skipped or reused, or a
+    /// stop-all is in progress.
+    private func spawnService(_ serviceID: String) async throws -> ServiceLaunch? {
         guard let state = serviceStates[serviceID],
-              let definition = graph?.nodes[serviceID] else { return }
+              let definition = graph?.nodes[serviceID] else { return nil }
+
+        guard !isShuttingDown, health != .stopped else {
+            // Stop-all won. Do not leave the service marked as on its way up.
+            if state.phase == .starting || state.phase == .pending { state.phase = .stopped }
+            return nil
+        }
 
         // Services outside the active profile are skipped. The verification
         // oneshots drive the local CDC evidence chain against the dev fixture, so
         // they run only in the full profile.
         if !isInProfile(serviceID) {
-            await MainActor.run { state.phase = .skipped }
-            return
+            state.phase = .skipped
+            return nil
         }
 
         // Reuse-if-running: Docker-managed services (Supabase) persist between sessions.
@@ -1347,11 +1488,10 @@ final class EnvironmentSupervisor {
                         throw ServiceError.portHeldByOtherStack(port: port, container: occupant)
                     }
                 }
-                await MainActor.run {
-                    state.phase = .running
-                    state.lastStarted = .now
-                }
-                return
+                state.phase = .running
+                state.lastStarted = .now
+                state.readyAt = .now
+                return nil
             }
         }
 
@@ -1359,20 +1499,33 @@ final class EnvironmentSupervisor {
         if serviceID == "stripe" {
             let available = await isStripeAvailable()
             if !available {
-                await MainActor.run {
-                    state.phase = .skipped
-                }
+                state.phase = .skipped
                 await logStore.append(
                     serviceID: serviceID,
                     entry: LogEntry(stream: .stdout, text: "[travel-runner] Stripe CLI not available — skipping")
                 )
-                return
+                return nil
             }
         }
 
-        // For non-reuse services, kill any stale occupant on the port
-        if !definition.shouldReuseIfRunning, let port = definition.probe?.port, definition.resolvedType == .daemon {
-            if isPortBound(port) {
+        // Local mode puts the local stack's keys into the app's .env.local. Without
+        // them the app has no signing key, or it takes the hosted dev values from its
+        // shared .env while the runner shows "local". Read the keys again, and do
+        // not start the app when they are still unknown.
+        if dbMode == .local, let envFile = Self.localKeyApps[serviceID], localSupabaseKeys == nil {
+            await refreshLocalSupabaseKeys()
+            guard localSupabaseKeys != nil else {
+                throw ServiceError.localKeysMissing(name: definition.displayName, envFile: envFile)
+            }
+        }
+
+        if !definition.shouldReuseIfRunning {
+            // A process of this service that the runner still tracks would fight the
+            // new one for the port. Callers stop it first; this covers one that did not.
+            await processRunner.stop(serviceID: serviceID)
+
+            // Kill any stale occupant on the port
+            if let port = definition.probe?.port, definition.resolvedType == .daemon, isPortBound(port) {
                 await killPortOccupants(port)
                 for _ in 0..<10 {
                     try? await Task.sleep(for: .milliseconds(500))
@@ -1389,10 +1542,8 @@ final class EnvironmentSupervisor {
            stripeService.probe?.artifact != nil {
             let stripeAvailable = await isStripeAvailable()
             if stripeAvailable {
-                await MainActor.run {
-                    state.phase = .starting
-                    state.lastStarted = .now
-                }
+                state.phase = .starting
+                state.lastStarted = .now
                 // Wait up to 30s for Stripe to capture its secret
                 for _ in 0..<60 {
                     if let _ = await secretStore.get("STRIPE_WEBHOOK_SECRET") { break }
@@ -1401,11 +1552,18 @@ final class EnvironmentSupervisor {
             }
         }
 
-        await MainActor.run {
-            state.phase = .starting
-            state.lastStarted = .now
-            state.exitCode = nil
+        // The waits above can outlast a stop-all.
+        guard !isShuttingDown, health != .stopped else {
+            if state.phase == .starting || state.phase == .pending { state.phase = .stopped }
+            return nil
         }
+
+        state.phase = .starting
+        state.lastStarted = .now
+        state.readyAt = nil
+        state.exitCode = nil
+        // No pid until the new process has one: handleTermination compares it.
+        state.pid = nil
 
         var stdoutProbe: StdoutProbe?
         if case .stdoutRegex = definition.probe?.type {
@@ -1467,30 +1625,52 @@ final class EnvironmentSupervisor {
                     }
                 }
             },
-            onTermination: { [weak self] exitCode in
-                Task { @MainActor in self?.handleTermination(serviceID: sid, exitCode: exitCode) }
+            onTermination: { [weak self] termination in
+                Task { @MainActor in self?.handleTermination(serviceID: sid, termination: termination) }
             }
         )
 
-        await MainActor.run { state.pid = pid }
+        state.pid = pid
+        return ServiceLaunch(
+            pid: pid, definition: effectiveDefinition, stdoutProbe: capturedProbe, artifactName: artifactName
+        )
+    }
+
+    /// Waits until the process that `spawnService` started is ready, then marks the
+    /// service as running. It holds no lock.
+    private func awaitReady(_ serviceID: String, _ launch: ServiceLaunch) async throws {
+        guard let state = serviceStates[serviceID] else { return }
 
         // Oneshots: wait for exit
-        if definition.resolvedType == .oneshot {
+        if launch.definition.resolvedType == .oneshot {
             while true {
-                let phase = await MainActor.run { state.phase }
-                if phase == .completed { return }
-                if phase == .failed {
+                if state.phase == .completed { return }
+                if state.phase == .failed {
                     throw ServiceError.oneshotFailed(serviceID)
                 }
+                // Stopped before it finished: stop-all, or a new run replaced this one.
+                if isShuttingDown || state.phase == .stopping || state.phase == .stopped { return }
+                if let exit = await processRunner.exit(of: launch.pid), exit.stoppedByRunner { return }
                 try await Task.sleep(for: .milliseconds(250))
             }
         }
 
-        // Daemons: wait for probe (use effectiveDefinition for LAN-aware host)
-        if let probeConfig = effectiveDefinition.probe {
-            let probe: Probe = if let sp = capturedProbe { sp } else { ProbeFactory.makeProbe(for: probeConfig) }
-            let timeout = probeConfig.resolvedTimeout
-            let ready = try await waitForProbe(probe, timeout: timeout)
+        // Daemons: wait for the probe (the launch's definition has the LAN-aware host)
+        if let probeConfig = launch.definition.probe {
+            let probe: Probe = if let sp = launch.stdoutProbe { sp } else { ProbeFactory.makeProbe(for: probeConfig) }
+            let deadline = ContinuousClock.now + probeConfig.resolvedTimeout
+            var ready = false
+            while ContinuousClock.now < deadline {
+                if await probe.check() {
+                    ready = true
+                    break
+                }
+                if let exit = await processRunner.exit(of: launch.pid),
+                   try !shouldKeepWaiting(for: state, after: exit) {
+                    return
+                }
+                try await Task.sleep(for: .seconds(2))
+            }
             if !ready {
                 throw ServiceError.probeTimeout(serviceID, seconds: probeConfig.timeout ?? 120)
             }
@@ -1499,38 +1679,90 @@ final class EnvironmentSupervisor {
         // If this service produces an artifact (e.g. Stripe secret), ensure it's
         // written to .env.local BEFORE we mark the service as running and unblock
         // dependents. The onChange observer fires async, so we do a direct write here.
-        if let name = artifactName {
+        if let name = launch.artifactName {
             // Brief wait for the async secretStore.set() Task to complete
             try? await Task.sleep(for: .milliseconds(200))
             if let value = await secretStore.get(name) {
-                await MainActor.run {
-                    recordArtifact(name, value: value)
-                    state.capturedArtifact = value
-                }
+                recordArtifact(name, value: value)
+                state.capturedArtifact = value
             }
         }
 
-        await MainActor.run {
-            state.phase = .running
+        // A stop can win while the probe passes; the stop owns the state then.
+        guard !isShuttingDown, state.phase != .stopping, state.phase != .stopped, state.phase != .skipped else { return }
+
+        // The process can end at the moment its probe passes. Then handleTermination
+        // owns the state, unless a newer process of the service runs.
+        if await processRunner.exit(of: launch.pid) != nil,
+           !launch.definition.shouldReuseIfRunning,
+           !(await processRunner.isRunning(serviceID: serviceID)) {
+            return
+        }
+
+        state.phase = .running
+        if state.readyAt == nil { state.readyAt = .now }
+    }
+
+    /// The process of a launch ended before its probe passed. Returns true to keep
+    /// waiting and false to stop without an error. Throws when the start failed.
+    private func shouldKeepWaiting(for state: ServiceState, after exit: ProcessRunner.Termination) throws -> Bool {
+        switch ServiceTermination.classify(exit) {
+        case .stoppedByRunner:
+            // Stop-all, or another operation replaced this process and owns the state.
+            return false
+        case .cleanExit:
+            // The launcher of a container-managed service ends while the stack still starts.
+            if state.definition.shouldReuseIfRunning { return true }
+            throw ServiceError.exitedDuringStartup(state.id)
+        case .commandNotRunnable(let code):
+            throw ServiceError.commandNotRunnable(
+                name: state.definition.displayName, command: state.definition.cmd.first ?? "its command", code: code
+            )
+        case .killedExternally, .crashed:
+            // Stripe degrades to skipped when its CLI fails.
+            if state.phase == .skipped { return false }
+            // A stop-all or another operation took over after the failure.
+            if isShuttingDown || health == .stopped || state.phase == .stopped { return false }
+            if state.isCircuitBroken {
+                // The reason is in lastError: a crash loop, or a container runtime that is down.
+                throw ServiceError.autoRestartStopped(
+                    lastError ?? "\(state.definition.displayName) keeps failing — auto-restart stopped; see its log"
+                )
+            }
+            // The supervisor restarts a failed daemon, and the new process can pass this probe.
+            if state.definition.resolvedRestart == .onFailure { return true }
+            throw ServiceError.exitedDuringStartup(state.id)
         }
     }
 
-    private func handleTermination(serviceID: String, exitCode: Int32) {
+    private func handleTermination(serviceID: String, termination: ProcessRunner.Termination) {
         guard let state = serviceStates[serviceID] else { return }
+        let kind = ServiceTermination.classify(termination)
+
+        // The runner stopped this process itself: a restart, a mode switch, wake
+        // recovery, or stop-all. The operation that stopped it owns the next state.
+        // The mark belongs to the launch, so a process that takes long to die
+        // cannot fail the one that started after it.
+        if kind == .stoppedByRunner { return }
+
+        // An older process of this service, not the one the state describes.
+        if let current = state.pid, current != termination.pid { return }
 
         // During shutdown, don't overwrite the .stopped/.stopping state
         if isShuttingDown || state.phase == .stopping || state.phase == .stopped {
             return
         }
 
+        let name = state.definition.displayName
+
         // Stripe is an optional local gateway. A stale/expired CLI session must
         // degrade to "skipped", not enter the daemon crash loop (and emit a
         // notification on every retry). The next manual/full start re-runs the
         // credential probe and will enable Stripe again once `stripe login`
         // succeeds.
-        if serviceID == "stripe", exitCode != 0 {
+        if serviceID == "stripe", kind != .cleanExit {
             state.phase = .skipped
-            state.exitCode = exitCode
+            state.exitCode = termination.status
             state.pid = nil
             state.lastStopped = .now
             state.failureTimestamps.removeAll()
@@ -1539,52 +1771,134 @@ final class EnvironmentSupervisor {
         }
 
         if state.definition.resolvedType == .oneshot {
-            state.phase = exitCode == 0 ? .completed : .failed
-            state.exitCode = exitCode
-        } else {
-            state.phase = exitCode == 0 ? .stopped : .failed
-            state.exitCode = exitCode
+            state.phase = kind == .cleanExit ? .completed : .failed
+            state.exitCode = termination.status
+            return
+        }
+
+        state.exitCode = termination.status
+        let uptime = state.lastStarted.map { Date.now.timeIntervalSince($0) }
+        // Time in the ready state. A service that never became ready has none, so a
+        // slow failure (two minutes to give up) does not start a new series each time.
+        let stableFor = state.readyAt.map { Date.now.timeIntervalSince($0) }
+        let restarts = state.definition.resolvedRestart == .onFailure
+
+        switch kind {
+        case .stoppedByRunner:
+            return
+
+        case .cleanExit:
+            // The launcher of a container-managed service (Supabase) ends when the
+            // stack is up, or while it still starts. The service itself runs on.
+            if state.definition.shouldReuseIfRunning {
+                if state.phase == .starting { return }
+                if let port = state.definition.probe?.port, isPortBound(port) { return }
+            }
+            state.phase = .stopped
             state.lastStopped = .now
 
-            if exitCode != 0 {
-                state.failureTimestamps.append(.now)
-                if !isShuttingDown && !state.isCircuitBroken {
-                    onServiceCrash?(state.definition.displayName, exitCode)
-                    Task { await captureDebugIssue(
-                        trigger: "service_crash",
-                        serviceID: serviceID,
-                        summary: "\(state.definition.displayName) exited with code \(exitCode)"
-                    )}
-                }
+        case .killedExternally(let signal):
+            // Someone stopped it from outside: `kill`, a script that frees the port.
+            // The service did not fail, so there is no crash notification and no
+            // debug issue. It still counts toward the circuit breaker: three kills
+            // in a minute mean that something else wants the port.
+            state.phase = .failed
+            state.lastStopped = .now
+            noteFailure(state, stableFor: stableFor)
+            let action = restarts ? "restarting it" : "it stays stopped"
+            Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
+                stream: .stderr,
+                text: "[travel-runner] \(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))) — \(action)"
+            ))}
+            if restarts {
+                scheduleRestart(serviceID: serviceID, wasEarlyExit: (uptime ?? 0) < 10)
             }
 
-            if state.definition.resolvedRestart == .onFailure && exitCode != 0 {
-                let earlyExit = state.lastStarted.map { Date.now.timeIntervalSince($0) < 10 } ?? false
-                scheduleRestart(serviceID: serviceID, wasEarlyExit: earlyExit)
+        case .commandNotRunnable(let code):
+            // Exit 126/127: the shell could not run the command. The same command
+            // fails again, so there is no automatic restart.
+            state.phase = .failed
+            state.lastStopped = .now
+            lastError = ServiceError.commandNotRunnable(
+                name: name, command: state.definition.cmd.first ?? "its command", code: code
+            ).description
+            onServiceCrash?(name, code)
+            Task { await captureDebugIssue(
+                trigger: "service_crash",
+                serviceID: serviceID,
+                summary: "\(name) \(ServiceTermination.describe(termination))"
+            )}
+
+        case .crashed:
+            state.phase = .failed
+            state.lastStopped = .now
+            noteFailure(state, stableFor: stableFor)
+            if !state.isCircuitBroken {
+                onServiceCrash?(name, termination.status)
+                Task { await captureDebugIssue(
+                    trigger: "service_crash",
+                    serviceID: serviceID,
+                    summary: "\(name) \(ServiceTermination.describe(termination))"
+                )}
             }
-            recalculateHealth()
+            if restarts {
+                scheduleRestart(serviceID: serviceID, wasEarlyExit: (uptime ?? 0) < 10)
+            }
+        }
+        recalculateHealth()
+    }
+
+    /// Records one failure of a daemon. A service that ran for a while before it
+    /// failed starts a new series: the restart count and the backoff start again.
+    private func noteFailure(_ state: ServiceState, stableFor: TimeInterval?, countsTowardBreaker: Bool = true) {
+        if AutoRestart.startsNewSeries(uptime: stableFor) {
+            state.restartCount = 0
+        }
+        if countsTowardBreaker {
+            state.failureTimestamps.append(.now)
         }
     }
 
     private func scheduleRestart(serviceID: String, wasEarlyExit: Bool = false) {
         guard let state = serviceStates[serviceID] else { return }
+        let name = state.definition.displayName
 
-        let cutoff = Date.now.addingTimeInterval(-60)
-        state.failureTimestamps.removeAll { $0 < cutoff }
-        if state.failureTimestamps.count >= 3 {
+        state.failureTimestamps = AutoRestart.recentFailures(state.failureTimestamps, now: .now)
+        let baseDelay: TimeInterval
+        switch AutoRestart.decide(recentFailureCount: state.failureTimestamps.count, restartCount: state.restartCount) {
+        case .crashLoop:
             state.isCircuitBroken = true
-            lastError = "\(state.definition.displayName) is crash-looping — auto-restart stopped"
+            lastError = "\(name) is crash-looping — auto-restart stopped"
             Task { await captureDebugIssue(
                 trigger: "circuit_breaker",
                 serviceID: serviceID,
-                summary: "\(state.definition.displayName) crash-looping — circuit breaker tripped"
+                summary: "\(name) crash-looping — circuit breaker tripped"
             )}
             return
+        case .exhausted:
+            if serviceID == "stripe" {
+                // The network stayed down. Stripe is optional: it degrades to skipped,
+                // and the next start (manual, start-all, or a wake) tries it again.
+                state.phase = .skipped
+                Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
+                    stream: .stdout,
+                    text: "[travel-runner] Stripe: no network after \(AutoRestart.maxRestarts) tries — skipped until the next start"
+                ))}
+                recalculateHealth()
+                return
+            }
+            state.isCircuitBroken = true
+            lastError = "\(name) did not come back after \(AutoRestart.maxRestarts) restarts — auto-restart stopped"
+            Task { await captureDebugIssue(
+                trigger: "circuit_breaker",
+                serviceID: serviceID,
+                summary: "\(name) failed \(AutoRestart.maxRestarts) restarts in a row — auto-restart stopped"
+            )}
+            return
+        case .restart(let after):
+            baseDelay = after
         }
 
-        guard state.restartCount < 5 else { return }
-
-        let baseDelay = min(2.0 * pow(2.0, Double(state.restartCount)), 60.0)
         let delay = (serviceID == "stripe" && wasEarlyExit) ? max(baseDelay, 15.0) : baseDelay
         Task {
             try? await Task.sleep(for: .seconds(delay))
@@ -1617,8 +1931,24 @@ final class EnvironmentSupervisor {
                 }
             }
 
-            state.restartCount += 1
-            restartService(serviceID)
+            // A service that failed because the container runtime is down fails again
+            // at once. Start the runtime first; if it does not come up, say so and stop.
+            let recentLines = await logStore.entries(for: serviceID).map(\.text)
+            if CrashCause.showsContainerRuntimeDown(recentLines), !(await ContainerRuntime.isResponding()) {
+                let runtime = ContainerRuntime.detect()
+                await logStore.append(serviceID: serviceID, entry: LogEntry(
+                    stream: .stdout,
+                    text: "[travel-runner] \(runtime.displayName) is not running — starting it before the restart of \(name)"
+                ))
+                guard await ContainerRuntime.ensureRunning() else {
+                    state.isCircuitBroken = true
+                    lastError = "\(runtime.displayName) is not running — open \(runtime.appName), then restart \(name)"
+                    return
+                }
+                guard serviceStates[serviceID]?.phase == .failed else { return }
+            }
+
+            await autoRestart(serviceID)
         }
     }
 
@@ -1652,118 +1982,149 @@ final class EnvironmentSupervisor {
         }
     }
 
-    private func handleWake() {
+    func handleWake() {
         guard health == .healthy || health == .degraded else { return }
-        Task {
-            try? await Task.sleep(for: .seconds(3))
 
-            // LAN mode: the network may have changed during sleep. Probing or
-            // restarting against a stale IP causes false probe failures and
-            // EADDRNOTAVAIL crash loops — re-detect before doing anything.
-            if networkMode {
-                // Wi-Fi can take 10-20s to associate after wake. A single check
-                // at +3s falsely concludes "no network" and drops to localhost
-                // while the user expects LAN mode to survive the commute.
-                var currentIP = ""
-                for _ in 0..<7 {
-                    let (output, ok) = await shellOutput("ipconfig getifaddr en0")
-                    currentIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : ""
-                    if !currentIP.isEmpty { break }
-                    try? await Task.sleep(for: .seconds(3))
-                }
-                if currentIP.isEmpty {
-                    await logStore.append(
-                        serviceID: "travel-portal",
-                        entry: LogEntry(stream: .stdout, text: "[travel-runner] No LAN IP ~20s after wake — switching back to localhost mode")
-                    )
-                    await killWebServicePorts()
-                    toggleNetworkMode()
-                    return
-                }
-                if currentIP != localIP {
-                    await logStore.append(
-                        serviceID: "travel-portal",
-                        entry: LogEntry(stream: .stdout, text: "[travel-runner] LAN IP changed after wake (\(localIP ?? "?") → \(currentIP)) — re-applying network mode")
-                    )
-                    await killWebServicePorts()
-                    applyNetworkMode()
-                    return
-                }
+        // Wake notifications can come in pairs a few seconds apart. Two passes at
+        // once probe the same services, and both restart the ones that fail.
+        if isHandlingWake {
+            // A notification that comes long after the pass started is a new wake:
+            // the machine slept again in the middle of the pass.
+            if let started = wakePassStartedAt, Date.now.timeIntervalSince(started) > 30 {
+                wakePending = true
             }
+            return
+        }
+        isHandlingWake = true
 
-            for (serviceID, state) in serviceStates where state.phase == .running {
-                guard let probeConfig = state.definition.probe,
-                      probeConfig.type != .stdoutRegex else { continue }
-                // Use the LAN-aware probe so we check the host the service is
-                // actually bound to, and allow a grace window — a single 2s
-                // check right after wake produces false failures.
-                let effectiveProbe = lanAwareDefinition(for: state.definition, serviceID: serviceID).probe ?? probeConfig
-                let probe = ProbeFactory.makeProbe(for: effectiveProbe)
-                let ok = (try? await waitForProbe(probe, timeout: .seconds(15), interval: .seconds(3))) ?? false
-                if !ok {
+        Task {
+            repeat {
+                wakePending = false
+                wakePassStartedAt = .now
+                await runWakeChecks()
+            } while wakePending && (health == .healthy || health == .degraded)
+            isHandlingWake = false
+            wakePassStartedAt = nil
+        }
+    }
+
+    private func runWakeChecks() async {
+        try? await Task.sleep(for: .seconds(3))
+
+        // LAN mode: the network may have changed during sleep. Probing or
+        // restarting against a stale IP causes false probe failures and
+        // EADDRNOTAVAIL crash loops — re-detect before doing anything.
+        if networkMode {
+            // Wi-Fi can take 10-20s to associate after wake. A single check
+            // at +3s falsely concludes "no network" and drops to localhost
+            // while the user expects LAN mode to survive the commute.
+            var currentIP = ""
+            for _ in 0..<7 {
+                let (output, ok) = await shellOutput("ipconfig getifaddr en0")
+                currentIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : ""
+                if !currentIP.isEmpty { break }
+                try? await Task.sleep(for: .seconds(3))
+            }
+            if currentIP.isEmpty {
+                await logStore.append(
+                    serviceID: "travel-portal",
+                    entry: LogEntry(stream: .stdout, text: "[travel-runner] No LAN IP ~20s after wake — switching back to localhost mode")
+                )
+                await killWebServicePorts()
+                networkMode = false
+                applyNetworkMode()
+                return
+            }
+            if currentIP != localIP {
+                await logStore.append(
+                    serviceID: "travel-portal",
+                    entry: LogEntry(stream: .stdout, text: "[travel-runner] LAN IP changed after wake (\(localIP ?? "?") → \(currentIP)) — re-applying network mode")
+                )
+                await killWebServicePorts()
+                applyNetworkMode()
+                return
+            }
+        }
+
+        for (serviceID, state) in serviceStates where state.phase == .running {
+            guard let probeConfig = state.definition.probe,
+                  probeConfig.type != .stdoutRegex else { continue }
+            // Use the LAN-aware probe so we check the host the service is
+            // actually bound to, and allow a grace window — a single 2s
+            // check right after wake produces false failures.
+            let effectiveProbe = lanAwareDefinition(for: state.definition, serviceID: serviceID).probe ?? probeConfig
+            let probe = ProbeFactory.makeProbe(for: effectiveProbe)
+            let ok = (try? await waitForProbe(probe, timeout: .seconds(15), interval: .seconds(3))) ?? false
+            // A restart or a stop can start while the probe runs; it owns the state then.
+            guard state.phase == .running else { continue }
+            if !ok {
+                noteFailure(state, stableFor: state.readyAt.map { Date.now.timeIntervalSince($0) }, countsTowardBreaker: false)
+                state.phase = .failed
+                recalculateHealth()
+                scheduleRestart(serviceID: serviceID)
+                Task { await self.captureDebugIssue(
+                    trigger: "probe_timeout",
+                    serviceID: serviceID,
+                    summary: "\(state.definition.displayName) failed wake probe"
+                )}
+            } else if let healthPath = Self.wakeHealthPaths[serviceID],
+                      let port = probeConfig.port {
+                // TCP answering isn't proof of health: an orphaned dev server
+                // (parent killed during sleep) can hold the port and serve
+                // 404s for every route while looking "running". Verify with
+                // a real HTTP request against a route that must exist.
+                let host = (networkMode ? localIP : nil) ?? "localhost"
+                let healthy = await httpServesPages(host: host, port: port, path: healthPath)
+                guard state.phase == .running else { continue }
+                if !healthy {
+                    await logStore.append(
+                        serviceID: serviceID,
+                        entry: LogEntry(stream: .stderr, text: "[travel-runner] \(state.definition.displayName) answers TCP but fails HTTP check after wake — killing port \(port) and restarting")
+                    )
+                    noteFailure(state, stableFor: state.readyAt.map { Date.now.timeIntervalSince($0) }, countsTowardBreaker: false)
                     state.phase = .failed
                     recalculateHealth()
+                    await lifecycle.withLock(serviceID) {
+                        await processRunner.stop(serviceID: serviceID)
+                        await killPortOccupants(port)
+                    }
                     scheduleRestart(serviceID: serviceID)
                     Task { await self.captureDebugIssue(
                         trigger: "probe_timeout",
                         serviceID: serviceID,
-                        summary: "\(state.definition.displayName) failed wake probe"
+                        summary: "\(state.definition.displayName) served HTTP errors after wake (zombie server) — restarted"
                     )}
-                } else if let healthPath = Self.wakeHealthPaths[serviceID],
-                          let port = probeConfig.port {
-                    // TCP answering isn't proof of health: an orphaned dev server
-                    // (parent killed during sleep) can hold the port and serve
-                    // 404s for every route while looking "running". Verify with
-                    // a real HTTP request against a route that must exist.
-                    let host = (networkMode ? localIP : nil) ?? "localhost"
-                    let healthy = await httpServesPages(host: host, port: port, path: healthPath)
-                    if !healthy {
-                        await logStore.append(
-                            serviceID: serviceID,
-                            entry: LogEntry(stream: .stderr, text: "[travel-runner] \(state.definition.displayName) answers TCP but fails HTTP check after wake — killing port \(port) and restarting")
-                        )
-                        state.phase = .failed
-                        recalculateHealth()
-                        await processRunner.stop(serviceID: serviceID)
-                        await killPortOccupants(port)
-                        scheduleRestart(serviceID: serviceID)
-                        Task { await self.captureDebugIssue(
-                            trigger: "probe_timeout",
-                            serviceID: serviceID,
-                            summary: "\(state.definition.displayName) served HTTP errors after wake (zombie server) — restarted"
-                        )}
-                    }
                 }
             }
+        }
 
-            // Stripe's WebSocket is guaranteed stale after sleep — proactively restart
-            // rather than waiting for the CLI to detect the failure and crash.
-            if let stripeState = serviceStates["stripe"],
-               stripeState.phase == .running || stripeState.phase == .failed {
-                await logStore.append(
+        // Stripe's WebSocket is guaranteed stale after sleep — proactively restart
+        // rather than waiting for the CLI to detect the failure and crash.
+        if let stripeState = serviceStates["stripe"],
+           stripeState.phase == .running || stripeState.phase == .failed {
+            await logStore.append(
+                serviceID: "stripe",
+                entry: LogEntry(stream: .stdout, text: "[travel-runner] Restarting Stripe after wake — waiting for network...")
+            )
+
+            let networkReady = await waitForNetwork(timeout: .seconds(30))
+            if networkReady {
+                stripeState.restartCount = 0
+                stripeState.isCircuitBroken = false
+                stripeState.failureTimestamps = []
+                restartService("stripe")
+            } else {
+                // Network still down — mark failed and let scheduleRestart
+                // keep retrying with backoff instead of abandoning.
+                stripeState.phase = .failed
+                lastError = "Stripe: network not available after wake — will retry"
+                recalculateHealth()
+                scheduleRestart(serviceID: "stripe")
+                Task { await self.captureDebugIssue(
+                    trigger: "probe_timeout",
                     serviceID: "stripe",
-                    entry: LogEntry(stream: .stdout, text: "[travel-runner] Restarting Stripe after wake — waiting for network...")
-                )
-
-                let networkReady = await waitForNetwork(timeout: .seconds(30))
-                if networkReady {
-                    stripeState.restartCount = 0
-                    stripeState.isCircuitBroken = false
-                    stripeState.failureTimestamps = []
-                    restartService("stripe")
-                } else {
-                    // Network still down — mark failed and let scheduleRestart
-                    // keep retrying with backoff instead of abandoning.
-                    stripeState.phase = .failed
-                    lastError = "Stripe: network not available after wake — will retry"
-                    recalculateHealth()
-                    scheduleRestart(serviceID: "stripe")
-                    Task { await self.captureDebugIssue(
-                        trigger: "probe_timeout",
-                        serviceID: "stripe",
-                        summary: "Network not available 30s after wake — Stripe restart deferred"
-                    )}
-                }
+                    summary: "Network not available 30s after wake — Stripe restart deferred"
+                )}
             }
         }
     }
@@ -1814,15 +2175,18 @@ final class EnvironmentSupervisor {
         }
 
         var logEntries: [DebugTracker.LogEntry] = []
+        var likelyCause: String?
         if let sid = serviceID {
             let raw = await logStore.entries(for: sid)
             logEntries = raw.map { DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: sid, line: $0.text) }
+            likelyCause = CrashCause.likelyCause(in: raw.map(\.text))
         }
 
         let _ = await tracker.captureIssue(
             trigger: trigger,
             serviceId: serviceID,
             errorMessage: errorMessage ?? summary,
+            likelyCause: likelyCause,
             logEntries: logEntries,
             stateSnapshots: snapshots
         )
@@ -2073,8 +2437,11 @@ final class EnvironmentSupervisor {
         return result == 0
     }
 
+    /// Kills the process that listens on the port. `lsof -i :port` alone also matches
+    /// the clients of the port (a browser tab, the Stripe CLI that forwards to the
+    /// portal, another dev server), and those must stay alive.
     private func killPortOccupants(_ port: Int) async {
-        _ = await runShellCommand("lsof -ti :\(port) | xargs kill -9 2>/dev/null")
+        _ = await runShellCommand("lsof -ti TCP:\(port) -sTCP:LISTEN | xargs kill -9 2>/dev/null")
     }
 
     /// Routes that must respond on a healthy server. "/" is wrong for
@@ -2104,10 +2471,12 @@ final class EnvironmentSupervisor {
     /// servers whose npm parent died during sleep. Without this, the replacement
     /// server silently binds port+1 while the zombie serves 404s on the real port.
     private func killWebServicePorts() async {
-        for serviceID in Self.wakeHealthPaths.keys {
+        for serviceID in Self.wakeHealthPaths.keys.sorted() {
             guard let port = serviceStates[serviceID]?.definition.probe?.port else { continue }
-            await processRunner.stop(serviceID: serviceID)
-            await killPortOccupants(port)
+            await lifecycle.withLock(serviceID) {
+                await processRunner.stop(serviceID: serviceID)
+                await killPortOccupants(port)
+            }
         }
     }
 

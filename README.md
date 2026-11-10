@@ -19,10 +19,10 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 - **Migration detection**: Auto-runs the DB reset (`scripts/db/manifest.json` `reset` profile) on first run, when pending migrations change or a new fb-amateur-backend baseline commit lands, on an empty database, and on a branch switch
 - **Shared code**: `packages/travel-data` hot-reloads into both apps — nothing to build or link
 - **Console tabs**: Live logs for Stripe, Booking Portal, and Universal Login with Pino JSON formatting
-- **Crash recovery**: Auto-restarts failed services with exponential backoff
+- **Crash recovery**: Auto-restarts failed services with exponential backoff, and stops after 3 failures in a minute (circuit breaker). A service that someone stops from outside (`kill`) comes back without a crash report
 - **LAN mode**: Toggle to make all services accessible from other devices (mobile testing); rewrites both apps' runner blocks
 - **Database mode**: Toggle between local Supabase and hosted dev (needs each profile app's shared `.env`)
-- **Sleep/wake**: Re-probes services after macOS wake
+- **Sleep/wake**: Re-probes services after macOS wake, one pass per wake
 
 ## Control API
 
