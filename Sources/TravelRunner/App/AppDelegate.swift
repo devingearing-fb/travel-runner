@@ -51,6 +51,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // The holds viewer of the Rooms tab is not a service, so it is not in the loop above.
+        if let pid = supervisor.holdsViewer.pid {
+            allPids.insert(pid)
+            collectDescendants(of: pid, into: &allPids)
+        }
+
         // Phase 2: SIGTERM everything we collected
         for pid in allPids {
             kill(pid, SIGTERM)

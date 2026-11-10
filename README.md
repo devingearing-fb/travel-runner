@@ -23,6 +23,7 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 - **LAN mode**: Toggle to make all services accessible from other devices (mobile testing); rewrites both apps' runner blocks
 - **Database mode**: Toggle between local Supabase and hosted dev (needs each profile app's shared `.env`)
 - **Sleep/wake**: Re-probes services after macOS wake, one pass per wake
+- **Rooms tab**: For one event and hotel, shows how many rooms of each room type are booked, held and free on each night, and who holds them. A switch selects the local stack or dev. The tab is read-only. It shows the page of the monolith's holds viewer (`scripts/holds-viewer`): the copy in your checkout, or the copy of `origin/dev` when your branch does not have it. Dev needs only the shared `apps/<app>/.env`, not Doppler. The viewer runs while the tab is open and stops 10 minutes after it closes. `defaults write ai.fastbreak.travel-runner holdsViewerPath <folder>` makes the tab use a copy from another folder; `defaults delete ai.fastbreak.travel-runner holdsViewerPath` removes that
 
 ## Control API
 

@@ -49,6 +49,12 @@ final class EnvironmentSupervisor {
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
+    /// The fb-travel-monolith checkout that the runner runs, or nil before setup.
+    var monorepoPath: String? {
+        guard let path = config?.paths?.monorepo, !path.isEmpty else { return nil }
+        return ServiceCatalog.expand(path)
+    }
+
     enum DatabaseMode: String, Sendable { case local, remote }
 
     var totalBehindCount: Int {
@@ -79,6 +85,8 @@ final class EnvironmentSupervisor {
     // MARK: - Internal Components
 
     private(set) var logStore = LogStore()
+    /// The reader for the Rooms tab. It is not a service of the graph.
+    let holdsViewer: HoldsViewerHost
     private let secretStore = SecretStore()
     private var graph: ServiceGraph?
     private let processRunner = ProcessRunner()
@@ -116,9 +124,13 @@ final class EnvironmentSupervisor {
     private var wakePassStartedAt: Date?
     private var wakePending = false
 
-    init(userDefaults: UserDefaults = .standard) {
+    init(userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil) {
+        self.holdsViewer = holdsViewer ?? HoldsViewerHost()
         self.userDefaults = userDefaults
         self.selectedDbSeedScenarioID = userDefaults.string(forKey: "dbSeedScenarioID")
+        if holdsViewer == nil {
+            self.holdsViewer.monorepo = { [weak self] in self?.monorepoPath }
+        }
     }
 
     // MARK: - Types

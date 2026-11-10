@@ -43,6 +43,8 @@ struct WorkshopView: View {
                             WorkshopIssuesView()
                         case .logs:
                             WorkshopLogsView()
+                        case .rooms:
+                            WorkshopRoomsView()
                         case .dbTools:
                             WorkshopDbToolsView()
                         case .settings:
