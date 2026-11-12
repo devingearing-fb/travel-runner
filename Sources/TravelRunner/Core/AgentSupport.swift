@@ -179,6 +179,82 @@ enum AgentEnv {
         /// Set when the model credential is the token of the event directory's
         /// Vercel project (`withProjectToken`).
         var modelProject: ModelProject?
+        /// True when the agent has its own `VERCEL_OIDC_TOKEN` that is good, or can get
+        /// one itself (project link and Vercel login). The runner then gives it none.
+        var ownsProjectToken = false
+        /// True when the token of the agent's own files stopped (or stops soon), and
+        /// the agent cannot get a new one itself.
+        var ownTokenStale = false
+        /// True when no file gives the agent the address of the PXI API.
+        var pxiMissing = false
+        /// Set when the runner gives the agent the token of the event directory's project.
+        var projectTokenUntil: Date?
+        /// The keys that the runner takes from the env of the event directory.
+        var eventDirectoryKeys: [String] = []
+    }
+
+    /// The agent reads the event data of the event directory (PXI). These are the
+    /// agent's keys for that, and the key of the event directory's env with the value.
+    static let eventDirectorySources: [(agentKey: String, eventKey: String)] = [
+        ("PXI_API_URL", "PXI_API_URL"),
+        ("NEXT_PUBLIC_REGISTRATION_BASE_URL", "NEXT_PUBLIC_REGISTRATION_BASE_URL"),
+        ("MAPBOX_ACCESS_TOKEN", "NEXT_PUBLIC_MAPBOX_ACCESS_TOKEN"),
+    ]
+    static let pxiURLKey = "PXI_API_URL"
+
+    /// For a PXI key that the agent's own files do not set, the runner gives the agent
+    /// the value of the event directory's env. The runner does not set
+    /// `EVENT_DIRECTORY_ORIGIN`: without it the agent makes relative links, which work
+    /// on each host of the event directory (localhost, the LAN address).
+    static func withEventDirectoryValues(_ plan: Plan, own: [String: String], event: [String: String]) -> Plan {
+        var plan = plan
+        func isSet(_ value: String?) -> Bool { !(value ?? "").trimmingCharacters(in: .whitespaces).isEmpty }
+        for (agentKey, eventKey) in eventDirectorySources where !isSet(own[agentKey]) && isSet(event[eventKey]) {
+            plan.passthrough[agentKey] = event[eventKey]
+            plan.eventDirectoryKeys.append(agentKey)
+        }
+        plan.pxiMissing = !isSet(own[pxiURLKey]) && plan.passthrough[pxiURLKey] == nil
+        return plan
+    }
+
+    /// Why a file is not an env of the agent, for Import…; nil when it is one.
+    /// The env of the event directory is refused: it has none of the agent's own keys,
+    /// and the runner already gives the agent the values of that file.
+    static func importProblem(_ values: [String: String]) -> String? {
+        func isSet(_ key: String) -> Bool { !(values[key] ?? "").trimmingCharacters(in: .whitespaces).isEmpty }
+        let ownKeys = supabaseKeys + [gatewayKey]
+        if ownKeys.contains(where: isSet) { return nil }
+        if isSet("SITE_URL") {
+            return "It is the env of the event directory. Import it on the row of the event directory; "
+                + "the runner gives the agent the values that it needs from that file."
+        }
+        return "It sets none of \(ownKeys.joined(separator: ", "))."
+    }
+
+    /// True when `@vercel/oidc` finds a Vercel project link from this folder. As the
+    /// library does, it walks up to the first folder with `.vercel`, and that folder
+    /// must have `project.json`.
+    static func hasProjectLink(from directory: String) -> Bool {
+        var current = (directory as NSString).standardizingPath
+        while true {
+            let folder = (current as NSString).appendingPathComponent(".vercel")
+            if FileManager.default.fileExists(atPath: folder) {
+                return FileManager.default.fileExists(atPath: (folder as NSString).appendingPathComponent("project.json"))
+            }
+            let parent = (current as NSString).deletingLastPathComponent
+            if parent == current || parent.isEmpty { return false }
+            current = parent
+        }
+    }
+
+    /// True when a token of the agent's own files cannot work: it stopped (or stops
+    /// soon), and the agent cannot get a new one itself. Text that is not a Vercel
+    /// token is not judged.
+    static func isStaleToken(_ value: String?, canRefresh: Bool, now: Date) -> Bool {
+        guard !canRefresh,
+              let claims = EventDirectoryEnv.claims(ofToken: value?.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let until = claims.expiresAt else { return false }
+        return until.timeIntervalSince(now) < minimumTokenLife
     }
 
     /// The Vercel project whose token pays for the model calls of the agent.
@@ -203,24 +279,35 @@ enum AgentEnv {
         return "cd \(quoted) && node -e '\(script)'"
     }
 
-    /// Gives the agent the token that `projectTokenCommand` printed, when no file gives
-    /// the agent a model credential. eve uses `VERCEL_OIDC_TOKEN` for the AI Gateway.
-    /// The agent cannot get a new token by itself (it has no project link), so the
-    /// token must have some life left.
+    /// Gives the agent the token that `projectTokenCommand` printed, when the agent's
+    /// own files give no `VERCEL_OIDC_TOKEN`. The agent uses the token for the event
+    /// data (PXI). eve also uses it for the AI Gateway, when no file gives the agent a
+    /// model credential. The agent cannot get a new token by itself (it has no project
+    /// link), so the token must have some life left.
     static func withProjectToken(_ plan: Plan, commandOutput: String, now: Date = Date()) -> Plan {
-        guard !plan.hasModelCredential else { return plan }
+        guard !plan.ownsProjectToken else { return plan }
         let token = commandOutput.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let claims = EventDirectoryEnv.claims(ofToken: token),
               let until = claims.expiresAt,
               until.timeIntervalSince(now) >= minimumTokenLife else { return plan }
         var plan = plan
         plan.passthrough[oidcKey] = token
-        plan.hasModelCredential = true
-        plan.modelProject = ModelProject(name: claims.projectName, until: until)
+        plan.projectTokenUntil = until
+        if !plan.hasModelCredential {
+            plan.hasModelCredential = true
+            plan.modelProject = ModelProject(name: claims.projectName, until: until)
+        }
         return plan
     }
 
-    static func plan(own: [String: String], shared: [String: String]) -> Plan {
+    /// `canRefreshToken`: the agent's folder has a Vercel project link, and this Mac
+    /// has a Vercel login, so the agent's library gets a token itself.
+    static func plan(
+        own: [String: String],
+        shared: [String: String],
+        canRefreshToken: Bool = false,
+        now: Date = Date()
+    ) -> Plan {
         var plan = Plan()
         for key in supabaseKeys {
             if isUsable(own[key], key: key) { continue }
@@ -233,7 +320,10 @@ enum AgentEnv {
                 plan.missing.append(key)
             }
         }
-        if isUsable(own[gatewayKey], key: gatewayKey) || isUsable(own[oidcKey], key: oidcKey) {
+        let hasOwnToken = isUsable(own[oidcKey], key: oidcKey)
+        plan.ownTokenStale = hasOwnToken && isStaleToken(own[oidcKey], canRefresh: canRefreshToken, now: now)
+        plan.ownsProjectToken = canRefreshToken || (hasOwnToken && !plan.ownTokenStale)
+        if isUsable(own[gatewayKey], key: gatewayKey) || plan.ownsProjectToken {
             plan.hasModelCredential = true
         } else if isUsable(shared[gatewayKey], key: gatewayKey) {
             plan.passthrough[gatewayKey] = shared[gatewayKey]
@@ -243,7 +333,11 @@ enum AgentEnv {
     }
 
     static func plan(agentDirectory: String, sharedEnvFile: String) -> Plan {
-        plan(own: ownValues(directory: agentDirectory), shared: sharedValues(file: sharedEnvFile))
+        plan(
+            own: ownValues(directory: agentDirectory),
+            shared: sharedValues(file: sharedEnvFile),
+            canRefreshToken: hasProjectLink(from: agentDirectory) && EventDirectoryEnv.hasVercelLogin()
+        )
     }
 
     /// One line for the log of the service and for the environment check.
@@ -262,6 +356,9 @@ enum AgentEnv {
         if plan.ownSigningKeyUnreadable {
             parts.append("the signing key in the agent's .env.local is not readable JSON (single quotes fix it)")
         }
+        if plan.ownTokenStale {
+            parts.append("the \(oidcKey) in the agent's own env stopped")
+        }
         if let project = plan.modelProject {
             let format = DateFormatter()
             format.dateFormat = "MMM d HH:mm"
@@ -270,10 +367,31 @@ enum AgentEnv {
                 "the model calls use \(name) (AI Gateway); its token is good until \(format.string(from: project.until)), "
                     + "restart the agent after that"
             )
+        } else if let until = plan.projectTokenUntil {
+            let format = DateFormatter()
+            format.dateFormat = "MMM d HH:mm"
+            parts.append(
+                "the event data uses the token of the event directory's Vercel project; it is good until "
+                    + "\(format.string(from: until)), restart the agent after that"
+            )
         } else if !plan.hasModelCredential, eventProjectUsable {
             parts.append("the model calls use the Vercel project of the event directory (AI Gateway)")
         } else if !plan.hasModelCredential {
             parts.append("no \(gatewayKey): add it to apps/amateur-agent/.env.local, or use /login in the eve REPL")
+        }
+        // The event tools of the agent (PXI) need the token of a Vercel project.
+        if !plan.ownsProjectToken, plan.projectTokenUntil == nil, !eventProjectUsable {
+            parts.append(
+                "no Vercel token for the event data: put the env of the event directory in place. \(EventDirectoryEnv.loginHint)"
+            )
+        }
+        if plan.pxiMissing {
+            parts.append(
+                "no \(pxiURLKey): the event tools of the agent fail. Import the env of the event directory (Environment Check)"
+            )
+        }
+        if !plan.eventDirectoryKeys.isEmpty {
+            parts.append("\(plan.eventDirectoryKeys.joined(separator: ", ")) from the env of the event directory")
         }
         return parts.joined(separator: "; ")
     }

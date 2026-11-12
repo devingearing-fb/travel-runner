@@ -1399,7 +1399,17 @@ final class EnvironmentSupervisor {
         let installs = await Task.detached { NodeLocator.installs() }.value
         let sharedEnv = sharedEnvPath("travel-portal") ?? ""
         var plan = AgentEnv.plan(agentDirectory: cwd, sharedEnvFile: sharedEnv)
-        if hasPackages, !plan.hasModelCredential, let eventDirectory = await linkedEventDirectory() {
+        if let eventDirectory = serviceStates[ServiceCatalog.eventDirectoryID]?.definition.resolvedCwd {
+            let current = plan
+            plan = await Task.detached {
+                AgentEnv.withEventDirectoryValues(
+                    current,
+                    own: AgentEnv.ownValues(directory: cwd),
+                    event: EventDirectoryEnv.values(directory: eventDirectory)
+                )
+            }.value
+        }
+        if hasPackages, !plan.ownsProjectToken, let eventDirectory = await linkedEventDirectory() {
             let (token, _) = await shellOutput(AgentEnv.projectTokenCommand(eventDirectory: eventDirectory))
             plan = AgentEnv.withProjectToken(plan, commandOutput: token)
         }

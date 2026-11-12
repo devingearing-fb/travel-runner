@@ -411,11 +411,18 @@ final class HackathonFlavorTests: XCTestCase {
         XCTAssertFalse(summary.contains("no \(AgentEnv.gatewayKey)"), summary)
         XCTAssertFalse(summary.contains(good), "The log must not show the token.")
 
-        // The agent's own credential stays.
+        // With its own model key, the agent gets the token for the event data only.
         let own = AgentEnv.plan(own: [AgentEnv.gatewayKey: "vck_own"], shared: [:])
-        XCTAssertEqual(AgentEnv.withProjectToken(own, commandOutput: good, now: now), own)
-        let shared = AgentEnv.plan(own: [:], shared: [AgentEnv.gatewayKey: "vck_shared"])
-        XCTAssertEqual(AgentEnv.withProjectToken(shared, commandOutput: good, now: now), shared)
+        let ownWithToken = AgentEnv.withProjectToken(own, commandOutput: good, now: now)
+        XCTAssertEqual(ownWithToken.passthrough[AgentEnv.oidcKey], good)
+        XCTAssertNil(ownWithToken.modelProject, "The agent's own key pays for the model calls.")
+        XCTAssertNil(ownWithToken.passthrough[AgentEnv.gatewayKey])
+        XCTAssertTrue(AgentEnv.summary(ownWithToken).contains("the event data uses the token"))
+        XCTAssertFalse(AgentEnv.summary(ownWithToken).contains("model calls use"))
+
+        // The agent's own token stays.
+        let ownToken = AgentEnv.plan(own: [AgentEnv.oidcKey: "own.token.value"], shared: [:])
+        XCTAssertEqual(AgentEnv.withProjectToken(ownToken, commandOutput: good, now: now), ownToken)
 
         // A token that stops soon, or text that is not a token, changes nothing.
         let short = try oidcToken(["project_id": "prj_1", "owner_id": "team_1", "exp": 1_800_000_300])
@@ -423,6 +430,134 @@ final class HackathonFlavorTests: XCTestCase {
         XCTAssertEqual(AgentEnv.withProjectToken(none, commandOutput: "ERR no login", now: now), none)
         XCTAssertEqual(AgentEnv.withProjectToken(none, commandOutput: "", now: now), none)
         XCTAssertTrue(AgentEnv.summary(none).contains("no \(AgentEnv.gatewayKey)"))
+    }
+
+    func testTheAgentGetsThePxiValuesOfTheEventDirectory() {
+        let event = [
+            "PXI_API_URL": "https://pxi.example", "NEXT_PUBLIC_MAPBOX_ACCESS_TOKEN": "pk.map",
+            "NEXT_PUBLIC_REGISTRATION_BASE_URL": " ", "SITE_URL": "https://site.example",
+        ]
+        let base = AgentEnv.plan(own: [:], shared: [:])
+        let filled = AgentEnv.withEventDirectoryValues(base, own: [:], event: event)
+        XCTAssertEqual(filled.passthrough["PXI_API_URL"], "https://pxi.example")
+        XCTAssertEqual(filled.passthrough["MAPBOX_ACCESS_TOKEN"], "pk.map")
+        XCTAssertNil(filled.passthrough["NEXT_PUBLIC_REGISTRATION_BASE_URL"], "An empty value is not passed.")
+        XCTAssertNil(filled.passthrough["SITE_URL"], "Only the PXI keys are passed.")
+        // Without an origin the agent makes relative links, which work on each host
+        // of the event directory (localhost, the LAN address). The team wants that.
+        XCTAssertNil(filled.passthrough["EVENT_DIRECTORY_ORIGIN"])
+        XCTAssertTrue(AgentEnv.summary(filled).contains("PXI_API_URL"))
+
+        // The agent's own values stay.
+        let own = ["PXI_API_URL": "https://own.example"]
+        let kept = AgentEnv.withEventDirectoryValues(base, own: own, event: event)
+        XCTAssertNil(kept.passthrough["PXI_API_URL"])
+        XCTAssertEqual(kept.passthrough["MAPBOX_ACCESS_TOKEN"], "pk.map")
+        XCTAssertEqual(kept.eventDirectoryKeys, ["MAPBOX_ACCESS_TOKEN"])
+
+        // Without the env of the event directory, the runner gives nothing, and says
+        // that the event tools fail.
+        let empty = AgentEnv.withEventDirectoryValues(base, own: [:], event: [:])
+        XCTAssertEqual(empty.passthrough, base.passthrough)
+        XCTAssertTrue(empty.pxiMissing)
+        XCTAssertTrue(AgentEnv.summary(empty).contains("no PXI_API_URL"), AgentEnv.summary(empty))
+        XCTAssertFalse(filled.pxiMissing)
+        XCTAssertFalse(kept.pxiMissing)
+        XCTAssertFalse(AgentEnv.summary(filled).contains("no PXI_API_URL"))
+    }
+
+    /// A person follows the README of the agent and copies the env of the event
+    /// directory into the agent's folder. Its token stops after 12 hours, and the
+    /// agent has no project link to get a new one.
+    func testAnOwnTokenThatStoppedIsReplaced() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let stopped = try oidcToken(["project_id": "prj_1", "owner_id": "team_1", "exp": 1_799_990_000])
+        let good = try oidcToken([
+            "project_id": "prj_1", "owner_id": "team_1", "project": "events.example", "exp": 1_800_030_000,
+        ])
+
+        let stale = AgentEnv.plan(own: [AgentEnv.oidcKey: stopped], shared: [:], canRefreshToken: false, now: now)
+        XCTAssertTrue(stale.ownTokenStale)
+        XCTAssertFalse(stale.ownsProjectToken)
+        XCTAssertFalse(stale.hasModelCredential, "A token that stopped is not a model credential.")
+        XCTAssertTrue(AgentEnv.summary(stale).contains("stopped"), AgentEnv.summary(stale))
+        let replaced = AgentEnv.withProjectToken(stale, commandOutput: good, now: now)
+        XCTAssertEqual(replaced.passthrough[AgentEnv.oidcKey], good)
+        XCTAssertEqual(replaced.modelProject?.name, "events.example")
+
+        // With a project link and a Vercel login, the agent gets a new token itself.
+        let linked = AgentEnv.plan(own: [AgentEnv.oidcKey: stopped], shared: [:], canRefreshToken: true, now: now)
+        XCTAssertFalse(linked.ownTokenStale)
+        XCTAssertTrue(linked.ownsProjectToken)
+        XCTAssertTrue(linked.hasModelCredential)
+        XCTAssertEqual(AgentEnv.withProjectToken(linked, commandOutput: good, now: now), linked)
+        let linkedOnly = AgentEnv.plan(own: [:], shared: [:], canRefreshToken: true, now: now)
+        XCTAssertTrue(linkedOnly.ownsProjectToken)
+        XCTAssertTrue(linkedOnly.hasModelCredential)
+
+        // A token that is still good stays (control).
+        let fresh = AgentEnv.plan(own: [AgentEnv.oidcKey: good], shared: [:], canRefreshToken: false, now: now)
+        XCTAssertFalse(fresh.ownTokenStale)
+        XCTAssertTrue(fresh.ownsProjectToken)
+        XCTAssertNil(AgentEnv.withProjectToken(fresh, commandOutput: good, now: now).passthrough[AgentEnv.oidcKey])
+
+        // The agent's own model key stays the model credential; only the token is replaced.
+        let keyAndStale = AgentEnv.plan(
+            own: [AgentEnv.gatewayKey: "vck_own", AgentEnv.oidcKey: stopped], shared: [:], canRefreshToken: false, now: now
+        )
+        XCTAssertTrue(keyAndStale.hasModelCredential)
+        let keyReplaced = AgentEnv.withProjectToken(keyAndStale, commandOutput: good, now: now)
+        XCTAssertEqual(keyReplaced.passthrough[AgentEnv.oidcKey], good)
+        XCTAssertNil(keyReplaced.modelProject)
+    }
+
+    func testOnlyAnEnvOfTheAgentIsImportedForTheAgent() {
+        // The file that the team sends: the agent's own keys.
+        XCTAssertNil(AgentEnv.importProblem([
+            "AMATEUR_SUPABASE_URL": "https://x.supabase.co", "AI_GATEWAY_API_KEY": "vck_1", "PXI_API_URL": "https://pxi.example",
+        ]))
+        // A file with only the model key is an env of the agent too: the runner gives the rest.
+        XCTAssertNil(AgentEnv.importProblem(["AI_GATEWAY_API_KEY": "vck_1"]))
+        // The env of the event directory is not: its token stops, and the agent cannot get a new one.
+        let event = AgentEnv.importProblem([
+            "SITE_URL": "https://site.example", "PXI_API_URL": "https://pxi.example", "VERCEL_OIDC_TOKEN": "a.b.c",
+        ])
+        XCTAssertNotNil(event)
+        XCTAssertTrue(event?.contains("event directory") ?? false, event ?? "")
+        // A file with none of the agent's keys is not.
+        XCTAssertNotNil(AgentEnv.importProblem(["FOO": "bar"]))
+        XCTAssertNotNil(AgentEnv.importProblem(["AI_GATEWAY_API_KEY": "  "]))
+        XCTAssertNotNil(AgentEnv.importProblem([:]))
+    }
+
+    func testTheProjectLinkOfTheAgentIsTheFirstVercelFolderOnTheWayUp() throws {
+        let agent = root.appendingPathComponent("fork/apps/amateur-agent")
+        try FileManager.default.createDirectory(at: agent, withIntermediateDirectories: true)
+        XCTAssertFalse(AgentEnv.hasProjectLink(from: agent.path))
+
+        // A link at the root of the fork counts: the library walks up.
+        let rootLink = root.appendingPathComponent("fork/.vercel")
+        try FileManager.default.createDirectory(at: rootLink, withIntermediateDirectories: true)
+        try Data("{}".utf8).write(to: rootLink.appendingPathComponent("project.json"))
+        XCTAssertTrue(AgentEnv.hasProjectLink(from: agent.path))
+
+        // A nearer `.vercel` folder without a link stops the search, as in the library.
+        try FileManager.default.createDirectory(at: agent.appendingPathComponent(".vercel"), withIntermediateDirectories: true)
+        XCTAssertFalse(AgentEnv.hasProjectLink(from: agent.path))
+    }
+
+    func testTheLogSaysWhenTheEventToolsHaveNoToken() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let good = try oidcToken(["project_id": "prj_1", "owner_id": "team_1", "exp": 1_800_030_000])
+        let own = AgentEnv.plan(own: [AgentEnv.gatewayKey: "vck_own"], shared: [:])
+        XCTAssertTrue(AgentEnv.summary(own).contains(EventDirectoryEnv.loginHint), AgentEnv.summary(own))
+        // The runner can get the token (the check), or it has one (the start of the agent).
+        XCTAssertFalse(AgentEnv.summary(own, eventProjectUsable: true).contains(EventDirectoryEnv.loginHint))
+        let withToken = AgentEnv.withProjectToken(own, commandOutput: good, now: now)
+        XCTAssertFalse(AgentEnv.summary(withToken).contains(EventDirectoryEnv.loginHint))
+        // The agent has its own token.
+        let ownToken = AgentEnv.plan(own: [AgentEnv.oidcKey: good], shared: [:], canRefreshToken: false, now: now)
+        XCTAssertFalse(AgentEnv.summary(ownToken).contains(EventDirectoryEnv.loginHint))
     }
 
     func testTheTokenCommandRunsInTheEventDirectory() {

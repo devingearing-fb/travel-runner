@@ -168,9 +168,9 @@ final class EnvironmentChecker {
                         checkCommand: "node --version",
                         checkDescription: "eve, the framework of the agent, needs Node \(major) or later. The runner looks for one from nvm, fnm, mise, Volta, asdf and Homebrew, and uses it only for the agent. The portals stay on your default Node."),
             HealthCheck(id: "agent-env", name: "Agent env", section: .supabase,
-                        isRequired: false,
+                        isRequired: false, fixLabel: "Import…",
                         checkCommand: "cat \(RepoDetector.agentDirectory)/.env.local",
-                        checkDescription: "The agent needs AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY and AMATEUR_SUPABASE_SIGNING_KEY, and a model credential (\(AgentEnv.gatewayKey)). Without a model credential in its files, the agent gets the token of the event directory's Vercel project, and that project pays for the model calls. For a Supabase key that \(RepoDetector.agentDirectory)/.env.local does not set, the runner gives the agent the value of apps/booking-portal/.env. The runner writes no file for the agent.",
+                        checkDescription: "The agent needs AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY and AMATEUR_SUPABASE_SIGNING_KEY, a model credential (\(AgentEnv.gatewayKey)), and for its event tools \(AgentEnv.pxiURLKey) and a Vercel token. For a value of these that its own files do not set, the runner gives the agent the value of the event directory's env, and a token of the event directory's Vercel project. Without a model credential in its files, that project pays for the model calls. For a Supabase key that \(RepoDetector.agentDirectory)/.env.local does not set, the runner gives the agent the value of apps/booking-portal/.env. The runner writes no file for the agent; Import… copies the env file of the agent that a teammate sent you into place.",
                         checkPath: (agentPath as NSString).appendingPathComponent(".env.local")),
             HealthCheck(id: "event-env", name: "Event directory env", section: .supabase,
                         isRequired: false, fixLabel: "Import…",
@@ -334,20 +334,27 @@ final class EnvironmentChecker {
 
         case "agent-env":
             let shared = (bookingPath as NSString).appendingPathComponent(".env")
-            let plan = AgentEnv.plan(agentDirectory: agentPath, sharedEnvFile: shared)
-            // Without a credential in a file, the runner gives the agent the token of
-            // the event directory's Vercel project at the start of the agent.
+            let agentPath = agentPath
+            // Without its own values, the agent gets the PXI values of the event
+            // directory's env, and the token of that app's Vercel project, at its start.
             let eventPath = eventDirectoryPath
-            let eventProjectUsable = await Task.detached {
-                let values = EventDirectoryEnv.values(directory: eventPath)
-                guard EventDirectoryEnv.missingKeys(values).isEmpty else { return false }
-                let claims = EventDirectoryEnv.claims(ofToken: values[EventDirectoryEnv.tokenKey])
-                return (EventDirectoryEnv.isLinked(directory: eventPath) || claims != nil)
+            return await Task.detached {
+                let event = EventDirectoryEnv.values(directory: eventPath)
+                let plan = AgentEnv.withEventDirectoryValues(
+                    AgentEnv.plan(agentDirectory: agentPath, sharedEnvFile: shared),
+                    own: AgentEnv.ownValues(directory: agentPath),
+                    event: event
+                )
+                let claims = EventDirectoryEnv.claims(ofToken: event[EventDirectoryEnv.tokenKey])
+                let eventProjectUsable = EventDirectoryEnv.missingKeys(event).isEmpty
+                    && (EventDirectoryEnv.isLinked(directory: eventPath) || claims != nil)
                     && EventDirectoryEnv.hasVercelLogin()
+                let summary = AgentEnv.summary(plan, eventProjectUsable: eventProjectUsable)
+                let hasModel = plan.hasModelCredential || eventProjectUsable
+                let hasToken = plan.ownsProjectToken || eventProjectUsable
+                let complete = plan.missing.isEmpty && hasModel && hasToken && !plan.pxiMissing
+                return complete ? CheckStatus.passing(summary) : CheckStatus.warning(summary)
             }.value
-            let summary = AgentEnv.summary(plan, eventProjectUsable: eventProjectUsable)
-            let hasModel = plan.hasModelCredential || eventProjectUsable
-            return plan.missing.isEmpty && hasModel ? .passing(summary) : .warning(summary)
 
         default:
             return .passing("OK")
@@ -406,6 +413,9 @@ final class EnvironmentChecker {
         case "event-env":
             return importEventDirectoryEnv()
 
+        case "agent-env":
+            return importAgentEnv()
+
         case "sb-linked":
             let script = (monorepoPath as NSString).appendingPathComponent("scripts/setup/link-project.sh")
             return await shellInDir(monorepoPath, "bash \(ShellQuote.quote(script))")
@@ -463,12 +473,44 @@ final class EnvironmentChecker {
     /// Copies the env file of the event directory that the developer picks to
     /// `apps/event-directory/.env.local`, after a check that it is that app's file.
     private func importEventDirectoryEnv() -> Bool? {
+        importEnvFile(
+            appName: "the event directory",
+            message: "Choose the env file of the event directory (the file of `vercel env pull`, for example env.local)",
+            directory: eventDirectoryPath,
+            relativeFolder: RepoDetector.eventDirectory
+        ) { values in
+            let missing = EventDirectoryEnv.missingKeys(values)
+            return missing.isEmpty ? nil : "It does not set \(missing.joined(separator: " and "))."
+        }
+    }
+
+    /// Copies the env file of the agent that the developer picks to
+    /// `apps/amateur-agent/.env.local`, after a check that it is that app's file.
+    private func importAgentEnv() -> Bool? {
+        importEnvFile(
+            appName: "the agent",
+            message: "Choose the env file of the agent (for example app/amateur-agent/.env.local of the file a teammate sent you)",
+            directory: agentPath,
+            relativeFolder: RepoDetector.agentDirectory,
+            problem: AgentEnv.importProblem
+        )
+    }
+
+    /// Asks for a file, checks with `problem` that it is the env of the app, and
+    /// copies it to `.env.local` of the app's folder. Returns nil when nothing changed.
+    private func importEnvFile(
+        appName: String,
+        message: String,
+        directory: String,
+        relativeFolder: String,
+        problem: ([String: String]) -> String?
+    ) -> Bool? {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
         panel.showsHiddenFiles = true
-        panel.message = "Choose the env file of the event directory (the file of `vercel env pull`, for example env.local)"
+        panel.message = message
         panel.level = .floating
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let source = panel.url else { return nil }
@@ -480,16 +522,15 @@ final class EnvironmentChecker {
             alert.runModal()
             return false
         }
-        let missing = EventDirectoryEnv.missingKeys(AgentEnv.parse(content, dialect: .node))
-        guard missing.isEmpty else {
-            alert.messageText = "This is not the env of the event directory"
-            alert.informativeText = "\(source.lastPathComponent) does not set \(missing.joined(separator: " and ")). Nothing was changed."
+        if let problem = problem(AgentEnv.parse(content, dialect: .node)) {
+            alert.messageText = "This is not the env of \(appName)"
+            alert.informativeText = "\(source.lastPathComponent): \(problem) Nothing was changed."
             alert.runModal()
             return nil
         }
-        let target = (eventDirectoryPath as NSString).appendingPathComponent(".env.local")
-        alert.messageText = exists(target) ? "Replace the env of the event directory?" : "Import the env of the event directory?"
-        alert.informativeText = "\(source.lastPathComponent) goes to \(RepoDetector.eventDirectory)/.env.local."
+        let target = (directory as NSString).appendingPathComponent(".env.local")
+        alert.messageText = exists(target) ? "Replace the env of \(appName)?" : "Import the env of \(appName)?"
+        alert.informativeText = "\(source.lastPathComponent) goes to \(relativeFolder)/.env.local."
         alert.addButton(withTitle: "Import")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
