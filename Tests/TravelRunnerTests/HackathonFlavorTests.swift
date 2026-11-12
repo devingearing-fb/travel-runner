@@ -80,7 +80,9 @@ final class HackathonFlavorTests: XCTestCase {
         XCTAssertFalse(agent.cmd.contains("--port"))
         XCTAssertEqual(agent.probe?.port, 2000)
         XCTAssertEqual(agent.resolvedRestart, .onFailure)
-        XCTAssertEqual(agent.dependsOn, ["supabase"])
+        // The agent reads hosted services only: a local database that does not start
+        // must not stop it.
+        XCTAssertEqual(agent.dependsOn, [])
     }
 
     func testTheAgentIsInEachProfileOfTheHackathonAppOnly() {

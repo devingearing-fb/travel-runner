@@ -94,10 +94,11 @@ enum ServiceCatalog {
         var services = standardServices(paths: paths)
         if flavor.runsAgent {
             let agent = (expand(paths.monorepo ?? "") as NSString).appendingPathComponent(RepoDetector.agentDirectory)
-            // After Supabase, with the login: the portals do not wait for the agent.
+            // The agent reads hosted services only (the dev database, the PXI API, the AI
+            // Gateway). It needs no other service, so it starts also when the local
+            // database does not start or its reset fails. The portals do not wait for it.
             services.append(service(agentID, "Amateur Agent", agentCommand, cwd: agent,
-                                    probe: tcp(agentPort, timeout: 120), restart: .onFailure, phase: "portal",
-                                    dependsOn: ["supabase"]))
+                                    probe: tcp(agentPort, timeout: 120), restart: .onFailure, phase: "portal"))
             // The event directory reads hosted services only: it needs no other service.
             let events = (expand(paths.monorepo ?? "") as NSString).appendingPathComponent(RepoDetector.eventDirectory)
             services.append(service(eventDirectoryID, "Event Directory",
