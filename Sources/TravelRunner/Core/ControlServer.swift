@@ -3,7 +3,7 @@ import FlyingFox
 
 actor ControlServer {
     private var server: HTTPServer?
-    private let port: UInt16 = 19900
+    private let port: UInt16 = Flavor.current.controlPort
 
     struct Actions: Sendable {
         let getStatus: @Sendable () async -> String

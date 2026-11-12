@@ -29,7 +29,7 @@ struct WorkshopView: View {
                     WorkshopHeaderBar()
 
                     NavigationSplitView {
-                        List(WorkshopSection.allCases, selection: $navigation.selectedSection) { section in
+                        List(WorkshopSection.visible(), selection: $navigation.selectedSection) { section in
                             Label(section.rawValue, systemImage: section.icon)
                                 .badge(section == .issues ? supervisor.debugOpenIssueCount
                                        : section == .status ? failedServiceCount : 0)

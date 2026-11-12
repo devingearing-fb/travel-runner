@@ -39,7 +39,7 @@ enum HoldsViewerLocator {
     static var defaultCacheRoot: String {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        return caches.appendingPathComponent("travel-runner/holds-viewer").path
+        return caches.appendingPathComponent("\(Flavor.current.storageName)/holds-viewer").path
     }
 
     /// The copy to run, in this order:

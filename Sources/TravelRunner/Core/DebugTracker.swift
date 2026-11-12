@@ -129,7 +129,7 @@ actor DebugTracker {
     // MARK: - Init
 
     init(baseDir: String? = nil) {
-        let root = baseDir ?? NSString(string: "~/Desktop/debug-tracking").expandingTildeInPath
+        let root = baseDir ?? NSString(string: "~/Desktop/\(Flavor.current.debugTrackingFolder)").expandingTildeInPath
         self.baseDir = root
         self.configPath = (root as NSString).appendingPathComponent("config.json")
         self.openDir = (root as NSString).appendingPathComponent("open")

@@ -17,51 +17,58 @@ struct DetectedRepos: Sendable {
 
 enum RepoDetector {
     /// Scans the dropped folder itself, its children and its grandchildren.
-    static func scan(directory: String) -> DetectedRepos {
+    static func scan(directory: String, flavor: Flavor = .current) -> DetectedRepos {
         let fm = FileManager.default
         let path = NSString(string: directory).expandingTildeInPath
         var result = DetectedRepos()
-        checkDirectory(path, result: &result)
+        checkDirectory(path, flavor: flavor, result: &result)
 
         for child in subdirectories(of: path) {
-            checkDirectory(child, result: &result)
+            checkDirectory(child, flavor: flavor, result: &result)
             // One level deeper too (e.g. "Codebases/TRAVEL BOOKING/fb-travel-monolith"),
-            // but never inside the monorepo itself.
-            guard !isMonorepo(child) else { continue }
+            // but never inside a monorepo checkout (of either app).
+            guard !isMonorepo(child, flavor: .standard) else { continue }
             for grandchild in subdirectories(of: child) where fm.fileExists(atPath: grandchild) {
-                checkDirectory(grandchild, result: &result)
+                checkDirectory(grandchild, flavor: flavor, result: &result)
             }
         }
         return result
     }
 
-    static func validate(path: String, role: RepoRole) -> Bool {
+    static func validate(path: String, role: RepoRole, flavor: Flavor = .current) -> Bool {
         let expanded = NSString(string: path).expandingTildeInPath
         switch role {
         case .monorepo:
-            return isMonorepo(expanded)
+            return isMonorepo(expanded, flavor: flavor)
         case .universalLogin, .streamServices, .loadTest:
             return FileManager.default.fileExists(atPath: (expanded as NSString).appendingPathComponent("package.json"))
         }
     }
 
     /// The fb-travel monorepo: a pnpm workspace with the booking app and the shared supabase/ directory.
-    static func isMonorepo(_ path: String) -> Bool {
+    /// The hackathon app takes only the fork, which also has the agent app. Thus a folder
+    /// that holds the two checkouts gives each app its own repo.
+    static func isMonorepo(_ path: String, flavor: Flavor = .current) -> Bool {
         let fm = FileManager.default
-        return ["pnpm-workspace.yaml", "apps/booking-portal/package.json", "supabase/config.toml"].allSatisfy {
+        var markers = ["pnpm-workspace.yaml", "apps/booking-portal/package.json", "supabase/config.toml"]
+        if flavor.runsAgent { markers.append("\(agentDirectory)/package.json") }
+        return markers.allSatisfy {
             fm.fileExists(atPath: (path as NSString).appendingPathComponent($0))
         }
     }
 
+    /// The agent app of the hackathon fork, from the monorepo root.
+    static let agentDirectory = "apps/amateur-agent"
+
     /// Finds the monorepo for a config that still points at an old sibling repo: the path
     /// itself or one of its ancestors, then the siblings at each of the three levels above it.
-    static func findMonorepo(near path: String) -> String? {
+    static func findMonorepo(near path: String, flavor: Flavor = .current) -> String? {
         var current = NSString(string: path).expandingTildeInPath
         for _ in 0..<3 {
-            if isMonorepo(current) { return current }
+            if isMonorepo(current, flavor: flavor) { return current }
             let parent = (current as NSString).deletingLastPathComponent
             guard parent != current else { break }
-            if let sibling = subdirectories(of: parent).sorted().first(where: isMonorepo) {
+            if let sibling = subdirectories(of: parent).sorted().first(where: { isMonorepo($0, flavor: flavor) }) {
                 return sibling
             }
             current = parent
@@ -87,10 +94,10 @@ enum RepoDetector {
         return json["name"] as? String
     }
 
-    private static func checkDirectory(_ path: String, result: inout DetectedRepos) {
+    private static func checkDirectory(_ path: String, flavor: Flavor, result: inout DetectedRepos) {
         let name = (path as NSString).lastPathComponent.lowercased()
 
-        if result.monorepo == nil, isMonorepo(path) {
+        if result.monorepo == nil, isMonorepo(path, flavor: flavor) {
             result.monorepo = path
             return
         }
@@ -118,7 +125,10 @@ enum RepoDetector {
 
         var description: String {
             switch self {
-            case .monorepo: "Supabase, booking portal (3002), partner portal (3006), travel-data"
+            case .monorepo:
+                Flavor.current.runsAgent
+                    ? "The hackathon fork: Supabase, booking portal (3002), partner portal (3006), agent (2000)"
+                    : "Supabase, booking portal (3002), partner portal (3006), travel-data"
             case .universalLogin: "Auth gateway (port 3000)"
             case .streamServices: "CDC ingest and reaction worker (port 3003)"
             case .loadTest: "Verification runs for the full profile"

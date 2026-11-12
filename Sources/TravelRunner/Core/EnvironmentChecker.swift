@@ -52,13 +52,16 @@ final class EnvironmentChecker {
     let monorepoPath: String
     let loginPath: String
     let streamServicesPath: String
+    let flavor: Flavor
 
+    private var agentPath: String { (monorepoPath as NSString).appendingPathComponent(RepoDetector.agentDirectory) }
     private var bookingPath: String { (monorepoPath as NSString).appendingPathComponent("apps/booking-portal") }
     private var partnerPath: String { (monorepoPath as NSString).appendingPathComponent("apps/partner-portal") }
 
     private(set) var checks: [HealthCheck] = []
 
-    init(monorepoPath: String, loginPath: String, streamServicesPath: String) {
+    init(monorepoPath: String, loginPath: String, streamServicesPath: String, flavor: Flavor = .current) {
+        self.flavor = flavor
         self.monorepoPath = NSString(string: monorepoPath).expandingTildeInPath
         self.loginPath = NSString(string: loginPath).expandingTildeInPath
         self.streamServicesPath = NSString(string: streamServicesPath).expandingTildeInPath
@@ -151,6 +154,23 @@ final class EnvironmentChecker {
                         checkCommand: "cat supabase/.temp/project-ref",
                         checkDescription: "Links to the remote Supabase project. Only needed for drift detection and pulling remote schema changes.",
                         checkPath: (monorepoPath as NSString).appendingPathComponent("supabase/.temp/project-ref")),
+        ]
+        if flavor.runsAgent { checks += agentChecks() }
+    }
+
+    /// The agent app of the hackathon fork. A failure here does not stop the portals.
+    private func agentChecks() -> [HealthCheck] {
+        let major = ServiceCatalog.agentNodeMajor
+        return [
+            HealthCheck(id: "agent-node", name: "Node.js \(major)+ (agent)", section: .prerequisites,
+                        isRequired: false, fixLabel: "brew install node@\(major)",
+                        checkCommand: "node --version",
+                        checkDescription: "eve, the framework of the agent, needs Node \(major) or later. The runner looks for one from nvm, fnm, mise, Volta, asdf and Homebrew, and uses it only for the agent. The portals stay on your default Node."),
+            HealthCheck(id: "agent-env", name: "Agent env", section: .supabase,
+                        isRequired: false,
+                        checkCommand: "cat \(RepoDetector.agentDirectory)/.env.local",
+                        checkDescription: "The agent needs AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY and AMATEUR_SUPABASE_SIGNING_KEY, and a model credential (\(AgentEnv.gatewayKey)). For a Supabase key that \(RepoDetector.agentDirectory)/.env.local does not set, the runner gives the agent the value of apps/booking-portal/.env. The runner writes no file for the agent.",
+                        checkPath: (agentPath as NSString).appendingPathComponent(".env.local")),
         ]
     }
 
@@ -272,6 +292,24 @@ final class EnvironmentChecker {
             let path = (monorepoPath as NSString).appendingPathComponent("supabase/.temp/project-ref")
             return exists(path) ? .passing("Linked") : .warning("Not linked — needed for remote sync only")
 
+        case "agent-node":
+            let minimum = ServiceCatalog.agentNodeMajor
+            let (output, ok) = await shellOutput("node --version")
+            if ok, let major = NodeLocator.major(ofVersionOutput: output), major >= minimum {
+                return .passing("\(output.trimmingCharacters(in: .whitespacesAndNewlines)) (default)")
+            }
+            let installs = await Task.detached { NodeLocator.installs() }.value
+            guard let install = NodeLocator.pick(installs, minimumMajor: minimum) else {
+                return .warning("Not found — the agent is skipped. nvm install \(minimum), or brew install node@\(minimum)")
+            }
+            return .passing("v\(install.version.map(String.init).joined(separator: ".")) — used only for the agent")
+
+        case "agent-env":
+            let shared = (bookingPath as NSString).appendingPathComponent(".env")
+            let plan = AgentEnv.plan(agentDirectory: agentPath, sharedEnvFile: shared)
+            let summary = AgentEnv.summary(plan)
+            return plan.missing.isEmpty && plan.hasModelCredential ? .passing(summary) : .warning(summary)
+
         default:
             return .passing("OK")
         }
@@ -322,6 +360,9 @@ final class EnvironmentChecker {
 
         case "hotel-data":
             return await shellInDir(monorepoPath, "pnpm db:setup:reset")
+
+        case "agent-node":
+            return await shell("brew install node@\(ServiceCatalog.agentNodeMajor)")
 
         case "sb-linked":
             let script = (monorepoPath as NSString).appendingPathComponent("scripts/setup/link-project.sh")

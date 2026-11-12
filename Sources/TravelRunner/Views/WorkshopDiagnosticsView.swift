@@ -91,7 +91,7 @@ struct WorkshopDiagnosticsView: View {
 
                 let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
                 let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
-                Text("Travel Runner v\(version) (build \(build))")
+                Text("\(Flavor.current.displayName) v\(version) (build \(build))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

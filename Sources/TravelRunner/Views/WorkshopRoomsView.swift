@@ -70,7 +70,7 @@ struct WorkshopRoomsView: View {
         case .unavailable(.noMonorepo):
             message(
                 "The monolith is not set up",
-                "Travel Runner does not know where fb-travel-monolith is. Open Settings, then Reconfigure Repos."
+                "\(Flavor.current.displayName) does not know where \(Flavor.current.monorepoName) is. Open Settings, then Reconfigure Repos."
             )
         case .unavailable(.noViewer):
             message(
@@ -79,7 +79,7 @@ struct WorkshopRoomsView: View {
                 The viewer is in the monolith at scripts/holds-viewer. Your checkout does not have it, and origin/dev does not have it.
 
                 The tab starts to work when the viewer is on dev and this Mac has fetched it. To use a copy from another folder now:
-                defaults write ai.fastbreak.travel-runner \(HoldsViewerHost.overrideDefaultsKey) /path/to/scripts/holds-viewer
+                defaults write \(Flavor.current.bundleID) \(HoldsViewerHost.overrideDefaultsKey) /path/to/scripts/holds-viewer
                 """
             )
         case .unavailable(.nodeNotFound):

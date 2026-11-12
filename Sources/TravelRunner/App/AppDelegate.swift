@@ -31,6 +31,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupNotifications()
         setupStatusItem()
         setupGlobalHotkey()
+
+        // `open -a … --args --open-panel` shows the window at once (scripts, screenshots).
+        if CommandLine.arguments.contains("--open-panel") { openPanel() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -38,7 +41,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let monitor = globalHotkeyMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = localHotkeyMonitor { NSEvent.removeMonitor(monitor) }
         iconTimer?.invalidate()
-        supervisor.resetEnvToLocalhost()
+        // While the other runner app runs a stack, the login's env and the ports are its.
+        let siblingRunsStack = !SiblingRunner.activeServicesNow().isEmpty
+        if !siblingRunsStack { supervisor.resetEnvToLocalhost() }
 
         // Phase 1: Collect the full process tree BEFORE sending signals.
         // Killing a parent reparents its children to launchd, making them
@@ -72,7 +77,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Phase 4: Kill by known service ports as a fallback. Only the Node dev servers:
         // Docker-published ports (Supabase 54322, Sequin 7376) are held by the container
         // runtime itself (OrbStack / Docker Desktop), and Supabase persists between sessions.
-        killProcessesOnPorts([3000, 3002, 3003, 3006, 8080])
+        guard !siblingRunsStack else { return }
+        var ports = [3000, 3002, 3003, 3006, 8080]
+        if Flavor.current.runsAgent { ports.append(ServiceCatalog.agentPort) }
+        killProcessesOnPorts(ports)
     }
 
     private func collectDescendants(of pid: pid_t, into result: inout Set<pid_t>) {
@@ -195,7 +203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        let openItem = NSMenuItem(title: "Open Travel Runner", action: #selector(openPanel), keyEquivalent: "")
+        let openItem = NSMenuItem(title: "Open \(Flavor.current.displayName)", action: #selector(openPanel), keyEquivalent: "")
         openItem.target = self
         menu.addItem(openItem)
 
@@ -210,7 +218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        let quitItem = NSMenuItem(title: "Quit Travel Runner", action: #selector(quitApp), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit \(Flavor.current.displayName)", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
 
@@ -267,7 +275,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let symbolConfig = NSImage.SymbolConfiguration(pointSize: 14, weight: .medium)
             .applying(.init(paletteColors: [color]))
-        if let symbol = NSImage(systemSymbolName: "suitcase.rolling.fill", accessibilityDescription: "Travel Runner")?
+        if let symbol = NSImage(systemSymbolName: Flavor.current.menuBarSymbol, accessibilityDescription: Flavor.current.displayName)?
             .withSymbolConfiguration(symbolConfig) {
             symbol.isTemplate = false
             button.image = symbol
@@ -306,7 +314,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let isHotkey: (NSEvent) -> Bool = { event in
             let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
             return flags.contains([.control, .shift])
-                && event.charactersIgnoringModifiers?.lowercased() == "t"
+                && event.charactersIgnoringModifiers?.lowercased() == Flavor.current.hotkeyCharacter
         }
 
         globalHotkeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in

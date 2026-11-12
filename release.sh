@@ -14,6 +14,12 @@ set -euo pipefail
 # Usage:
 #   ./release.sh 0.2.0             Build + sign + notarize + release
 #   ./release.sh 0.2.0 --draft     Same but creates a draft release
+#   FLAVOR=hackathon ./release.sh 1.0.0   Release Travel Runner Hackathon
+#
+# The two apps release to the same repository. The standard app reads the appcast of
+# the release that GitHub marks as latest. A hackathon release is never marked as
+# latest (tag hackathon-v<version>), and its app reads the appcast of the fixed
+# release "hackathon-appcast", which each hackathon release replaces.
 #
 # The script first makes sure that the release can finish (signing identity, notary
 # access, GitHub access, a clean tree that is on the remote), then runs the tests.
@@ -24,8 +30,28 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 APP_NAME="TravelRunner"
-APP_BUNDLE="$APP_NAME.app"
-BUNDLE_ID="ai.fastbreak.travel-runner"
+# FLAVOR=hackathon makes the second app from the same source: Travel Runner Hackathon,
+# for fb-travel-monolith-hackathon. It has its own bundle ID, icon and update feed.
+FLAVOR="${FLAVOR:-standard}"
+case "$FLAVOR" in
+    standard)
+        PRODUCT_NAME="TravelRunner"
+        DISPLAY_NAME="Travel Runner"
+        BUNDLE_ID="ai.fastbreak.travel-runner"
+        ICON_FILE="AppIcon.icns"
+        ;;
+    hackathon)
+        PRODUCT_NAME="TravelRunnerHackathon"
+        DISPLAY_NAME="Travel Runner Hackathon"
+        BUNDLE_ID="ai.fastbreak.travel-runner-hackathon"
+        ICON_FILE="AppIcon-hackathon.icns"
+        ;;
+    *)
+        echo "  ✗ Unknown FLAVOR '$FLAVOR' (standard or hackathon)"
+        exit 1
+        ;;
+esac
+APP_BUNDLE="$PRODUCT_NAME.app"
 
 # ── Update these after initial setup ───────────────────────────────────────
 DEVELOPER_ID="${DEVELOPER_ID:-B614A6CBF6DEE52D65D2E4B7BF7C1312E04E39AF}"
@@ -39,11 +65,19 @@ DRAFT=false
 [[ "${2:-}" == "--draft" ]] && DRAFT=true
 
 BUILD_NUMBER="$(date +%Y%m%d%H%M%S)"
-ZIP_NAME="TravelRunner-${VERSION}.zip"
+ZIP_NAME="${PRODUCT_NAME}-${VERSION}.zip"
+FEED_TAG="hackathon-appcast"
+if [ "$FLAVOR" = "hackathon" ]; then
+    TAG="hackathon-v${VERSION}"
+    FEED_URL="https://github.com/$GITHUB_REPO/releases/download/$FEED_TAG/appcast.xml"
+else
+    TAG="v${VERSION}"
+    FEED_URL="https://github.com/$GITHUB_REPO/releases/latest/download/appcast.xml"
+fi
 
 echo ""
 echo "  ╔════════════════════════════════════╗"
-echo "  ║   travel-runner release v$VERSION"
+echo "  ║   $DISPLAY_NAME release $TAG"
 echo "  ╚════════════════════════════════════╝"
 echo ""
 
@@ -69,8 +103,10 @@ NOTARY_CHECK=$(xcrun notarytool history --keychain-profile "$NOTARIZE_PROFILE" 2
 [ "$(gh api "repos/$GITHUB_REPO" --jq .permissions.push 2>/dev/null)" = "true" ] \
     || fail "The active gh account cannot release to $GITHUB_REPO (gh auth switch --user <owner>)"
 
-gh release view "v${VERSION}" --repo "$GITHUB_REPO" >/dev/null 2>&1 \
-    && fail "v${VERSION} is already released. Use the next version number."
+gh release view "$TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1 \
+    && fail "$TAG is already released. Use the next version number."
+
+[ -f "$ICON_FILE" ] || fail "$ICON_FILE is missing (./generate-icon.swift $FLAVOR)"
 
 [ -z "$(git status --porcelain)" ] || fail "The working tree has changes. Commit them first."
 
@@ -110,9 +146,9 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 mkdir -p "$APP_BUNDLE/Contents/Frameworks"
 
-cp ".build/release/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/"
+cp ".build/release/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$PRODUCT_NAME"
 
-[ -f "AppIcon.icns" ] && cp AppIcon.icns "$APP_BUNDLE/Contents/Resources/"
+cp "$ICON_FILE" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 
 RESOURCE_BUNDLE=".build/release/${APP_NAME}_${APP_NAME}.bundle"
 [ -d "$RESOURCE_BUNDLE" ] && cp -R "$RESOURCE_BUNDLE" "$APP_BUNDLE/Contents/Resources/"
@@ -122,7 +158,7 @@ SPARKLE_FW=$(find .build/artifacts -name "Sparkle.framework" -type d 2>/dev/null
 if [ -n "$SPARKLE_FW" ] && [ -d "$SPARKLE_FW" ]; then
     ditto "$SPARKLE_FW" "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
     install_name_tool -add_rpath @executable_path/../Frameworks \
-        "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+        "$APP_BUNDLE/Contents/MacOS/$PRODUCT_NAME" 2>/dev/null || true
 fi
 
 # Write Info.plist
@@ -132,9 +168,11 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>$APP_NAME</string>
+    <string>$PRODUCT_NAME</string>
     <key>CFBundleDisplayName</key>
-    <string>Travel Runner</string>
+    <string>$DISPLAY_NAME</string>
+    <key>TRFlavor</key>
+    <string>$FLAVOR</string>
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>
@@ -142,7 +180,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <key>CFBundleShortVersionString</key>
     <string>$VERSION</string>
     <key>CFBundleExecutable</key>
-    <string>$APP_NAME</string>
+    <string>$PRODUCT_NAME</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSUIElement</key>
@@ -154,7 +192,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>SUFeedURL</key>
-    <string>https://github.com/$GITHUB_REPO/releases/latest/download/appcast.xml</string>
+    <string>$FEED_URL</string>
     <key>SUPublicEDKey</key>
     <string>$EDDSA_PUBLIC_KEY</string>
     <key>SUEnableAutomaticChecks</key>
@@ -242,7 +280,7 @@ if ! "$SPARKLE_SIGN" --verify "$ZIP_NAME" "$EDDSA_SIGNATURE" >/dev/null 2>&1; th
     exit 1
 fi
 
-DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/download/v${VERSION}/${ZIP_NAME}"
+DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/download/${TAG}/${ZIP_NAME}"
 PUB_DATE=$(date -R)
 
 cat > appcast.xml << APPCAST
@@ -250,7 +288,7 @@ cat > appcast.xml << APPCAST
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"
      xmlns:dc="http://purl.org/dc/elements/1.1/">
   <channel>
-    <title>Travel Runner Updates</title>
+    <title>$DISPLAY_NAME Updates</title>
     <link>https://github.com/$GITHUB_REPO</link>
     <language>en</language>
     <item>
@@ -274,21 +312,54 @@ APPCAST
 DRAFT_FLAG=""
 $DRAFT && DRAFT_FLAG="--draft"
 
-gh release create "v${VERSION}" \
-    "$ZIP_NAME" \
-    appcast.xml \
-    --repo "$GITHUB_REPO" \
-    --title "Travel Runner v${VERSION}" \
-    --target "$RELEASE_COMMIT" \
-    --generate-notes \
-    $DRAFT_FLAG
+if [ "$FLAVOR" = "hackathon" ]; then
+    # Never the latest release: the standard app reads its appcast from the latest one.
+    gh release create "$TAG" \
+        "$ZIP_NAME" \
+        appcast.xml \
+        --repo "$GITHUB_REPO" \
+        --title "$DISPLAY_NAME v${VERSION}" \
+        --target "$RELEASE_COMMIT" \
+        --notes "Travel Runner for fb-travel-monolith-hackathon. It also starts the agent app (apps/amateur-agent). First install: download ${ZIP_NAME}, unzip it, and move the app to Applications. Later versions arrive through the app's update check." \
+        --latest=false \
+        $DRAFT_FLAG
+
+    # The feed of the installed hackathon apps: one fixed release that holds the newest appcast.
+    if ! $DRAFT; then
+        if gh release view "$FEED_TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
+            gh release upload "$FEED_TAG" appcast.xml --repo "$GITHUB_REPO" --clobber
+        else
+            gh release create "$FEED_TAG" appcast.xml \
+                --repo "$GITHUB_REPO" \
+                --title "$DISPLAY_NAME update feed" \
+                --target "$RELEASE_COMMIT" \
+                --notes "The update feed of Travel Runner Hackathon. Each hackathon release replaces appcast.xml here. Do not delete this release." \
+                --latest=false
+        fi
+    fi
+
+    LATEST=$(gh api "repos/$GITHUB_REPO/releases/latest" --jq .tag_name)
+    case "$LATEST" in
+        hackathon-*) echo "  ✗ GitHub marks $LATEST as the latest release. Fix it now: the standard app reads its updates from the latest release."; exit 1 ;;
+    esac
+    echo "  ✓ Latest release is still $LATEST (the feed of the standard app)"
+else
+    gh release create "$TAG" \
+        "$ZIP_NAME" \
+        appcast.xml \
+        --repo "$GITHUB_REPO" \
+        --title "Travel Runner v${VERSION}" \
+        --target "$RELEASE_COMMIT" \
+        --generate-notes \
+        $DRAFT_FLAG
+fi
 
 # Cleanup
 rm -f appcast.xml
 
 echo ""
 echo "  ╔═══════════════════════════════════════════════════════╗"
-echo "  ║  Release v${VERSION} complete!                             ║"
+echo "  ║  Release ${TAG} complete!"
 echo "  ║  https://github.com/$GITHUB_REPO/releases  ║"
 echo "  ╚═══════════════════════════════════════════════════════╝"
 echo ""

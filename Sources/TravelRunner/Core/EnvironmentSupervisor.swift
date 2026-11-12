@@ -235,13 +235,17 @@ final class EnvironmentSupervisor {
 
             // Always reset .env.local files to localhost on startup. Keys from the
             // last block first; the running stack's keys replace them after GROUND.
+            // Not while the other runner app runs a stack: the login's env file is
+            // the same file for the two apps.
             cacheLocalSupabaseKeys()
-            resetEnvToLocalhost()
+            if SiblingRunner.activeServicesNow().isEmpty {
+                resetEnvToLocalhost()
+            }
 
             // Start control API server
             startControlServer()
 
-            // Initialize debug tracking (opt-in via ~/Desktop/debug-tracking/config.json)
+            // Initialize debug tracking (opt-in via config.json in the tickets folder on the Desktop)
             Task { await initDebugTracking() }
 
             // Initialize git branch watcher for all repos with cwds
@@ -314,6 +318,18 @@ final class EnvironmentSupervisor {
                 Task { @MainActor in
                     self.startTask = nil
                 }
+            }
+
+            // The other runner app uses the same ports, and this start stops what it
+            // finds on them.
+            let siblingServices = await SiblingRunner.activeServices()
+            if !siblingServices.isEmpty {
+                await MainActor.run {
+                    self.health = .degraded
+                    self.lastError = SiblingRunner.refusal(activeServices: siblingServices)
+                    self.currentPhase = .idle
+                }
+                return
             }
 
             // Preflight
@@ -507,6 +523,7 @@ final class EnvironmentSupervisor {
                         let behind = await MainActor.run { self.gitBehindCounts }
                         let npmStale = await MainActor.run { Array(self.npmStaleServices) }
                         let dict: [String: Any] = [
+                            "app": Flavor.current.rawValue,
                             "health": health, "services": states, "lan": lan, "ip": ip,
                             "profile": profile,
                             "db_mode": dbMode,
@@ -1371,6 +1388,24 @@ final class EnvironmentSupervisor {
         )
     }
 
+    /// Looks at what the agent needs on this Mac: its packages, a Node that is new
+    /// enough, and its env.
+    private func prepareAgent(_ definition: ServiceDefinition) async -> AgentLauncher.Decision {
+        guard let cwd = definition.resolvedCwd else { return .skip("The service has no folder.") }
+        let hasPackages = FileManager.default.isExecutableFile(
+            atPath: (cwd as NSString).appendingPathComponent("node_modules/.bin/eve")
+        )
+        let (output, ok) = await shellOutput("node --version")
+        let installs = await Task.detached { NodeLocator.installs() }.value
+        let sharedEnv = sharedEnvPath("travel-portal") ?? ""
+        return AgentLauncher.decide(
+            hasPackages: hasPackages,
+            defaultNodeMajor: ok ? NodeLocator.major(ofVersionOutput: output) : nil,
+            installs: installs,
+            env: AgentEnv.plan(agentDirectory: cwd, sharedEnvFile: sharedEnv)
+        )
+    }
+
     /// The service's own command with `--hostname <ip>` appended, so LAN mode keeps the
     /// configured package manager and port. `npm run` needs `--` before script flags;
     /// pnpm passes trailing flags to the script.
@@ -1520,6 +1555,29 @@ final class EnvironmentSupervisor {
             }
         }
 
+        // The agent needs its packages and Node 24 or later. Without them it is
+        // skipped, as Stripe is: the portals do not need the agent.
+        var agentLaunch: AgentLauncher.Launch?
+        if serviceID == ServiceCatalog.agentID {
+            switch await prepareAgent(definition) {
+            case .skip(let reason):
+                state.phase = .skipped
+                await logStore.append(
+                    serviceID: serviceID,
+                    entry: LogEntry(stream: .stderr, text: "[travel-runner] The agent is skipped. \(reason)")
+                )
+                return nil
+            case .run(let launch):
+                agentLaunch = launch
+                for note in launch.notes {
+                    await logStore.append(
+                        serviceID: serviceID,
+                        entry: LogEntry(stream: .stdout, text: "[travel-runner] \(note)")
+                    )
+                }
+            }
+        }
+
         // Local mode puts the local stack's keys into the app's .env.local. Without
         // them the app has no signing key, or it takes the hosted dev values from its
         // shared .env while the runner shows "local". Read the keys again, and do
@@ -1588,7 +1646,8 @@ final class EnvironmentSupervisor {
         let artifactName = definition.probe?.artifact
         let capturedProbe = stdoutProbe
         let streamDefinition = streamAwareDefinition(for: definition, serviceID: serviceID)
-        let effectiveDefinition = lanAwareDefinition(for: streamDefinition, serviceID: serviceID)
+        let lanDefinition = lanAwareDefinition(for: streamDefinition, serviceID: serviceID)
+        let effectiveDefinition = agentLaunch.map { AgentLauncher.definition(lanDefinition, launch: $0) } ?? lanDefinition
 
         let sid = serviceID
         let pid = try await processRunner.start(

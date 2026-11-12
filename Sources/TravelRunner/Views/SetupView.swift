@@ -48,7 +48,7 @@ struct SetupView: View {
                     .font(.title2)
                     .foregroundStyle(.blue)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(isFirstRun ? "Welcome to Travel Runner" : "Settings — Repo Paths")
+                    Text(isFirstRun ? "Welcome to \(Flavor.current.displayName)" : "Settings — Repo Paths")
                         .font(.headline)
                     Text("Point to your local repos")
                         .font(.caption)
@@ -121,7 +121,7 @@ struct SetupView: View {
             Image(systemName: "folder.badge.plus")
                 .font(.system(size: 28))
                 .foregroundStyle(dropTargetHighlighted ? .blue : .secondary)
-            Text("Drop your Codebases folder (or the monorepo) here")
+            Text("Drop your Codebases folder (or \(Flavor.current.monorepoName)) here")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             Text("Auto-detects repos inside the folder")

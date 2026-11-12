@@ -12,14 +12,41 @@ set -euo pipefail
 #   ./build.sh              Build and create TravelRunner.app
 #   ./build.sh --install    Build + copy to /Applications
 #   ./build.sh --run        Build + launch immediately
+#   FLAVOR=hackathon ./build.sh   Build TravelRunnerHackathon.app
 # ────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 APP_NAME="TravelRunner"
-APP_BUNDLE="$APP_NAME.app"
-BUNDLE_ID="ai.fastbreak.travel-runner"
+# FLAVOR=hackathon makes the second app from the same source: Travel Runner Hackathon,
+# for fb-travel-monolith-hackathon. It has its own bundle ID, icon and update feed.
+FLAVOR="${FLAVOR:-standard}"
+case "$FLAVOR" in
+    standard)
+        PRODUCT_NAME="TravelRunner"
+        DISPLAY_NAME="Travel Runner"
+        BUNDLE_ID="ai.fastbreak.travel-runner"
+        ICON_FILE="AppIcon.icns"
+        ;;
+    hackathon)
+        PRODUCT_NAME="TravelRunnerHackathon"
+        DISPLAY_NAME="Travel Runner Hackathon"
+        BUNDLE_ID="ai.fastbreak.travel-runner-hackathon"
+        ICON_FILE="AppIcon-hackathon.icns"
+        ;;
+    *)
+        echo "  ✗ Unknown FLAVOR '$FLAVOR' (standard or hackathon)"
+        exit 1
+        ;;
+esac
+APP_BUNDLE="$PRODUCT_NAME.app"
+GITHUB_REPO="${GITHUB_REPO:-devingearing-fb/travel-runner}"
+if [ "$FLAVOR" = "hackathon" ]; then
+    FEED_URL="https://github.com/$GITHUB_REPO/releases/download/hackathon-appcast/appcast.xml"
+else
+    FEED_URL="https://github.com/$GITHUB_REPO/releases/latest/download/appcast.xml"
+fi
 VERSION="${VERSION:-0.1.0}"
 BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M%S)}"
 
@@ -128,11 +155,11 @@ mkdir -p "$APP_BUNDLE/Contents/MacOS"
 mkdir -p "$APP_BUNDLE/Contents/Resources"
 
 # Copy binary
-cp ".build/release/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/"
+cp ".build/release/$APP_NAME" "$APP_BUNDLE/Contents/MacOS/$PRODUCT_NAME"
 
 # Copy app icon
-if [ -f "AppIcon.icns" ]; then
-    cp AppIcon.icns "$APP_BUNDLE/Contents/Resources/"
+if [ -f "$ICON_FILE" ]; then
+    cp "$ICON_FILE" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
 fi
 
 # Copy the SPM resource bundle, if the target declares resources
@@ -147,7 +174,7 @@ if [ -n "$SPARKLE_FW" ] && [ -d "$SPARKLE_FW" ]; then
     mkdir -p "$APP_BUNDLE/Contents/Frameworks"
     ditto "$SPARKLE_FW" "$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
     install_name_tool -add_rpath @executable_path/../Frameworks \
-        "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+        "$APP_BUNDLE/Contents/MacOS/$PRODUCT_NAME" 2>/dev/null || true
 fi
 
 # Write Info.plist
@@ -157,9 +184,11 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>$APP_NAME</string>
+    <string>$PRODUCT_NAME</string>
     <key>CFBundleDisplayName</key>
-    <string>Travel Runner</string>
+    <string>$DISPLAY_NAME</string>
+    <key>TRFlavor</key>
+    <string>$FLAVOR</string>
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>
@@ -167,7 +196,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <key>CFBundleShortVersionString</key>
     <string>$VERSION</string>
     <key>CFBundleExecutable</key>
-    <string>$APP_NAME</string>
+    <string>$PRODUCT_NAME</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSUIElement</key>
@@ -179,7 +208,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>SUFeedURL</key>
-    <string>https://github.com/devingearing-fb/travel-runner/releases/latest/download/appcast.xml</string>
+    <string>$FEED_URL</string>
     <key>SUPublicEDKey</key>
     <string>Z7c9sySgE0b4RH8NOK405c3mv/7w4NKMrs3DJDCxHsU=</string>
     <key>SUEnableAutomaticChecks</key>

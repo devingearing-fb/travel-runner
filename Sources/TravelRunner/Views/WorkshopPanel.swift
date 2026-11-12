@@ -21,6 +21,11 @@ enum WorkshopSection: String, CaseIterable, Identifiable {
 
     var id: Self { self }
 
+    /// The sections this app shows. The Rooms tab needs the monolith's holds viewer.
+    static func visible(in flavor: Flavor = .current) -> [WorkshopSection] {
+        allCases.filter { $0 != .rooms || flavor.hasRoomsTab }
+    }
+
     var icon: String {
         switch self {
         case .status: "heart.text.clipboard"
@@ -96,7 +101,7 @@ final class WorkshopPanel {
             backing: .buffered,
             defer: false
         )
-        newPanel.title = "Travel Runner"
+        newPanel.title = Flavor.current.displayName
         newPanel.titlebarAppearsTransparent = false
         newPanel.isFloatingPanel = false
         newPanel.level = .normal

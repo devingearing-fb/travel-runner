@@ -17,12 +17,14 @@ enum RunProfile: String, Codable, CaseIterable, Sendable {
     }
 
     /// Canonical services in this profile. `full` is every canonical service.
+    /// The agent is in each profile; only the hackathon app has that service.
     var baseServiceIDs: Set<String>? {
+        let agent = ServiceCatalog.agentID
         switch self {
-        case .booking: ["supabase", "universal-login", "stripe", "travel-portal"]
-        case .partner: ["supabase", "universal-login", "partner-portal"]
-        case .both: ["supabase", "universal-login", "stripe", "travel-portal", "partner-portal"]
-        case .full: nil
+        case .booking: return ["supabase", "universal-login", "stripe", "travel-portal", agent]
+        case .partner: return ["supabase", "universal-login", "partner-portal", agent]
+        case .both: return ["supabase", "universal-login", "stripe", "travel-portal", "partner-portal", agent]
+        case .full: return nil
         }
     }
 
@@ -49,7 +51,22 @@ enum RunProfile: String, Codable, CaseIterable, Sendable {
 /// The canonical service graph for the fb-travel monorepo, built from repo paths.
 /// It is regenerated on every config load, so the code is the single source of truth.
 enum ServiceCatalog {
-    static let canonicalIDs: Set<String> = [
+    static var canonicalIDs: Set<String> { canonicalIDs(for: .current) }
+
+    static func canonicalIDs(for flavor: Flavor) -> Set<String> {
+        flavor.runsAgent ? standardIDs.union([agentID]) : standardIDs
+    }
+
+    /// The agent app of the hackathon fork (`apps/amateur-agent`, eve).
+    static let agentID = "amateur-agent"
+    /// The default port of `eve dev`. The runner passes no `--port`, so that an
+    /// `eve dev` in a terminal connects its REPL to the server that the runner started.
+    static let agentPort = 2000
+    /// eve needs this Node version or later; the rest of the fork runs on Node 22.
+    static let agentNodeMajor = 24
+    static let agentCommand = ["pnpm", "exec", "eve", "dev", "--no-ui"]
+
+    private static let standardIDs: Set<String> = [
         "supabase", "universal-login", "stripe", "travel-portal", "partner-portal",
         "stream-services-install", "stream-qstash", "stream-db-setup", "stream-services",
         "stream-qstash-wire", "stream-sequin",
@@ -62,7 +79,19 @@ enum ServiceCatalog {
 
     static let cacheApplySecret = "p5-runner-local-current-secret"
 
-    static func services(paths: RepoPaths) -> [ServiceDefinition] {
+    static func services(paths: RepoPaths, flavor: Flavor = .current) -> [ServiceDefinition] {
+        var services = standardServices(paths: paths)
+        if flavor.runsAgent {
+            let agent = (expand(paths.monorepo ?? "") as NSString).appendingPathComponent(RepoDetector.agentDirectory)
+            // After Supabase, with the login: the portals do not wait for the agent.
+            services.append(service(agentID, "Amateur Agent", agentCommand, cwd: agent,
+                                    probe: tcp(agentPort, timeout: 120), restart: .onFailure, phase: "portal",
+                                    dependsOn: ["supabase"]))
+        }
+        return services
+    }
+
+    private static func standardServices(paths: RepoPaths) -> [ServiceDefinition] {
         let monorepo = expand(paths.monorepo ?? "")
         let booking = (monorepo as NSString).appendingPathComponent("apps/booking-portal")
         let partner = (monorepo as NSString).appendingPathComponent("apps/partner-portal")
@@ -148,7 +177,7 @@ enum ServiceCatalog {
                         "CACHE_CDC_STREAM_URL": "http://127.0.0.1:3003",
                         "CACHE_CDC_QSTASH_URL": "http://127.0.0.1:8080",
                         "CACHE_CDC_PORTAL_URL": "http://127.0.0.1:3002",
-                        "TRAVEL_RUNNER_CONTROL_URL": "http://[::1]:19900",
+                        "TRAVEL_RUNNER_CONTROL_URL": Flavor.current.controlURL,
                     ]),
             service("cache-cutover-audit", "Cache Cutover Audit", ["npm", "run", "audit:p6"], cwd: loadTest,
                     type: .oneshot, restart: .never, phase: "verification",

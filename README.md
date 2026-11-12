@@ -25,13 +25,24 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 - **Sleep/wake**: Re-probes services after macOS wake, one pass per wake
 - **Rooms tab**: For one event and hotel, shows how many rooms of each room type are booked, held and free on each night, and who holds them. A switch selects the local stack or dev. The tab is read-only. It shows the page of the monolith's holds viewer (`scripts/holds-viewer`): the copy in your checkout, or the copy of `origin/dev` when your branch does not have it. Dev needs only the shared `apps/<app>/.env`, not Doppler. The viewer runs while the tab is open and stops 10 minutes after it closes. `defaults write ai.fastbreak.travel-runner holdsViewerPath <folder>` makes the tab use a copy from another folder; `defaults delete ai.fastbreak.travel-runner holdsViewerPath` removes that
 
+## Travel Runner Hackathon
+
+The same source makes a second app, Travel Runner Hackathon, for the hackathon fork (`SnapBuild-2026/fb-travel-monolith-hackathon`). `FLAVOR=hackathon ./build.sh` builds it; `FLAVOR=hackathon ./release.sh <version>` releases it (tag `hackathon-v<version>`, never the latest release; its update feed is the fixed release `hackathon-appcast`).
+
+- **Own state**: bundle ID `ai.fastbreak.travel-runner-hackathon`, config in `~/.config/travel-runner-hackathon/`, control API on port **19901**, tickets in `~/Desktop/debug-tracking-hackathon`, hotkey Control-Shift-H. A person can have the two apps
+- **One stack at a time**: the two apps use the same service ports. An app does not start a stack while the other app runs one
+- **Setup** takes only a checkout that has `apps/amateur-agent`, so a folder with the two repos gives each app its own repo
+- **Amateur Agent** (`amateur-agent`, port 2000): the runner starts `pnpm exec eve dev --no-ui` in `apps/amateur-agent`. An `eve dev` (`pnpm dev`) in a terminal then opens the REPL on that server. eve needs Node 24 or later: when the default Node is older, the runner uses one from nvm, fnm, mise, Volta, asdf or Homebrew (`node@24`) for the agent only. With no such Node, or without the packages, the agent is skipped and the portals start
+- **Agent env**: the runner writes no file for the agent. For an `AMATEUR_SUPABASE_*` key that `apps/amateur-agent/.env.local` does not set, the runner gives the agent the value of `apps/booking-portal/.env`. Do not paste the Doppler line of `AMATEUR_SUPABASE_SIGNING_KEY` into the agent's `.env.local`: eve cannot read its escaped quotes. Put `AI_GATEWAY_API_KEY` in the agent's `.env.local`, or use `/login` in the REPL
+- **No Rooms tab**: the fork does not have the holds viewer
+
 ## Control API
 
 When running, travel-runner exposes an HTTP API on `http://[::1]:19900` for programmatic control (useful from Claude Code, scripts, or CI):
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/status` | All service statuses, health, LAN mode, profile, DB mode, git branches |
+| `GET` | `/api/status` | All service statuses, health, LAN mode, profile, DB mode, git branches, and `app` (`standard` or `hackathon`) |
 | `GET` | `/api/logs/{serviceId}?lines=N` | Last N log lines (default 50) |
 | `POST` | `/api/restart/{serviceId}` | Restart a service |
 | `POST` | `/api/restart-cascade/{serviceId}` | Restart a service and its dependents |

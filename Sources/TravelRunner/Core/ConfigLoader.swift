@@ -1,7 +1,7 @@
 import Foundation
 
 enum ConfigLoader {
-    static let configDir = NSString(string: "~/.config/travel-runner").expandingTildeInPath
+    static let configDir = NSString(string: "~/.config/\(Flavor.current.storageName)").expandingTildeInPath
     static let configPath = (configDir as NSString).appendingPathComponent("services.json")
     static let currentVersion = 3
 
@@ -98,7 +98,7 @@ enum ConfigLoader {
     /// next to its old booking-portal path.
     static func upgradedData(
         _ data: Data,
-        findMonorepo: (String) -> String? = RepoDetector.findMonorepo(near:)
+        findMonorepo: (String) -> String? = { RepoDetector.findMonorepo(near: $0) }
     ) throws -> Data {
         guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             throw ConfigError.noConfig

@@ -1,6 +1,18 @@
 #!/usr/bin/env swift
 import AppKit
 
+// Usage: ./generate-icon.swift             the icon of Travel Runner (AppIcon.icns)
+//        ./generate-icon.swift hackathon   the icon of Travel Runner Hackathon (AppIcon-hackathon.icns)
+let isHackathon = CommandLine.arguments.dropFirst().first == "hackathon"
+let symbolName = isHackathon ? "trophy.fill" : "suitcase.rolling.fill"
+let gradientStart = isHackathon
+    ? NSColor(red: 0.30, green: 0.10, blue: 0.36, alpha: 1.0)
+    : NSColor(red: 0.08, green: 0.12, blue: 0.30, alpha: 1.0)
+let gradientEnd = isHackathon
+    ? NSColor(red: 0.85, green: 0.42, blue: 0.14, alpha: 1.0)
+    : NSColor(red: 0.10, green: 0.28, blue: 0.42, alpha: 1.0)
+let iconName = isHackathon ? "AppIcon-hackathon" : "AppIcon"
+
 let sizes: [(name: String, size: CGFloat)] = [
     ("icon_16x16", 16),
     ("icon_16x16@2x", 32),
@@ -38,10 +50,7 @@ func renderIcon(size: CGFloat) -> NSBitmapImageRep {
 
     // Background gradient
     let path = NSBezierPath(roundedRect: rect, xRadius: cornerRadius, yRadius: cornerRadius)
-    let gradient = NSGradient(
-        starting: NSColor(red: 0.08, green: 0.12, blue: 0.30, alpha: 1.0),
-        ending: NSColor(red: 0.10, green: 0.28, blue: 0.42, alpha: 1.0)
-    )!
+    let gradient = NSGradient(starting: gradientStart, ending: gradientEnd)!
     gradient.draw(in: path, angle: -45)
 
     // Subtle border
@@ -50,11 +59,11 @@ func renderIcon(size: CGFloat) -> NSBitmapImageRep {
     borderPath.lineWidth = size > 64 ? 1.5 : 0.5
     borderPath.stroke()
 
-    // Draw suitcase symbol as white
+    // Draw the symbol as white
     let symbolSize = size * 0.48
     let config = NSImage.SymbolConfiguration(pointSize: symbolSize, weight: .regular)
         .applying(.init(paletteColors: [.white]))
-    if let symbol = NSImage(systemSymbolName: "suitcase.rolling.fill", accessibilityDescription: nil)?
+    if let symbol = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
         .withSymbolConfiguration(config) {
 
         let imgSize = symbol.size
@@ -68,7 +77,7 @@ func renderIcon(size: CGFloat) -> NSBitmapImageRep {
     return rep
 }
 
-let iconsetPath = "AppIcon.iconset"
+let iconsetPath = "\(iconName).iconset"
 let fm = FileManager.default
 try? fm.removeItem(atPath: iconsetPath)
 try! fm.createDirectory(atPath: iconsetPath, withIntermediateDirectories: true)
@@ -88,4 +97,4 @@ try! task.run()
 task.waitUntilExit()
 
 try? fm.removeItem(atPath: iconsetPath)
-print("  ✓ AppIcon.icns created")
+print("  ✓ \(iconName).icns created")
