@@ -56,6 +56,7 @@ final class EnvironmentChecker {
 
     private var agentPath: String { (monorepoPath as NSString).appendingPathComponent(RepoDetector.agentDirectory) }
     private var eventDirectoryPath: String { (monorepoPath as NSString).appendingPathComponent(RepoDetector.eventDirectory) }
+    private var platformCorePath: String { (monorepoPath as NSString).appendingPathComponent(RepoDetector.platformCoreDirectory) }
     private var bookingPath: String { (monorepoPath as NSString).appendingPathComponent("apps/booking-portal") }
     private var partnerPath: String { (monorepoPath as NSString).appendingPathComponent("apps/partner-portal") }
 
@@ -172,6 +173,11 @@ final class EnvironmentChecker {
                         checkCommand: "cat \(RepoDetector.agentDirectory)/.env.local",
                         checkDescription: "The agent needs AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY and AMATEUR_SUPABASE_SIGNING_KEY, a model credential (\(AgentEnv.gatewayKey)), and for its event tools \(AgentEnv.pxiURLKey) and a Vercel token. For a value of these that its own files do not set, the runner gives the agent the value of the event directory's env, and a token of the event directory's Vercel project. Without a model credential in its files, that project pays for the model calls. For a Supabase key that \(RepoDetector.agentDirectory)/.env.local does not set, the runner gives the agent the value of apps/booking-portal/.env. The runner writes no file for the agent; Import… copies the env file of the agent that a teammate sent you into place.",
                         checkPath: (agentPath as NSString).appendingPathComponent(".env.local")),
+            HealthCheck(id: "platform-env", name: "Platform core env", section: .supabase,
+                        isRequired: false, fixLabel: "Import…",
+                        checkCommand: "cat \(RepoDetector.platformCoreDirectory)/\(PlatformCoreApp.envFile(directory: platformCorePath))",
+                        checkDescription: "Platform core needs its env file at \(RepoDetector.platformCoreDirectory)/\(PlatformCoreApp.envFile(directory: platformCorePath)), with \(PlatformCoreEnv.requiredKeys.joined(separator: " and ")). Get the file from a teammate: Import… copies it into place. The app uses the database and the login that this file names. The fork sets the port and the env file of the app in its script `\(PlatformCoreApp.script)`; the runner reads the two from there and writes no env for platform core.",
+                        checkPath: (platformCorePath as NSString).appendingPathComponent(PlatformCoreApp.envFile(directory: platformCorePath))),
             HealthCheck(id: "event-env", name: "Event directory env", section: .supabase,
                         isRequired: false, fixLabel: "Import…",
                         checkCommand: "cat \(RepoDetector.eventDirectory)/.env.local",
@@ -310,6 +316,23 @@ final class EnvironmentChecker {
             }
             return .passing("v\(install.version.map(String.init).joined(separator: ".")) — used only for the agent")
 
+        case "platform-env":
+            guard exists((platformCorePath as NSString).appendingPathComponent("package.json")) else {
+                return .warning("This checkout does not have \(RepoDetector.platformCoreDirectory) — pull the fork")
+            }
+            let directory = platformCorePath
+            return await Task.detached {
+                guard let launch = PlatformCoreApp.launch(directory: directory) else {
+                    return CheckStatus.warning("\(RepoDetector.platformCoreDirectory) has no script `\(PlatformCoreApp.script)` — pull the fork")
+                }
+                let missing = PlatformCoreEnv.missingKeys(PlatformCoreEnv.values(directory: directory, envFiles: launch.envFiles))
+                guard missing.isEmpty else {
+                    return CheckStatus.warning("Not set: \(missing.joined(separator: ", ")) — platform core is skipped. Use Import…")
+                }
+                let port = launch.port.map { "port \($0)" } ?? "no port in its script"
+                return CheckStatus.passing("The env of platform core is in place (\(port))")
+            }.value
+
         case "event-env":
             guard exists((eventDirectoryPath as NSString).appendingPathComponent("package.json")) else {
                 return .warning("This checkout does not have \(RepoDetector.eventDirectory) — pull the fork")
@@ -410,6 +433,9 @@ final class EnvironmentChecker {
         case "agent-node":
             return await shell("brew install node@\(ServiceCatalog.agentNodeMajor)")
 
+        case "platform-env":
+            return importPlatformCoreEnv()
+
         case "event-env":
             return importEventDirectoryEnv()
 
@@ -470,6 +496,20 @@ final class EnvironmentChecker {
         }
     }
 
+    /// Copies the env file of platform core that the developer picks to the file that
+    /// the app's script reads (`apps/platform-core/.env.dev`), after a check that it
+    /// is that app's file.
+    private func importPlatformCoreEnv() -> Bool? {
+        importEnvFile(
+            appName: "platform core",
+            message: "Choose the env file of platform core (for example the .env.dev a teammate sent you)",
+            directory: platformCorePath,
+            relativeFolder: RepoDetector.platformCoreDirectory,
+            fileName: PlatformCoreApp.envFile(directory: platformCorePath),
+            problem: PlatformCoreEnv.importProblem
+        )
+    }
+
     /// Copies the env file of the event directory that the developer picks to
     /// `apps/event-directory/.env.local`, after a check that it is that app's file.
     private func importEventDirectoryEnv() -> Bool? {
@@ -497,12 +537,13 @@ final class EnvironmentChecker {
     }
 
     /// Asks for a file, checks with `problem` that it is the env of the app, and
-    /// copies it to `.env.local` of the app's folder. Returns nil when nothing changed.
+    /// copies it to `fileName` of the app's folder. Returns nil when nothing changed.
     private func importEnvFile(
         appName: String,
         message: String,
         directory: String,
         relativeFolder: String,
+        fileName: String = ".env.local",
         problem: ([String: String]) -> String?
     ) -> Bool? {
         let panel = NSOpenPanel()
@@ -528,9 +569,9 @@ final class EnvironmentChecker {
             alert.runModal()
             return nil
         }
-        let target = (directory as NSString).appendingPathComponent(".env.local")
+        let target = (directory as NSString).appendingPathComponent(fileName)
         alert.messageText = exists(target) ? "Replace the env of \(appName)?" : "Import the env of \(appName)?"
-        alert.informativeText = "\(source.lastPathComponent) goes to \(relativeFolder)/.env.local."
+        alert.informativeText = "\(source.lastPathComponent) goes to \(relativeFolder)/\(fileName)."
         alert.addButton(withTitle: "Import")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }

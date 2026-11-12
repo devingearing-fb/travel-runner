@@ -59,6 +59,8 @@ enum RepoDetector {
 
     /// The agent app of the hackathon fork, from the monorepo root.
     static let agentDirectory = "apps/amateur-agent"
+    /// Platform core of the hackathon fork, from the monorepo root.
+    static let platformCoreDirectory = "apps/platform-core"
     /// The event listing site of the hackathon fork, from the monorepo root.
     static let eventDirectory = "apps/event-directory"
 
@@ -129,7 +131,7 @@ enum RepoDetector {
             switch self {
             case .monorepo:
                 Flavor.current.runsAgent
-                    ? "The hackathon fork: Supabase, booking portal (3002), partner portal (3006), agent (2000), event directory (3001)"
+                    ? "The hackathon fork: Supabase, booking portal (3002), partner portal (3006), agent (2000), platform core (3007), event directory (3004)"
                     : "Supabase, booking portal (3002), partner portal (3006), travel-data"
             case .universalLogin: "Auth gateway (port 3000)"
             case .streamServices: "CDC ingest and reaction worker (port 3003)"

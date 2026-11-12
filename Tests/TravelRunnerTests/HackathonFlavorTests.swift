@@ -108,10 +108,12 @@ final class HackathonFlavorTests: XCTestCase {
         let hackathon = ServiceCatalog.services(paths: paths, flavor: .hackathon)
         let events = try XCTUnwrap(hackathon.first { $0.id == ServiceCatalog.eventDirectoryID })
         XCTAssertEqual(events.resolvedCwd, "/work/fb-travel-monolith-hackathon/apps/event-directory")
-        // Not 3000: that is the port of the login.
-        XCTAssertEqual(events.cmd, ["pnpm", "dev", "--port", "3001"])
-        XCTAssertEqual(events.probe?.port, 3001)
+        // Not 3000: that is the port of the login. Not 3001: that is the usual port of platform core.
+        XCTAssertEqual(events.cmd, ["pnpm", "dev", "--port", "3004"])
+        XCTAssertEqual(events.probe?.port, 3004)
         XCTAssertNotEqual(events.probe?.port, hackathon.first { $0.id == "universal-login" }?.probe?.port)
+        XCTAssertNotEqual(events.probe?.port, hackathon.first { $0.id == ServiceCatalog.platformCoreID }?.probe?.port)
+        XCTAssertNotEqual(events.probe?.port, 3001)
         // It reads hosted services only.
         XCTAssertEqual(events.dependsOn, [])
         XCTAssertEqual(events.resolvedRestart, .onFailure)
@@ -125,15 +127,111 @@ final class HackathonFlavorTests: XCTestCase {
         XCTAssertEqual(ports.count, Set(ports).count)
     }
 
+    func testThePlatformCoreServiceOfTheHackathonApp() throws {
+        let standard = ServiceCatalog.services(paths: paths, flavor: .standard)
+        XCTAssertNil(standard.first { $0.id == ServiceCatalog.platformCoreID })
+        XCTAssertFalse(ServiceCatalog.canonicalIDs(for: .standard).contains(ServiceCatalog.platformCoreID))
+
+        let hackathon = ServiceCatalog.services(paths: paths, flavor: .hackathon)
+        let platform = try XCTUnwrap(hackathon.first { $0.id == ServiceCatalog.platformCoreID })
+        XCTAssertEqual(platform.id, "platform-core")
+        XCTAssertEqual(platform.resolvedCwd, "/work/fb-travel-monolith-hackathon/apps/platform-core")
+        // The script that `pnpm dev:platform-core` of the fork runs. It sets the port
+        // and the env file, so the runner passes no port.
+        XCTAssertEqual(platform.cmd, ["pnpm", "dev:dev"])
+        // No checkout to read the script from: the port of the fork at this release.
+        XCTAssertEqual(platform.probe?.port, 3007)
+        // It uses the services that its own env names.
+        XCTAssertEqual(platform.dependsOn, [])
+        XCTAssertEqual(platform.resolvedRestart, .onFailure)
+        // The portals do not wait for it.
+        for id in ["travel-portal", "partner-portal", "universal-login"] {
+            XCTAssertFalse(hackathon.first { $0.id == id }?.dependsOn.contains(ServiceCatalog.platformCoreID) ?? true, id)
+        }
+
+        for profile in RunProfile.allCases {
+            XCTAssertTrue(profile.members(of: hackathon).contains(ServiceCatalog.platformCoreID), "\(profile)")
+            XCTAssertFalse(profile.members(of: standard).contains(ServiceCatalog.platformCoreID), "\(profile)")
+        }
+        let ports = hackathon.compactMap { $0.probe?.port }
+        XCTAssertEqual(ports.count, Set(ports).count)
+    }
+
+    private func makeForkWithPlatformCore(script: String?) throws -> RepoPaths {
+        let app = root.appendingPathComponent("fork/apps/platform-core")
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        let scripts = script.map { ["dev:dev": $0] } ?? [:]
+        try JSONSerialization.data(withJSONObject: ["name": "fb-platform-core", "scripts": scripts])
+            .write(to: app.appendingPathComponent("package.json"))
+        return RepoPaths(monorepo: root.appendingPathComponent("fork").path, universalLogin: "/work/login", streamServices: nil, loadTest: nil)
+    }
+
+    func testPlatformCoreHasThePortOfTheScriptOfTheFork() throws {
+        // The usual port of platform core. The event directory had it before; now it is free.
+        var fork = try makeForkWithPlatformCore(script: "dotenv -e .env.dev -- next dev --turbopack -p 3001")
+        var hackathon = ServiceCatalog.services(paths: fork, flavor: .hackathon)
+        XCTAssertEqual(hackathon.filter { $0.probe?.port == 3001 }.map(\.id), [ServiceCatalog.platformCoreID])
+        var ports = hackathon.compactMap { $0.probe?.port }
+        XCTAssertEqual(ports.count, Set(ports).count)
+
+        // The fork moved the app to 3007.
+        fork = try makeForkWithPlatformCore(script: "dotenv -e .env.dev -- next dev --turbopack -p 3007")
+        hackathon = ServiceCatalog.services(paths: fork, flavor: .hackathon)
+        XCTAssertEqual(hackathon.first { $0.id == ServiceCatalog.platformCoreID }?.probe?.port, 3007)
+        XCTAssertEqual(hackathon.filter { $0.probe?.port == 3001 }.map(\.id), [])
+        ports = hackathon.compactMap { $0.probe?.port }
+        XCTAssertEqual(ports.count, Set(ports).count)
+
+        // A checkout without the script: the port of the fork at this release.
+        fork = try makeForkWithPlatformCore(script: nil)
+        hackathon = ServiceCatalog.services(paths: fork, flavor: .hackathon)
+        XCTAssertEqual(hackathon.first { $0.id == ServiceCatalog.platformCoreID }?.probe?.port, PlatformCoreApp.defaultPort)
+    }
+
+    func testWhatTheScriptOfPlatformCoreSays() {
+        XCTAssertEqual(
+            PlatformCoreApp.launch(ofScript: "dotenv -e .env.dev -- next dev --turbopack -p 3007"),
+            .init(port: 3007, envFiles: [".env.dev"])
+        )
+        XCTAssertEqual(PlatformCoreApp.launch(ofScript: "next dev --turbopack -p 3001"), .init(port: 3001, envFiles: []))
+        XCTAssertEqual(PlatformCoreApp.launch(ofScript: "next dev --port 3010"), .init(port: 3010, envFiles: []))
+        XCTAssertEqual(PlatformCoreApp.launch(ofScript: "next dev --port=3011"), .init(port: 3011, envFiles: []))
+        // Two files of dotenv: the first one is the strongest.
+        XCTAssertEqual(
+            PlatformCoreApp.launch(ofScript: "dotenv -e .env.dev -e .env.shared -- next dev -p 3007").envFiles,
+            [".env.dev", ".env.shared"]
+        )
+        // No port: `next dev` would take 3000, the port of the login.
+        XCTAssertNil(PlatformCoreApp.launch(ofScript: "next dev --turbopack").port)
+        XCTAssertNil(PlatformCoreApp.launch(ofScript: "next dev -p").port)
+        XCTAssertNil(PlatformCoreApp.launch(ofScript: "next dev -p auto").port)
+
+        XCTAssertNil(PlatformCoreApp.launch(directory: root.appendingPathComponent("not-there").path))
+        XCTAssertEqual(PlatformCoreApp.envFile(directory: root.appendingPathComponent("not-there").path), ".env.dev")
+    }
+
+    func testTheRunnerFreesThePortsOfEachForkApp() throws {
+        let hackathon = ServiceCatalog.services(paths: paths, flavor: .hackathon)
+        XCTAssertEqual(ServiceCatalog.forkAppPorts(of: hackathon), [2000, 3004, 3007])
+        // The port of platform core is the port of the script.
+        let fork = try makeForkWithPlatformCore(script: "next dev -p 3001")
+        XCTAssertEqual(ServiceCatalog.forkAppPorts(of: ServiceCatalog.services(paths: fork, flavor: .hackathon)), [2000, 3001, 3004])
+        // The standard app has no fork app.
+        XCTAssertEqual(ServiceCatalog.forkAppPorts(of: ServiceCatalog.services(paths: paths, flavor: .standard)), [])
+    }
+
     func testAnOldCheckoutWithoutAForkAppStillPassesPreflight() {
         // The folder of a fork app is not a preflight condition: the app is skipped at its start.
         let hackathon = ServiceCatalog.services(paths: paths, flavor: .hackathon)
         let checks = PreflightRunner().allChecks(for: hackathon).map(\.id)
         XCTAssertFalse(checks.contains("dir-event-directory"))
         XCTAssertFalse(checks.contains("dir-amateur-agent"))
+        XCTAssertFalse(checks.contains("dir-platform-core"))
         // The folders of the other services stay conditions, and the ports too.
         XCTAssertTrue(checks.contains("dir-booking-portal"))
-        XCTAssertTrue(checks.contains("port-3001"))
+        XCTAssertTrue(checks.contains("port-3007"))
+        XCTAssertTrue(checks.contains("port-3004"))
+        XCTAssertFalse(checks.contains("port-3001"))
         XCTAssertTrue(checks.contains("port-2000"))
     }
 
@@ -752,6 +850,99 @@ final class HackathonFlavorTests: XCTestCase {
         XCTAssertEqual(definition.probe?.port, events.probe?.port)
         // With nothing to give, the service does not change.
         XCTAssertNil(EventDirectoryLauncher.definition(events, env: [:]).env)
+    }
+
+    // MARK: - Platform core
+
+    func testTheEnvOfPlatformCore() throws {
+        let app = root.appendingPathComponent("platform")
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        func missing(_ files: [String] = [".env.dev"]) -> [String] {
+            PlatformCoreEnv.missingKeys(PlatformCoreEnv.values(directory: app.path, envFiles: files))
+        }
+        XCTAssertEqual(missing(), ["LOGIN_URL", "NEXT_PUBLIC_FASTBREAK_DOMAIN"])
+
+        try """
+        LOGIN_URL=https://identity.example.ai/login/init
+        NEXT_PUBLIC_FASTBREAK_DOMAIN=""
+        """.write(to: app.appendingPathComponent(".env.dev"), atomically: true, encoding: .utf8)
+        // An empty value is a missing value.
+        XCTAssertEqual(missing(), ["NEXT_PUBLIC_FASTBREAK_DOMAIN"])
+        // A script that does not read the file: the app does not get its values.
+        XCTAssertEqual(missing([]), ["LOGIN_URL", "NEXT_PUBLIC_FASTBREAK_DOMAIN"])
+
+        // The file of the script is in the process, so it is stronger than the files
+        // that Next.js reads, also with an empty value.
+        try "NEXT_PUBLIC_FASTBREAK_DOMAIN=example.ai\nLOGIN_URL=https://weaker\n"
+            .write(to: app.appendingPathComponent(".env.local"), atomically: true, encoding: .utf8)
+        let values = PlatformCoreEnv.values(directory: app.path, envFiles: [".env.dev"])
+        XCTAssertEqual(values["LOGIN_URL"], "https://identity.example.ai/login/init")
+        XCTAssertEqual(PlatformCoreEnv.missingKeys(values), ["NEXT_PUBLIC_FASTBREAK_DOMAIN"])
+        // Without the file of the script, the files of Next.js give the values.
+        XCTAssertEqual(missing([]), [])
+
+        try "LOGIN_URL=https://identity.example.ai/login/init\nNEXT_PUBLIC_FASTBREAK_DOMAIN=example.ai\n"
+            .write(to: app.appendingPathComponent(".env.dev"), atomically: true, encoding: .utf8)
+        XCTAssertEqual(missing(), [])
+    }
+
+    func testOnlyAnEnvOfPlatformCoreIsImportedForPlatformCore() {
+        XCTAssertNil(PlatformCoreEnv.importProblem([
+            "LOGIN_URL": "https://identity.example.ai/login/init", "NEXT_PUBLIC_FASTBREAK_DOMAIN": "example.ai",
+        ]))
+        // The env of the event directory, and the env of the agent.
+        let events = PlatformCoreEnv.importProblem(["SITE_URL": "https://events.example.ai", "PXI_API_URL": "https://api.example.ai"])
+        XCTAssertEqual(events, "It does not set LOGIN_URL and NEXT_PUBLIC_FASTBREAK_DOMAIN.")
+        XCTAssertNotNil(PlatformCoreEnv.importProblem(["AMATEUR_SUPABASE_URL": "https://x.supabase.co", "LOGIN_URL": "https://l"]))
+    }
+
+    func testPlatformCoreIsSkippedWithoutItsFolderItsPackagesOrItsEnv() {
+        let script = PlatformCoreApp.Launch(port: 3007, envFiles: [".env.dev"])
+        func skip(
+            _ launch: PlatformCoreApp.Launch?, runnerPort: Int? = 3007, packages: Bool = true, missing: [String] = [],
+            line: UInt = #line
+        ) -> String {
+            guard case .skip(let reason) = PlatformCoreLauncher.decide(
+                launch: launch, runnerPort: runnerPort, hasPackages: packages, missingKeys: missing
+            ) else {
+                XCTFail("expected a skip", line: line)
+                return ""
+            }
+            return reason
+        }
+
+        // An old checkout: no app, or no script.
+        let noApp = skip(nil)
+        XCTAssertTrue(noApp.contains("apps/platform-core"))
+        XCTAssertTrue(noApp.contains("Pull the fork"))
+
+        // Without a port in the script, Next.js takes 3000, the port of the login.
+        XCTAssertTrue(skip(.init(port: nil, envFiles: [])).contains("names no port"))
+
+        // The fork changed the port after the runner loaded its services.
+        let moved = skip(.init(port: 3001, envFiles: [".env.dev"]))
+        XCTAssertTrue(moved.contains("port 3001"))
+        XCTAssertTrue(moved.contains("3007"))
+        XCTAssertTrue(moved.contains("Quit the runner"))
+
+        XCTAssertTrue(skip(script, packages: false).contains("pnpm install"))
+
+        let noEnv = skip(script, missing: ["LOGIN_URL"])
+        XCTAssertTrue(noEnv.contains("LOGIN_URL"))
+        XCTAssertTrue(noEnv.contains("apps/platform-core/.env.dev"))
+        XCTAssertTrue(noEnv.contains("Import"))
+        // A script without dotenv: the app reads the files of Next.js.
+        XCTAssertTrue(skip(.init(port: 3007, envFiles: []), missing: ["LOGIN_URL"]).contains("apps/platform-core/.env.local"))
+
+        guard case .run(let notes) = PlatformCoreLauncher.decide(
+            launch: script, runnerPort: 3007, hasPackages: true, missingKeys: []
+        ) else { return XCTFail("expected a run") }
+        XCTAssertTrue(notes.contains { $0.contains("http://localhost:3007") })
+        // The port of the script, when the runner has the same one.
+        guard case .run(let on3001) = PlatformCoreLauncher.decide(
+            launch: .init(port: 3001, envFiles: [".env.dev"]), runnerPort: 3001, hasPackages: true, missingKeys: []
+        ) else { return XCTFail("expected a run") }
+        XCTAssertTrue(on3001.contains { $0.contains("http://localhost:3001") })
     }
 
     // MARK: - The other runner app

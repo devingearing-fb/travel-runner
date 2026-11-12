@@ -314,4 +314,69 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("web").phase, .running)
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
     }
+
+    /// Platform core of the hackathon fork: a checkout without the app, or without
+    /// its packages or its env, must not make a crash loop on the port of the app. The
+    /// service is skipped with the cause in its log, and it starts when the cause is gone.
+    func testPlatformCoreIsSkippedUntilItsFolderHasThePackagesAndTheEnv() async throws {
+        let id = ServiceCatalog.platformCoreID
+        try load(daemon(id, webServer))
+        let fm = FileManager.default
+
+        /// Restarts the service and waits for a line of the runner with `text` in its log.
+        func restartAndWait(for text: String) async throws -> [String] {
+            supervisor.restartService(id)
+            var lines: [String] = []
+            let deadline = Date().addingTimeInterval(20)
+            repeat {
+                try await Task.sleep(for: .milliseconds(100))
+                lines = await logLines(id)
+            } while !lines.contains { $0.contains(text) } && Date() < deadline
+            XCTAssertTrue(lines.contains { $0.contains(text) }, lines.joined(separator: "\n"))
+            let idle = await waitUntil(10) { self.supervisor.actionsInFlight.isEmpty }
+            XCTAssertTrue(idle)
+            return lines
+        }
+        func writePackage(port: Int) throws {
+            let scripts = ["dev:dev": "dotenv -e .env.dev -- next dev --turbopack -p \(port)"]
+            try JSONSerialization.data(withJSONObject: ["scripts": scripts]).write(to: workDir.appendingPathComponent("package.json"))
+        }
+
+        // An old checkout: the app is not there.
+        var lines = try await restartAndWait(for: "Pull the fork")
+        XCTAssertTrue(lines.contains { $0.contains("Platform core is skipped") && $0.contains("apps/platform-core") })
+        XCTAssertEqual(state(id).phase, .skipped)
+
+        // The fork starts the app on a port that the runner did not read.
+        try writePackage(port: port + 1)
+        lines = try await restartAndWait(for: "Quit the runner")
+        XCTAssertTrue(lines.contains { $0.contains("port \(port + 1)") })
+        XCTAssertEqual(state(id).phase, .skipped)
+
+        // The port of the runner, but no packages.
+        try writePackage(port: port)
+        _ = try await restartAndWait(for: "pnpm install")
+        XCTAssertEqual(state(id).phase, .skipped)
+
+        // The packages, but no env.
+        let bin = workDir.appendingPathComponent("node_modules/.bin")
+        try fm.createDirectory(at: bin, withIntermediateDirectories: true)
+        try Data("#!/bin/sh\n".utf8).write(to: bin.appendingPathComponent("next"))
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: bin.appendingPathComponent("next").path)
+        lines = try await restartAndWait(for: "LOGIN_URL, NEXT_PUBLIC_FASTBREAK_DOMAIN")
+        XCTAssertTrue(lines.contains { $0.contains("apps/platform-core/.env.dev") })
+        XCTAssertEqual(state(id).phase, .skipped)
+        XCTAssertTrue(Self.listeners(on: port).isEmpty)
+
+        // The env in the file that the script reads.
+        try "LOGIN_URL=https://identity.example.ai/login/init\nNEXT_PUBLIC_FASTBREAK_DOMAIN=example.ai\n"
+            .write(to: workDir.appendingPathComponent(".env.dev"), atomically: true, encoding: .utf8)
+        supervisor.restartService(id)
+        let ready = await waitUntil(40) { self.settled(id) }
+        XCTAssertTrue(ready, "\(id) is \(state(id).phase.rawValue)")
+        XCTAssertEqual(Self.listeners(on: port).count, 1)
+        lines = await logLines(id)
+        XCTAssertTrue(lines.contains { $0.contains("http://localhost:\(port)") }, lines.joined(separator: "\n"))
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
 }

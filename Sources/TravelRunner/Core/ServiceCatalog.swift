@@ -60,13 +60,17 @@ enum ServiceCatalog {
 
     /// The apps that only the hackathon fork has. Each one is skipped, and the rest
     /// of the stack starts, when the Mac does not have what the app needs.
-    static let forkAppIDs: Set<String> = [agentID, eventDirectoryID]
+    static let forkAppIDs: Set<String> = [agentID, platformCoreID, eventDirectoryID]
+
+    /// Platform core of the hackathon fork (`apps/platform-core`, Next.js). The fork
+    /// sets its port; see `PlatformCoreApp`.
+    static let platformCoreID = "platform-core"
 
     /// The event listing site of the hackathon fork (`apps/event-directory`, Next.js).
     static let eventDirectoryID = "event-directory"
     /// `next dev` uses 3000 by default, which is the port of the login. 3001 is the
-    /// port that Next takes by itself when 3000 is in use.
-    static let eventDirectoryPort = 3001
+    /// usual port of platform core, and 3002 and 3003 are ports of the standard services.
+    static let eventDirectoryPort = 3004
 
     /// The agent app of the hackathon fork (`apps/amateur-agent`, eve).
     /// The booking portal. In the fork it shows the chat of the agent.
@@ -78,6 +82,11 @@ enum ServiceCatalog {
     /// eve needs this Node version or later; the rest of the fork runs on Node 22.
     static let agentNodeMajor = 24
     static let agentCommand = ["pnpm", "exec", "eve", "dev", "--no-ui"]
+
+    /// The ports of the fork's apps among these services. The runner frees them when it quits.
+    static func forkAppPorts(of services: [ServiceDefinition]) -> [Int] {
+        services.filter { forkAppIDs.contains($0.id) }.compactMap { $0.probe?.port }.sorted()
+    }
 
     private static let standardIDs: Set<String> = [
         "supabase", "universal-login", "stripe", "travel-portal", "partner-portal",
@@ -101,6 +110,12 @@ enum ServiceCatalog {
             // database does not start or its reset fails. The portals do not wait for it.
             services.append(service(agentID, "Amateur Agent", agentCommand, cwd: agent,
                                     probe: tcp(agentPort, timeout: 120), restart: .onFailure, phase: "portal"))
+            // Platform core uses the services that its own env names: it needs no other
+            // service. Its script sets the port, and the runner reads the port from there.
+            let platform = (expand(paths.monorepo ?? "") as NSString).appendingPathComponent(RepoDetector.platformCoreDirectory)
+            let platformPort = PlatformCoreApp.launch(directory: platform)?.port ?? PlatformCoreApp.defaultPort
+            services.append(service(platformCoreID, "Platform Core", PlatformCoreApp.command, cwd: platform,
+                                    probe: tcp(platformPort, timeout: 180), restart: .onFailure, phase: "portal"))
             // The event directory reads hosted services only: it needs no other service.
             let events = (expand(paths.monorepo ?? "") as NSString).appendingPathComponent(RepoDetector.eventDirectory)
             services.append(service(eventDirectoryID, "Event Directory",

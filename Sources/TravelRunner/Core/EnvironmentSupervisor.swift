@@ -1434,6 +1434,26 @@ final class EnvironmentSupervisor {
         }.value
     }
 
+    /// Looks at what platform core needs on this Mac: its folder with the script of the
+    /// fork, its packages and its env.
+    private func preparePlatformCore(_ definition: ServiceDefinition) async -> PlatformCoreLauncher.Decision {
+        guard let cwd = definition.resolvedCwd else { return .skip("The service has no folder.") }
+        let runnerPort = definition.probe?.port
+        return await Task.detached {
+            let launch = PlatformCoreApp.launch(directory: cwd)
+            return PlatformCoreLauncher.decide(
+                launch: launch,
+                runnerPort: runnerPort,
+                hasPackages: FileManager.default.isExecutableFile(
+                    atPath: (cwd as NSString).appendingPathComponent("node_modules/.bin/next")
+                ),
+                missingKeys: PlatformCoreEnv.missingKeys(
+                    PlatformCoreEnv.values(directory: cwd, envFiles: launch?.envFiles ?? [])
+                )
+            )
+        }.value
+    }
+
     /// Looks at what the event directory needs on this Mac: its folder, its packages
     /// and its env. Writes the Vercel project link when the env file names the project.
     private func prepareEventDirectory(_ definition: ServiceDefinition) async -> EventDirectoryLauncher.Decision {
@@ -1626,6 +1646,27 @@ final class EnvironmentSupervisor {
             case .run(let launch):
                 agentLaunch = launch
                 for note in launch.notes {
+                    await logStore.append(
+                        serviceID: serviceID,
+                        entry: LogEntry(stream: .stdout, text: "[travel-runner] \(note)")
+                    )
+                }
+            }
+        }
+
+        // Platform core needs its packages and its env file. Without them it is
+        // skipped, and the rest of the stack starts.
+        if serviceID == ServiceCatalog.platformCoreID {
+            switch await preparePlatformCore(definition) {
+            case .skip(let reason):
+                state.phase = .skipped
+                await logStore.append(
+                    serviceID: serviceID,
+                    entry: LogEntry(stream: .stderr, text: "[travel-runner] Platform core is skipped. \(reason)")
+                )
+                return nil
+            case .run(let notes):
+                for note in notes {
                     await logStore.append(
                         serviceID: serviceID,
                         entry: LogEntry(stream: .stdout, text: "[travel-runner] \(note)")
