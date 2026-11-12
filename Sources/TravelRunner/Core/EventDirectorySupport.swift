@@ -106,6 +106,15 @@ enum EventDirectoryEnv {
         }
     }
 
+    /// Writes the link when the env of the folder is complete and its token names
+    /// the project. Returns true when it wrote the file.
+    @discardableResult
+    static func linkFromEnv(directory: String) -> Bool {
+        let values = values(directory: directory)
+        guard missingKeys(values).isEmpty, let claims = claims(ofToken: values[tokenKey]) else { return false }
+        return ensureLink(directory: directory, claims: claims)
+    }
+
     /// True when the Vercel CLI has a login on this Mac. The app's library uses it
     /// to get a new token.
     static func hasVercelLogin(home: String = NSHomeDirectory()) -> Bool {

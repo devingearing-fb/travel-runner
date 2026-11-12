@@ -393,6 +393,54 @@ final class HackathonFlavorTests: XCTestCase {
 
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
+    func testTheAgentGetsTheTokenOfTheEventProjectOnlyWithoutItsOwnCredential() throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let good = try oidcToken([
+            "project_id": "prj_1", "owner_id": "team_1", "project": "events.example", "exp": 1_800_030_000,
+        ])
+        let none = AgentEnv.plan(own: [:], shared: [:])
+        XCTAssertFalse(none.hasModelCredential)
+
+        let filled = AgentEnv.withProjectToken(none, commandOutput: "\n\(good)\n", now: now)
+        XCTAssertEqual(filled.passthrough[AgentEnv.oidcKey], good)
+        XCTAssertTrue(filled.hasModelCredential)
+        XCTAssertEqual(filled.modelProject?.name, "events.example")
+        XCTAssertEqual(filled.modelProject?.until, Date(timeIntervalSince1970: 1_800_030_000))
+        let summary = AgentEnv.summary(filled)
+        XCTAssertTrue(summary.contains("events.example"), summary)
+        XCTAssertFalse(summary.contains("no \(AgentEnv.gatewayKey)"), summary)
+        XCTAssertFalse(summary.contains(good), "The log must not show the token.")
+
+        // The agent's own credential stays.
+        let own = AgentEnv.plan(own: [AgentEnv.gatewayKey: "vck_own"], shared: [:])
+        XCTAssertEqual(AgentEnv.withProjectToken(own, commandOutput: good, now: now), own)
+        let shared = AgentEnv.plan(own: [:], shared: [AgentEnv.gatewayKey: "vck_shared"])
+        XCTAssertEqual(AgentEnv.withProjectToken(shared, commandOutput: good, now: now), shared)
+
+        // A token that stops soon, or text that is not a token, changes nothing.
+        let short = try oidcToken(["project_id": "prj_1", "owner_id": "team_1", "exp": 1_800_000_300])
+        XCTAssertEqual(AgentEnv.withProjectToken(none, commandOutput: short, now: now), none)
+        XCTAssertEqual(AgentEnv.withProjectToken(none, commandOutput: "ERR no login", now: now), none)
+        XCTAssertEqual(AgentEnv.withProjectToken(none, commandOutput: "", now: now), none)
+        XCTAssertTrue(AgentEnv.summary(none).contains("no \(AgentEnv.gatewayKey)"))
+    }
+
+    func testTheTokenCommandRunsInTheEventDirectory() {
+        let command = AgentEnv.projectTokenCommand(eventDirectory: "/Users/a b/it's/apps/event-directory")
+        XCTAssertTrue(command.hasPrefix(#"cd '/Users/a b/it'\''s/apps/event-directory' && node "#), command)
+        XCTAssertTrue(command.contains("@vercel/oidc"))
+        XCTAssertTrue(command.contains("expirationBufferMs"))
+    }
+
+    func testTheCheckKnowsThatTheRunnerCanGetTheToken() {
+        let none = AgentEnv.plan(own: [:], shared: [:])
+        XCTAssertTrue(AgentEnv.summary(none, eventProjectUsable: true).contains("event directory"))
+        XCTAssertFalse(AgentEnv.summary(none, eventProjectUsable: true).contains("no \(AgentEnv.gatewayKey)"))
+        XCTAssertTrue(AgentEnv.summary(none, eventProjectUsable: false).contains("no \(AgentEnv.gatewayKey)"))
+        let own = AgentEnv.plan(own: [AgentEnv.gatewayKey: "vck_own"], shared: [:])
+        XCTAssertFalse(AgentEnv.summary(own, eventProjectUsable: true).contains("event directory"))
+    }
+
     func testTheClaimsOfTheTokenNameTheProject() throws {
         let token = try oidcToken([
             "project_id": "prj_abc", "owner_id": "team_xyz", "project": "events.example.ai",

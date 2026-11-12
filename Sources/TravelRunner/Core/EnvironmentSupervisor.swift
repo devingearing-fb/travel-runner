@@ -1398,12 +1398,30 @@ final class EnvironmentSupervisor {
         let (output, ok) = await shellOutput("node --version")
         let installs = await Task.detached { NodeLocator.installs() }.value
         let sharedEnv = sharedEnvPath("travel-portal") ?? ""
+        var plan = AgentEnv.plan(agentDirectory: cwd, sharedEnvFile: sharedEnv)
+        if hasPackages, !plan.hasModelCredential, let eventDirectory = await linkedEventDirectory() {
+            let (token, _) = await shellOutput(AgentEnv.projectTokenCommand(eventDirectory: eventDirectory))
+            plan = AgentEnv.withProjectToken(plan, commandOutput: token)
+        }
         return AgentLauncher.decide(
             hasPackages: hasPackages,
             defaultNodeMajor: ok ? NodeLocator.major(ofVersionOutput: output) : nil,
             installs: installs,
-            env: AgentEnv.plan(agentDirectory: cwd, sharedEnvFile: sharedEnv)
+            env: plan
         )
+    }
+
+    /// The folder of the event directory, when it has its packages and the link to
+    /// its Vercel project. Writes the link when the env file names the project: the
+    /// agent can start before the event directory does.
+    private func linkedEventDirectory() async -> String? {
+        guard let directory = serviceStates[ServiceCatalog.eventDirectoryID]?.definition.resolvedCwd else { return nil }
+        return await Task.detached {
+            let library = (directory as NSString).appendingPathComponent("node_modules/@vercel/oidc")
+            guard FileManager.default.fileExists(atPath: library) else { return nil }
+            EventDirectoryEnv.linkFromEnv(directory: directory)
+            return EventDirectoryEnv.isLinked(directory: directory) ? directory : nil
+        }.value
     }
 
     /// Looks at what the event directory needs on this Mac: its folder, its packages
@@ -1417,10 +1435,7 @@ final class EnvironmentSupervisor {
             let values = EventDirectoryEnv.values(directory: cwd)
             let missing = EventDirectoryEnv.missingKeys(values)
             let claims = EventDirectoryEnv.claims(ofToken: values[EventDirectoryEnv.tokenKey])
-            var wroteLink = false
-            if missing.isEmpty, let claims {
-                wroteLink = EventDirectoryEnv.ensureLink(directory: cwd, claims: claims)
-            }
+            let wroteLink = EventDirectoryEnv.linkFromEnv(directory: cwd)
             return EventDirectoryLauncher.decide(
                 hasPackages: FileManager.default.isExecutableFile(
                     atPath: (cwd as NSString).appendingPathComponent("node_modules/.bin/next")

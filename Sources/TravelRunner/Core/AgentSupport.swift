@@ -176,6 +176,48 @@ enum AgentEnv {
         var hasModelCredential = false
         /// True when the agent's own signing key is one that eve cannot read.
         var ownSigningKeyUnreadable = false
+        /// Set when the model credential is the token of the event directory's
+        /// Vercel project (`withProjectToken`).
+        var modelProject: ModelProject?
+    }
+
+    /// The Vercel project whose token pays for the model calls of the agent.
+    struct ModelProject: Equatable, Sendable {
+        var name: String?
+        var until: Date
+    }
+
+    /// A token must be good for this long, or the runner does not use it.
+    static let minimumTokenLife: TimeInterval = 600
+    /// The app's library gets a new token when the one it has stops sooner than this.
+    static let tokenRefreshBufferMs = 6 * 60 * 60 * 1000
+
+    /// The shell command that prints a token of the event directory's Vercel project.
+    /// It uses the library of that app (`@vercel/oidc`), which reads the project link
+    /// and the Vercel login of this Mac, and gets a new token when the old one stops soon.
+    static func projectTokenCommand(eventDirectory: String) -> String {
+        let quoted = "'" + eventDirectory.replacingOccurrences(of: "'", with: #"'\''"#) + "'"
+        let script = "setTimeout(()=>process.exit(2),20000).unref();"
+            + #"import("@vercel/oidc").then(m=>m.getVercelOidcToken({expirationBufferMs:\#(tokenRefreshBufferMs)}))"#
+            + ".then(t=>process.stdout.write(t)).catch(()=>process.exit(1))"
+        return "cd \(quoted) && node -e '\(script)'"
+    }
+
+    /// Gives the agent the token that `projectTokenCommand` printed, when no file gives
+    /// the agent a model credential. eve uses `VERCEL_OIDC_TOKEN` for the AI Gateway.
+    /// The agent cannot get a new token by itself (it has no project link), so the
+    /// token must have some life left.
+    static func withProjectToken(_ plan: Plan, commandOutput: String, now: Date = Date()) -> Plan {
+        guard !plan.hasModelCredential else { return plan }
+        let token = commandOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let claims = EventDirectoryEnv.claims(ofToken: token),
+              let until = claims.expiresAt,
+              until.timeIntervalSince(now) >= minimumTokenLife else { return plan }
+        var plan = plan
+        plan.passthrough[oidcKey] = token
+        plan.hasModelCredential = true
+        plan.modelProject = ModelProject(name: claims.projectName, until: until)
+        return plan
     }
 
     static func plan(own: [String: String], shared: [String: String]) -> Plan {
@@ -205,7 +247,9 @@ enum AgentEnv {
     }
 
     /// One line for the log of the service and for the environment check.
-    static func summary(_ plan: Plan) -> String {
+    /// `eventProjectUsable`: the runner can get the token of the event directory's
+    /// project at the start of the agent (for the environment check).
+    static func summary(_ plan: Plan, eventProjectUsable: Bool = false) -> String {
         var parts: [String] = []
         let supabase = supabaseKeys.filter { plan.passthrough[$0] != nil }
         if !plan.missing.isEmpty {
@@ -218,7 +262,17 @@ enum AgentEnv {
         if plan.ownSigningKeyUnreadable {
             parts.append("the signing key in the agent's .env.local is not readable JSON (single quotes fix it)")
         }
-        if !plan.hasModelCredential {
+        if let project = plan.modelProject {
+            let format = DateFormatter()
+            format.dateFormat = "MMM d HH:mm"
+            let name = project.name.map { "the Vercel project \($0)" } ?? "the Vercel project of the event directory"
+            parts.append(
+                "the model calls use \(name) (AI Gateway); its token is good until \(format.string(from: project.until)), "
+                    + "restart the agent after that"
+            )
+        } else if !plan.hasModelCredential, eventProjectUsable {
+            parts.append("the model calls use the Vercel project of the event directory (AI Gateway)")
+        } else if !plan.hasModelCredential {
             parts.append("no \(gatewayKey): add it to apps/amateur-agent/.env.local, or use /login in the eve REPL")
         }
         return parts.joined(separator: "; ")

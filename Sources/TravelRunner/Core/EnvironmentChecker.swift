@@ -170,7 +170,7 @@ final class EnvironmentChecker {
             HealthCheck(id: "agent-env", name: "Agent env", section: .supabase,
                         isRequired: false,
                         checkCommand: "cat \(RepoDetector.agentDirectory)/.env.local",
-                        checkDescription: "The agent needs AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY and AMATEUR_SUPABASE_SIGNING_KEY, and a model credential (\(AgentEnv.gatewayKey)). For a Supabase key that \(RepoDetector.agentDirectory)/.env.local does not set, the runner gives the agent the value of apps/booking-portal/.env. The runner writes no file for the agent.",
+                        checkDescription: "The agent needs AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY and AMATEUR_SUPABASE_SIGNING_KEY, and a model credential (\(AgentEnv.gatewayKey)). Without a model credential in its files, the agent gets the token of the event directory's Vercel project, and that project pays for the model calls. For a Supabase key that \(RepoDetector.agentDirectory)/.env.local does not set, the runner gives the agent the value of apps/booking-portal/.env. The runner writes no file for the agent.",
                         checkPath: (agentPath as NSString).appendingPathComponent(".env.local")),
             HealthCheck(id: "event-env", name: "Event directory env", section: .supabase,
                         isRequired: false, fixLabel: "Import…",
@@ -335,8 +335,19 @@ final class EnvironmentChecker {
         case "agent-env":
             let shared = (bookingPath as NSString).appendingPathComponent(".env")
             let plan = AgentEnv.plan(agentDirectory: agentPath, sharedEnvFile: shared)
-            let summary = AgentEnv.summary(plan)
-            return plan.missing.isEmpty && plan.hasModelCredential ? .passing(summary) : .warning(summary)
+            // Without a credential in a file, the runner gives the agent the token of
+            // the event directory's Vercel project at the start of the agent.
+            let eventPath = eventDirectoryPath
+            let eventProjectUsable = await Task.detached {
+                let values = EventDirectoryEnv.values(directory: eventPath)
+                guard EventDirectoryEnv.missingKeys(values).isEmpty else { return false }
+                let claims = EventDirectoryEnv.claims(ofToken: values[EventDirectoryEnv.tokenKey])
+                return (EventDirectoryEnv.isLinked(directory: eventPath) || claims != nil)
+                    && EventDirectoryEnv.hasVercelLogin()
+            }.value
+            let summary = AgentEnv.summary(plan, eventProjectUsable: eventProjectUsable)
+            let hasModel = plan.hasModelCredential || eventProjectUsable
+            return plan.missing.isEmpty && hasModel ? .passing(summary) : .warning(summary)
 
         default:
             return .passing("OK")
