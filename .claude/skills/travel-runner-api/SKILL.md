@@ -8,7 +8,7 @@ trigger: when the user asks to check service status, read logs, restart services
 
 travel-runner is a macOS menu bar app that supervises the local dev environment. It runs the `fb-travel-monolith` pnpm+turbo monorepo (apps/booking-portal on :3002, apps/partner-portal on :3006, packages/travel-data, root `supabase/` and `scripts/`), starts the services of the selected profile in dependency order (Supabase -> Login/Stripe -> portals), monitors health probes, and exposes an HTTP control API on **http://localhost:19900** for programmatic access.
 
-**Two apps.** Travel Runner (fb-travel-monolith) answers on port 19900. Travel Runner Hackathon (fb-travel-monolith-hackathon) answers on port **19901** with the same API, and has one more service ID: `amateur-agent` (the eve agent, port 2000). `GET /api/status` has the field `app` (`standard` or `hackathon`). Only one of the two apps can run a stack at a time.
+**Two apps.** Travel Runner (fb-travel-monolith) answers on port 19900. Travel Runner Hackathon (fb-travel-monolith-hackathon) answers on port **19901** with the same API, and has two more service IDs: `amateur-agent` (the eve agent, port 2000) and `event-directory` (the event listing site, port 3001). Each of the two is `SKIPPED` when the Mac does not have what it needs; its log says why. `GET /api/status` has the field `app` (`standard` or `hackathon`). Only one of the two apps can run a stack at a time.
 
 ## Checking availability
 

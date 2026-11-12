@@ -17,13 +17,14 @@ enum RunProfile: String, Codable, CaseIterable, Sendable {
     }
 
     /// Canonical services in this profile. `full` is every canonical service.
-    /// The agent is in each profile; only the hackathon app has that service.
+    /// The apps of the hackathon fork are in each profile; only the hackathon app has
+    /// those services.
     var baseServiceIDs: Set<String>? {
-        let agent = ServiceCatalog.agentID
+        let forkApps = ServiceCatalog.forkAppIDs
         switch self {
-        case .booking: return ["supabase", "universal-login", "stripe", "travel-portal", agent]
-        case .partner: return ["supabase", "universal-login", "partner-portal", agent]
-        case .both: return ["supabase", "universal-login", "stripe", "travel-portal", "partner-portal", agent]
+        case .booking: return forkApps.union(["supabase", "universal-login", "stripe", "travel-portal"])
+        case .partner: return forkApps.union(["supabase", "universal-login", "partner-portal"])
+        case .both: return forkApps.union(["supabase", "universal-login", "stripe", "travel-portal", "partner-portal"])
         case .full: return nil
         }
     }
@@ -54,8 +55,18 @@ enum ServiceCatalog {
     static var canonicalIDs: Set<String> { canonicalIDs(for: .current) }
 
     static func canonicalIDs(for flavor: Flavor) -> Set<String> {
-        flavor.runsAgent ? standardIDs.union([agentID]) : standardIDs
+        flavor.runsAgent ? standardIDs.union(forkAppIDs) : standardIDs
     }
+
+    /// The apps that only the hackathon fork has. Each one is skipped, and the rest
+    /// of the stack starts, when the Mac does not have what the app needs.
+    static let forkAppIDs: Set<String> = [agentID, eventDirectoryID]
+
+    /// The event listing site of the hackathon fork (`apps/event-directory`, Next.js).
+    static let eventDirectoryID = "event-directory"
+    /// `next dev` uses 3000 by default, which is the port of the login. 3001 is the
+    /// port that Next takes by itself when 3000 is in use.
+    static let eventDirectoryPort = 3001
 
     /// The agent app of the hackathon fork (`apps/amateur-agent`, eve).
     static let agentID = "amateur-agent"
@@ -87,6 +98,11 @@ enum ServiceCatalog {
             services.append(service(agentID, "Amateur Agent", agentCommand, cwd: agent,
                                     probe: tcp(agentPort, timeout: 120), restart: .onFailure, phase: "portal",
                                     dependsOn: ["supabase"]))
+            // The event directory reads hosted services only: it needs no other service.
+            let events = (expand(paths.monorepo ?? "") as NSString).appendingPathComponent(RepoDetector.eventDirectory)
+            services.append(service(eventDirectoryID, "Event Directory",
+                                    ["pnpm", "dev", "--port", "\(eventDirectoryPort)"], cwd: events,
+                                    probe: tcp(eventDirectoryPort, timeout: 120), restart: .onFailure, phase: "portal"))
         }
         return services
     }

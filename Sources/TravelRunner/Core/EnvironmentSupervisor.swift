@@ -1406,6 +1406,37 @@ final class EnvironmentSupervisor {
         )
     }
 
+    /// Looks at what the event directory needs on this Mac: its folder, its packages
+    /// and its env. Writes the Vercel project link when the env file names the project.
+    private func prepareEventDirectory(_ definition: ServiceDefinition) async -> EventDirectoryLauncher.Decision {
+        guard let cwd = definition.resolvedCwd,
+              FileManager.default.fileExists(atPath: (cwd as NSString).appendingPathComponent("package.json")) else {
+            return .skip("This checkout does not have \(RepoDetector.eventDirectory). Pull the fork, then restart the event directory.")
+        }
+        return await Task.detached {
+            let values = EventDirectoryEnv.values(directory: cwd)
+            let missing = EventDirectoryEnv.missingKeys(values)
+            let claims = EventDirectoryEnv.claims(ofToken: values[EventDirectoryEnv.tokenKey])
+            var wroteLink = false
+            if missing.isEmpty, let claims {
+                wroteLink = EventDirectoryEnv.ensureLink(directory: cwd, claims: claims)
+            }
+            return EventDirectoryLauncher.decide(
+                hasPackages: FileManager.default.isExecutableFile(
+                    atPath: (cwd as NSString).appendingPathComponent("node_modules/.bin/next")
+                ),
+                missingKeys: missing,
+                access: EventDirectoryEnv.access(
+                    claims: claims,
+                    linked: EventDirectoryEnv.isLinked(directory: cwd),
+                    hasLogin: EventDirectoryEnv.hasVercelLogin()
+                ),
+                wroteLink: wroteLink,
+                env: EventDirectoryEnv.processEnv(values)
+            )
+        }.value
+    }
+
     /// The service's own command with `--hostname <ip>` appended, so LAN mode keeps the
     /// configured package manager and port. `npm run` needs `--` before script flags;
     /// pnpm passes trailing flags to the script.
@@ -1578,6 +1609,29 @@ final class EnvironmentSupervisor {
             }
         }
 
+        // The event directory needs its packages and its env file. Without them it is
+        // skipped, and the rest of the stack starts.
+        var eventDirectoryEnv: [String: String] = [:]
+        if serviceID == ServiceCatalog.eventDirectoryID {
+            switch await prepareEventDirectory(definition) {
+            case .skip(let reason):
+                state.phase = .skipped
+                await logStore.append(
+                    serviceID: serviceID,
+                    entry: LogEntry(stream: .stderr, text: "[travel-runner] The event directory is skipped. \(reason)")
+                )
+                return nil
+            case .run(let notes, let env):
+                eventDirectoryEnv = env
+                for note in notes {
+                    await logStore.append(
+                        serviceID: serviceID,
+                        entry: LogEntry(stream: .stdout, text: "[travel-runner] \(note)")
+                    )
+                }
+            }
+        }
+
         // Local mode puts the local stack's keys into the app's .env.local. Without
         // them the app has no signing key, or it takes the hosted dev values from its
         // shared .env while the runner shows "local". Read the keys again, and do
@@ -1647,7 +1701,8 @@ final class EnvironmentSupervisor {
         let capturedProbe = stdoutProbe
         let streamDefinition = streamAwareDefinition(for: definition, serviceID: serviceID)
         let lanDefinition = lanAwareDefinition(for: streamDefinition, serviceID: serviceID)
-        let effectiveDefinition = agentLaunch.map { AgentLauncher.definition(lanDefinition, launch: $0) } ?? lanDefinition
+        let agentDefinition = agentLaunch.map { AgentLauncher.definition(lanDefinition, launch: $0) } ?? lanDefinition
+        let effectiveDefinition = EventDirectoryLauncher.definition(agentDefinition, env: eventDirectoryEnv)
 
         let sid = serviceID
         let pid = try await processRunner.start(

@@ -54,7 +54,9 @@ struct PreflightRunner: Sendable {
             checks.append(PreflightCheck(id: "port-\(port)", name: "Port \(port) available"))
         }
 
-        let cwds = Set(services.compactMap { $0.resolvedCwd })
+        // An app of the hackathon fork that an old checkout does not have is skipped
+        // at its start. Its folder is not a condition for the rest of the stack.
+        let cwds = Set(services.filter { !ServiceCatalog.forkAppIDs.contains($0.id) }.compactMap { $0.resolvedCwd })
         for cwd in cwds.sorted() {
             let dirName = URL(fileURLWithPath: cwd).lastPathComponent
             checks.append(PreflightCheck(

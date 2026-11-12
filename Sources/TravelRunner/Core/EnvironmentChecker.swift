@@ -55,6 +55,7 @@ final class EnvironmentChecker {
     let flavor: Flavor
 
     private var agentPath: String { (monorepoPath as NSString).appendingPathComponent(RepoDetector.agentDirectory) }
+    private var eventDirectoryPath: String { (monorepoPath as NSString).appendingPathComponent(RepoDetector.eventDirectory) }
     private var bookingPath: String { (monorepoPath as NSString).appendingPathComponent("apps/booking-portal") }
     private var partnerPath: String { (monorepoPath as NSString).appendingPathComponent("apps/partner-portal") }
 
@@ -171,6 +172,11 @@ final class EnvironmentChecker {
                         checkCommand: "cat \(RepoDetector.agentDirectory)/.env.local",
                         checkDescription: "The agent needs AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY and AMATEUR_SUPABASE_SIGNING_KEY, and a model credential (\(AgentEnv.gatewayKey)). For a Supabase key that \(RepoDetector.agentDirectory)/.env.local does not set, the runner gives the agent the value of apps/booking-portal/.env. The runner writes no file for the agent.",
                         checkPath: (agentPath as NSString).appendingPathComponent(".env.local")),
+            HealthCheck(id: "event-env", name: "Event directory env", section: .supabase,
+                        isRequired: false, fixLabel: "Import…",
+                        checkCommand: "cat \(RepoDetector.eventDirectory)/.env.local",
+                        checkDescription: "The event directory needs the env file of its Vercel project (`vercel env pull .env.local --environment=production` in \(RepoDetector.eventDirectory), or the file a teammate sent you: Import… copies it into place). The API token in that file stops after 12 hours. After that, the app gets a new one through your Vercel login (npx vercel login); the runner links the app to its Vercel project for that.",
+                        checkPath: (eventDirectoryPath as NSString).appendingPathComponent(".env.local")),
         ]
     }
 
@@ -304,6 +310,28 @@ final class EnvironmentChecker {
             }
             return .passing("v\(install.version.map(String.init).joined(separator: ".")) — used only for the agent")
 
+        case "event-env":
+            guard exists((eventDirectoryPath as NSString).appendingPathComponent("package.json")) else {
+                return .warning("This checkout does not have \(RepoDetector.eventDirectory) — pull the fork")
+            }
+            let directory = eventDirectoryPath
+            return await Task.detached {
+                let values = EventDirectoryEnv.values(directory: directory)
+                let missing = EventDirectoryEnv.missingKeys(values)
+                guard missing.isEmpty else {
+                    return CheckStatus.warning("Not set: \(missing.joined(separator: ", ")) — the event directory is skipped. Use Import…")
+                }
+                let claims = EventDirectoryEnv.claims(ofToken: values[EventDirectoryEnv.tokenKey])
+                // The runner writes the link at the start of the service, when the token names the project.
+                let access = EventDirectoryEnv.access(
+                    claims: claims,
+                    linked: EventDirectoryEnv.isLinked(directory: directory) || claims != nil,
+                    hasLogin: EventDirectoryEnv.hasVercelLogin()
+                )
+                let summary = EventDirectoryEnv.summary(access)
+                return EventDirectoryEnv.isUsable(access) ? CheckStatus.passing(summary) : CheckStatus.warning(summary)
+            }.value
+
         case "agent-env":
             let shared = (bookingPath as NSString).appendingPathComponent(".env")
             let plan = AgentEnv.plan(agentDirectory: agentPath, sharedEnvFile: shared)
@@ -364,6 +392,9 @@ final class EnvironmentChecker {
         case "agent-node":
             return await shell("brew install node@\(ServiceCatalog.agentNodeMajor)")
 
+        case "event-env":
+            return importEventDirectoryEnv()
+
         case "sb-linked":
             let script = (monorepoPath as NSString).appendingPathComponent("scripts/setup/link-project.sh")
             return await shellInDir(monorepoPath, "bash \(ShellQuote.quote(script))")
@@ -411,6 +442,48 @@ final class EnvironmentChecker {
         do {
             let data = try Data(contentsOf: source)
             try data.write(to: URL(fileURLWithPath: target), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Copies the env file of the event directory that the developer picks to
+    /// `apps/event-directory/.env.local`, after a check that it is that app's file.
+    private func importEventDirectoryEnv() -> Bool? {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.message = "Choose the env file of the event directory (the file of `vercel env pull`, for example env.local)"
+        panel.level = .floating
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let source = panel.url else { return nil }
+
+        let alert = NSAlert()
+        alert.window.level = .floating
+        guard let content = try? String(contentsOf: source, encoding: .utf8) else {
+            alert.messageText = "Could not read the file"
+            alert.runModal()
+            return false
+        }
+        let missing = EventDirectoryEnv.missingKeys(AgentEnv.parse(content, dialect: .node))
+        guard missing.isEmpty else {
+            alert.messageText = "This is not the env of the event directory"
+            alert.informativeText = "\(source.lastPathComponent) does not set \(missing.joined(separator: " and ")). Nothing was changed."
+            alert.runModal()
+            return nil
+        }
+        let target = (eventDirectoryPath as NSString).appendingPathComponent(".env.local")
+        alert.messageText = exists(target) ? "Replace the env of the event directory?" : "Import the env of the event directory?"
+        alert.informativeText = "\(source.lastPathComponent) goes to \(RepoDetector.eventDirectory)/.env.local."
+        alert.addButton(withTitle: "Import")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        do {
+            try Data(content.utf8).write(to: URL(fileURLWithPath: target), options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target)
             return true
         } catch {

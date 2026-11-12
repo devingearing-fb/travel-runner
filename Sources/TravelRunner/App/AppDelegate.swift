@@ -79,7 +79,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // runtime itself (OrbStack / Docker Desktop), and Supabase persists between sessions.
         guard !siblingRunsStack else { return }
         var ports = [3000, 3002, 3003, 3006, 8080]
-        if Flavor.current.runsAgent { ports.append(ServiceCatalog.agentPort) }
+        if Flavor.current.runsAgent { ports += [ServiceCatalog.agentPort, ServiceCatalog.eventDirectoryPort] }
         killProcessesOnPorts(ports)
     }
 
