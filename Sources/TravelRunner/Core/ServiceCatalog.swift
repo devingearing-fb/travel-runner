@@ -69,6 +69,8 @@ enum ServiceCatalog {
     static let eventDirectoryPort = 3001
 
     /// The agent app of the hackathon fork (`apps/amateur-agent`, eve).
+    /// The booking portal. In the fork it shows the chat of the agent.
+    static let bookingPortalID = "travel-portal"
     static let agentID = "amateur-agent"
     /// The default port of `eve dev`. The runner passes no `--port`, so that an
     /// `eve dev` in a terminal connects its REPL to the server that the runner started.

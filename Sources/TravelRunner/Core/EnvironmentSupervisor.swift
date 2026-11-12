@@ -1657,6 +1657,27 @@ final class EnvironmentSupervisor {
             }
         }
 
+        // The booking portal of the fork shows the chat of the agent when it knows the
+        // address of the agent (AMATEUR_AGENT_URL). The runner gives it the agent that it
+        // started, when the portal's own env files do not set an address.
+        if Flavor.current.runsAgent, serviceID == ServiceCatalog.bookingPortalID,
+           serviceStates[ServiceCatalog.agentID]?.phase != .skipped,
+           let cwd = definition.resolvedCwd {
+            let env = await Task.detached {
+                EventDirectoryEnv.processEnv(EventDirectoryEnv.values(directory: cwd))
+            }.value
+            eventDirectoryEnv = env
+            if let agent = env[EventDirectoryEnv.agentURLKey] {
+                await logStore.append(
+                    serviceID: serviceID,
+                    entry: LogEntry(
+                        stream: .stdout,
+                        text: "[travel-runner] The chat of the portal uses the agent of the runner (\(EventDirectoryEnv.agentURLKey)=\(agent))."
+                    )
+                )
+            }
+        }
+
         // Local mode puts the local stack's keys into the app's .env.local. Without
         // them the app has no signing key, or it takes the hosted dev values from its
         // shared .env while the runner shows "local". Read the keys again, and do
