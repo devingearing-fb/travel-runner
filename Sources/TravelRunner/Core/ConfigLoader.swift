@@ -127,10 +127,20 @@ enum ConfigLoader {
                 ?? (parent as NSString).appendingPathComponent("travel-load-test")
         )
 
+        // A custom service that cannot run stays in the file as it was written, so
+        // its owner can correct it. `ServiceConfig` leaves it out when it reads the file.
         let excluded = ServiceCatalog.canonicalIDs.union(ServiceCatalog.retiredIDs)
-        let customServices = try rawServices
-            .filter { !excluded.contains($0["id"] as? String ?? "") }
-            .map { try JSONDecoder().decode(ServiceDefinition.self, from: JSONSerialization.data(withJSONObject: $0)) }
+        var customServices: [ServiceDefinition] = []
+        var unusableServices: [[String: Any]] = []
+        for raw in rawServices where !excluded.contains(raw["id"] as? String ?? "") {
+            if let service = try? JSONDecoder().decode(
+                ServiceDefinition.self, from: JSONSerialization.data(withJSONObject: raw)
+            ), service.probe?.problem == nil {
+                customServices.append(service)
+            } else {
+                unusableServices.append(raw)
+            }
+        }
 
         let profile = (root["profile"] as? String).flatMap(RunProfile.init(rawValue:)) ?? .both
         let config = ServiceConfig(
@@ -142,7 +152,13 @@ enum ConfigLoader {
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        return try encoder.encode(config)
+        let encoded = try encoder.encode(config)
+        guard !unusableServices.isEmpty,
+              var object = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] else { return encoded }
+        object["services"] = (object["services"] as? [Any] ?? []) + unusableServices
+        return try JSONSerialization.data(
+            withJSONObject: object, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
     }
 
     private static func cwd(of id: String, in services: [[String: Any]]) -> String? {

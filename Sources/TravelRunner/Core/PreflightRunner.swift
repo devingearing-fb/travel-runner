@@ -201,6 +201,8 @@ struct PreflightRunner: Sendable {
     }
 
     private func portAvailable(_ port: Int) -> Bool {
+        // A number that is not a port cannot be in use.
+        guard let portNumber = UInt16(exactly: port) else { return true }
         let sock = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard sock >= 0 else { return false }
         defer { Darwin.close(sock) }
@@ -210,7 +212,7 @@ struct PreflightRunner: Sendable {
 
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = UInt16(port).bigEndian
+        addr.sin_port = portNumber.bigEndian
         addr.sin_addr.s_addr = UInt32(INADDR_LOOPBACK).bigEndian
 
         let result = withUnsafePointer(to: &addr) {

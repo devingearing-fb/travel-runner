@@ -11,11 +11,14 @@ struct TcpProbe: Probe {
     }
 
     func check() async -> Bool {
-        await withCheckedContinuation { continuation in
+        // A number that is not a port has no listener.
+        guard ProbeConfig.validPorts.contains(port),
+              let endpointPort = UInt16(exactly: port).flatMap(NWEndpoint.Port.init(rawValue:)) else { return false }
+        return await withCheckedContinuation { continuation in
             let guard_ = ContinuationGuard()
             let connection = NWConnection(
                 host: NWEndpoint.Host(host),
-                port: NWEndpoint.Port(rawValue: UInt16(port))!,
+                port: endpointPort,
                 using: .tcp
             )
             let queue = DispatchQueue(label: "tcp-probe-\(port)")

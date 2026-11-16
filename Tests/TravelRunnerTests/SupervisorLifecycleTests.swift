@@ -447,6 +447,39 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(Self.listeners(on: port).isEmpty)
     }
 
+    /// A probe with no port crashed the app at Start. It must fail the one service
+    /// with a message, and start no process.
+    func testAServiceWithABadProbeFailsWithAMessageAndStartsNothing() async throws {
+        let probes = [
+            ProbeConfig(type: .tcp, port: nil, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5),
+            ProbeConfig(type: .tcp, port: 70000, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5),
+            ProbeConfig(type: .stdoutRegex, port: nil, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5),
+            ProbeConfig(type: .stdoutRegex, port: nil, host: nil, url: nil, pattern: "ready (", artifact: nil, timeout: 5),
+            ProbeConfig(type: .http, port: nil, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5),
+        ]
+        for probe in probes {
+            try load(ServiceDefinition(
+                id: "custom", name: "Custom", cmd: ["sh", "-c", "echo custom-start; sleep 30"], cwd: workDir.path,
+                probe: probe, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+            ))
+
+            supervisor.restartService("custom")
+
+            let failed = await waitUntil(20) {
+                self.state("custom").phase == .failed && self.supervisor.actionsInFlight.isEmpty
+            }
+            XCTAssertTrue(failed, "custom is \(state("custom").phase.rawValue) for \(probe)")
+            let reason = try XCTUnwrap(probe.problem)
+            XCTAssertEqual(
+                supervisor.lastError,
+                "Custom cannot start: \(reason). Correct its probe in services.json, then restart Custom."
+            )
+            let lines = await logLines("custom")
+            XCTAssertFalse(lines.contains("custom-start"), "the process must not start")
+            XCTAssertNil(state("custom").pid)
+        }
+    }
+
     /// Ticket "failed wake probe" with a recurrence five seconds later: two wake
     /// notifications ran two passes, and both restarted the service.
     func testTwoWakeNotificationsRestartAFailedServiceOnce() async throws {

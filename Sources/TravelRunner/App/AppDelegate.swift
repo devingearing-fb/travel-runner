@@ -299,7 +299,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Notifications
 
+    /// The notification centre aborts the process when the binary has no app bundle
+    /// (`swift run`, or the bare executable). Such a run has no notifications.
+    private var canNotify: Bool { Bundle.main.bundleIdentifier != nil }
+
     private func setupNotifications() {
+        guard canNotify else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         let openAction = UNNotificationAction(identifier: "OPEN_LOGS", title: "Open Logs", options: [.foreground])
         let category = UNNotificationCategory(identifier: "CRASH", actions: [openAction], intentIdentifiers: [])
@@ -307,6 +312,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func postCrashNotification(serviceName: String, exitCode: Int32) {
+        guard canNotify else { return }
         let content = UNMutableNotificationContent()
         content.title = "\(serviceName) crashed"
         content.body = "Exited with code \(exitCode)"

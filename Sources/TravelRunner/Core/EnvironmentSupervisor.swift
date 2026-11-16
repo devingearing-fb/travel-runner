@@ -15,6 +15,8 @@ final class EnvironmentSupervisor {
     var lastError: String? = nil
     /// Set when the control API could not listen on a loopback address.
     var controlAPIError: String? = nil
+    /// One line for each service of services.json that the last load left out.
+    var configIssues: [String] = []
     var startupBeganAt: Date? = nil
     /// Migrations the local database has not applied (from the last check).
     var pendingMigrations: [String] = []
@@ -212,6 +214,8 @@ final class EnvironmentSupervisor {
         case portHeldByOtherStack(port: Int, container: String)
         /// `owner` is the process name of the container runtime that listens on the port.
         case portHeldByContainer(name: String, port: Int, owner: String)
+        /// `reason` is `ProbeConfig.problem`.
+        case badProbe(name: String, reason: String)
 
         var description: String {
             switch self {
@@ -227,6 +231,8 @@ final class EnvironmentSupervisor {
                 "\(name) was not started: the keys of the local Supabase stack could not be read (scripts/local-db.sh status -o env). Without them it would use the hosted dev values in \(envFile). Restart Supabase, then restart \(name)."
             case .portHeldByOtherStack(let port, let container):
                 "Port \(port) is held by another Supabase stack (\(container)) — stop it, then start again"
+            case .badProbe(let name, let reason):
+                "\(name) cannot start: \(reason). Correct its probe in services.json, then restart \(name)."
             case .portHeldByContainer(let name, let port, let owner):
                 "\(name) cannot start: port \(port) is published by a container (\(owner)) — stop that container, then restart \(name)"
             }
@@ -237,8 +243,11 @@ final class EnvironmentSupervisor {
 
     func loadConfig() {
         do {
+            configIssues = []
             let config = try ConfigLoader.load()
             self.config = config
+            configIssues = config.skippedServices.map(\.message)
+            for issue in configIssues { print("[Config] \(issue)") }
             self.serviceStates = [:]
             let graph = try ServiceGraph(services: config.services)
             self.graph = graph
@@ -1615,6 +1624,11 @@ final class EnvironmentSupervisor {
             return nil
         }
 
+        // A probe with a missing or wrong field: say so, and start nothing.
+        if let problem = definition.probe?.problem {
+            throw ServiceError.badProbe(name: definition.displayName, reason: problem)
+        }
+
         // Reuse-if-running: Docker-managed services (Supabase) persist between sessions.
         // If the port is already bound, skip starting and mark as running.
         if definition.shouldReuseIfRunning, let port = definition.probe?.port {
@@ -1808,8 +1822,12 @@ final class EnvironmentSupervisor {
         state.pid = nil
 
         var stdoutProbe: StdoutProbe?
-        if case .stdoutRegex = definition.probe?.type {
-            stdoutProbe = StdoutProbe(pattern: definition.probe!.pattern!)
+        if let probeConfig = definition.probe, probeConfig.type == .stdoutRegex {
+            do {
+                stdoutProbe = try StdoutProbe(pattern: probeConfig.pattern ?? "")
+            } catch {
+                throw ServiceError.badProbe(name: definition.displayName, reason: "\(error)")
+            }
             stdoutProbes[serviceID] = stdoutProbe
         }
 
@@ -1901,7 +1919,7 @@ final class EnvironmentSupervisor {
 
         // Daemons: wait for the probe (the launch's definition has the LAN-aware host)
         if let probeConfig = launch.definition.probe {
-            let probe: Probe = if let sp = launch.stdoutProbe { sp } else { ProbeFactory.makeProbe(for: probeConfig) }
+            let probe: Probe = if let sp = launch.stdoutProbe { sp } else { try ProbeFactory.makeProbe(for: probeConfig) }
             let deadline = ContinuousClock.now + probeConfig.resolvedTimeout
             var ready = false
             while ContinuousClock.now < deadline {
@@ -2373,7 +2391,7 @@ final class EnvironmentSupervisor {
             // actually bound to, and allow a grace window — a single 2s
             // check right after wake produces false failures.
             let effectiveProbe = lanAwareDefinition(for: state.definition, serviceID: serviceID).probe ?? probeConfig
-            let probe = ProbeFactory.makeProbe(for: effectiveProbe)
+            guard let probe = try? ProbeFactory.makeProbe(for: effectiveProbe) else { continue }
             let ok = (try? await waitForProbe(probe, timeout: .seconds(15), interval: .seconds(3))) ?? false
             // A restart or a stop can start while the probe runs; it owns the state then.
             guard state.phase == .running else { continue }
@@ -2853,9 +2871,11 @@ final class EnvironmentSupervisor {
         guard sock >= 0 else { return false }
         defer { Darwin.close(sock) }
 
+        // A number that is not a port has no listener.
+        guard let portNumber = UInt16(exactly: port) else { return false }
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = UInt16(port).bigEndian
+        addr.sin_port = portNumber.bigEndian
         addr.sin_addr.s_addr = address
 
         let result = withUnsafePointer(to: &addr) {

@@ -144,6 +144,17 @@ struct WorkshopHeaderBar: View {
                     action: nil
                 )
             }
+            ForEach(supervisor.configIssues, id: \.self) { issue in
+                alertBanner(
+                    icon: "exclamationmark.triangle.fill",
+                    color: .orange,
+                    text: issue,
+                    subtitle: "Correct the file, then quit Travel Runner and open it again.",
+                    action: ("Open services.json", {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: ConfigLoader.configPath))
+                    })
+                )
+            }
             if supervisor.migrationsBannerVisible {
                 alertBanner(
                     icon: "arrow.triangle.2.circlepath",
