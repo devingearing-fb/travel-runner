@@ -9,7 +9,8 @@ enum SetupStep {
 
 struct SetupView: View {
     let isFirstRun: Bool
-    let onComplete: () -> Void
+    /// The argument is true when the stack must start: "Save & Start" of the first run.
+    let onComplete: (_ start: Bool) -> Void
 
     @State private var currentStep: SetupStep = .paths
     @State private var checker: EnvironmentChecker?
@@ -20,6 +21,7 @@ struct SetupView: View {
     @State private var loadTestPath: String = ""
     @State private var dropTargetHighlighted = false
     @State private var statusMessage: String? = nil
+    @State private var loadedExistingPaths = false
 
     var body: some View {
         switch currentStep {
@@ -29,10 +31,11 @@ struct SetupView: View {
             if let checker {
                 SetupStep2View(
                     checker: checker,
+                    startsOnComplete: isFirstRun,
                     onBack: { currentStep = .paths },
                     onComplete: {
                         savePaths()
-                        onComplete()
+                        onComplete(isFirstRun)
                     }
                 )
             }
@@ -56,7 +59,7 @@ struct SetupView: View {
                 }
                 Spacer()
                 if !isFirstRun {
-                    Button("Back") { onComplete() }
+                    Button("Back") { onComplete(false) }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                 }
@@ -101,7 +104,7 @@ struct SetupView: View {
                         .controlSize(.regular)
                         .disabled(!canProceed)
 
-                    Button(action: { savePaths(); onComplete() }) {
+                    Button(action: { savePaths(); onComplete(false) }) {
                         Label("Save", systemImage: "checkmark.circle")
                     }
                     .buttonStyle(.borderedProminent)
@@ -205,8 +208,8 @@ struct SetupView: View {
         RepoDetector.validate(path: monorepoPath, role: .monorepo) && !universalLoginPath.isEmpty
     }
 
+    /// The paths are saved at the end, not here: a wizard that stops at the checks leaves no config.
     private func goToStep2() {
-        savePaths()
         checker = EnvironmentChecker(
             monorepoPath: monorepoPath,
             loginPath: universalLoginPath,
@@ -231,6 +234,9 @@ struct SetupView: View {
     }
 
     private func loadExistingPaths() {
+        // Once: "Back" from the checks must keep the paths that were typed.
+        guard !loadedExistingPaths else { return }
+        loadedExistingPaths = true
         guard !ConfigLoader.isFirstRun else { return }
         let paths = ConfigLoader.existingPaths()
         if let p = paths.monorepo, !p.isEmpty { monorepoPath = p }

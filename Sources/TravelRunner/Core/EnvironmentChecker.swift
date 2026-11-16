@@ -8,7 +8,7 @@ enum CheckSection: String, Sendable, CaseIterable {
     case optional = "Optional"
 }
 
-enum CheckStatus: Sendable {
+enum CheckStatus: Sendable, Equatable {
     case pending
     case passing(String)
     case failing(String)
@@ -69,15 +69,117 @@ final class EnvironmentChecker {
         self.streamServicesPath = NSString(string: streamServicesPath).expandingTildeInPath
     }
 
-    var allRequiredPassing: Bool {
-        checks.filter(\.isRequired).allSatisfy {
-            if case .passing = $0.status { return true }
-            return false
+    /// False only when a required check fails. A warning does not block.
+    var allRequiredPassing: Bool { blockers.isEmpty }
+
+    /// The required checks that fail.
+    var blockers: [HealthCheck] { Self.blockers(in: checks) }
+
+    /// True while a check or a fix still runs.
+    var isChecking: Bool {
+        checks.contains { $0.status == .pending || $0.status == .fixing }
+    }
+
+    static func blockers(in checks: [HealthCheck]) -> [HealthCheck] {
+        checks.filter { check in
+            guard check.isRequired, case .failing = check.status else { return false }
+            return true
         }
+    }
+
+    /// What does not work when a required check fails. Shown before "Continue anyway".
+    nonisolated static func impact(of checkID: String) -> String? {
+        switch checkID {
+        case "docker": "the local database will not start"
+        case "node": "the portals and the login will not run"
+        case "pnpm": "installs and both portals will not run"
+        case "python-jwt": "the contract data copy of the database setup will fail"
+        case "registry-auth": "pnpm install cannot download the @fastbreak-amateur packages"
+        case "workspace-modules": "both portals will not run"
+        case "login-modules": "the login will not run"
+        case "login-env": "sign-in on localhost will not work"
+        default: nil
+        }
+    }
+
+    /// One line per failing required check, for example "pnpm 10 — installs and both portals will not run".
+    static func impactLines(for checks: [HealthCheck]) -> [String] {
+        checks.map { check in
+            impact(of: check.id).map { "\(check.name) — \($0)" } ?? check.name
+        }
+    }
+
+    // MARK: - pnpm pin
+
+    /// The pnpm major to ask for when package.json has no pin.
+    nonisolated static let defaultPnpmMajor = 10
+
+    /// The pnpm version that package.json pins: `"packageManager": "pnpm@10.34.5+sha512.…"` gives "10.34.5".
+    nonisolated static func pnpmPin(packageJSON: String) -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: Data(packageJSON.utf8)) as? [String: Any],
+              let manager = root["packageManager"] as? String,
+              manager.hasPrefix("pnpm@") else { return nil }
+        let version = manager.dropFirst("pnpm@".count).prefix { $0.isNumber || $0 == "." }
+        return toolVersion(String(version))
+    }
+
+    nonisolated static func pnpmPin(monorepo: String) -> String? {
+        let path = (monorepo as NSString).appendingPathComponent("package.json")
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
+        return pnpmPin(packageJSON: content)
+    }
+
+    /// The last line of the output that is only a version, without the "v". Other lines are notices.
+    nonisolated static func toolVersion(_ output: String) -> String? {
+        output.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .last { $0.range(of: #"^v?\d+\.\d+(\.\d+)?$"#, options: .regularExpression) != nil }
+            .map { $0.hasPrefix("v") ? String($0.dropFirst()) : $0 }
+    }
+
+    nonisolated static func major(of version: String) -> Int? {
+        version.split(separator: ".").first.flatMap { Int($0) }
+    }
+
+    /// The pnpm check passes when the major of `pnpm --version`, run in the monorepo, is the pinned major.
+    nonisolated static func pnpmStatus(output: String, ok: Bool, pin: String?) -> CheckStatus {
+        guard ok, let version = toolVersion(output), let major = major(of: version) else {
+            return .failing("Not installed")
+        }
+        guard let pin, let pinnedMajor = Self.major(of: pin) else {
+            return major == defaultPnpmMajor
+                ? .passing("v\(version)")
+                : .failing("v\(version) — need \(defaultPnpmMajor).x")
+        }
+        guard major == pinnedMajor else {
+            return .failing("v\(version) — the monorepo pins \(pin)")
+        }
+        return version == pin
+            ? .passing("v\(version) (pinned by the monorepo)")
+            : .passing("v\(version) (the monorepo pins \(pin))")
+    }
+
+    /// The command of the pnpm check. In the monorepo, pnpm and corepack follow the pin.
+    nonisolated static func pnpmCheckCommand(monorepo: String) -> String {
+        "cd \(ShellQuote.quote(monorepo)) 2>/dev/null; COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version"
+    }
+
+    /// Installs the pinned pnpm with the first tool that is there: corepack, Homebrew, npm.
+    /// A plain `brew install pnpm` gives the newest major, which the check does not accept.
+    nonisolated static func pnpmFixCommand(pin: String?) -> String {
+        let major = pin.flatMap(Self.major(of:)) ?? defaultPnpmMajor
+        let version = pin ?? "\(major)"
+        return [
+            "(command -v corepack >/dev/null 2>&1 && corepack enable pnpm && corepack prepare pnpm@\(version) --activate)",
+            "(command -v brew >/dev/null 2>&1 && brew install pnpm@\(major) && brew link --overwrite --force pnpm@\(major))",
+            "npm install -g pnpm@\(version)",
+        ].joined(separator: " || ")
     }
 
     func buildChecks() {
         let runtime = ContainerRuntime.detect()
+        let pnpmPin = Self.pnpmPin(monorepo: monorepoPath)
+        let pnpmMajor = pnpmPin.flatMap(Self.major(of:)) ?? Self.defaultPnpmMajor
         checks = [
             // Prerequisites
             HealthCheck(id: "docker", name: runtime.displayName, section: .prerequisites,
@@ -87,10 +189,10 @@ final class EnvironmentChecker {
             HealthCheck(id: "node", name: "Node.js 22+", section: .prerequisites,
                         checkCommand: "node --version",
                         checkDescription: "Next.js 16 requires Node.js 22 or higher"),
-            HealthCheck(id: "pnpm", name: "pnpm 10", section: .prerequisites,
-                        fixLabel: "brew install pnpm",
+            HealthCheck(id: "pnpm", name: "pnpm \(pnpmMajor)", section: .prerequisites,
+                        fixLabel: "Install pnpm \(pnpmMajor)",
                         checkCommand: "pnpm --version",
-                        checkDescription: "The monorepo pins pnpm 10 (packageManager in package.json)"),
+                        checkDescription: "The monorepo pins pnpm \(pnpmPin ?? "\(pnpmMajor)") (packageManager in package.json). The check runs in the monorepo."),
             HealthCheck(id: "python-jwt", name: "Python 3 + PyJWT", section: .prerequisites,
                         fixLabel: "pip3 install pyjwt",
                         checkCommand: "python3 -c 'import jwt'",
@@ -240,10 +342,8 @@ final class EnvironmentChecker {
             return .failing("v\(version) — need 22+")
 
         case "pnpm":
-            let (output, ok) = await shellOutput("pnpm --version")
-            if !ok { return .failing("Not installed") }
-            let version = output.trimmingCharacters(in: .whitespacesAndNewlines)
-            return version.hasPrefix("10.") ? .passing("v\(version)") : .failing("v\(version) — need 10.x")
+            let (output, ok) = await shellOutput(Self.pnpmCheckCommand(monorepo: monorepoPath))
+            return Self.pnpmStatus(output: output, ok: ok, pin: Self.pnpmPin(monorepo: monorepoPath))
 
         case "python-jwt":
             let ok = await shell("python3 -c 'import jwt' 2>/dev/null")
@@ -399,7 +499,7 @@ final class EnvironmentChecker {
             return false
 
         case "pnpm":
-            return await shell("brew install pnpm")
+            return await shell(Self.pnpmFixCommand(pin: Self.pnpmPin(monorepo: monorepoPath)))
 
         case "python-jwt":
             return await shell("pip3 install pyjwt")

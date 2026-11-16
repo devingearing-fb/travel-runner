@@ -2,8 +2,12 @@ import SwiftUI
 
 struct SetupStep2View: View {
     let checker: EnvironmentChecker
+    /// True in the first run, where the end of the wizard starts the stack.
+    var startsOnComplete = true
     let onBack: () -> Void
     let onComplete: () -> Void
+
+    @State private var confirmContinue = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -49,14 +53,27 @@ struct SetupStep2View: View {
                     .buttonStyle(.bordered)
                     .controlSize(.regular)
                 Spacer()
-                Button(action: onComplete) {
-                    Label("Save & Start", systemImage: "checkmark.circle")
+                if checker.allRequiredPassing {
+                    Button(action: onComplete) {
+                        Label(startsOnComplete ? "Save & Start" : "Save", systemImage: "checkmark.circle")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(checker.isChecking)
+                    .controlSize(.regular)
+                } else {
+                    Button("Continue anyway…") { confirmContinue = true }
+                        .buttonStyle(.bordered)
+                        .disabled(checker.isChecking)
+                        .controlSize(.regular)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(!checker.allRequiredPassing)
-                .controlSize(.regular)
             }
             .padding(14)
+        }
+        .alert("Continue with failed checks?", isPresented: $confirmContinue) {
+            Button(startsOnComplete ? "Save & Start" : "Save", action: onComplete)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(EnvironmentChecker.impactLines(for: checker.blockers).joined(separator: "\n"))
         }
         .task {
             checker.buildChecks()

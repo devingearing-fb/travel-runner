@@ -33,7 +33,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupGlobalHotkey()
 
         // `open -a … --args --open-panel` shows the window at once (scripts, screenshots).
-        if CommandLine.arguments.contains("--open-panel") { openPanel() }
+        // Without a usable config, the setup wizard is the only way forward: show it.
+        if CommandLine.arguments.contains("--open-panel") || ConfigLoader.needsSetup { openPanel() }
+    }
+
+    /// A second launch from Finder or Spotlight shows the window. The app has no Dock icon.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openPanel()
+        return false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
