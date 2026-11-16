@@ -239,6 +239,23 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(supervisor.lastError?.contains("cannot start") == true, supervisor.lastError ?? "nil")
     }
 
+    /// Exit 127 for a tool, not a script: the error names the tool and the PATH
+    /// that the runner searched.
+    func testAMissingToolNamesThePathThatWasSearched() async throws {
+        let tool = "tr-no-such-tool-\(UUID().uuidString)"
+        try load(daemon("toolless", [tool, "dev"]))
+
+        supervisor.restartService("toolless")
+
+        let expected = "toolless cannot start: \(tool) was not found. Travel Runner looked in: "
+        let named = await waitUntil(30) {
+            self.state("toolless").phase == .failed && self.supervisor.lastError?.hasPrefix(expected) == true
+        }
+        XCTAssertTrue(named, supervisor.lastError ?? "nil")
+        XCTAssertTrue(supervisor.lastError?.contains("/usr/bin") == true, supervisor.lastError ?? "nil")
+        XCTAssertEqual(state("toolless").restartCount, 0)
+    }
+
     /// A stop-all while a service starts: the start's wait for the probe must not
     /// mark the service as failed after the stop.
     func testStopAllDuringAStartLeavesTheServiceStopped() async throws {
@@ -551,4 +568,191 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 127, stdout: "", stderr: "")), .unknown("exit code 127"))
         XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "", stderr: "")), .unknown("the query gave no answer"))
     }
+
+    /// A daemon that ends with code 0 has no process, and nothing starts it again.
+    /// The environment showed "starting" with no end.
+    func testACleanExitOfADaemonGivesDegradedNotStarting() async throws {
+        let quitter = ServiceDefinition(
+            id: "quitter", name: "quitter", cmd: ["sh", "-c", "echo quitter-start; sleep 2; exit 0"], cwd: workDir.path,
+            probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try load(quitter)
+        supervisor.restartService("quitter")
+        let ready = await waitUntil(15) { self.settled("quitter") }
+        XCTAssertTrue(ready, "quitter is \(state("quitter").phase.rawValue)")
+        XCTAssertEqual(supervisor.health, .healthy)
+
+        let ended = await waitUntil(15) { self.state("quitter").phase != .running }
+        XCTAssertTrue(ended)
+        // Long enough for an automatic restart, if there was one.
+        try await Task.sleep(for: .seconds(4))
+
+        XCTAssertEqual(supervisor.health, .degraded)
+        XCTAssertEqual(state("quitter").phase, .failed)
+        XCTAssertEqual(state("quitter").exitCode, 0)
+        let lines = await logLines("quitter")
+        XCTAssertTrue(lines.contains("[travel-runner] quitter exited (code 0) — not restarted"), lines.joined(separator: "\n"))
+        XCTAssertEqual(lines.filter { $0 == "quitter-start" }.count, 1, "it is not restarted")
+        XCTAssertTrue(crashes.isEmpty, "a clean exit is not a crash: \(crashes)")
+    }
+
+    private func stripe(_ script: String) -> ServiceDefinition {
+        ServiceDefinition(
+            id: "stripe", name: "Stripe CLI", cmd: ["sh", "-c", script], cwd: workDir.path,
+            probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+    }
+
+    /// 105 tickets: Stripe ended as "skipped" with no line that says why. The CLI
+    /// check is a fake; the test does not run the Stripe CLI.
+    func testStripeWithoutItsCliIsSkippedWithTheCauseInItsLog() async throws {
+        try load(stripe("echo stripe-start; sleep 30"))
+        supervisor.stripeAvailability = { false }
+        var feedback: [String] = []
+        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+
+        supervisor.restartService("stripe")
+
+        let skipped = await waitUntil(15) { self.state("stripe").phase == .skipped && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        let lines = await logLines("stripe")
+        XCTAssertTrue(
+            lines.contains { $0.hasPrefix("[travel-runner] Stripe stopped: ") && $0.contains("stripe login") },
+            lines.joined(separator: "\n")
+        )
+        XCTAssertFalse(lines.contains("stripe-start"), "the process must not start")
+        XCTAssertEqual(feedback, ["Stripe CLI skipped — see its log"])
+        XCTAssertEqual(supervisor.health, .healthy, "Stripe is optional")
+    }
+
+    /// A Stripe CLI that fails (an expired session, say) is skipped, not restarted in
+    /// a loop. Its log says so, with the exit code.
+    func testAStripeCrashIsSkippedWithTheCauseInItsLog() async throws {
+        try load(stripe("echo stripe-start; sleep 2; exit 1"))
+        supervisor.stripeAvailability = { true }
+
+        supervisor.restartService("stripe")
+
+        let started = await waitUntil(15) { self.settled("stripe") }
+        XCTAssertTrue(started, "stripe is \(state("stripe").phase.rawValue)")
+        let skipped = await waitUntil(15) { self.state("stripe").phase == .skipped }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        try await Task.sleep(for: .seconds(3))
+
+        let lines = await logLines("stripe")
+        XCTAssertTrue(
+            lines.contains { $0.hasPrefix("[travel-runner] Stripe stopped: the Stripe CLI exited with code 1") },
+            lines.joined(separator: "\n")
+        )
+        XCTAssertEqual(lines.filter { $0 == "stripe-start" }.count, 1, "it is not restarted")
+        XCTAssertEqual(state("stripe").phase, .skipped)
+        XCTAssertEqual(supervisor.health, .healthy, "Stripe is optional")
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
+    /// The row showed the first 20 characters of the webhook secret.
+    func testTheRowShowsOnlyTheEndOfTheWebhookSecret() {
+        let state = ServiceState(definition: stripe("true"))
+        XCTAssertNil(state.capturedArtifactSummary)
+
+        state.capturedArtifact = "whsec_0123456789abcdefWXYZ"
+
+        XCTAssertEqual(state.capturedArtifactSummary, "Webhook secret captured (…WXYZ)")
+    }
+
+    /// Tickets on the port cleanup: a start killed each listener on a known port, also
+    /// for a service outside the profile, and also the port helper of the container
+    /// runtime. It also killed each `stripe listen` on the Mac.
+    /// The test runs the cleanup step of a start with fake tools; no process is killed.
+    func testAStartDoesNotKillAListenerOutsideTheProfile() async throws {
+        let inProfile = try Self.listeningSocket()
+        let outside = try Self.listeningSocket()
+        let container = try Self.listeningSocket()
+        defer { for socket in [inProfile, outside, container] { close(socket.fd) } }
+
+        func service(_ id: String, _ cmd: [String], port: Int?) -> ServiceDefinition {
+            ServiceDefinition(
+                id: id, name: id, cmd: cmd, cwd: workDir.path,
+                probe: port.map { ProbeConfig(type: .tcp, port: $0, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30) },
+                type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+            )
+        }
+        let stripeCmd = ["stripe", "listen", "--forward-to", "http://localhost:\(inProfile.port)/hook"]
+        let services = [
+            service("travel-portal", ["sleep", "1"], port: inProfile.port),
+            service("partner-portal", ["sleep", "1"], port: outside.port),
+            service("universal-login", ["sleep", "1"], port: container.port),
+            service("stripe", stripeCmd, port: nil),
+        ]
+
+        let calls = PortToolCalls()
+        let commands = [inProfile.port: "node", outside.port: "node", container.port: "OrbStack Helper"]
+        supervisor.portTools = PortTools(
+            listeners: { port in commands[port].map { [PortOwner.Listener(pid: pid_t(port), command: $0)] } ?? [] },
+            kill: { calls.addKill($0) },
+            killCommands: { calls.addPattern($0) }
+        )
+
+        // The booking profile: the partner portal is outside it.
+        try supervisor.loadServices(services, profile: .booking)
+        XCTAssertFalse(supervisor.isInProfile("partner-portal"))
+        await supervisor.cleanupStaleProcesses()
+
+        XCTAssertEqual(calls.kills, [pid_t(inProfile.port)], "only the listener of the profile's service")
+        XCTAssertEqual(calls.patterns, [PortOwner.commandPattern(for: stripeCmd)])
+        let lines = await logLines("universal-login")
+        XCTAssertTrue(
+            lines.contains("[travel-runner] Port \(container.port) is published by OrbStack Helper (a container). Not killed."),
+            lines.joined(separator: "\n")
+        )
+
+        // The stop sweeps the same ports with the same rules.
+        calls.reset()
+        supervisor.health = .healthy
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(calls.kills, [pid_t(inProfile.port)])
+
+        // The partner profile: now the partner portal is in, and Stripe is out.
+        calls.reset()
+        try supervisor.loadServices(services, profile: .partner)
+        await supervisor.cleanupStaleProcesses()
+        XCTAssertEqual(calls.kills, [pid_t(outside.port)])
+        XCTAssertEqual(calls.patterns, [], "Stripe is outside the profile")
+    }
+
+    /// A socket of the test that listens on a free loopback port.
+    private static func listeningSocket() throws -> (fd: Int32, port: Int) {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = UInt32(INADDR_LOOPBACK).bigEndian
+        addr.sin_port = 0
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        guard sock >= 0, bound == 0, listen(sock, 8) == 0 else {
+            if sock >= 0 { close(sock) }
+            throw POSIXError(.EADDRNOTAVAIL)
+        }
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(sock, $0, &length) }
+        }
+        return (sock, Int(UInt16(bigEndian: addr.sin_port)))
+    }
+}
+
+/// What the fake port tools were asked to kill.
+private final class PortToolCalls: @unchecked Sendable {
+    private let lock = NSLock()
+    private var killed: [pid_t] = []
+    private var killedPatterns: [String] = []
+
+    var kills: [pid_t] { lock.withLock { killed } }
+    var patterns: [String] { lock.withLock { killedPatterns } }
+    func addKill(_ pid: pid_t) { lock.withLock { killed.append(pid) } }
+    func addPattern(_ pattern: String) { lock.withLock { killedPatterns.append(pattern) } }
+    func reset() { lock.withLock { killed = []; killedPatterns = [] } }
 }

@@ -38,6 +38,10 @@ final class ServiceState {
     var lastStopped: Date? = nil
     var restartCount: Int = 0
     var capturedArtifact: String? = nil
+    /// The row text for the captured webhook secret: the last four characters only.
+    var capturedArtifactSummary: String? {
+        capturedArtifact.map { "Webhook secret captured (…\($0.suffix(4)))" }
+    }
     var failureTimestamps: [Date] = []
     var isCircuitBroken: Bool = false
 

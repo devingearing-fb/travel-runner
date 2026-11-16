@@ -42,6 +42,12 @@ actor ProcessRunner {
     private var exits: [pid_t: Termination] = [:]
     private var exitOrder: [pid_t] = []
     private let exitHistoryLimit = 64
+    /// The directories to add to PATH for a service with this cwd.
+    private let toolDirectories: @Sendable (String?) -> [String]
+
+    init(toolDirectories: @escaping @Sendable (String?) -> [String] = { ToolPath.directories(cwd: $0) }) {
+        self.toolDirectories = toolDirectories
+    }
 
     func start(
         service: ServiceDefinition,
@@ -67,7 +73,9 @@ actor ProcessRunner {
         }
 
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-l", "-c", ShellQuote.join(service.cmd)]
+        process.arguments = ["-l", "-c", ToolPath.wrap(
+            ShellQuote.join(service.cmd), directories: toolDirectories(service.resolvedCwd)
+        )]
 
         var env = ProcessInfo.processInfo.environment
         if let overrides = service.env {

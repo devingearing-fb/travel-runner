@@ -13,6 +13,8 @@ final class EnvironmentSupervisor {
     var completedPhases: Set<String> = []
     var sortedServiceIDs: [String] = []
     var lastError: String? = nil
+    /// Set when the control API could not listen on a loopback address.
+    var controlAPIError: String? = nil
     var startupBeganAt: Date? = nil
     /// Migrations the local database has not applied (from the last check).
     var pendingMigrations: [String] = []
@@ -90,6 +92,11 @@ final class EnvironmentSupervisor {
     private let secretStore = SecretStore()
     private var graph: ServiceGraph?
     private let processRunner = ProcessRunner()
+    /// The port cleanup reads listeners and kills through these tools.
+    @ObservationIgnored var portTools = PortTools.live
+    /// The check that the Stripe CLI is installed and logged in. Tests set it; nil
+    /// runs the CLI.
+    @ObservationIgnored var stripeAvailability: (@Sendable () async -> Bool)?
     private let preflightRunner = PreflightRunner()
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
@@ -182,7 +189,8 @@ final class EnvironmentSupervisor {
         case exitedDuringStartup(String)
         /// The supervisor stopped the automatic restarts; the text says why.
         case autoRestartStopped(String)
-        case commandNotRunnable(name: String, command: String, code: Int32)
+        /// `searchedPath` is the PATH of the launch when the command is a tool that is not on it.
+        case commandNotRunnable(name: String, command: String, code: Int32, searchedPath: String? = nil)
         case localKeysMissing(name: String, envFile: String)
         case portHeldByOtherStack(port: Int, container: String)
 
@@ -192,7 +200,9 @@ final class EnvironmentSupervisor {
             case .probeTimeout(let id, let s): "'\(id)' health probe timed out after \(s)s"
             case .exitedDuringStartup(let id): "'\(id)' exited before it was ready — see its log"
             case .autoRestartStopped(let reason): reason
-            case .commandNotRunnable(let name, let command, let code):
+            case .commandNotRunnable(let name, let command, _, let searchedPath?):
+                "\(name) cannot start: \(ToolPath.notFoundText(tool: command, searchedPath: searchedPath))"
+            case .commandNotRunnable(let name, let command, let code, nil):
                 "\(name) cannot start: the shell could not run \(command) (exit \(code)). Does the current branch have it? Restart \(name) after the fix."
             case .localKeysMissing(let name, let envFile):
                 "\(name) was not started: the keys of the local Supabase stack could not be read (scripts/local-db.sh status -o env). Without them it would use the hosted dev values in \(envFile). Restart Supabase, then restart \(name)."
@@ -459,12 +469,10 @@ final class EnvironmentSupervisor {
 
             await processRunner.stopAll()
 
-            // Kill any orphaned processes still bound to service ports
-            if let config {
-                for service in config.services where !service.shouldReuseIfRunning {
-                    if let port = service.probe?.port, isPortBound(port) {
-                        await killPortOccupants(port)
-                    }
+            // Kill any orphaned processes still bound to the ports of the profile's services
+            for service in killableServices {
+                if let port = service.probe?.port, isPortBound(port) {
+                    await killPortOccupants(port)
                 }
             }
 
@@ -490,7 +498,7 @@ final class EnvironmentSupervisor {
         let logStore = self.logStore
         controlServer = ControlServer()
         Task {
-            try await controlServer?.start(
+            let failures = await controlServer?.start(
                 actions: ControlServer.Actions(
                     getStatus: { [weak self] in
                         guard let self else { return "{}" }
@@ -616,7 +624,8 @@ final class EnvironmentSupervisor {
                     }
                 ),
                 logStore: logStore
-            )
+            ) ?? []
+            controlAPIError = ControlServer.BindFailure.summary(failures)
         }
     }
 
@@ -916,7 +925,11 @@ final class EnvironmentSupervisor {
                     self.queuedRestarts.remove(serviceID)
                     try? await Task.sleep(for: .seconds(1))
                 })
-                onActionFeedback?("\(name) restarted", true)
+                if serviceStates[serviceID]?.phase == .skipped {
+                    onActionFeedback?("\(name) skipped — see its log", false)
+                } else {
+                    onActionFeedback?("\(name) restarted", true)
+                }
             } catch {
                 serviceStates[serviceID]?.phase = .failed
                 lastError = "\(error)"
@@ -1600,7 +1613,9 @@ final class EnvironmentSupervisor {
                 state.phase = .skipped
                 await logStore.append(
                     serviceID: serviceID,
-                    entry: LogEntry(stream: .stdout, text: "[travel-runner] Stripe CLI not available — skipping")
+                    entry: LogEntry(stream: .stderr, text: Self.stripeStoppedLine(
+                        "the Stripe CLI is not installed or not logged in — run: stripe login, then start it from its row"
+                    ))
                 )
                 return nil
             }
@@ -1854,7 +1869,7 @@ final class EnvironmentSupervisor {
                     break
                 }
                 if let exit = await processRunner.exit(of: launch.pid),
-                   try !shouldKeepWaiting(for: state, after: exit) {
+                   try await !shouldKeepWaiting(for: state, after: exit) {
                     return
                 }
                 try await Task.sleep(for: .seconds(2))
@@ -1916,7 +1931,7 @@ final class EnvironmentSupervisor {
 
     /// The process of a launch ended before its probe passed. Returns true to keep
     /// waiting and false to stop without an error. Throws when the start failed.
-    private func shouldKeepWaiting(for state: ServiceState, after exit: ProcessRunner.Termination) throws -> Bool {
+    private func shouldKeepWaiting(for state: ServiceState, after exit: ProcessRunner.Termination) async throws -> Bool {
         switch ServiceTermination.classify(exit) {
         case .stoppedByRunner:
             // Stop-all, or another operation replaced this process and owns the state.
@@ -1924,10 +1939,13 @@ final class EnvironmentSupervisor {
         case .cleanExit:
             // The launcher of a container-managed service ends while the stack still starts.
             if state.definition.shouldReuseIfRunning { return true }
+            // Stripe degrades to skipped; handleTermination owns its state.
+            if state.id == "stripe" { return false }
             throw ServiceError.exitedDuringStartup(state.id)
         case .commandNotRunnable(let code):
             throw ServiceError.commandNotRunnable(
-                name: state.definition.displayName, command: state.definition.cmd.first ?? "its command", code: code
+                name: state.definition.displayName, command: state.definition.cmd.first ?? "its command", code: code,
+                searchedPath: await searchedPath(forExit: code, of: state.definition)
             )
         case .killedExternally, .crashed:
             // Stripe degrades to skipped when its CLI fails.
@@ -1944,6 +1962,16 @@ final class EnvironmentSupervisor {
             if state.definition.resolvedRestart == .onFailure { return true }
             throw ServiceError.exitedDuringStartup(state.id)
         }
+    }
+
+    /// The PATH of the launch when exit 127 means that the tool of the service is
+    /// not on it. Nil for a script path, and when the shell finds the tool.
+    private func searchedPath(forExit code: Int32, of definition: ServiceDefinition) async -> String? {
+        guard code == 127, let tool = ToolPath.toolName(of: definition.cmd) else { return nil }
+        let cwd = definition.resolvedCwd
+        return await Task.detached {
+            await ToolPath.searchedPath(missing: tool, directories: ToolPath.directories(cwd: cwd))
+        }.value
     }
 
     private func handleTermination(serviceID: String, termination: ProcessRunner.Termination) {
@@ -1971,12 +1999,17 @@ final class EnvironmentSupervisor {
         // notification on every retry). The next manual/full start re-runs the
         // credential probe and will enable Stripe again once `stripe login`
         // succeeds.
-        if serviceID == "stripe", kind != .cleanExit {
+        if serviceID == "stripe" {
             state.phase = .skipped
             state.exitCode = termination.status
             state.pid = nil
             state.lastStopped = .now
             state.failureTimestamps.removeAll()
+            let cause = "the Stripe CLI \(ServiceTermination.describe(termination)) — see the lines above "
+                + "(401: run stripe login), then start it from its row"
+            Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
+                stream: .stderr, text: Self.stripeStoppedLine(cause)
+            ))}
             recalculateHealth()
             return
         }
@@ -2005,8 +2038,14 @@ final class EnvironmentSupervisor {
                 if state.phase == .starting { return }
                 if let port = state.definition.probe?.port, isPortBound(port) { return }
             }
-            state.phase = .stopped
+            // The daemon ended by itself and nothing starts it again. "Failed" makes
+            // the environment degraded; "stopped" left it at "starting" with no end.
+            // It is not a crash: no notification and no debug issue.
+            state.phase = .failed
             state.lastStopped = .now
+            Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
+                stream: .stderr, text: "[travel-runner] \(name) exited (code 0) — not restarted"
+            ))}
 
         case .killedExternally(let signal):
             // Someone stopped it from outside: `kill`, a script that frees the port.
@@ -2030,9 +2069,22 @@ final class EnvironmentSupervisor {
             // fails again, so there is no automatic restart.
             state.phase = .failed
             state.lastStopped = .now
-            lastError = ServiceError.commandNotRunnable(
-                name: name, command: state.definition.cmd.first ?? "its command", code: code
-            ).description
+            let command = state.definition.cmd.first ?? "its command"
+            let plain = ServiceError.commandNotRunnable(name: name, command: command, code: code).description
+            lastError = plain
+            let definition = state.definition
+            Task {
+                guard let path = await searchedPath(forExit: code, of: definition) else { return }
+                await logStore.append(serviceID: serviceID, entry: LogEntry(
+                    stream: .stderr, text: "[travel-runner] \(ToolPath.notFoundText(tool: command, searchedPath: path))"
+                ))
+                // A newer error stays.
+                if lastError == plain {
+                    lastError = ServiceError.commandNotRunnable(
+                        name: name, command: command, code: code, searchedPath: path
+                    ).description
+                }
+            }
             onServiceCrash?(name, code)
             Task { await captureDebugIssue(
                 trigger: "service_crash",
@@ -2092,8 +2144,10 @@ final class EnvironmentSupervisor {
                 // and the next start (manual, start-all, or a wake) tries it again.
                 state.phase = .skipped
                 Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
-                    stream: .stdout,
-                    text: "[travel-runner] Stripe: no network after \(AutoRestart.maxRestarts) tries — skipped until the next start"
+                    stream: .stderr,
+                    text: Self.stripeStoppedLine(
+                        "no network after \(AutoRestart.maxRestarts) tries — start it from its row when the network is back"
+                    )
                 ))}
                 recalculateHealth()
                 return
@@ -2510,11 +2564,17 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// The line in the Stripe log for each case where Stripe ends as skipped.
+    nonisolated static func stripeStoppedLine(_ cause: String) -> String {
+        "[travel-runner] Stripe stopped: \(cause)"
+    }
+
     private func isStripeAvailable() async -> Bool {
+        if let stripeAvailability { return await stripeAvailability() }
         // `stripe config --list` only proves that a credential is stored; it
         // still exits zero for expired API keys. Exercise the authenticated API
         // so invalid sessions are skipped before `stripe listen` can crash.
-        await runShellCommand("which stripe >/dev/null 2>&1 && stripe balance retrieve >/dev/null 2>&1")
+        return await runShellCommand("which stripe >/dev/null 2>&1 && stripe balance retrieve >/dev/null 2>&1")
     }
 
     private func canReachHost(_ host: String) async -> Bool {
@@ -2720,8 +2780,28 @@ final class EnvironmentSupervisor {
     /// Kills the process that listens on the port. `lsof -i :port` alone also matches
     /// the clients of the port (a browser tab, the Stripe CLI that forwards to the
     /// portal, another dev server), and those must stay alive.
+    /// A container runtime is never killed: its port helper serves every container.
     private func killPortOccupants(_ port: Int) async {
-        _ = await runShellCommand("lsof -ti TCP:\(port) -sTCP:LISTEN | xargs kill -9 2>/dev/null")
+        for listener in await portTools.listeners(port) {
+            if PortOwner.isContainerRuntime(listener.command) {
+                if let serviceID = sortedServiceIDs.first(where: { serviceStates[$0]?.definition.probe?.port == port }) {
+                    await logStore.append(
+                        serviceID: serviceID,
+                        entry: LogEntry(stream: .stderr, text: "[travel-runner] Port \(port) is published by \(listener.command) (a container). Not killed.")
+                    )
+                }
+                continue
+            }
+            portTools.kill(listener.pid)
+        }
+    }
+
+    /// Services whose port the cleanup may clear: in the profile, and not a
+    /// reuse_if_running service (e.g. Docker-managed Supabase).
+    private var killableServices: [ServiceDefinition] {
+        sortedServiceIDs
+            .compactMap { serviceStates[$0]?.definition }
+            .filter { isInProfile($0.id) && !$0.shouldReuseIfRunning }
     }
 
     /// Routes that must respond on a healthy server. "/" is wrong for
@@ -2751,7 +2831,7 @@ final class EnvironmentSupervisor {
     /// servers whose npm parent died during sleep. Without this, the replacement
     /// server silently binds port+1 while the zombie serves 404s on the real port.
     private func killWebServicePorts() async {
-        for serviceID in Self.wakeHealthPaths.keys.sorted() {
+        for serviceID in Self.wakeHealthPaths.keys.sorted() where isInProfile(serviceID) {
             guard let port = serviceStates[serviceID]?.definition.probe?.port else { continue }
             await lifecycle.withLock(serviceID) {
                 await processRunner.stop(serviceID: serviceID)
@@ -2761,14 +2841,11 @@ final class EnvironmentSupervisor {
     }
 
     /// Kill any stale processes from a previous session before starting the DAG.
-    /// Skips ports belonging to reuse_if_running services (e.g. Docker-managed Supabase).
-    private func cleanupStaleProcesses() async {
-        guard let config else { return }
-
-        // Kill by port — only non-reuse services (skip Docker-managed ports)
-        let killablePorts = config.services
-            .filter { !$0.shouldReuseIfRunning }
-            .compactMap { $0.probe?.port }
+    /// Skips ports belonging to reuse_if_running services (e.g. Docker-managed Supabase)
+    /// and to services outside the profile.
+    func cleanupStaleProcesses() async {
+        // Kill by port — only non-reuse services of the profile (skip Docker-managed ports)
+        let killablePorts = killableServices.compactMap { $0.probe?.port }
 
         var didKill = false
         for port in killablePorts {
@@ -2778,10 +2855,10 @@ final class EnvironmentSupervisor {
             }
         }
 
-        // Kill known command patterns that shouldn't be running outside of us
-        let patterns = ["stripe listen"]
-        for pattern in patterns {
-            _ = await runShellCommand("pkill -f '\(pattern)' 2>/dev/null")
+        // Kill a Stripe listener that an earlier session left. The pattern is the
+        // command of the service, so any other `stripe listen` stays alive.
+        if isInProfile("stripe"), let stripe = serviceStates["stripe"]?.definition {
+            await portTools.killCommands(PortOwner.commandPattern(for: stripe.cmd))
         }
 
         if didKill {

@@ -26,6 +26,15 @@ struct ServiceRow: View {
             && (state.phase == .completed || state.phase == .skipped)
     }
 
+    /// A daemon with no process while the environment runs: skipped (Stripe without
+    /// its CLI or its session) or stopped. A service outside the profile cannot start.
+    private var canStart: Bool {
+        state.definition.resolvedType != .oneshot
+            && (state.phase == .skipped || state.phase == .stopped)
+            && supervisor.health != .stopped
+            && supervisor.isInProfile(state.id)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
@@ -114,6 +123,13 @@ struct ServiceRow: View {
                         .buttonStyle(.borderless)
                         .help("Restart with dependents")
                     }
+                } else if canStart {
+                    Button(action: onRestart) {
+                        Image(systemName: "play.fill")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Start")
                 }
 
                 Button {
@@ -139,8 +155,8 @@ struct ServiceRow: View {
                             .foregroundStyle(.orange)
                             .contentTransition(.numericText())
                     }
-                    if let artifact = state.capturedArtifact {
-                        Text(artifact.prefix(20) + "...")
+                    if let artifact = state.capturedArtifactSummary {
+                        Text(artifact)
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
                     }
