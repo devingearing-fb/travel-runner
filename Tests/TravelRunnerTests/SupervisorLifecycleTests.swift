@@ -256,6 +256,30 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
     }
 
+    /// Finding "startup timeouts create no ticket": a service that never passes its
+    /// probe gets an issue that says whether the process still runs.
+    func testAStartupProbeTimeoutIsCaptured() async throws {
+        let issues = workDir.appendingPathComponent("issues")
+        try FileManager.default.createDirectory(at: issues, withIntermediateDirectories: true)
+        try #"{"enabled": true}"#.write(to: issues.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        supervisor.debugTracker = DebugTracker(baseDir: issues.path)
+        try load(daemon("slow", ["sh", "-c", "echo slow-start; sleep 60"], probeTimeout: 3))
+
+        supervisor.restartService("slow")
+        let failed = await waitUntil(20) { self.state("slow").phase == .failed }
+        XCTAssertTrue(failed, "slow is \(state("slow").phase.rawValue)")
+        let captured = await waitUntil(5) { self.supervisor.debugOpenIssueCount == 1 }
+        XCTAssertTrue(captured)
+
+        let found = await supervisor.listDebugIssues()
+        let issue = try XCTUnwrap(found.first)
+        XCTAssertEqual(issue.trigger, "probe_timeout")
+        XCTAssertEqual(issue.serviceId, "slow")
+        XCTAssertEqual(issue.errorMessage, "slow did not pass its startup probe in 3s (process alive: yes)")
+        let log = try String(contentsOf: issues.appendingPathComponent("open/\(issue.id)/logs-slow.txt"), encoding: .utf8)
+        XCTAssertTrue(log.contains("slow-start"), log)
+    }
+
     /// Supabase: `supabase start` ends with code 0 when the stack is up. The stack
     /// runs on, so the service must stay "running".
     func testALauncherThatEndsCleanlyLeavesAReusedServiceRunning() async throws {

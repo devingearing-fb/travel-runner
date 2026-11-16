@@ -102,7 +102,8 @@ final class EnvironmentSupervisor {
     private var observerRegistered = false
     private var phaseStartedAt: Date? = nil
     private var dbSetupRunner: DbSetupRunner?
-    private var debugTracker: DebugTracker?
+    /// Nil while issue capture is off. Tests set a tracker with a temporary folder.
+    var debugTracker: DebugTracker?
     private var gitBranchWatcher: GitBranchWatcher?
     private var gitRepoRoots: [String: String] = [:]
     private var dependencyWatcher: DependencyWatcher?
@@ -1213,13 +1214,7 @@ final class EnvironmentSupervisor {
                 await refreshLocalSupabaseKeys()
             } else if let failed = pipeline.firstFailed {
                 lastError = "DB setup failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
-                Task { await captureDebugIssue(
-                    trigger: "db_setup_failure",
-                    serviceID: nil,
-                    summary: "DB setup failed at \(failed.name)",
-                    errorMessage: failed.errorMessage,
-                    recoveryGuidance: failed.recoveryGuidance
-                )}
+                await captureDbSetupFailure(failed)
             }
         }
     }
@@ -1253,8 +1248,18 @@ final class EnvironmentSupervisor {
             dbResetRunning = false
             if !success {
                 lastError = "DB setup failed at \(step.name): \(step.errorMessage ?? "unknown error")"
+                await captureDbSetupFailure(step)
             }
         }
+    }
+
+    /// The issue of a failed DB step. It names the step and holds the step's log.
+    func captureDbSetupFailure(_ step: DbSetupStep) async {
+        await captureDebugIssue(
+            trigger: "db_setup_failure",
+            serviceID: "db-setup-\(step.id)",
+            summary: "\(step.name) (\(step.id)): \(step.errorMessage ?? "unknown error")"
+        )
     }
 
     func dbSetupStatusJSON() -> String {
@@ -1848,7 +1853,16 @@ final class EnvironmentSupervisor {
                 try await Task.sleep(for: .seconds(2))
             }
             if !ready {
-                throw ServiceError.probeTimeout(serviceID, seconds: probeConfig.timeout ?? 120)
+                let seconds = probeConfig.timeout ?? 120
+                // Every start path throws from here, so one capture covers them all.
+                let alive = await processRunner.exit(of: launch.pid) == nil
+                let name = state.definition.displayName
+                Task { await self.captureDebugIssue(
+                    trigger: "probe_timeout",
+                    serviceID: serviceID,
+                    summary: "\(name) did not pass its startup probe in \(seconds)s (process alive: \(alive ? "yes" : "no"))"
+                )}
+                throw ServiceError.probeTimeout(serviceID, seconds: seconds)
             }
         }
 
@@ -2609,6 +2623,7 @@ final class EnvironmentSupervisor {
         if pipeline.allRequiredPassed { await refreshLocalSupabaseKeys() }
         if let failed = pipeline.firstFailed {
             lastError = "DB reset failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
+            await captureDbSetupFailure(failed)
         }
         return pipeline.allRequiredPassed
     }

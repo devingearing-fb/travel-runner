@@ -102,6 +102,42 @@ final class DebugTrackerTests: XCTestCase {
         XCTAssertEqual(after["resolution"] as? String, "fixed")
     }
 
+    /// Findings "seed tickets have empty logs" and "no step id": the ticket of a failed
+    /// DB step names the step and holds what the step printed.
+    @MainActor
+    func testADbSetupFailureHasTheStepNameAndItsLog() async throws {
+        try writeConfig(#"{"enabled": true}"#)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DebugTrackerTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        supervisor.debugTracker = DebugTracker(baseDir: root.path)
+        let step = DbSetupStep(
+            id: "load-hotels", name: "Load hotels", command: "true", healthCheckCommand: nil,
+            timeoutSeconds: 60, isOptional: false, stepNumber: 4
+        )
+        step.status = .failed
+        step.errorMessage = "Exit code 1"
+        await supervisor.logStore.append(
+            serviceID: "db-setup-load-hotels", entry: LogEntry(stream: .stdout, text: "hotel fetch failed: HTTP 401")
+        )
+        // The log of another step stays out of the step's file.
+        await supervisor.logStore.append(
+            serviceID: "db-setup-seed", entry: LogEntry(stream: .stdout, text: "seed done")
+        )
+
+        await supervisor.captureDbSetupFailure(step)
+
+        let issues = await supervisor.listDebugIssues()
+        let issue = try XCTUnwrap(issues.first)
+        XCTAssertEqual(issues.count, 1)
+        XCTAssertEqual(issue.trigger, "db_setup_failure")
+        XCTAssertEqual(issue.serviceId, "db-setup-load-hotels")
+        XCTAssertEqual(issue.errorMessage, "Load hotels (load-hotels): Exit code 1")
+        let log = try String(
+            contentsOf: root.appendingPathComponent("open/\(issue.id)/logs-db-setup-load-hotels.txt"), encoding: .utf8
+        )
+        XCTAssertEqual(log, "hotel fetch failed: HTTP 401")
+    }
+
     func testNothingIsCapturedWhenTrackingIsOff() async {
         let tracker = DebugTracker(baseDir: root.path)
         let captured = await tracker.captureIssue(trigger: "service_crash", serviceId: "x", errorMessage: "x exited")
