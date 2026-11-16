@@ -142,7 +142,7 @@ struct ServiceConsoleView: View {
             }
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
-            .help("Clear")
+            .help("Clear view (the log file is kept)")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 5)

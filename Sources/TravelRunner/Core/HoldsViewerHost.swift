@@ -159,9 +159,13 @@ final class HoldsViewerHost {
 
     /// The monolith checkout. The supervisor sets it, because the config can change.
     var monorepo: @MainActor () -> String? = { nil }
+    /// The output of the viewer goes here, under the id `holds-viewer`. The
+    /// supervisor sets it.
+    var logStore: LogStore?
+    static let logID = "holds-viewer"
 
     private let runner = ProcessRunner()
-    private let serviceID = "holds-viewer"
+    private let serviceID = HoldsViewerHost.logID
     private let nodeCommand: String
     private let cacheRoot: String
     private let defaults: UserDefaults
@@ -265,15 +269,29 @@ final class HoldsViewerHost {
             cwd: repo, probe: nil, type: .daemon, restart: .never,
             dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
         )
+        let logStore = self.logStore
+        let logID = serviceID
         do {
-            pid = try await runner.start(
+            let started = try await runner.start(
                 service: definition,
-                onStdout: { [weak self] lines in Task { @MainActor in self?.keep(lines) } },
-                onStderr: { [weak self] lines in Task { @MainActor in self?.keep(lines) } },
+                onStdout: { [weak self] lines in
+                    Task {
+                        await logStore?.appendBatch(serviceID: logID, entries: lines.map { LogEntry(stream: .stdout, text: $0) })
+                        await MainActor.run { self?.keep(lines) }
+                    }
+                },
+                onStderr: { [weak self] lines in
+                    Task {
+                        await logStore?.appendBatch(serviceID: logID, entries: lines.map { LogEntry(stream: .stderr, text: $0) })
+                        await MainActor.run { self?.keep(lines) }
+                    }
+                },
                 onTermination: { [weak self] termination in
                     Task { @MainActor in self?.processEnded(termination, launch: launch) }
                 }
             )
+            pid = started
+            await logStore?.markStart(serviceID: logID, name: definition.displayName, pid: started)
         } catch {
             pid = nil
             state = .failed("The holds viewer did not start: \(error.localizedDescription)")

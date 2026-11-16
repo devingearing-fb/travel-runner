@@ -86,7 +86,8 @@ final class EnvironmentSupervisor {
 
     // MARK: - Internal Components
 
-    private(set) var logStore = LogStore()
+    /// The app gives it a file sink. Without one the logs stay in memory.
+    let logStore: LogStore
     /// The reader for the Rooms tab. It is not a service of the graph.
     let holdsViewer: HoldsViewerHost
     private let secretStore = SecretStore()
@@ -138,8 +139,10 @@ final class EnvironmentSupervisor {
     var databaseProbeRetry: (interval: Duration, timeout: Duration) = (.seconds(2), .seconds(60))
     var dbResetAction: ((_ cwd: String) async -> Bool)?
 
-    init(userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil) {
+    init(userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil, logSink: LogFileSink? = nil) {
+        self.logStore = LogStore(sink: logSink)
         self.holdsViewer = holdsViewer ?? HoldsViewerHost()
+        self.holdsViewer.logStore = logStore
         self.userDefaults = userDefaults
         self.selectedDbSeedScenarioID = userDefaults.string(forKey: "dbSeedScenarioID")
         if holdsViewer == nil {
@@ -228,6 +231,8 @@ final class EnvironmentSupervisor {
             self.serviceStates = [:]
             let graph = try ServiceGraph(services: config.services)
             self.graph = graph
+            let redactor = makeRedactor()
+            Task { [logStore] in await logStore.setRunnerRedactor(redactor) }
             self.sortedServiceIDs = graph.sortedIDs
             self.profile = config.resolvedProfile
             self.profileMembers = config.resolvedProfile.members(of: config.services)
@@ -1852,6 +1857,7 @@ final class EnvironmentSupervisor {
         )
 
         state.pid = pid
+        await logStore.markStart(serviceID: sid, name: definition.displayName, pid: pid)
         return ServiceLaunch(
             pid: pid, definition: effectiveDefinition, stdoutProbe: capturedProbe, artifactName: artifactName
         )

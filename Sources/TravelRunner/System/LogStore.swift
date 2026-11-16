@@ -62,8 +62,31 @@ actor LogStore {
     private var levelCounts: [String: LogCounts] = [:]
     private var versions: [String: Int] = [:]
     private let capacity = 500
+    /// The files on disk. Nil keeps the log in memory only, as the tests do.
+    private let sink: LogFileSink?
+
+    init(sink: LogFileSink? = nil) {
+        self.sink = sink
+    }
+
+    /// The log file of one id. Nil when the store writes no files.
+    nonisolated func fileURL(for serviceID: String) -> URL? {
+        sink?.fileURL(for: serviceID)
+    }
+
+    /// Writes the separator of a process start to the log file. The view does
+    /// not show it.
+    func markStart(serviceID: String, name: String, pid: Int32) {
+        sink?.writeStart(id: serviceID, name: name, pid: pid)
+    }
+
+    /// The `runner` log file gets its lines redacted with this redactor.
+    func setRunnerRedactor(_ redactor: Redactor) {
+        sink?.setRunnerRedactor(redactor)
+    }
 
     func append(serviceID: String, entry: LogEntry) {
+        sink?.write(id: serviceID, entries: [entry])
         if buffers[serviceID] == nil {
             buffers[serviceID] = RingBuffer(capacity: capacity)
         }
@@ -73,6 +96,7 @@ actor LogStore {
     }
 
     func appendBatch(serviceID: String, entries: [LogEntry]) {
+        sink?.write(id: serviceID, entries: entries)
         if buffers[serviceID] == nil {
             buffers[serviceID] = RingBuffer(capacity: capacity)
         }
@@ -106,6 +130,7 @@ actor LogStore {
         levelCounts[serviceID] ?? LogCounts()
     }
 
+    /// Clears the view. The log file is kept.
     func clear(serviceID: String) {
         buffers[serviceID] = nil
         levelCounts[serviceID] = nil

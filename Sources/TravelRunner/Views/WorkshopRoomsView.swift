@@ -88,11 +88,11 @@ struct WorkshopRoomsView: View {
                 "The holds viewer needs Node 22 or later in your login shell (zsh -l). The portals need it too."
             )
         case .failed(let reason):
-            message("The holds viewer stopped", reason)
+            message("The holds viewer stopped", reason, logFile: supervisor.logStore.fileURL(for: HoldsViewerHost.logID))
         }
     }
 
-    private func message(_ title: String, _ detail: String) -> some View {
+    private func message(_ title: String, _ detail: String, logFile: URL? = nil) -> some View {
         VStack(spacing: 10) {
             Image(systemName: "bed.double")
                 .font(.system(size: 28))
@@ -105,8 +105,16 @@ struct WorkshopRoomsView: View {
                 .multilineTextAlignment(.center)
                 .textSelection(.enabled)
                 .frame(maxWidth: 520)
-            Button("Try Again") {
-                Task { await supervisor.holdsViewer.restart() }
+            HStack(spacing: 8) {
+                Button("Try Again") {
+                    Task { await supervisor.holdsViewer.restart() }
+                }
+                // The message shows one line. The file has all the output.
+                if let logFile {
+                    Button("Show Log File") {
+                        NSWorkspace.shared.activateFileViewerSelecting([logFile])
+                    }
+                }
             }
             .controlSize(.small)
         }

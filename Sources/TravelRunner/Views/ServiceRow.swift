@@ -214,7 +214,7 @@ struct ServiceRow: View {
                         .foregroundStyle(.secondary)
                 }
                 .buttonStyle(.borderless)
-                .help("Clear logs")
+                .help("Clear view (the log file is kept)")
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 2)

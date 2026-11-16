@@ -13,10 +13,14 @@ final class SupervisorLifecycleTests: XCTestCase {
 
     override func setUp() async throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "SupervisorLifecycleTests-\(UUID().uuidString)"))
-        supervisor = EnvironmentSupervisor(userDefaults: defaults)
-        port = Self.freePort()
         workDir = FileManager.default.temporaryDirectory.appendingPathComponent("SupervisorLifecycleTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        // The log files of a test go to its own folder.
+        supervisor = EnvironmentSupervisor(
+            userDefaults: defaults,
+            logSink: LogFileSink(directory: workDir.appendingPathComponent("logs"), version: "9.9.9")
+        )
+        port = Self.freePort()
         crashes = []
         // The port cleanup of a test kills only a process that the test started. A
         // stranger can take the free port after `freePort` lets it go.
@@ -132,7 +136,39 @@ final class SupervisorLifecycleTests: XCTestCase {
         state(id).phase == .running && supervisor.actionsInFlight.isEmpty
     }
 
+    private func logFile(_ id: String) -> [String] {
+        let url = workDir.appendingPathComponent("logs/\(id).log")
+        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        return text.split(separator: "\n").map(String.init)
+    }
+
     // MARK: - Tests
+
+    func testEachStartWritesASeparatorAndTheOutputToTheLogFile() async throws {
+        try load(daemon("web", ["sh", "-c", "echo hello from web; exec \(webServer.joined(separator: " "))"]))
+
+        supervisor.restartService("web")
+        let started = await waitUntil(20) { self.settled("web") }
+        XCTAssertTrue(started)
+        let firstPid = try XCTUnwrap(state("web").pid)
+        let wrote = await waitUntil(5) { self.logFile("web").contains { $0.hasSuffix("[out] hello from web") } }
+        XCTAssertTrue(wrote, logFile("web").joined(separator: "\n"))
+
+        supervisor.restartService("web")
+        let restarted = await waitUntil(20) { self.settled("web") && self.state("web").pid != firstPid }
+        XCTAssertTrue(restarted)
+        let secondPid = try XCTUnwrap(state("web").pid)
+        let both = await waitUntil(5) { self.logFile("web").filter { $0.contains("── started web pid ") }.count == 2 }
+        XCTAssertTrue(both, logFile("web").joined(separator: "\n"))
+
+        let separators = logFile("web").filter { $0.contains("[travel-runner] ── started") }
+        XCTAssertTrue(separators[0].hasSuffix("[out] [travel-runner] ── started web pid \(firstPid) (runner v9.9.9) ──"), separators[0])
+        XCTAssertTrue(separators[1].hasSuffix("[out] [travel-runner] ── started web pid \(secondPid) (runner v9.9.9) ──"), separators[1])
+        // The file has the time on each line. The view does not show the separator.
+        XCTAssertTrue(logFile("web").allSatisfy { $0.range(of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{4} \[(out|err)\] "#, options: .regularExpression) != nil })
+        let view = await logLines("web")
+        XCTAssertFalse(view.contains { $0.contains("── started") })
+    }
 
     /// Tickets "Travel Portal exited with code 1" with EADDRINUSE in the log: two
     /// requests for one service each started a process.

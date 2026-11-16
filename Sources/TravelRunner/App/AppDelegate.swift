@@ -17,7 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
 
-        supervisor = EnvironmentSupervisor()
+        supervisor = EnvironmentSupervisor(logSink: .live())
         supervisor.loadConfig()
 
         supervisor.onServiceCrash = { [weak self] serviceName, exitCode in
