@@ -285,6 +285,60 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("toolless").restartCount, 0)
     }
 
+    /// The PATH question takes time. A stop that arrives while it runs keeps the
+    /// service stopped, and the answer does not bring the error back.
+    func testAStopDuringThePathQuestionLeavesTheServiceStopped() async throws {
+        let tool = "tr-no-such-tool-\(UUID().uuidString)"
+        let question = PathQuestion()
+        supervisor.missingToolPath = { _, _ in await question.ask() }
+        try load(daemon("toolless", [tool, "dev"]))
+
+        supervisor.restartService("toolless")
+        let asked = await waitUntil(30) { self.state("toolless").phase == .failed && question.calls == 1 }
+        XCTAssertTrue(asked, "\(question.calls) questions")
+        // Longer than one round of the probe, so the wait for the probe asks too.
+        try await Task.sleep(for: .seconds(3))
+
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        question.release()
+        let done = await waitUntil(10) { self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(done)
+        // Time for the answer to reach the end of the process.
+        try await Task.sleep(for: .milliseconds(500))
+
+        XCTAssertEqual(state("toolless").phase, .stopped)
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertEqual(question.calls, 1)
+    }
+
+    /// The control of the test above: with no stop, the answer gives the error. The
+    /// wait for the probe and the end of the process ask one question for the process.
+    func testThePathQuestionIsAskedOncePerProcess() async throws {
+        let tool = "tr-no-such-tool-\(UUID().uuidString)"
+        let question = PathQuestion()
+        supervisor.missingToolPath = { _, _ in await question.ask() }
+        try load(daemon("toolless", [tool, "dev"]))
+
+        supervisor.restartService("toolless")
+        let asked = await waitUntil(30) { self.state("toolless").phase == .failed && question.calls == 1 }
+        XCTAssertTrue(asked, "\(question.calls) questions")
+        try await Task.sleep(for: .seconds(3))
+        XCTAssertFalse(supervisor.actionsInFlight.isEmpty, "the wait for the probe has not ended")
+
+        question.release()
+        let done = await waitUntil(10) { self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(done)
+
+        XCTAssertEqual(state("toolless").phase, .failed)
+        XCTAssertEqual(
+            supervisor.lastError,
+            "toolless cannot start: \(ToolPath.notFoundText(tool: tool, searchedPath: "/fake/bin"))"
+        )
+        XCTAssertEqual(question.calls, 1)
+    }
+
     /// A stop-all while a service starts: the start's wait for the probe must not
     /// mark the service as failed after the stop.
     func testStopAllDuringAStartLeavesTheServiceStopped() async throws {
@@ -833,6 +887,28 @@ final class SupervisorLifecycleTests: XCTestCase {
             )),
             .unknown("Error response from daemon: No such container: x")
         )
+        // psql prints `LINE 1:` and a caret after an SQL error. The detail is the error.
+        XCTAssertEqual(
+            DbProbe.classify(DbQueryResult(
+                exitCode: 1, stdout: "",
+                stderr: "ERROR:  relation \"public.events\" does not exist\nLINE 1: SELECT count(*) FROM public.events\n                             ^\n"
+            )),
+            .unknown("ERROR:  relation \"public.events\" does not exist")
+        )
+        // A socket that does not answer: the cause is the first line, a hint is the last.
+        XCTAssertEqual(
+            DbProbe.classify(DbQueryResult(
+                exitCode: 2, stdout: "",
+                stderr: "psql: error: connection to server on socket \"/tmp/.s.PGSQL.5432\" failed: No such file or directory\n"
+                    + "\tIs the server running locally and accepting connections on that socket?\n"
+            )),
+            .unknown("psql: error: connection to server on socket \"/tmp/.s.PGSQL.5432\" failed: No such file or directory")
+        )
+        // An error with no known mark: the last line.
+        XCTAssertEqual(
+            DbProbe.classify(DbQueryResult(exitCode: 1, stdout: "", stderr: "first\nsomething broke\n")),
+            .unknown("something broke")
+        )
         // An answer that is not a number stays on one line of the banner.
         XCTAssertEqual(
             DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "first line\nnot a number", stderr: "")),
@@ -867,6 +943,35 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(crashes.isEmpty, "a clean exit is not a crash: \(crashes)")
         // The header shows its banner only with a text.
         XCTAssertEqual(supervisor.lastError, "quitter exited (code 0) and was not restarted — restart it from its row")
+    }
+
+    /// The banner of a clean exit asks for a restart from the row. The restart
+    /// clears it, and it does not clear another error.
+    func testARestartFromTheRowClearsTheCleanExitBanner() async throws {
+        let marker = workDir.appendingPathComponent("second-run").path
+        let script = "if [ -f '\(marker)' ]; then exec sleep 60; else touch '\(marker)'; sleep 2; exit 0; fi"
+        let quitter = ServiceDefinition(
+            id: "quitter", name: "quitter", cmd: ["sh", "-c", script], cwd: workDir.path,
+            probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try load(quitter)
+        supervisor.restartService("quitter")
+        let banner = EnvironmentSupervisor.cleanExitMessage("quitter")
+        let ended = await waitUntil(20) { self.state("quitter").phase == .failed && self.supervisor.lastError == banner }
+        XCTAssertTrue(ended, supervisor.lastError ?? "nil")
+
+        supervisor.restartService("quitter")
+        let cleared = await waitUntil(15) { self.settled("quitter") && self.supervisor.lastError == nil }
+        XCTAssertTrue(cleared, supervisor.lastError ?? "nil")
+
+        // An error that is not the banner of this service stays.
+        supervisor.lastError = "Could not save profile: disk full"
+        supervisor.restartService("quitter")
+        let started = await waitUntil(5) { !self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(started)
+        let restarted = await waitUntil(15) { self.settled("quitter") }
+        XCTAssertTrue(restarted)
+        XCTAssertEqual(supervisor.lastError, "Could not save profile: disk full")
     }
 
     /// The Start control of a row: only for a daemon of the profile that has no
@@ -1122,4 +1227,22 @@ private final class PortToolCalls: @unchecked Sendable {
     func addKill(_ pid: pid_t) { lock.withLock { killed.append(pid) } }
     func addPattern(_ pattern: String) { lock.withLock { killedPatterns.append(pattern) } }
     func reset() { lock.withLock { killed = []; killedPatterns = [] } }
+}
+
+/// A PATH question that a test holds open.
+private final class PathQuestion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    private var open = false
+
+    var calls: Int { lock.withLock { count } }
+    func release() { lock.withLock { open = true } }
+
+    func ask() async -> String? {
+        lock.withLock { count += 1 }
+        while !lock.withLock({ open }) {
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return "/fake/bin"
+    }
 }

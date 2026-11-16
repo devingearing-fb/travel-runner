@@ -143,6 +143,8 @@ final class EnvironmentSupervisor {
     private var wakePending = false
     /// The last question "which PATH did the launch search" and the process it is for.
     private var missingToolQuestion: (pid: Int32, answer: Task<String?, Never>)?
+    /// Tests replace the PATH question with a fake.
+    var missingToolPath: (@Sendable (_ tool: String, _ directories: [String]) async -> String?)?
     /// Tests replace the database query and the reset with fakes.
     var databaseQuery: ((_ cwd: String, _ sql: String) async -> DbQueryResult)?
     /// How long the automatic reset waits for a database that does not answer yet.
@@ -737,6 +739,7 @@ final class EnvironmentSupervisor {
                     await self.logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: "[travel-runner] Cleared .next cache"))
                     try? await Task.sleep(for: .seconds(1))
                 })
+                clearCleanExitError(serviceID)
             } catch {
                 serviceStates[serviceID]?.phase = .failed
                 lastError = "\(error)"
@@ -941,6 +944,7 @@ final class EnvironmentSupervisor {
                     self.queuedRestarts.remove(serviceID)
                     try? await Task.sleep(for: .seconds(1))
                 })
+                clearCleanExitError(serviceID)
                 if serviceStates[serviceID]?.phase == .skipped {
                     onActionFeedback?("\(name) skipped — see its log", false)
                 } else {
@@ -971,6 +975,17 @@ final class EnvironmentSupervisor {
             lastError = "\(error)"
         }
         recalculateHealth()
+    }
+
+    /// The banner text for a daemon that ended with code 0.
+    nonisolated static func cleanExitMessage(_ name: String) -> String {
+        "\(name) exited (code 0) and was not restarted — restart it from its row"
+    }
+
+    /// The person restarted the service, as the banner asked. A newer error stays.
+    private func clearCleanExitError(_ serviceID: String) {
+        guard let name = serviceStates[serviceID]?.definition.displayName else { return }
+        if lastError == Self.cleanExitMessage(name) { lastError = nil }
     }
 
     private func clearFailureHistory(_ serviceID: String) {
@@ -1055,6 +1070,7 @@ final class EnvironmentSupervisor {
                     onActionFeedback?("Cascade restart failed at \(id)", false)
                     return
                 }
+                clearCleanExitError(id)
 
                 // After Supabase comes back, check if DB is empty and auto-reset
                 if id == "supabase", let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd {
@@ -2001,8 +2017,11 @@ final class EnvironmentSupervisor {
         guard code == 127, let tool = ToolPath.toolName(of: definition.cmd) else { return nil }
         if let asked = missingToolQuestion, asked.pid == pid { return await asked.answer.value }
         let cwd = definition.resolvedCwd
+        let ask = missingToolPath
         let answer = Task.detached {
-            await ToolPath.searchedPath(missing: tool, directories: ToolPath.directories(cwd: cwd))
+            let directories = ToolPath.directories(cwd: cwd)
+            if let ask { return await ask(tool, directories) }
+            return await ToolPath.searchedPath(missing: tool, directories: directories)
         }
         missingToolQuestion = (pid, answer)
         return await answer.value
@@ -2078,7 +2097,7 @@ final class EnvironmentSupervisor {
             state.phase = .failed
             state.lastStopped = .now
             // The header shows the banner only with a text: say which service ended.
-            lastError = "\(name) exited (code 0) and was not restarted — restart it from its row"
+            lastError = Self.cleanExitMessage(name)
             Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
                 stream: .stderr, text: "[travel-runner] \(name) exited (code 0) — not restarted"
             ))}

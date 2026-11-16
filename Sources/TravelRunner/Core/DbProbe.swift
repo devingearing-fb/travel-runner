@@ -6,10 +6,22 @@ struct DbQueryResult: Sendable, Equatable {
     var stdout: String
     var stderr: String
 
-    /// The last line of the error, for a message to the person. Docker and psql put
-    /// the error last; a line that the login profile prints comes before it.
+    /// One line of the error, for a message to the person: the last line that names
+    /// an error, or the last line. A line that the login profile prints comes before
+    /// the error. psql prints more lines after it: `LINE 1:` and a caret for an SQL
+    /// error, a hint for a socket that does not answer.
     var failureDetail: String {
-        Self.lastLine(of: stderr) ?? "exit code \(exitCode)"
+        Self.errorLine(of: stderr) ?? Self.lastLine(of: stderr) ?? "exit code \(exitCode)"
+    }
+
+    /// The last line of `text` that looks like an error of Docker or psql.
+    static func errorLine(of text: String) -> String? {
+        text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .last { line in
+                line.lowercased().contains("error:") || line.contains("FATAL:")
+                    || line.hasPrefix("Error response from daemon") || line.hasPrefix("Cannot connect")
+            }
     }
 
     /// The last line of `text` that is not empty.
