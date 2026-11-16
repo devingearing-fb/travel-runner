@@ -274,16 +274,19 @@ final class HoldsViewerHost {
         do {
             let started = try await runner.start(
                 service: definition,
+                // `keep` goes straight to the main actor, as `processEnded` does, so
+                // the last line is there when the failure message is made. The log
+                // store gets the lines after that.
                 onStdout: { [weak self] lines in
-                    Task {
+                    Task { @MainActor in
+                        self?.keep(lines)
                         await logStore?.appendBatch(serviceID: logID, entries: lines.map { LogEntry(stream: .stdout, text: $0) })
-                        await MainActor.run { self?.keep(lines) }
                     }
                 },
                 onStderr: { [weak self] lines in
-                    Task {
+                    Task { @MainActor in
+                        self?.keep(lines)
                         await logStore?.appendBatch(serviceID: logID, entries: lines.map { LogEntry(stream: .stderr, text: $0) })
-                        await MainActor.run { self?.keep(lines) }
                     }
                 },
                 onTermination: { [weak self] termination in

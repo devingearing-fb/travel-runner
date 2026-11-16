@@ -205,6 +205,23 @@ final class HoldsViewerHostTests: XCTestCase {
         XCTAssertTrue(reason.contains("boom: no config"), reason)
     }
 
+    /// The app always has a log store. A last line with no newline comes out
+    /// only when the process ends, just before the end is reported.
+    func testAViewerThatExitsShowsALastLineWithNoNewlineWhenALogStoreIsSet() async throws {
+        try writeViewer(in: repo, marker: "x", script: "process.stderr.write('boom: no config'); process.exit(3);")
+        let store = LogStore(sink: LogFileSink(directory: root.appendingPathComponent("logs"), version: "9.9.9"))
+        let host = makeHost()
+        host.logStore = store
+
+        await host.ensureRunning()
+        let settled = await waitUntil(10) { host.state != .starting }
+
+        XCTAssertTrue(settled)
+        guard case .failed(let reason) = host.state else { return XCTFail("state is \(host.state)") }
+        XCTAssertTrue(reason.contains("exited with code 3"), reason)
+        XCTAssertTrue(reason.contains("boom: no config"), reason)
+    }
+
     func testAllTheOutputOfTheViewerGoesToTheHoldsViewerLog() async throws {
         let script = "for (let i = 1; i <= 9; i++) console.error('line ' + i); console.log('last words'); process.exit(3);"
         try writeViewer(in: repo, marker: "x", script: script)

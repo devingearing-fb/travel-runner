@@ -323,6 +323,20 @@ final class LogFileSinkTests: XCTestCase {
         XCTAssertEqual(store.fileURL(for: "api"), sink.fileURL(for: "api"))
     }
 
+    func testShowLogFileGoesToTheFileAndToTheFolderWhenTheFileIsNotThere() async {
+        let sink = makeSink()
+        let store = LogStore(sink: sink)
+        let file = sink.fileURL(for: "holds-viewer")
+
+        // No line yet, so no file: the folder opens.
+        XCTAssertEqual(store.revealTarget(for: "holds-viewer"), .folder(file.deletingLastPathComponent()))
+
+        await store.append(serviceID: "holds-viewer", entry: entry("one"))
+        XCTAssertEqual(store.revealTarget(for: "holds-viewer"), .file(file))
+
+        XCTAssertNil(LogStore().revealTarget(for: "holds-viewer"))
+    }
+
     func testTheSeparatorIsNotInTheView() async {
         let store = LogStore(sink: makeSink())
 
