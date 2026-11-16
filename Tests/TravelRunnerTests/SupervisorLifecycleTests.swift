@@ -380,6 +380,97 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
     }
 
+    /// A daemon that ends with code 0 has no process, and nothing starts it again.
+    /// The environment showed "starting" with no end.
+    func testACleanExitOfADaemonGivesDegradedNotStarting() async throws {
+        let quitter = ServiceDefinition(
+            id: "quitter", name: "quitter", cmd: ["sh", "-c", "echo quitter-start; sleep 2; exit 0"], cwd: workDir.path,
+            probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try load(quitter)
+        supervisor.restartService("quitter")
+        let ready = await waitUntil(15) { self.settled("quitter") }
+        XCTAssertTrue(ready, "quitter is \(state("quitter").phase.rawValue)")
+        XCTAssertEqual(supervisor.health, .healthy)
+
+        let ended = await waitUntil(15) { self.state("quitter").phase != .running }
+        XCTAssertTrue(ended)
+        // Long enough for an automatic restart, if there was one.
+        try await Task.sleep(for: .seconds(4))
+
+        XCTAssertEqual(supervisor.health, .degraded)
+        XCTAssertEqual(state("quitter").phase, .failed)
+        XCTAssertEqual(state("quitter").exitCode, 0)
+        let lines = await logLines("quitter")
+        XCTAssertTrue(lines.contains("[travel-runner] quitter exited (code 0) — not restarted"), lines.joined(separator: "\n"))
+        XCTAssertEqual(lines.filter { $0 == "quitter-start" }.count, 1, "it is not restarted")
+        XCTAssertTrue(crashes.isEmpty, "a clean exit is not a crash: \(crashes)")
+    }
+
+    private func stripe(_ script: String) -> ServiceDefinition {
+        ServiceDefinition(
+            id: "stripe", name: "Stripe CLI", cmd: ["sh", "-c", script], cwd: workDir.path,
+            probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+    }
+
+    /// 105 tickets: Stripe ended as "skipped" with no line that says why. The CLI
+    /// check is a fake; the test does not run the Stripe CLI.
+    func testStripeWithoutItsCliIsSkippedWithTheCauseInItsLog() async throws {
+        try load(stripe("echo stripe-start; sleep 30"))
+        supervisor.stripeAvailability = { false }
+        var feedback: [String] = []
+        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+
+        supervisor.restartService("stripe")
+
+        let skipped = await waitUntil(15) { self.state("stripe").phase == .skipped && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        let lines = await logLines("stripe")
+        XCTAssertTrue(
+            lines.contains { $0.hasPrefix("[travel-runner] Stripe stopped: ") && $0.contains("stripe login") },
+            lines.joined(separator: "\n")
+        )
+        XCTAssertFalse(lines.contains("stripe-start"), "the process must not start")
+        XCTAssertEqual(feedback, ["Stripe CLI skipped — see its log"])
+        XCTAssertEqual(supervisor.health, .healthy, "Stripe is optional")
+    }
+
+    /// A Stripe CLI that fails (an expired session, say) is skipped, not restarted in
+    /// a loop. Its log says so, with the exit code.
+    func testAStripeCrashIsSkippedWithTheCauseInItsLog() async throws {
+        try load(stripe("echo stripe-start; sleep 2; exit 1"))
+        supervisor.stripeAvailability = { true }
+
+        supervisor.restartService("stripe")
+
+        let started = await waitUntil(15) { self.settled("stripe") }
+        XCTAssertTrue(started, "stripe is \(state("stripe").phase.rawValue)")
+        let skipped = await waitUntil(15) { self.state("stripe").phase == .skipped }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        try await Task.sleep(for: .seconds(3))
+
+        let lines = await logLines("stripe")
+        XCTAssertTrue(
+            lines.contains { $0.hasPrefix("[travel-runner] Stripe stopped: the Stripe CLI exited with code 1") },
+            lines.joined(separator: "\n")
+        )
+        XCTAssertEqual(lines.filter { $0 == "stripe-start" }.count, 1, "it is not restarted")
+        XCTAssertEqual(state("stripe").phase, .skipped)
+        XCTAssertEqual(supervisor.health, .healthy, "Stripe is optional")
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
+    /// The row showed the first 20 characters of the webhook secret.
+    func testTheRowShowsOnlyTheEndOfTheWebhookSecret() {
+        let state = ServiceState(definition: stripe("true"))
+        XCTAssertNil(state.capturedArtifactSummary)
+
+        state.capturedArtifact = "whsec_0123456789abcdefWXYZ"
+
+        XCTAssertEqual(state.capturedArtifactSummary, "Webhook secret captured (…WXYZ)")
+    }
+
     /// Tickets on the port cleanup: a start killed each listener on a known port, also
     /// for a service outside the profile, and also the port helper of the container
     /// runtime. It also killed each `stripe listen` on the Mac.

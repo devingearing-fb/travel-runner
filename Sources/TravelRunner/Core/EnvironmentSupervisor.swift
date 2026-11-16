@@ -92,6 +92,9 @@ final class EnvironmentSupervisor {
     private let processRunner = ProcessRunner()
     /// The port cleanup reads listeners and kills through these tools.
     @ObservationIgnored var portTools = PortTools.live
+    /// The check that the Stripe CLI is installed and logged in. Tests set it; nil
+    /// runs the CLI.
+    @ObservationIgnored var stripeAvailability: (@Sendable () async -> Bool)?
     private let preflightRunner = PreflightRunner()
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
@@ -931,7 +934,11 @@ final class EnvironmentSupervisor {
                     self.queuedRestarts.remove(serviceID)
                     try? await Task.sleep(for: .seconds(1))
                 })
-                onActionFeedback?("\(name) restarted", true)
+                if serviceStates[serviceID]?.phase == .skipped {
+                    onActionFeedback?("\(name) skipped — see its log", false)
+                } else {
+                    onActionFeedback?("\(name) restarted", true)
+                }
             } catch {
                 serviceStates[serviceID]?.phase = .failed
                 lastError = "\(error)"
@@ -1625,7 +1632,9 @@ final class EnvironmentSupervisor {
                 state.phase = .skipped
                 await logStore.append(
                     serviceID: serviceID,
-                    entry: LogEntry(stream: .stdout, text: "[travel-runner] Stripe CLI not available — skipping")
+                    entry: LogEntry(stream: .stderr, text: Self.stripeStoppedLine(
+                        "the Stripe CLI is not installed or not logged in — run: stripe login, then start it from its row"
+                    ))
                 )
                 return nil
             }
@@ -1926,6 +1935,8 @@ final class EnvironmentSupervisor {
         case .cleanExit:
             // The launcher of a container-managed service ends while the stack still starts.
             if state.definition.shouldReuseIfRunning { return true }
+            // Stripe degrades to skipped; handleTermination owns its state.
+            if state.id == "stripe" { return false }
             throw ServiceError.exitedDuringStartup(state.id)
         case .commandNotRunnable(let code):
             throw ServiceError.commandNotRunnable(
@@ -1973,12 +1984,17 @@ final class EnvironmentSupervisor {
         // notification on every retry). The next manual/full start re-runs the
         // credential probe and will enable Stripe again once `stripe login`
         // succeeds.
-        if serviceID == "stripe", kind != .cleanExit {
+        if serviceID == "stripe" {
             state.phase = .skipped
             state.exitCode = termination.status
             state.pid = nil
             state.lastStopped = .now
             state.failureTimestamps.removeAll()
+            let cause = "the Stripe CLI \(ServiceTermination.describe(termination)) — see the lines above "
+                + "(401: run stripe login), then start it from its row"
+            Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
+                stream: .stderr, text: Self.stripeStoppedLine(cause)
+            ))}
             recalculateHealth()
             return
         }
@@ -2007,8 +2023,14 @@ final class EnvironmentSupervisor {
                 if state.phase == .starting { return }
                 if let port = state.definition.probe?.port, isPortBound(port) { return }
             }
-            state.phase = .stopped
+            // The daemon ended by itself and nothing starts it again. "Failed" makes
+            // the environment degraded; "stopped" left it at "starting" with no end.
+            // It is not a crash: no notification and no debug issue.
+            state.phase = .failed
             state.lastStopped = .now
+            Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
+                stream: .stderr, text: "[travel-runner] \(name) exited (code 0) — not restarted"
+            ))}
 
         case .killedExternally(let signal):
             // Someone stopped it from outside: `kill`, a script that frees the port.
@@ -2094,8 +2116,10 @@ final class EnvironmentSupervisor {
                 // and the next start (manual, start-all, or a wake) tries it again.
                 state.phase = .skipped
                 Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
-                    stream: .stdout,
-                    text: "[travel-runner] Stripe: no network after \(AutoRestart.maxRestarts) tries — skipped until the next start"
+                    stream: .stderr,
+                    text: Self.stripeStoppedLine(
+                        "no network after \(AutoRestart.maxRestarts) tries — start it from its row when the network is back"
+                    )
                 ))}
                 recalculateHealth()
                 return
@@ -2509,11 +2533,17 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// The line in the Stripe log for each case where Stripe ends as skipped.
+    nonisolated static func stripeStoppedLine(_ cause: String) -> String {
+        "[travel-runner] Stripe stopped: \(cause)"
+    }
+
     private func isStripeAvailable() async -> Bool {
+        if let stripeAvailability { return await stripeAvailability() }
         // `stripe config --list` only proves that a credential is stored; it
         // still exits zero for expired API keys. Exercise the authenticated API
         // so invalid sessions are skipped before `stripe listen` can crash.
-        await runShellCommand("which stripe >/dev/null 2>&1 && stripe balance retrieve >/dev/null 2>&1")
+        return await runShellCommand("which stripe >/dev/null 2>&1 && stripe balance retrieve >/dev/null 2>&1")
     }
 
     private func canReachHost(_ host: String) async -> Bool {
