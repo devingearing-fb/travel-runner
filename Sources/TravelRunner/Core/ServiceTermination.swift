@@ -110,18 +110,44 @@ enum CrashCause {
 
     private static let pidPattern = try! NSRegularExpression(pattern: #"PID:\s*(\d+)"#)
 
-    static func likelyCause(in lines: [String]) -> String? {
-        let tail = Array(lines.suffix(window))
+    static let stripeSessionExpired = "Stripe session expired — run `stripe login`, then restart Stripe"
+    static let noNetwork = "No network or DNS"
 
-        // Known failures first: they have one cause and one fix.
+    private static let stripeAuthMarkers = ["status=401", "Authorization failed", "api_key_expired"]
+
+    /// A failure with one cause and one fix, when the last lines show one.
+    /// A 401 means an expired Stripe session only in the output of the Stripe CLI.
+    static func knownCause(in lines: [String], serviceID: String? = nil) -> String? {
+        let tail = lines.suffix(window)
         if tail.contains(where: { $0.localizedCaseInsensitiveContains(containerRuntimeDown) }) {
             return "The container runtime is not running (\(containerRuntimeDown))"
         }
+        if tail.contains(where: { line in
+            line.contains("api_key_expired")
+                || (serviceID == "stripe" && stripeAuthMarkers.contains { line.localizedCaseInsensitiveContains($0) })
+        }) {
+            return stripeSessionExpired
+        }
+        if tail.contains(where: { $0.localizedCaseInsensitiveContains("no such host") }) {
+            return noNetwork
+        }
+        return nil
+    }
+
+    /// The line that says why a service failed. Secret values in it are redacted;
+    /// the rest of the line stays.
+    static func likelyCause(
+        in lines: [String], serviceID: String? = nil, redactor: Redactor = .patterns
+    ) -> String? {
+        let tail = Array(lines.suffix(window))
+
+        // Known failures first: they have one cause and one fix.
+        if let known = knownCause(in: tail, serviceID: serviceID) { return known }
         // Node prints the port on the "address already in use" line; the lines after it
         // (stack frames, `code: 'EADDRINUSE'`) say less.
         if let line = tail.last(where: { $0.contains("EADDRINUSE") && $0.contains("address already in use") && isCandidate($0) })
             ?? tail.last(where: { $0.contains("EADDRINUSE") }) {
-            return clean(line)
+            return clean(line, redactor)
         }
         if let index = tail.lastIndex(where: { $0.contains("Another next dev server is already running") }) {
             let after = tail[index...].prefix(6).joined(separator: " ")
@@ -135,12 +161,12 @@ enum CrashCause {
 
         let candidates = tail.filter(isCandidate)
         if let line = candidates.last(where: { line in strongMarkers.contains { line.contains($0) } }) {
-            return clean(line)
+            return clean(line, redactor)
         }
         if let line = candidates.last(where: { line in
             weakPattern.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
         }) {
-            return clean(line)
+            return clean(line, redactor)
         }
         return nil
     }
@@ -154,7 +180,6 @@ enum CrashCause {
     private static func isCandidate(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty || trimmed.hasPrefix("[travel-runner]") || trimmed.hasPrefix("at ") { return false }
-        if DebugTracker.isSecretLine(line) { return false }
         // Structured app logs: only the error level is a cause.
         if trimmed.hasPrefix("{"), let level = jsonLevel(trimmed) { return level >= 50 }
         return true
@@ -166,7 +191,8 @@ enum CrashCause {
         return json["level"] as? Int
     }
 
-    private static func clean(_ line: String) -> String {
+    /// Redacts before it cuts, so a cut never leaves half of a secret behind.
+    private static func clean(_ line: String, _ redactor: Redactor) -> String {
         var text = line.trimmingCharacters(in: .whitespaces)
         if text.hasPrefix("{"),
            let data = text.data(using: .utf8),
@@ -174,6 +200,7 @@ enum CrashCause {
            let message = json["msg"] as? String {
             text = message
         }
+        text = redactor.redact(text)
         return text.count > maxLength ? String(text.prefix(maxLength)) + "…" : text
     }
 }

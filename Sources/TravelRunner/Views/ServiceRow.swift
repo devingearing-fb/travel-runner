@@ -193,7 +193,8 @@ struct ServiceRow: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
-                    let allText = logEntries.map(\.text).joined(separator: "\n")
+                    let redactor = supervisor.makeRedactor()
+                    let allText = logEntries.map { redactor.redact($0.text) }.joined(separator: "\n")
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(allText, forType: .string)
                 } label: {

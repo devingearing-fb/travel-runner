@@ -541,7 +541,10 @@ final class EnvironmentSupervisor {
                         guard let self else { return "[]" }
                         let entries = await self.logStore.entries(for: serviceId)
                         let tail = entries.suffix(lines)
-                        let lines = tail.map { ["stream": $0.stream == .stdout ? "stdout" : "stderr", "text": $0.text] }
+                        let redactor = await MainActor.run { self.makeRedactor() }
+                        let lines = tail.map {
+                            ["stream": $0.stream == .stdout ? "stdout" : "stderr", "text": redactor.redact($0.text)]
+                        }
                         if let data = try? JSONSerialization.data(withJSONObject: lines, options: []),
                            let str = String(data: data, encoding: .utf8) { return str }
                         return "[]"
@@ -2020,11 +2023,18 @@ final class EnvironmentSupervisor {
             state.pid = nil
             state.lastStopped = .now
             state.failureTimestamps.removeAll()
-            let cause = "the Stripe CLI \(ServiceTermination.describe(termination)) — see the lines above "
-                + "(401: run stripe login), then start it from its row"
-            Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
-                stream: .stderr, text: Self.stripeStoppedLine(cause)
-            ))}
+            let exit = "the Stripe CLI \(ServiceTermination.describe(termination))"
+            Task {
+                let output = await logStore.entries(for: serviceID).map(\.text)
+                let cause = if let known = CrashCause.knownCause(in: output, serviceID: serviceID) {
+                    "\(exit) — \(known)"
+                } else {
+                    "\(exit) — see the lines above (401: run stripe login), then start it from its row"
+                }
+                await logStore.append(serviceID: serviceID, entry: LogEntry(
+                    stream: .stderr, text: Self.stripeStoppedLine(cause)
+                ))
+            }
             recalculateHealth()
             return
         }
@@ -2456,12 +2466,13 @@ final class EnvironmentSupervisor {
             )
         }
 
+        let redactor = makeRedactor()
         var logEntries: [DebugTracker.LogEntry] = []
         var likelyCause: String?
         if let sid = serviceID {
             let raw: [LogEntry] = if let log { log } else { await logStore.entries(for: sid) }
             logEntries = raw.map { DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: sid, line: $0.text) }
-            likelyCause = CrashCause.likelyCause(in: raw.map(\.text))
+            likelyCause = CrashCause.likelyCause(in: raw.map(\.text), serviceID: sid, redactor: redactor)
         }
 
         let _ = await tracker.captureIssue(
@@ -2471,10 +2482,21 @@ final class EnvironmentSupervisor {
             signatureText: signature,
             likelyCause: likelyCause,
             logEntries: logEntries,
-            stateSnapshots: snapshots
+            stateSnapshots: snapshots,
+            redactor: redactor
         )
 
         debugOpenIssueCount = await tracker.openIssueCount()
+    }
+
+    /// The redactor for text that leaves the app. It knows the secret values in the
+    /// env files of the services, as they are now.
+    func makeRedactor() -> Redactor {
+        let definitions = graph.map { Array($0.nodes.values) } ?? []
+        return Redactor(
+            envDirectories: definitions.compactMap(\.resolvedCwd),
+            environments: definitions.compactMap(\.env)
+        )
     }
 
     func listDebugIssues(status: String = "open") async -> [DebugTracker.Issue] {

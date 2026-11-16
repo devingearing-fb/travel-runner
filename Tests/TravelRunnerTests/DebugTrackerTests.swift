@@ -235,9 +235,45 @@ final class DebugTrackerTests: XCTestCase {
         XCTAssertNil(captured)
     }
 
-    func testSecretLines() {
-        XCTAssertTrue(DebugTracker.isSecretLine("STRIPE_WEBHOOK_SECRET=whsec_123"))
-        XCTAssertTrue(DebugTracker.isSecretLine("using api key abc"))
-        XCTAssertFalse(DebugTracker.isSecretLine("Error: listen EADDRINUSE: address already in use :::3002"))
+    /// Whole lines became "[REDACTED]", and the cause went with them.
+    func testAnIssueKeepsTheLineAndLosesOnlyTheSecret() async throws {
+        try writeConfig(#"{"enabled": true}"#)
+        let tracker = DebugTracker(baseDir: root.path)
+        let key = "sk_" + "test_" + "51AbCdEfGhIjKlMn"
+        let now = Date()
+        let captured = await tracker.captureIssue(
+            trigger: "service_crash",
+            serviceId: "stripe",
+            errorMessage: "Stripe CLI exited with code 1 (key \(key), HOTEL_API_KEY hotel-opaque-0001)",
+            likelyCause: "Expired API Key provided: \(key)",
+            logEntries: [
+                .init(timestamp: now, serviceId: "stripe", line: #"  "code": "api_key_expired","#),
+                .init(timestamp: now, serviceId: "stripe", line: "Expired API Key provided: \(key)"),
+                .init(timestamp: now, serviceId: "stripe", line: "sent hotel-opaque-0001 to the hotel API"),
+            ],
+            redactor: Redactor(knownValues: ["hotel-opaque-0001"])
+        )
+        let id = try XCTUnwrap(captured)
+
+        let issue = try issueJSON(id)
+        XCTAssertEqual(
+            issue["error_message"] as? String,
+            "Stripe CLI exited with code 1 (key ‹redacted:stripe-key›, HOTEL_API_KEY ‹redacted:env-value›)"
+        )
+        XCTAssertEqual(issue["likely_cause"] as? String, "Expired API Key provided: ‹redacted:stripe-key›")
+
+        let expected = """
+              "code": "api_key_expired",
+            Expired API Key provided: ‹redacted:stripe-key›
+            sent ‹redacted:env-value› to the hotel API
+            """
+        let folder = root.appendingPathComponent("open/\(id)")
+        XCTAssertEqual(try String(contentsOf: folder.appendingPathComponent("logs-stripe.txt"), encoding: .utf8), expected)
+        for file in try FileManager.default.contentsOfDirectory(atPath: folder.path) {
+            let text = try String(contentsOf: folder.appendingPathComponent(file), encoding: .utf8)
+            XCTAssertFalse(text.contains(key), file)
+            XCTAssertFalse(text.contains("hotel-opaque-0001"), file)
+            XCTAssertFalse(text.contains("[REDACTED]"), file)
+        }
     }
 }

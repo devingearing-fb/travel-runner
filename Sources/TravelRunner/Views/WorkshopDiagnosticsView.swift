@@ -122,7 +122,7 @@ struct WorkshopDiagnosticsView: View {
     }
 
     private func copyDiagnosticBundle() async {
-        let secretPatterns = ["SECRET", "KEY", "TOKEN", "PASSWORD"]
+        let redactor = supervisor.makeRedactor()
         var bundle: [String: Any] = [
             "health": supervisor.health.rawValue,
             "currentPhase": supervisor.currentPhase.rawValue,
@@ -131,9 +131,9 @@ struct WorkshopDiagnosticsView: View {
             "generatedAt": ISO8601DateFormatter().string(from: .now),
         ]
 
-        if let error = supervisor.lastError { bundle["lastError"] = error }
+        if let error = supervisor.lastError { bundle["lastError"] = redactor.redact(error) }
         if let error = supervisor.controlAPIError { bundle["controlAPIError"] = error }
-        if let rootCause = supervisor.rootCauseDescription { bundle["rootCause"] = rootCause }
+        if let rootCause = supervisor.rootCauseDescription { bundle["rootCause"] = redactor.redact(rootCause) }
 
         var services: [String: [String: Any]] = [:]
         for (id, state) in supervisor.serviceStates {
@@ -162,13 +162,7 @@ struct WorkshopDiagnosticsView: View {
         var logs: [String: [String]] = [:]
         for id in supervisor.sortedServiceIDs {
             let entries = await supervisor.logStore.entries(for: id)
-            logs[id] = entries.suffix(20).map { entry in
-                let upper = entry.text.uppercased()
-                for pat in secretPatterns where upper.contains(pat) {
-                    return "[REDACTED]"
-                }
-                return entry.text
-            }
+            logs[id] = entries.suffix(20).map { redactor.redact($0.text) }
         }
         bundle["recentLogs"] = logs
 

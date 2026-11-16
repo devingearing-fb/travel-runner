@@ -772,6 +772,25 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
     }
 
+    /// The Stripe line said "see the lines above". Now it names the cause it finds there.
+    func testAStripeCrashWithA401SaysThatTheSessionExpired() async throws {
+        try load(stripe("echo 'Authorization failed, status=401'; sleep 2; exit 1"))
+        supervisor.stripeAvailability = { true }
+
+        supervisor.restartService("stripe")
+
+        let skipped = await waitUntil(20) { self.state("stripe").phase == .skipped }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        let expected = "[travel-runner] Stripe stopped: the Stripe CLI exited with code 1 — "
+            + "Stripe session expired — run `stripe login`, then restart Stripe"
+        var lines: [String] = []
+        for _ in 0..<100 where !lines.contains(expected) {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines("stripe")
+        }
+        XCTAssertTrue(lines.contains(expected), lines.joined(separator: "\n"))
+    }
+
     /// The row showed the first 20 characters of the webhook secret.
     func testTheRowShowsOnlyTheEndOfTheWebhookSecret() {
         let state = ServiceState(definition: stripe("true"))

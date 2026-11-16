@@ -118,12 +118,6 @@ actor DebugTracker {
     }()
     private let jsonDecoder = JSONDecoder()
 
-    // MARK: - Redaction patterns
-
-    private static let secretPatterns: [String] = [
-        "SECRET", "KEY", "TOKEN", "PASSWORD"
-    ]
-
     // MARK: - Normalisation patterns
 
     private static let iso8601Regex = try! NSRegularExpression(
@@ -188,9 +182,15 @@ actor DebugTracker {
         category: String = "runtime",
         likelyCause: String? = nil,
         logEntries: [LogEntry] = [],
-        stateSnapshots: [ServiceStateSnapshot] = []
+        stateSnapshots: [ServiceStateSnapshot] = [],
+        redactor: Redactor = .patterns
     ) -> String? {
         guard isAutoCaptureEnabled(trigger: trigger) else { return nil }
+
+        // Nothing goes into an issue before the redactor has seen it.
+        let errorMessage = redactor.redact(errorMessage)
+        let signatureText = signatureText.map(redactor.redact)
+        let likelyCause = likelyCause.map(redactor.redact)
 
         // `signatureText` replaces the message for dedup when the message has details that vary.
         let normalized = normalizeError(signatureText ?? errorMessage)
@@ -256,7 +256,8 @@ actor DebugTracker {
             serviceId: serviceId,
             folderPath: folderPath,
             maxFailingLines: maxFailingLines,
-            maxOtherLines: maxOtherLines
+            maxOtherLines: maxOtherLines,
+            redactor: redactor
         )
 
         // Write state snapshot
@@ -449,14 +450,15 @@ actor DebugTracker {
         serviceId: String?,
         folderPath: String,
         maxFailingLines: Int,
-        maxOtherLines: Int
+        maxOtherLines: Int,
+        redactor: Redactor
     ) {
         // Failing service logs
         if let sid = serviceId {
             let serviceEntries = logEntries
                 .filter { $0.serviceId == sid }
                 .suffix(maxFailingLines)
-            let lines = serviceEntries.map { redactLine($0.line) }
+            let lines = serviceEntries.map { redactor.redact($0.line) }
             let content = lines.joined(separator: "\n")
             let path = (folderPath as NSString).appendingPathComponent("logs-\(sid).txt")
             try? content.write(toFile: path, atomically: true, encoding: .utf8)
@@ -468,7 +470,7 @@ actor DebugTracker {
         for (sid, entries) in grouped {
             let tail = entries.suffix(maxOtherLines)
             for entry in tail {
-                let redacted = redactLine(entry.line)
+                let redacted = redactor.redact(entry.line)
                 allLines.append((entry.timestamp, "[\(sid)] \(redacted)"))
             }
         }
@@ -476,16 +478,6 @@ actor DebugTracker {
         let combined = allLines.map { $0.1 }.joined(separator: "\n")
         let allPath = (folderPath as NSString).appendingPathComponent("logs-all.txt")
         try? combined.write(toFile: allPath, atomically: true, encoding: .utf8)
-    }
-
-    private func redactLine(_ line: String) -> String {
-        Self.isSecretLine(line) ? "[REDACTED]" : line
-    }
-
-    /// True for a line that can hold a credential. Such a line never goes into an issue.
-    static func isSecretLine(_ line: String) -> Bool {
-        let upper = line.uppercased()
-        return secretPatterns.contains { upper.contains($0) }
     }
 
     private func makeSlug(trigger: String, serviceId: String?) -> String {
