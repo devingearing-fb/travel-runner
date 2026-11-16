@@ -1,0 +1,44 @@
+name: CI
+
+# Builds the app and runs the tests on every pull request and on every push to main.
+# The tests use fakes: they need no dev stack, no database and no sibling checkout.
+# Tests that read fb-travel-monolith skip themselves here, because it is not checked out.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A new push to the same branch cancels the run of the old push.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        run: swift --version
+
+      - name: Cache the Swift packages
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}
+
+      - name: Check the syntax of the build scripts
+        run: bash -n build.sh && bash -n release.sh
+
+      - name: Build
+        run: swift build
+
+      - name: Test
+        run: swift test
