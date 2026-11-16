@@ -11,6 +11,9 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
 
     /// The update the header pill shows. `nil` when there is none.
     private(set) var pending: PendingUpdate?
+    /// A copy of Sparkle's `canCheckForUpdates` that SwiftUI can observe.
+    private(set) var canCheckForUpdates = false
+    @ObservationIgnored private var canCheckObservation: NSKeyValueObservation?
 
     var updater: SPUUpdater { updaterController.updater }
 
@@ -27,19 +30,29 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
         UpdatePolicy.applyAutoUpdateDefault(defaults: .standard, build: .current) {
             updater.automaticallyDownloadsUpdates = true
         }
+        canCheckObservation = updater.observe(\.canCheckForUpdates, options: [.initial, .new]) { [weak self] _, change in
+            guard let value = change.newValue else { return }
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { self?.canCheckForUpdates = value }
+            } else {
+                Task { @MainActor in self?.canCheckForUpdates = value }
+            }
+        }
     }
 
     func checkForUpdates() {
         updaterController.checkForUpdates(nil)
     }
 
-    var canCheckForUpdates: Bool {
-        updater.canCheckForUpdates
-    }
-
     /// Install the downloaded update and relaunch. The app quits the normal way, so the stack stops.
     func installAndRestart() {
-        installHandler?()
+        guard let installHandler else {
+            // Sparkle dropped the download. Show its window, so the user sees what is true now.
+            pending = nil
+            checkForUpdates()
+            return
+        }
+        installHandler()
     }
 
     // MARK: - SPUUpdaterDelegate
@@ -52,8 +65,44 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
         immediateInstallationBlock immediateInstallHandler: @escaping () -> Void
     ) -> Bool {
         installHandler = immediateInstallHandler
-        pending = .ready(version: item.displayVersionString)
+        apply(.downloaded(version: item.displayVersionString))
         return true
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        shouldProceedWithUpdate updateItem: SUAppcastItem,
+        updateCheck: SPUUpdateCheck
+    ) throws {
+        let allowed = UpdatePolicy.mayProceed(
+            isDev: BuildInfo.current.isDev,
+            backgroundCheck: updateCheck == .updatesInBackground,
+            automaticDownloads: updater.automaticallyDownloadsUpdates
+        )
+        guard !allowed else { return }
+        throw NSError(
+            domain: "TravelRunner.Update",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "A dev build does not install updates in the background."]
+        )
+    }
+
+    /// The cycle failed, for example the installer is gone. Sparkle's install handler is dead now.
+    func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        endCycle()
+    }
+
+    func updater(_ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: Error?) {
+        endCycle()
+    }
+
+    private func endCycle() {
+        installHandler = nil
+        apply(.cycleEnded)
+    }
+
+    private func apply(_ event: UpdateEvent) {
+        pending = UpdatePolicy.pending(pending, after: event)
     }
 
     // MARK: - SPUStandardUserDriverDelegate
@@ -66,20 +115,14 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
         forUpdate update: SUAppcastItem,
         state: SPUUserUpdateState
     ) {
-        guard !state.userInitiated else { return }
-        pending = .available(version: update.displayVersionString)
+        apply(.found(version: update.displayVersionString, userInitiated: state.userInitiated))
     }
 
     func standardUserDriverDidReceiveUserAttention(forUpdate update: SUAppcastItem) {
-        clearAvailable()
+        apply(.seen)
     }
 
     func standardUserDriverWillFinishUpdateSession() {
-        clearAvailable()
-    }
-
-    /// A downloaded update stays in the pill until the restart.
-    private func clearAvailable() {
-        if case .available = pending { pending = nil }
+        apply(.windowSessionEnded)
     }
 }

@@ -244,6 +244,8 @@ struct SettingsPageView: View {
                             Button("Check for Updates…") { updates.checkForUpdates() }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
+                                // Sparkle ignores a check while an update cycle runs or a download waits.
+                                .disabled(!updates.canCheckForUpdates)
                         }
                     }
                 }

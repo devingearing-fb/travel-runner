@@ -11,6 +11,13 @@ struct UpdatePill: View {
         supervisor.serviceStates.values.filter { $0.pid != nil }.count
     }
 
+    private var blockedReason: String? {
+        UpdatePolicy.restartBlockedReason(
+            dbResetRunning: supervisor.dbResetRunning,
+            setupPipelineRunning: supervisor.dbSetupPipeline?.isRunning == true
+        )
+    }
+
     var body: some View {
         if let updates, let pending = updates.pending {
             Button(action: { act(on: pending, updates: updates) }) {
@@ -28,9 +35,8 @@ struct UpdatePill: View {
                 .clipShape(RoundedRectangle(cornerRadius: 4))
             }
             .buttonStyle(.plain)
-            // A restart in the middle of a database reset leaves the database half built.
-            .disabled(supervisor.dbResetRunning)
-            .help(supervisor.dbResetRunning ? "A database reset is running. Restart after it ends." : "")
+            .disabled(blockedReason != nil)
+            .help(blockedReason ?? "")
             .alert(
                 UpdatePolicy.pillText(pending),
                 isPresented: Binding(
@@ -38,7 +44,10 @@ struct UpdatePill: View {
                     set: { if !$0 { restartWarning = nil } }
                 )
             ) {
-                Button("Restart now") { updates.installAndRestart() }
+                Button("Restart now") {
+                    // A reset or setup may have started while the question was open.
+                    if blockedReason == nil { updates.installAndRestart() }
+                }
                 Button("Later", role: .cancel) {}
             } message: {
                 Text(restartWarning ?? "")
@@ -47,15 +56,16 @@ struct UpdatePill: View {
     }
 
     private func act(on pending: PendingUpdate, updates: UpdateController) {
-        switch pending {
-        case .available:
-            updates.checkForUpdates()
-        case .ready:
-            if let warning = UpdatePolicy.restartWarning(liveServices: liveServiceCount) {
-                restartWarning = warning
-            } else {
-                updates.installAndRestart()
-            }
+        let action = UpdatePolicy.pillAction(
+            pending: pending,
+            liveServices: liveServiceCount,
+            blockedReason: blockedReason
+        )
+        switch action {
+        case .showUpdateWindow: updates.checkForUpdates()
+        case .install: updates.installAndRestart()
+        case .ask(let warning): restartWarning = warning
+        case .blocked: break
         }
     }
 }
