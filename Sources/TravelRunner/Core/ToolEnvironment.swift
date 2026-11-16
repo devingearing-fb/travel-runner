@@ -262,13 +262,54 @@ final class ToolEnvironment: @unchecked Sendable {
         return tool
     }
 
-    /// The PATH that a command of `runner` gets, when `tool` is not on it. Nil
-    /// when the shell finds the tool, or when the shell itself cannot run.
-    static func searchedPath(missing tool: String, cwd: String?, runner: any CommandRunning) async -> String? {
-        let probe = "command -v -- \(ShellQuote.quote(tool)) >/dev/null 2>&1 && exit 0; print -r -- \"$PATH\"; exit 3"
+    /// Where the shell of a command finds a tool.
+    enum Lookup: Sendable, Equatable {
+        /// What `command -v` prints: the path of the tool.
+        case found(String)
+        /// The PATH of the command. The tool is not on it.
+        case missing(searchedPath: String)
+    }
+
+    /// Asks the shell of `runner` for `tool`. Nil when the shell itself cannot run.
+    static func lookup(_ tool: String, cwd: String?, runner: any CommandRunning) async -> Lookup? {
+        let probe = "found=$(command -v -- \(ShellQuote.quote(tool)) 2>/dev/null) && { print -r -- \"$found\"; exit 0 }; "
+            + "print -r -- \"$PATH\"; exit 3"
         let result = await runner.run(probe, cwd: cwd, timeout: .seconds(10))
-        guard result.exitCode == 3 else { return nil }
-        return result.stdout.split(whereSeparator: \.isNewline).last.map(String.init)
+        guard !result.timedOut, result.exitCode == 0 || result.exitCode == 3,
+              let line = result.stdout.split(whereSeparator: \.isNewline).last.map(String.init) else { return nil }
+        return result.exitCode == 0 ? .found(line) : .missing(searchedPath: line)
+    }
+
+    /// What exit 127 of a service says about the tool of its command.
+    enum MissingTool: Sendable, Equatable {
+        /// The tool is not on the PATH, also after a new read of the shell.
+        case notFound(searchedPath: String)
+        /// The PATH of the launch did not have the tool. The new read of the shell has it.
+        case foundNow(path: String)
+    }
+
+    /// After exit 127: looks for the tool on the PATH of the launch, reads the
+    /// shell again, and looks once more. The tool can be new on this Mac, and the
+    /// next start of the service waits for the new read. Nil when the PATH of
+    /// the launch had the tool (the exit code then comes from inside the command),
+    /// or when the shell cannot run.
+    func diagnoseMissing(tool: String, cwd: String?, runner: any CommandRunning) async -> MissingTool? {
+        let atLaunch = await Self.lookup(tool, cwd: cwd, runner: runner)
+        refresh()
+        guard case .missing(let launchPath) = atLaunch else { return nil }
+        // This command waits for the new read.
+        switch await Self.lookup(tool, cwd: cwd, runner: runner) {
+        case .found(let path): return .foundNow(path: path)
+        case .missing(let searchedPath): return .notFound(searchedPath: searchedPath)
+        case nil: return .notFound(searchedPath: launchPath)
+        }
+    }
+
+    /// What the user reads when the new read of the shell found the tool.
+    static func foundNowText(
+        name: String, tool: String, path: String, appName: String = Flavor.current.displayName
+    ) -> String {
+        "\(name) could not find \(tool) when it started. \(appName) read your shell again and found it at \(path). Restart \(name)."
     }
 
     /// What the user reads when a tool is not on PATH.
@@ -284,52 +325,70 @@ final class ToolEnvironment: @unchecked Sendable {
     private static let reportPathMarker = "__TR_PATH__"
     private static let reportToolMarker = "__TR_TOOL__"
 
-    /// Prints the PATH, then for each tool its path and the output of `--version`.
-    static func reportCommand(tools: [String]) -> String {
-        "print -r -- \"\(reportPathMarker)$PATH\"; "
-            + "for tool in \(ShellQuote.join(tools)); do "
-            + "found=$(command -v -- \"$tool\" 2>/dev/null) || found=; "
-            + "print -r -- \"\(reportToolMarker)$tool=$found\"; "
-            + "[ -n \"$found\" ] && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \"$tool\" --version 2>/dev/null | head -n 5; "
-            + "done; exit 0"
+    /// One tool gets this time to say where it is and which version it has.
+    static let reportTimeout: Duration = .seconds(10)
+
+    /// Prints the PATH, then the path of the tool and the output of its `--version`.
+    static func reportCommand(tool: String) -> String {
+        let name = ShellQuote.quote(tool)
+        return "print -r -- \"\(reportPathMarker)$PATH\"; "
+            + "found=$(command -v -- \(name) 2>/dev/null) || found=; "
+            + "print -r -- \"\(reportToolMarker)$found\"; "
+            + "[ -n \"$found\" ] && COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \(name) --version 2>/dev/null | head -n 5; "
+            + "exit 0"
     }
 
     /// Where each tool is and which version it has, for a command with this cwd.
+    /// Each tool has its own command and its own timeout, so a tool that hangs
+    /// does not hide the others.
     func report(
         runner: any CommandRunning, cwd: String? = nil, tools: [String] = ToolEnvironment.reportedTools
     ) async -> [ToolReport] {
-        let result = await runner.run(Self.reportCommand(tools: tools), cwd: cwd, timeout: .seconds(20))
-        return Self.parseReport(result.stdout, tools: tools, capture: capture)
+        let capture = self.capture
+        return await withTaskGroup(of: (Int, ToolReport).self) { group in
+            for (index, tool) in tools.enumerated() {
+                group.addTask {
+                    let result = await runner.run(Self.reportCommand(tool: tool), cwd: cwd, timeout: Self.reportTimeout)
+                    return (index, Self.parseReport(result, tool: tool, capture: capture))
+                }
+            }
+            var reports: [(Int, ToolReport)] = []
+            for await report in group { reports.append(report) }
+            return reports.sorted { $0.0 < $1.0 }.map(\.1)
+        }
     }
 
-    static func parseReport(_ output: String, tools: [String], capture: Capture) -> [ToolReport] {
+    /// Reads the result of `reportCommand`. A tool is "not found" only when the
+    /// shell said so. A command that timed out, was cancelled or did not run
+    /// gives a tool that was not read.
+    static func parseReport(_ result: CommandResult, tool: String, capture: Capture) -> ToolReport {
         var searched = ""
-        var paths: [String: String] = [:]
-        var versions: [String: [String]] = [:]
-        var tool: String?
-        for line in output.split(whereSeparator: \.isNewline).map(String.init) {
-            if line.hasPrefix(reportPathMarker) {
-                searched = String(line.dropFirst(reportPathMarker.count))
+        var found: String?
+        var versionLines: [String] = []
+        for line in result.stdout.split(whereSeparator: \.isNewline).map(String.init) {
+            if found != nil {
+                versionLines.append(line)
             } else if line.hasPrefix(reportToolMarker) {
-                let entry = line.dropFirst(reportToolMarker.count)
-                guard let equals = entry.firstIndex(of: "=") else { continue }
-                let name = String(entry[..<equals])
-                tool = name
-                paths[name] = String(entry[entry.index(after: equals)...])
-            } else if let tool {
-                versions[tool, default: []].append(line)
+                found = String(line.dropFirst(reportToolMarker.count))
+            } else if line.hasPrefix(reportPathMarker) {
+                searched = String(line.dropFirst(reportPathMarker.count))
             }
         }
-        return tools.map { name in
-            guard let path = paths[name], path.hasPrefix("/") else {
-                return ToolReport(name: name, path: nil, version: nil, origin: nil, searchedPath: searched)
-            }
-            return ToolReport(
-                name: name, path: path,
-                version: ToolVersion.find(in: (versions[name] ?? []).joined(separator: "\n")),
-                origin: origin(ofToolAt: path, capture: capture), searchedPath: searched
-            )
+        let limit = "\(reportTimeout.components.seconds) s"
+        guard let found else {
+            let why = result.timedOut ? "the shell did not answer in \(limit)" : "the shell command did not run"
+            return ToolReport(name: tool, path: nil, version: nil, origin: nil, searchedPath: searched, problem: why)
         }
+        guard !found.isEmpty else {
+            return ToolReport(name: tool, path: nil, version: nil, origin: nil, searchedPath: searched)
+        }
+        return ToolReport(
+            name: tool, path: found,
+            version: ToolVersion.find(in: versionLines.joined(separator: "\n")),
+            origin: found.hasPrefix("/") ? origin(ofToolAt: found, capture: capture) : nil,
+            searchedPath: searched,
+            problem: result.timedOut ? "\(tool) --version did not answer in \(limit)" : nil
+        )
     }
 
     /// Which source put the folder of this tool on the PATH. Nil when the shell
@@ -377,20 +436,28 @@ struct ToolReport: Sendable, Equatable, Identifiable {
     }
 
     let name: String
-    /// Nil when the tool is not on the PATH.
+    /// Nil when the tool is not on the PATH, or when it was not read.
     let path: String?
     /// Without the "v".
     let version: String?
     let origin: Origin?
     /// The PATH of the commands of the runner.
     let searchedPath: String
+    /// Why the runner could not read the tool, or its version. Nil when it could.
+    var problem: String?
 
     var id: String { name }
     var isFound: Bool { path != nil }
+    /// True when the runner does not know if the tool is there.
+    var isUnread: Bool { path == nil && problem != nil }
 
     /// What the user reads about this tool.
     func text(appName: String = Flavor.current.displayName) -> String {
-        guard let path else { return "\(name) was not found. \(appName) looked in: \(searchedPath)." }
+        guard let path else {
+            if let problem { return "\(appName) could not read \(name): \(problem). Click Look Again." }
+            return "\(name) was not found. \(appName) looked in: \(searchedPath)."
+        }
+        if let problem { return "\(name) is at \(path). \(problem). Click Look Again." }
         let which = version.map { "v\($0) at \(path)" } ?? path
         switch origin {
         case .rcFile(let file, let manager):

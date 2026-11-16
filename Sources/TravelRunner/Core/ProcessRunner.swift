@@ -49,16 +49,16 @@ actor ProcessRunner {
         self.tools = tools
     }
 
+    /// Starts the process of a service. It does not wait for anything before it
+    /// writes `launches`, so a `stop` or a `stopAll` that comes later always sees
+    /// the process. The caller waits for a read of the shell (`tools.settled()`)
+    /// and then checks that the start is still wanted.
     func start(
         service: ServiceDefinition,
         onStdout: @escaping @Sendable ([String]) -> Void,
         onStderr: @escaping @Sendable ([String]) -> Void,
         onTermination: @escaping @Sendable (Termination) -> Void
     ) async throws -> Int32 {
-        // A start during a resolve waits for the new PATH. The wait comes first:
-        // the rest of the start reads and changes `launches` in one step.
-        await tools.settled()
-
         // Two processes of one service fight for its port. Callers stop the old
         // process first; this covers a caller that did not.
         if let running = launches[service.id], running.process.isRunning {

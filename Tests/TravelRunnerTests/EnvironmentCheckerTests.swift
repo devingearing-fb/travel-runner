@@ -276,4 +276,87 @@ final class EnvironmentCheckerTests: XCTestCase {
             XCTAssertNotNil(EnvironmentChecker.impact(of: check.id), "\(check.id) has no impact text")
         }
     }
+
+    // MARK: - Commands of the checks
+
+    /// A checker whose commands go to `runner`. It has its own tool environment,
+    /// so no test reads the shell of this Mac.
+    private func makeChecker(_ runner: FakeCommandRunner) -> EnvironmentChecker {
+        let checker = EnvironmentChecker(
+            monorepoPath: "/nonexistent/mono", loginPath: "/nonexistent/login", streamServicesPath: "/nonexistent/stream",
+            flavor: .standard, shell: runner, tools: ToolEnvironment(home: "/nonexistent/home")
+        )
+        checker.buildChecks()
+        return checker
+    }
+
+    private func status(_ id: String, in checker: EnvironmentChecker) -> CheckStatus? {
+        checker.checks.first { $0.id == id }?.status
+    }
+
+    /// "Re-check All" reads the shell of the user before the checks, so a tool
+    /// that was installed a moment ago counts.
+    func testRecheckAllReadsTheShellBeforeTheChecks() async {
+        let runner = FakeCommandRunner()
+        let checker = makeChecker(runner)
+
+        await checker.recheckAll()
+
+        XCTAssertEqual(runner.commands.first, ToolEnvironment.captureCommand)
+        XCTAssertEqual(runner.commands.filter { $0 == ToolEnvironment.captureCommand }.count, 1)
+        XCTAssertTrue(runner.commands.contains("node --version"), "the checks ran after the read")
+
+        // Control: the first run of the checks does not read the shell.
+        let plain = FakeCommandRunner()
+        await makeChecker(plain).runAllChecks()
+        XCTAssertFalse(plain.commands.contains(ToolEnvironment.captureCommand))
+        XCTAssertTrue(plain.commands.contains("node --version"))
+    }
+
+    /// A check command that hangs is killed after 15 s. Its row must say that,
+    /// not "not installed": the fix for a missing tool does not help a tool that hangs.
+    func testACheckCommandThatTimesOutSaysSoOnItsRow() async {
+        let runner = FakeCommandRunner { _ in FakeCommandRunner.timedOut }
+        let checker = makeChecker(runner)
+
+        await checker.runAllChecks()
+
+        XCTAssertEqual(status("docker", in: checker), .failing("docker ps did not answer in 15 s"))
+        XCTAssertEqual(status("node", in: checker), .failing("node --version did not answer in 15 s"))
+        XCTAssertEqual(status("pnpm", in: checker), .failing("pnpm --version did not answer in 15 s"))
+        XCTAssertEqual(status("registry-auth", in: checker), .failing("grep ~/.npmrc did not answer in 15 s"))
+        // An optional check warns, so it does not block the wizard.
+        XCTAssertEqual(status("stripe-cli", in: checker), .warning("which stripe did not answer in 15 s"))
+        XCTAssertEqual(status("stripe-auth", in: checker), .warning("stripe balance retrieve did not answer in 15 s"))
+        XCTAssertEqual(status("booking-env", in: checker), .warning("The check of the .env file did not answer in 15 s"))
+        XCTAssertTrue(runner.calls.allSatisfy { $0.timeout == .seconds(15) }, "each check command has a timeout")
+    }
+
+    /// Control: a command that fails without a timeout keeps its own text.
+    func testACheckCommandThatFailsKeepsItsOwnText() async {
+        let checker = makeChecker(FakeCommandRunner { _ in FakeCommandRunner.failed() })
+
+        await checker.runAllChecks()
+
+        XCTAssertEqual(status("node", in: checker), .failing("Node.js not found"))
+        XCTAssertEqual(status("stripe-cli", in: checker), .warning("Not installed — webhooks won't work"))
+        XCTAssertEqual(status("stripe-auth", in: checker), .warning("Session invalid or expired — run: stripe login"))
+        for check in checker.checks {
+            if case .failing(let text) = check.status { XCTAssertFalse(text.contains("did not answer"), "\(check.id): \(text)") }
+            if case .warning(let text) = check.status { XCTAssertFalse(text.contains("did not answer"), "\(check.id): \(text)") }
+        }
+    }
+
+    func testTheAgentNodeCheckSaysWhenNodeDidNotAnswer() async {
+        let checker = EnvironmentChecker(
+            monorepoPath: "/nonexistent/mono", loginPath: "/nonexistent/login", streamServicesPath: "",
+            flavor: .hackathon, shell: FakeCommandRunner { _ in FakeCommandRunner.timedOut },
+            tools: ToolEnvironment(home: "/nonexistent/home")
+        )
+        checker.buildChecks()
+
+        await checker.runAllChecks()
+
+        XCTAssertEqual(status("agent-node", in: checker), .warning("node --version did not answer in 15 s"))
+    }
 }

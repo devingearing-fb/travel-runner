@@ -250,6 +250,10 @@ final class HoldsViewerHost {
         recentOutput = []
         generation += 1
         let launch = generation
+        // A start during a read of the shell waits for the new PATH. A stop in
+        // that time wins.
+        await ToolEnvironment.shared.settled()
+        guard launch == generation, state == .starting else { return }
         let port = Self.freePort()
 
         let definition = ServiceDefinition(

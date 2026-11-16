@@ -132,6 +132,15 @@ actor DbSetupRunner {
 
         // A step that starts during a resolve waits for the new PATH.
         await tools.settled()
+        // A cancel during the wait finds no process to end, so the step ends here.
+        if cancelled {
+            await MainActor.run {
+                step.status = .failed
+                step.completedAt = .now
+                step.errorMessage = "Cancelled"
+            }
+            return false
+        }
         let command = tools.wrap(step.command, cwd: portalCwd)
         let timeout = step.timeoutSeconds
         let cwd = self.portalCwd

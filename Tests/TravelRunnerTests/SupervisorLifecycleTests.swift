@@ -202,7 +202,71 @@ final class SupervisorLifecycleTests: XCTestCase {
         await tools.settled()
         XCTAssertEqual(tools.capture.shellPath.first, path)
 
+        // The user reads that the tool is found now, not a question about the branch.
+        let found = "web could not find \(tool) when it started. \(Flavor.current.displayName) read your shell again "
+            + "and found it at \(path)/\(tool). Restart web."
+        let said = await waitUntil(20) { self.supervisor.lastError == found && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(said, supervisor.lastError ?? "no error")
+        let lines = await logLines("web")
+        XCTAssertEqual(lines.filter { $0 == "[travel-runner] \(found)" }.count, 1, lines.joined(separator: "\n"))
+        XCTAssertEqual(userShell.calls.count, 2, "one new read for one exit 127")
+
         supervisor.restartService("web")
+        let ready = await waitUntil(40) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+    }
+
+    /// Stop All while the shell is read: the start waited for the read inside the
+    /// process runner, the stop saw no process, and the start then ran one. The
+    /// port was taken while the app said "stopped".
+    func testAStopAllDuringAReadOfTheShellStartsNoProcess() async throws {
+        let gate = Gate()
+        let userShell = FakeCommandRunner { _ in
+            await gate.wait()
+            return FakeCommandRunner.ok("__TR_ENV_START__\nPATH=/usr/bin:/bin\n__TR_ENV_END__\n")
+        }
+        let tools = ToolEnvironment(home: workDir.appendingPathComponent("home").path)
+        try makeSupervisor(tools: tools)
+        try load(daemon("web", webServer))
+
+        tools.beginResolve(runner: userShell)
+        supervisor.restartService("web")
+        // A restart pauses for one second before the start. After that the start
+        // waits for the read.
+        try await Task.sleep(for: .seconds(3))
+        XCTAssertEqual(Self.listeners(on: port), [], "the start did not wait for the read of the shell")
+
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+
+        await gate.open()
+        await tools.settled()
+        // A start that still runs would open the port within this time.
+        try await Task.sleep(for: .seconds(3))
+
+        XCTAssertEqual(Self.listeners(on: port), [], "a process started after Stop All")
+        XCTAssertEqual(state("web").phase, .stopped)
+        XCTAssertTrue(supervisor.actionsInFlight.isEmpty)
+    }
+
+    /// Control for the test above: without a stop, the start runs when the read ends.
+    func testAStartThatWaitedForAReadOfTheShellRunsAfterIt() async throws {
+        let gate = Gate()
+        let userShell = FakeCommandRunner { _ in
+            await gate.wait()
+            return FakeCommandRunner.ok("__TR_ENV_START__\nPATH=/usr/bin:/bin\n__TR_ENV_END__\n")
+        }
+        let tools = ToolEnvironment(home: workDir.appendingPathComponent("home").path)
+        try makeSupervisor(tools: tools)
+        try load(daemon("web", webServer))
+
+        tools.beginResolve(runner: userShell)
+        supervisor.restartService("web")
+        try await Task.sleep(for: .seconds(3))
+        XCTAssertEqual(Self.listeners(on: port), [], "the start did not wait for the read of the shell")
+
+        await gate.open()
         let ready = await waitUntil(40) { self.settled("web") }
         XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
     }
@@ -591,6 +655,38 @@ final class SupervisorLifecycleTests: XCTestCase {
         // A database with tables is left alone.
         answer = DbQueryResult(exitCode: 0, stdout: "42", stderr: "")
         _ = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
+        XCTAssertEqual(resets, 1)
+    }
+
+    /// The query itself (`docker exec … psql`) with a Docker that hangs: the
+    /// timeout counts as a failed query, never as an empty database.
+    func testADatabaseQueryThatTimesOutNeverStartsAReset() async throws {
+        try loadSupabase()
+        supervisor.databaseProbeRetry = (.milliseconds(10), .zero)
+        var resets = 0
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+        let docker = FakeCommandRunner { _ in FakeCommandRunner.timedOut }
+        supervisor.shell = docker
+
+        let didReset = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+
+        XCTAssertFalse(didReset)
+        XCTAssertEqual(resets, 0)
+        XCTAssertEqual(docker.calls.count, 1)
+        XCTAssertTrue(docker.commands.first?.contains("psql") == true, "\(docker.commands)")
+        XCTAssertEqual(docker.calls.first?.timeout, .seconds(20))
+        XCTAssertEqual(
+            supervisor.lastError, "Could not read the local database (The database did not answer in 20 s.). Nothing was changed."
+        )
+
+        // Control: the same path with a database that answers "no tables" is reset.
+        docker.respond { _ in FakeCommandRunner.ok("0\n") }
+        supervisor.lastError = nil
+        let emptyDatabase = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+        XCTAssertTrue(emptyDatabase)
         XCTAssertEqual(resets, 1)
     }
 

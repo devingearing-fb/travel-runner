@@ -162,10 +162,11 @@ final class ProcessRunnerTests: XCTestCase {
         let termination = await waitForTermination(box)
         XCTAssertEqual(termination.map(ServiceTermination.classify), .cleanExit)
 
-        let searched = await ToolEnvironment.searchedPath(missing: tool, cwd: nil, runner: LoginShell(tools: bare))
-        XCTAssertNotNil(searched, "the tool is not on the PATH of the shell")
-        let found = await ToolEnvironment.searchedPath(missing: tool, cwd: nil, runner: LoginShell(tools: resolved))
-        XCTAssertNil(found, "the shell finds the tool in the added directory")
+        let searched = await ToolEnvironment.lookup(tool, cwd: nil, runner: LoginShell(tools: bare))
+        guard case .missing(let path) = searched else { return XCTFail("the tool is not on the PATH of the shell: \(String(describing: searched))") }
+        XCTAssertTrue(path.contains("/usr/bin"), path)
+        let found = await ToolEnvironment.lookup(tool, cwd: nil, runner: LoginShell(tools: resolved))
+        XCTAssertEqual(found, .found(file.path), "the shell finds the tool in the added directory")
     }
 
     /// A stop that started before a new launch must not drop the new launch.

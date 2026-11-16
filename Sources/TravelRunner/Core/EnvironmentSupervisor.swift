@@ -131,6 +131,9 @@ final class EnvironmentSupervisor {
     private var queuedRestarts: Set<String> = []
     private var queuedCacheClears: Set<String> = []
     private var actionCounts: [String: Int] = [:]
+    /// The last exit 127 of each service and what it means. The wait for the
+    /// start and the end of the process both ask, and they must get one answer.
+    private var missingToolDiagnoses: [String: (pid: Int32, task: Task<ToolEnvironment.MissingTool?, Never>)] = [:]
     private var isHandlingWake = false
     private var networkReapplyPending = false
     private var wakePassStartedAt: Date?
@@ -201,8 +204,9 @@ final class EnvironmentSupervisor {
         case exitedDuringStartup(String)
         /// The supervisor stopped the automatic restarts; the text says why.
         case autoRestartStopped(String)
-        /// `searchedPath` is the PATH of the launch when the command is a tool that is not on it.
-        case commandNotRunnable(name: String, command: String, code: Int32, searchedPath: String? = nil)
+        /// `tool` says what exit 127 means when the command is a tool that the
+        /// PATH of the launch did not have.
+        case commandNotRunnable(name: String, command: String, code: Int32, tool: ToolEnvironment.MissingTool? = nil)
         case localKeysMissing(name: String, envFile: String)
         case portHeldByOtherStack(port: Int, container: String)
         /// `owner` is the process name of the container runtime that listens on the port.
@@ -214,8 +218,10 @@ final class EnvironmentSupervisor {
             case .probeTimeout(let id, let s): "'\(id)' health probe timed out after \(s)s"
             case .exitedDuringStartup(let id): "'\(id)' exited before it was ready — see its log"
             case .autoRestartStopped(let reason): reason
-            case .commandNotRunnable(let name, let command, _, let searchedPath?):
+            case .commandNotRunnable(let name, let command, _, .notFound(let searchedPath)):
                 "\(name) cannot start: \(ToolEnvironment.notFoundText(tool: command, searchedPath: searchedPath))"
+            case .commandNotRunnable(let name, let command, _, .foundNow(let path)):
+                ToolEnvironment.foundNowText(name: name, tool: command, path: path)
             case .commandNotRunnable(let name, let command, let code, nil):
                 "\(name) cannot start: the shell could not run \(command) (exit \(code)). Does the current branch have it? Restart \(name) after the fix."
             case .localKeysMissing(let name, let envFile):
@@ -1766,6 +1772,11 @@ final class EnvironmentSupervisor {
             }
         }
 
+        // A start during a read of the shell waits for the new PATH. The wait is
+        // here, before the last check for a stop: the process runner must not
+        // wait, or a stop-all in that time sees no process and the start runs one.
+        await tools.settled()
+
         // The waits above can outlast a stop-all.
         guard !isShuttingDown, health != .stopped else {
             if state.phase == .starting || state.phase == .pending { state.phase = .stopped }
@@ -1958,7 +1969,7 @@ final class EnvironmentSupervisor {
         case .commandNotRunnable(let code):
             throw ServiceError.commandNotRunnable(
                 name: state.definition.displayName, command: state.definition.cmd.first ?? "its command", code: code,
-                searchedPath: await searchedPath(forExit: code, of: state.definition)
+                tool: await missingTool(forExit: code, pid: exit.pid, of: state.definition)
             )
         case .killedExternally, .crashed:
             // Stripe degrades to skipped when its CLI fails.
@@ -1977,14 +1988,18 @@ final class EnvironmentSupervisor {
         }
     }
 
-    /// The PATH of the launch when exit 127 means that the tool of the service is
-    /// not on it. Nil for a script path, and when the shell finds the tool.
-    private func searchedPath(forExit code: Int32, of definition: ServiceDefinition) async -> String? {
+    /// What exit 127 means when the PATH of the launch did not have the tool of
+    /// the service. It reads the shell again. Nil for a script path, and when the
+    /// PATH of the launch had the tool.
+    private func missingTool(
+        forExit code: Int32, pid: Int32, of definition: ServiceDefinition
+    ) async -> ToolEnvironment.MissingTool? {
         guard code == 127, let tool = ToolEnvironment.toolName(of: definition.cmd) else { return nil }
-        // The tool can be new on this Mac: read the shell again. The probe waits
-        // for it, and so does the next start of the service.
-        tools.refresh()
-        return await ToolEnvironment.searchedPath(missing: tool, cwd: definition.resolvedCwd, runner: shell)
+        if let known = missingToolDiagnoses[definition.id], known.pid == pid { return await known.task.value }
+        let (tools, shell, cwd) = (tools, shell, definition.resolvedCwd)
+        let task = Task { await tools.diagnoseMissing(tool: tool, cwd: cwd, runner: shell) }
+        missingToolDiagnoses[definition.id] = (pid, task)
+        return await task.value
     }
 
     private func handleTermination(serviceID: String, termination: ProcessRunner.Termination) {
@@ -2087,14 +2102,16 @@ final class EnvironmentSupervisor {
             lastError = plain
             let definition = state.definition
             Task {
-                guard let path = await searchedPath(forExit: code, of: definition) else { return }
-                await logStore.append(serviceID: serviceID, entry: LogEntry(
-                    stream: .stderr, text: "[travel-runner] \(ToolEnvironment.notFoundText(tool: command, searchedPath: path))"
-                ))
+                guard let tool = await missingTool(forExit: code, pid: termination.pid, of: definition) else { return }
+                let line = switch tool {
+                case .notFound(let path): ToolEnvironment.notFoundText(tool: command, searchedPath: path)
+                case .foundNow(let path): ToolEnvironment.foundNowText(name: name, tool: command, path: path)
+                }
+                await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(line)"))
                 // A newer error stays.
                 if lastError == plain {
                     lastError = ServiceError.commandNotRunnable(
-                        name: name, command: command, code: code, searchedPath: path
+                        name: name, command: command, code: code, tool: tool
                     ).description
                 }
             }

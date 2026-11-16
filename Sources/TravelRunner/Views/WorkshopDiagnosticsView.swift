@@ -126,9 +126,17 @@ struct WorkshopDiagnosticsView: View {
         if let toolReports {
             ForEach(toolReports) { tool in
                 HStack(alignment: .top, spacing: 8) {
-                    Image(systemName: tool.isFound ? "checkmark.circle.fill" : "xmark.circle.fill")
-                        .foregroundStyle(tool.isFound ? .green : .red)
-                        .frame(width: 16)
+                    Group {
+                        if tool.problem != nil {
+                            // Not read is not the same as not found.
+                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                        } else if tool.isFound {
+                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        } else {
+                            Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+                        }
+                    }
+                    .frame(width: 16)
                     Text(tool.text())
                         .font(.caption)
                         .textSelection(.enabled)
@@ -147,7 +155,10 @@ struct WorkshopDiagnosticsView: View {
     }
 
     private func loadTools() async {
-        toolReports = await supervisor.tools.report(runner: supervisor.shell, cwd: toolsCwd)
+        let reports = await supervisor.tools.report(runner: supervisor.shell, cwd: toolsCwd)
+        // The view went away: its commands were stopped, so the result says nothing.
+        guard !Task.isCancelled else { return }
+        toolReports = reports
     }
 
     /// The monorepo, so the Node is the one that its `.nvmrc` picks.
@@ -210,9 +221,11 @@ struct WorkshopDiagnosticsView: View {
 
         let tools = await supervisor.tools.report(runner: supervisor.shell, cwd: toolsCwd)
         bundle["tools"] = Dictionary(uniqueKeysWithValues: tools.map { tool in
-            (tool.name, ["path": tool.path ?? "not found", "version": tool.version ?? "unknown"])
+            var entry = ["path": tool.path ?? (tool.isUnread ? "not read" : "not found"), "version": tool.version ?? "unknown"]
+            if let problem = tool.problem { entry["problem"] = problem }
+            return (tool.name, entry)
         })
-        if let searched = tools.first?.searchedPath { bundle["toolsPath"] = searched }
+        if let searched = tools.map(\.searchedPath).first(where: { !$0.isEmpty }) { bundle["toolsPath"] = searched }
 
         var logs: [String: [String]] = [:]
         for id in supervisor.sortedServiceIDs {

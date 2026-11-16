@@ -420,17 +420,39 @@ final class EnvironmentChecker {
         FileManager.default.fileExists(atPath: path)
     }
 
+    /// The command of a check was killed after the timeout. `label` is the short
+    /// form of the command that the row shows.
+    private struct CheckTimedOut: Error {
+        let label: String
+    }
+
+    /// The status of one check. A command that hangs says so on its row: it is
+    /// not "not installed" and not "not found". A required check fails; an
+    /// optional one warns.
     private func runCheck(_ id: String) async -> CheckStatus {
+        do {
+            return try await status(of: id)
+        } catch {
+            let label = (error as? CheckTimedOut)?.label ?? "The check"
+            let isRequired = checks.first { $0.id == id }?.isRequired ?? true
+            return Self.timedOutStatus(label: label, isRequired: isRequired)
+        }
+    }
+
+    nonisolated static func timedOutStatus(label: String, isRequired: Bool) -> CheckStatus {
+        let text = Shell.timeoutText(label, after: checkTimeout)
+        return isRequired ? .failing(text) : .warning(text)
+    }
+
+    private func status(of id: String) async throws -> CheckStatus {
         switch id {
         case "docker":
             let runtime = ContainerRuntime.detect()
-            let result = await runCommand("docker ps >/dev/null 2>&1")
-            if result.timedOut { return .failing(Shell.timeoutText("docker ps", after: Self.checkTimeout)) }
+            let result = try await check("docker ps >/dev/null 2>&1", label: "docker ps")
             return result.succeeded ? .passing(runtime.displayName) : .failing("\(runtime.displayName) not responding")
 
         case "node":
-            let result = await runCommand("node --version")
-            if result.timedOut { return .failing(Shell.timeoutText("node --version", after: Self.checkTimeout)) }
+            let result = try await check("node --version", label: "node --version")
             let (output, ok) = (result.stdout, result.succeeded)
             if !ok { return .failing("Node.js not found") }
             let version = output.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "v", with: "")
@@ -440,24 +462,25 @@ final class EnvironmentChecker {
             return .failing("v\(version) — need 22+")
 
         case "pnpm":
-            let (output, ok) = await shellOutput(Self.pnpmCheckCommand(monorepo: monorepoPath))
-            return Self.pnpmStatus(output: output, ok: ok, pin: Self.pnpmPin(monorepo: monorepoPath))
+            let result = try await check(Self.pnpmCheckCommand(monorepo: monorepoPath), label: "pnpm --version")
+            return Self.pnpmStatus(output: result.stdout, ok: result.succeeded, pin: Self.pnpmPin(monorepo: monorepoPath))
 
         case "python-jwt":
-            let ok = await shell("python3 -c 'import jwt' 2>/dev/null")
+            let ok = try await check("python3 -c 'import jwt' 2>/dev/null", label: "python3 -c 'import jwt'").succeeded
             return ok ? .passing("Installed") : .warning("Not installed — only monolith checkouts from before the .env dump script need it")
 
         case "registry-auth":
-            let ok = await shell("grep -q '^//npm.pkg.github.com/:_authToken=.' ~/.npmrc 2>/dev/null")
+            let ok = try await check(
+                "grep -q '^//npm.pkg.github.com/:_authToken=.' ~/.npmrc 2>/dev/null", label: "grep ~/.npmrc"
+            ).succeeded
             return ok ? .passing("Configured") : .failing("No token in ~/.npmrc — see the description")
 
         case "stripe-cli":
-            let ok = await shell("which stripe >/dev/null 2>&1")
+            let ok = try await check("which stripe >/dev/null 2>&1", label: "which stripe").succeeded
             return ok ? .passing("Found") : .warning("Not installed — webhooks won't work")
 
         case "stripe-auth":
-            let result = await runCommand("stripe balance retrieve >/dev/null 2>&1")
-            if result.timedOut { return .warning(Shell.timeoutText("stripe balance retrieve", after: Self.checkTimeout)) }
+            let result = try await check("stripe balance retrieve >/dev/null 2>&1", label: "stripe balance retrieve")
             return result.succeeded ? .passing("Authenticated") : .warning("Session invalid or expired — run: stripe login")
 
         case "workspace-modules":
@@ -474,8 +497,10 @@ final class EnvironmentChecker {
 
         case "booking-env", "partner-env":
             let app: SharedEnvFiles.App = id == "booking-env" ? .booking : .partner
-            let (output, _) = await shellOutput(SharedEnvFiles.command(monorepo: monorepoPath, app: app))
-            return SharedEnvFiles.status(SharedEnvFiles.decode(output, app: app))
+            let result = try await check(
+                SharedEnvFiles.command(monorepo: monorepoPath, app: app), label: "The check of the .env file"
+            )
+            return SharedEnvFiles.status(SharedEnvFiles.decode(result.stdout, app: app))
 
         case "backend-baseline":
             let sibling = ((monorepoPath as NSString).deletingLastPathComponent as NSString)
@@ -505,7 +530,8 @@ final class EnvironmentChecker {
 
         case "agent-node":
             let minimum = ServiceCatalog.agentNodeMajor
-            let (output, ok) = await shellOutput("node --version")
+            let result = try await check("node --version", label: "node --version")
+            let (output, ok) = (result.stdout, result.succeeded)
             if ok, let major = NodeLocator.major(ofVersionOutput: output), major >= minimum {
                 return .passing("\(output.trimmingCharacters(in: .whitespacesAndNewlines)) (default)")
             }
@@ -820,6 +846,13 @@ final class EnvironmentChecker {
     /// services get (see `ToolEnvironment`).
     private func runCommand(_ command: String, timeout: Duration = EnvironmentChecker.checkTimeout) async -> CommandResult {
         await commandRunner.run(command, cwd: commandCwd, timeout: timeout)
+    }
+
+    /// The command of a check. It throws when the command was killed after the timeout.
+    private func check(_ command: String, label: String) async throws -> CommandResult {
+        let result = await runCommand(command)
+        if result.timedOut { throw CheckTimedOut(label: label) }
+        return result
     }
 
     private func shell(_ command: String) async -> Bool {

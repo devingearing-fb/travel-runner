@@ -254,22 +254,6 @@ final class ToolEnvironmentTests: XCTestCase {
         XCTAssertEqual(seen.value, "inner")
     }
 
-    private actor Gate {
-        private var isOpen = false
-        private var waiters: [CheckedContinuation<Void, Never>] = []
-
-        func wait() async {
-            if isOpen { return }
-            await withCheckedContinuation { waiters.append($0) }
-        }
-
-        func open() {
-            isOpen = true
-            waiters.forEach { $0.resume() }
-            waiters = []
-        }
-    }
-
     private final class Seen: @unchecked Sendable {
         private let lock = NSLock()
         private var stored: String?
@@ -289,34 +273,44 @@ final class ToolEnvironmentTests: XCTestCase {
 
     // MARK: - Tools report
 
+    private static let reportPath =
+        "/Users/a/.nvm/versions/node/v22.11.0/bin:/usr/local/bin:/usr/bin:/bin:/Users/a/.orbstack/bin"
+
+    /// The answer of the report command of one tool.
+    private static func toolAnswer(_ found: String, _ version: String = "") -> CommandResult {
+        FakeCommandRunner.ok("__TR_PATH__\(reportPath)\n__TR_TOOL__\(found)\n\(version)")
+    }
+
+    /// The tool that a report command asks for.
+    private static func tool(of call: FakeCommandRunner.Call, in tools: [String]) -> String? {
+        tools.first { call.command == ToolEnvironment.reportCommand(tool: $0) }
+    }
+
     func testTheReportSaysWhereEachToolComesFrom() async {
         let capture = ToolEnvironment.parseCapture(captured)
         let tools = ToolEnvironment(home: home.path, capture: capture)
-        let runner = FakeCommandRunner { _ in
-            FakeCommandRunner.ok("""
-                __TR_PATH__/Users/a/.nvm/versions/node/v22.11.0/bin:/usr/local/bin:/usr/bin:/bin:/Users/a/.orbstack/bin
-                __TR_TOOL__node=/Users/a/.nvm/versions/node/v22.11.0/bin/node
-                v22.11.0
-                __TR_TOOL__pnpm=/Users/a/Library/pnpm/pnpm
-                Update available! 10.1.0 → 12.0.0
-                10.34.5
-                __TR_TOOL__docker=/Users/a/.orbstack/bin/docker
-                Docker version 27.0.3, build 7d4bcd8
-                __TR_TOOL__stripe=
-                __TR_TOOL__git=/usr/bin/git
-                git version 2.50.1 (Apple Git-155)
-
-                """)
+        let names = ["node", "pnpm", "docker", "stripe", "git"]
+        let runner = FakeCommandRunner { call in
+            switch Self.tool(of: call, in: names) {
+            case "node": Self.toolAnswer("/Users/a/.nvm/versions/node/v22.11.0/bin/node", "v22.11.0\n")
+            case "pnpm": Self.toolAnswer("/Users/a/Library/pnpm/pnpm", "Update available! 10.1.0 → 12.0.0\n10.34.5\n")
+            case "docker": Self.toolAnswer("/Users/a/.orbstack/bin/docker", "Docker version 27.0.3, build 7d4bcd8\n")
+            case "stripe": Self.toolAnswer("")
+            case "git": Self.toolAnswer("/usr/bin/git", "git version 2.50.1 (Apple Git-155)\n")
+            default: FakeCommandRunner.failed()
+            }
         }
 
-        let report = await tools.report(runner: runner, cwd: "/mono", tools: ["node", "pnpm", "docker", "stripe", "git"])
+        let report = await tools.report(runner: runner, cwd: "/mono", tools: names)
 
-        XCTAssertEqual(runner.calls.first?.cwd, "/mono")
-        XCTAssertEqual(report.map(\.name), ["node", "pnpm", "docker", "stripe", "git"])
+        XCTAssertEqual(runner.calls.count, 5, "one command for each tool")
+        XCTAssertTrue(runner.calls.allSatisfy { $0.cwd == "/mono" && $0.timeout == .seconds(10) })
+        XCTAssertEqual(report.map(\.name), names)
         XCTAssertEqual(report.map(\.version), ["22.11.0", "10.34.5", "27.0.3", nil, "2.50.1"])
         XCTAssertEqual(report.map(\.origin), [
             .rcFile("~/.zshrc", manager: "nvm"), .rcFile("~/.zshrc", manager: "pnpm"), .runner, nil, .loginShell,
         ])
+        XCTAssertEqual(report.map(\.problem), [nil, nil, nil, nil, nil])
         XCTAssertEqual(
             report[0].text(appName: "Travel Runner"),
             "node comes from ~/.zshrc (nvm). Travel Runner found it and will use v22.11.0 at /Users/a/.nvm/versions/node/v22.11.0/bin/node."
@@ -330,17 +324,167 @@ final class ToolEnvironmentTests: XCTestCase {
             "stripe was not found. Travel Runner looked in: /Users/a/.nvm/versions/node/v22.11.0/bin:/usr/local/bin:/usr/bin:/bin:/Users/a/.orbstack/bin."
         )
         XCTAssertFalse(report[3].isFound)
+        XCTAssertFalse(report[3].isUnread, "the shell said that stripe is not there")
         XCTAssertEqual(report[4].text(appName: "Travel Runner"), "git v2.50.1 at /usr/bin/git.")
+    }
+
+    /// `pnpm --version` can hang (corepack with no network). The tools after it
+    /// had no line in the one shared command, and all of them read "was not found".
+    func testAToolThatHangsDoesNotHideTheOthers() async {
+        let tools = ToolEnvironment(home: home.path, capture: ToolEnvironment.parseCapture(captured))
+        let names = ["node", "pnpm", "docker"]
+        let runner = FakeCommandRunner { call in
+            switch Self.tool(of: call, in: names) {
+            case "node": Self.toolAnswer("/usr/local/bin/node", "v22.11.0\n")
+            // The path came before the hang; the version did not.
+            case "pnpm": CommandResult(
+                exitCode: -1, stdout: "__TR_PATH__\(Self.reportPath)\n__TR_TOOL__/Users/a/Library/pnpm/pnpm\n",
+                stderr: "", timedOut: true
+            )
+            case "docker": Self.toolAnswer("/Users/a/.orbstack/bin/docker", "Docker version 27.0.3, build 7d4bcd8\n")
+            default: FakeCommandRunner.failed()
+            }
+        }
+
+        let report = await tools.report(runner: runner, tools: names)
+
+        XCTAssertEqual(report.map(\.isFound), [true, true, true])
+        XCTAssertEqual(report.map(\.version), ["22.11.0", nil, "27.0.3"])
+        XCTAssertEqual(
+            report[1].text(appName: "Travel Runner"),
+            "pnpm is at /Users/a/Library/pnpm/pnpm. pnpm --version did not answer in 10 s. Click Look Again."
+        )
+        XCTAssertNil(report[2].problem)
+    }
+
+    /// A report that timed out, or did not run, is not a list of missing tools.
+    func testAReportThatTimedOutOrDidNotRunSaysSoAndNamesNoToolAsMissing() async {
+        let tools = ToolEnvironment(home: home.path)
+
+        let timedOut = await tools.report(runner: FakeCommandRunner { _ in FakeCommandRunner.timedOut }, tools: ["node", "docker"])
+        XCTAssertEqual(timedOut.map(\.isUnread), [true, true])
+        XCTAssertEqual(timedOut.map(\.isFound), [false, false])
+        XCTAssertEqual(
+            timedOut[1].text(appName: "Travel Runner"),
+            "Travel Runner could not read docker: the shell did not answer in 10 s. Click Look Again."
+        )
+
+        // A cancelled command, or one that did not start: exit -1 and no output.
+        let empty = await tools.report(
+            runner: FakeCommandRunner { _ in CommandResult(exitCode: -1, stdout: "", stderr: "Cancelled") }, tools: ["node"]
+        )
+        XCTAssertTrue(empty[0].isUnread)
+        XCTAssertEqual(
+            empty[0].text(appName: "Travel Runner"),
+            "Travel Runner could not read node: the shell command did not run. Click Look Again."
+        )
+        XCTAssertFalse(empty[0].text().contains("was not found"))
+
+        // Control: only the shell's own "not there" line gives "was not found".
+        let missing = await tools.report(runner: FakeCommandRunner { _ in Self.toolAnswer("") }, tools: ["node"])
+        XCTAssertFalse(missing[0].isUnread)
+        XCTAssertTrue(missing[0].text().contains("node was not found."), missing[0].text())
     }
 
     /// Before the shell was read the sources are not known, so the text names none.
     func testWithoutACaptureTheReportNamesNoSource() {
         let report = ToolEnvironment.parseReport(
-            "__TR_PATH__/usr/bin\n__TR_TOOL__node=/opt/homebrew/bin/node\nv22.1.0\n",
-            tools: ["node"], capture: ToolEnvironment.Capture()
+            FakeCommandRunner.ok("__TR_PATH__/usr/bin\n__TR_TOOL__/opt/homebrew/bin/node\nv22.1.0\n"),
+            tool: "node", capture: ToolEnvironment.Capture()
         )
-        XCTAssertNil(report[0].origin)
-        XCTAssertEqual(report[0].text(appName: "Travel Runner"), "node v22.1.0 at /opt/homebrew/bin/node.")
+        XCTAssertNil(report.origin)
+        XCTAssertEqual(report.text(appName: "Travel Runner"), "node v22.1.0 at /opt/homebrew/bin/node.")
+    }
+
+    // MARK: - Exit 127
+
+    /// The probe of `lookup` as the shell would answer it. Like the login shell,
+    /// it waits for a read of the user's shell that runs.
+    private static func lookupRunner(
+        _ tools: ToolEnvironment, found: @escaping @Sendable () -> String?
+    ) -> FakeCommandRunner {
+        FakeCommandRunner { _ in
+            await tools.settled()
+            if let path = found() { return FakeCommandRunner.ok("\(path)\n") }
+            return CommandResult(exitCode: 3, stdout: "/usr/bin:/bin\n", stderr: "")
+        }
+    }
+
+    private final class Flag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+
+        func set() {
+            lock.lock()
+            value = true
+            lock.unlock()
+        }
+
+        var isSet: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+    }
+
+    /// The user added the tool to the rc file after the launch of the app. The
+    /// text must say that the tool is found now, not ask about the branch.
+    func testAfterExit127AToolThatTheNewReadFindsIsFoundNow() async {
+        let tools = ToolEnvironment(home: home.path)
+        let userShell = FakeCommandRunner { _ in
+            FakeCommandRunner.ok("__TR_ENV_START__\nPATH=/usr/bin\n__TR_ENV_END__\n")
+        }
+        await tools.resolve(runner: userShell)
+        // The shell has the tool only after the next read.
+        let readAgain = Flag()
+        userShell.respond { _ in
+            readAgain.set()
+            return FakeCommandRunner.ok("__TR_ENV_START__\nPATH=/new/bin:/usr/bin\n__TR_ENV_END__\n")
+        }
+
+        let finding = await tools.diagnoseMissing(
+            tool: "pnpm", cwd: nil, runner: Self.lookupRunner(tools) { readAgain.isSet ? "/new/bin/pnpm" : nil }
+        )
+
+        XCTAssertEqual(finding, .foundNow(path: "/new/bin/pnpm"))
+        XCTAssertEqual(userShell.calls.count, 2, "exit 127 reads the shell again")
+        XCTAssertEqual(
+            ToolEnvironment.foundNowText(name: "Booking Portal", tool: "pnpm", path: "/new/bin/pnpm", appName: "Travel Runner"),
+            "Booking Portal could not find pnpm when it started. Travel Runner read your shell again and found it at /new/bin/pnpm. Restart Booking Portal."
+        )
+    }
+
+    func testAfterExit127AToolThatIsStillNotThereIsNotFound() async {
+        let tools = ToolEnvironment(home: home.path)
+        let userShell = FakeCommandRunner { _ in
+            FakeCommandRunner.ok("__TR_ENV_START__\nPATH=/usr/bin\n__TR_ENV_END__\n")
+        }
+        await tools.resolve(runner: userShell)
+
+        let finding = await tools.diagnoseMissing(tool: "pnpm", cwd: nil, runner: Self.lookupRunner(tools) { nil })
+
+        XCTAssertEqual(finding, .notFound(searchedPath: "/usr/bin:/bin"))
+        XCTAssertEqual(userShell.calls.count, 2, "exit 127 reads the shell again")
+    }
+
+    /// Control: `pnpm dev` ends with 127 when a tool inside the script is missing.
+    /// pnpm itself was there, so the text must not say that pnpm was found again.
+    func testAfterExit127AToolThatTheLaunchHadGivesNoFinding() async {
+        let tools = ToolEnvironment(home: home.path)
+        let userShell = FakeCommandRunner { _ in
+            FakeCommandRunner.ok("__TR_ENV_START__\nPATH=/usr/bin\n__TR_ENV_END__\n")
+        }
+        await tools.resolve(runner: userShell)
+
+        let finding = await tools.diagnoseMissing(tool: "pnpm", cwd: nil, runner: Self.lookupRunner(tools) { "/usr/bin/pnpm" })
+
+        XCTAssertNil(finding)
+        await tools.settled()
+        XCTAssertEqual(userShell.calls.count, 2, "exit 127 still reads the shell again")
+
+        // A shell that cannot run gives no finding.
+        let broken = await tools.diagnoseMissing(tool: "pnpm", cwd: nil, runner: FakeCommandRunner { _ in FakeCommandRunner.timedOut })
+        XCTAssertNil(broken)
     }
 
     /// The report command in a real zsh, with a tool that no Mac has.

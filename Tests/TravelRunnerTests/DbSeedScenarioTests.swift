@@ -386,6 +386,91 @@ final class DbSeedScenarioTests: XCTestCase {
         XCTAssertEqual(step.status, .passed)
     }
 
+    /// A health check that hangs is killed after 60 s, and the step says so.
+    @MainActor
+    func testAHealthCheckThatTimesOutFailsTheStepAndSaysSo() async throws {
+        let cwd = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DbSetupRunnerTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: cwd) }
+        func step() -> DbSetupStep {
+            DbSetupStep(
+                id: "verify", name: "Verify", command: "true", healthCheckCommand: "check-the-data",
+                timeoutSeconds: 5, isOptional: false, stepNumber: 1
+            )
+        }
+        let tools = ToolEnvironment(home: cwd.appendingPathComponent("home").path)
+
+        let hanging = FakeCommandRunner { _ in FakeCommandRunner.timedOut }
+        let timedOut = step()
+        let failed = await DbSetupRunner(
+            portalCwd: cwd.path, logStore: LogStore(), seedScenarioID: "default", tools: tools, shell: hanging
+        ).executeStepPublic(timedOut)
+
+        XCTAssertFalse(failed)
+        XCTAssertEqual(timedOut.status, .failed)
+        XCTAssertEqual(timedOut.errorMessage, "Health check timed out after 60s")
+        XCTAssertEqual(hanging.calls.map(\.command), ["check-the-data"])
+        XCTAssertEqual(hanging.calls.first?.timeout, .seconds(60))
+
+        // Control: a health check that fails at once has its own text, and one that passes, passes.
+        let failing = step()
+        _ = await DbSetupRunner(
+            portalCwd: cwd.path, logStore: LogStore(), seedScenarioID: "default", tools: tools,
+            shell: FakeCommandRunner { _ in FakeCommandRunner.failed() }
+        ).executeStepPublic(failing)
+        XCTAssertEqual(failing.errorMessage, "Health check failed after successful execution")
+
+        let passing = step()
+        let passed = await DbSetupRunner(
+            portalCwd: cwd.path, logStore: LogStore(), seedScenarioID: "default", tools: tools, shell: FakeCommandRunner()
+        ).executeStepPublic(passing)
+        XCTAssertTrue(passed)
+        XCTAssertEqual(passing.status, .passed)
+    }
+
+    /// A cancel while the step waits for a read of the shell: the cancel found no
+    /// process to end, and the step then ran.
+    @MainActor
+    func testACancelDuringAReadOfTheShellRunsNoStep() async throws {
+        let cwd = FileManager.default.temporaryDirectory
+            .appendingPathComponent("DbSetupRunnerTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: cwd) }
+        let marker = cwd.appendingPathComponent("ran").path
+        func step() -> DbSetupStep {
+            DbSetupStep(
+                id: "reset", name: "Reset", command: "touch \(ShellQuote.quote(marker))", healthCheckCommand: nil,
+                timeoutSeconds: 5, isOptional: false, stepNumber: 1
+            )
+        }
+        let gate = Gate()
+        let tools = ToolEnvironment(home: cwd.appendingPathComponent("home").path)
+        tools.beginResolve(runner: FakeCommandRunner { _ in
+            await gate.wait()
+            return FakeCommandRunner.ok()
+        })
+        let runner = DbSetupRunner(portalCwd: cwd.path, logStore: LogStore(), seedScenarioID: "default", tools: tools)
+        let cancelledStep = step()
+
+        let run = Task { await runner.executeStepPublic(cancelledStep) }
+        try await Task.sleep(for: .milliseconds(300))
+        await runner.cancel()
+        await gate.open()
+        let success = await run.value
+
+        XCTAssertFalse(success)
+        XCTAssertEqual(cancelledStep.status, .failed)
+        XCTAssertEqual(cancelledStep.errorMessage, "Cancelled")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker), "the step ran after the cancel")
+
+        // Control: without a cancel the same step runs.
+        let other = DbSetupRunner(portalCwd: cwd.path, logStore: LogStore(), seedScenarioID: "default", tools: tools)
+        let ran = await other.executeStepPublic(step())
+        XCTAssertTrue(ran)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker))
+    }
+
     private struct Fixture {
         let container: URL
         let root: URL
