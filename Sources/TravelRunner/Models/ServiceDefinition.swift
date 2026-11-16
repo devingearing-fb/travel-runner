@@ -26,14 +26,39 @@ extension ServiceConfig {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let entries = try container.decode([ServiceEntry].self, forKey: .services)
+        var services = entries.compactMap { if case .valid(let service) = $0 { service } else { nil } }
+        var skipped = entries.compactMap { if case .skipped(let skipped) = $0 { skipped } else { nil } }
+        Self.skipDependents(of: &skipped, in: &services)
         self.init(
             version: try container.decode(Int.self, forKey: .version),
             registryPortRange: try container.decode([Int].self, forKey: .registryPortRange),
-            services: entries.compactMap { if case .valid(let service) = $0 { service } else { nil } },
+            services: services,
             paths: try container.decodeIfPresent(RepoPaths.self, forKey: .paths),
             profile: try container.decodeIfPresent(RunProfile.self, forKey: .profile),
-            skippedServices: entries.compactMap { if case .skipped(let skipped) = $0 { skipped } else { nil } }
+            skippedServices: skipped
         )
+    }
+
+    /// A service that needs a skipped service cannot start, so it is skipped too,
+    /// and so is each service that needs it. Without this the dependency graph
+    /// rejects the whole file.
+    private static func skipDependents(of skipped: inout [SkippedService], in services: inout [ServiceDefinition]) {
+        while true {
+            let present = Set(services.map(\.id))
+            let gone = Set(skipped.compactMap(\.id)).subtracting(present)
+            var kept: [ServiceDefinition] = []
+            var found = false
+            for service in services {
+                if let missing = service.dependsOn.first(where: gone.contains) {
+                    skipped.append(SkippedService(id: service.id, reason: "depends on \"\(missing)\", which was skipped"))
+                    found = true
+                } else {
+                    kept.append(service)
+                }
+            }
+            services = kept
+            if !found { return }
+        }
     }
 
     private enum ServiceEntry: Decodable {
@@ -72,8 +97,18 @@ struct SkippedService: Sendable, Equatable {
     /// Says which field of the service is wrong, in the words of the file.
     /// `servicePath` is the place of the service in the file; the field is named from there.
     static func reason(for error: Error, in servicePath: [CodingKey] = []) -> String {
+        // The place of an element in a list reads as `cmd[1]`: the decoder's own name
+        // for it ("Index 1") is not a name from the file.
         func field(_ path: [CodingKey], _ last: CodingKey? = nil) -> String {
-            (path.dropFirst(servicePath.count) + (last.map { [$0] } ?? [])).map(\.stringValue).joined(separator: ".")
+            var name = ""
+            for key in path.dropFirst(servicePath.count) + (last.map { [$0] } ?? []) {
+                if let index = key.intValue, key.stringValue == "Index \(index)" {
+                    name += "[\(index)]"
+                } else {
+                    name += name.isEmpty ? key.stringValue : ".\(key.stringValue)"
+                }
+            }
+            return name
         }
         switch error {
         case DecodingError.keyNotFound(let key, let context):

@@ -145,6 +145,46 @@ final class ConfigLoaderTests: XCTestCase {
         }
     }
 
+    /// The graph rejects a service whose dependency is not there. A dependent of a
+    /// skipped service is skipped too, so the rest of the file still loads.
+    func testADependentOfASkippedServiceIsSkippedAndTheRestLoad() throws {
+        var foo = service(id: "foo")
+        foo["probe"] = ["type": "tcp"]
+        let bar = service(id: "bar", dependsOn: ["foo"])
+        let baz = service(id: "baz", dependsOn: ["bar", "good"])
+        let good = service(id: "good")
+
+        let (config, _) = try load(customServices: [baz, bar, foo, good])
+
+        XCTAssertEqual(
+            config.skippedServices.map(\.message),
+            [
+                "services.json: custom service \"foo\" was skipped — probe type tcp needs a port (1–65535).",
+                "services.json: custom service \"bar\" was skipped — depends on \"foo\", which was skipped.",
+                "services.json: custom service \"baz\" was skipped — depends on \"bar\", which was skipped.",
+            ]
+        )
+        XCTAssertEqual(Set(config.services.map(\.id)).intersection(["foo", "bar", "baz", "good"]), ["good"])
+        XCTAssertEqual(Set(ServiceCatalog.canonicalIDs).subtracting(config.services.map(\.id)), [])
+        XCTAssertNoThrow(try ServiceGraph(services: config.services))
+    }
+
+    /// Negative control: a dependency that is present skips nothing.
+    func testADependentOfAGoodServiceIsNotSkipped() throws {
+        let (config, _) = try load(customServices: [service(id: "bar", dependsOn: ["good"]), service(id: "good")])
+        XCTAssertEqual(config.skippedServices, [])
+        XCTAssertNotNil(config.services.first { $0.id == "bar" })
+    }
+
+    func testAWrongElementOfAListIsNamedByItsPlace() throws {
+        var foo = service(id: "foo")
+        foo["cmd"] = ["a", 5]
+        let (config, _) = try load(customServices: [foo])
+        XCTAssertEqual(
+            config.skippedServices, [SkippedService(id: "foo", reason: "its \"cmd[1]\" has the wrong kind of value")]
+        )
+    }
+
     func testGoodProbesAreNotSkipped() throws {
         let probes: [[String: Any]] = [
             ["type": "tcp", "port": 1], ["type": "tcp", "port": 65535, "host": "0.0.0.0"],

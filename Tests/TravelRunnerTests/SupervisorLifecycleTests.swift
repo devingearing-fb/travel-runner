@@ -472,7 +472,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             let reason = try XCTUnwrap(probe.problem)
             XCTAssertEqual(
                 supervisor.lastError,
-                "Custom cannot start: \(reason). Correct its probe in services.json, then restart Custom."
+                "Custom cannot start: \(reason). Correct its probe in services.json, then quit Travel Runner and open it again."
             )
             let lines = await logLines("custom")
             XCTAssertFalse(lines.contains("custom-start"), "the process must not start")

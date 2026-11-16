@@ -232,7 +232,7 @@ final class EnvironmentSupervisor {
             case .portHeldByOtherStack(let port, let container):
                 "Port \(port) is held by another Supabase stack (\(container)) — stop it, then start again"
             case .badProbe(let name, let reason):
-                "\(name) cannot start: \(reason). Correct its probe in services.json, then restart \(name)."
+                "\(name) cannot start: \(reason). Correct its probe in services.json, then quit Travel Runner and open it again."
             case .portHeldByContainer(let name, let port, let owner):
                 "\(name) cannot start: port \(port) is published by a container (\(owner)) — stop that container, then restart \(name)"
             }

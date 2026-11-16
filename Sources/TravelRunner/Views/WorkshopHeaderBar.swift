@@ -144,7 +144,8 @@ struct WorkshopHeaderBar: View {
                     action: nil
                 )
             }
-            ForEach(supervisor.configIssues, id: \.self) { issue in
+            // Keyed by place: two skipped services can give the same text.
+            ForEach(Array(supervisor.configIssues.enumerated()), id: \.offset) { _, issue in
                 alertBanner(
                     icon: "exclamationmark.triangle.fill",
                     color: .orange,
