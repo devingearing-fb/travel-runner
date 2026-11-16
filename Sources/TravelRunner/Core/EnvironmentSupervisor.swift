@@ -1271,6 +1271,7 @@ final class EnvironmentSupervisor {
             if let msg = step.errorMessage { dict["error"] = msg }
             if let guidance = step.recoveryGuidance { dict["recovery"] = guidance }
             if let health = step.healthResult { dict["health_result"] = health }
+            // Same 0–1 scale as the view.
             if let progress = step.progress { dict["progress"] = progress }
             if let label = step.progressLabel { dict["progress_label"] = label }
             steps.append(dict)

@@ -65,7 +65,7 @@ When running, travel-runner exposes an HTTP API on `http://[::1]:19900` for prog
 | `POST` | `/api/db-setup/retry/{stepId}` | Re-run the pipeline from a step |
 | `POST` | `/api/db-setup/step/{stepId}` | Run a single step |
 | `POST` | `/api/db-setup/cancel` | Cancel a running pipeline |
-| `GET` | `/api/db-setup/status` | Pipeline state with per-step progress |
+| `GET` | `/api/db-setup/status` | Pipeline state with per-step progress (a fraction from 0 to 1) |
 | `GET` | `/api/debug/issues` | List open debug-tracking issues |
 | `POST` | `/api/debug/issues` | Capture an issue; body `{"description": "..."}` |
 | `POST` | `/api/debug/issues/close/{id}` | Close an issue; optional body `{"resolution": "..."}` |

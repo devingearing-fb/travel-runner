@@ -34,6 +34,7 @@ final class DbSetupStep: Identifiable {
     nonisolated let stepNumber: Int
 
     var status: DbStepStatus = .pending
+    /// Fraction from 0 to 1.
     var progress: Double? = nil
     var progressLabel: String? = nil
     var healthResult: String? = nil

@@ -248,8 +248,10 @@ actor DbSetupRunner {
 
     // MARK: - Protocol Line Parser
 
+    /// The scripts report progress as a fraction from 0 to 1.
+    /// `step.progress` keeps that scale; the view and the status API read it.
     @MainActor
-    private static func parseProtocolLine(_ payload: String, step: DbSetupStep) {
+    static func parseProtocolLine(_ payload: String, step: DbSetupStep) {
         let parts = payload.split(separator: ":", maxSplits: 2).map(String.init)
         guard let type = parts.first else { return }
 
@@ -264,8 +266,8 @@ actor DbSetupRunner {
             }
 
         case "progress":
-            if parts.count > 1, let pct = Double(parts[1]) {
-                step.progress = pct
+            if parts.count > 1, let fraction = Double(parts[1]), fraction.isFinite {
+                step.progress = min(max(fraction, 0), 1)
                 if parts.count > 2 {
                     step.progressLabel = parts[2]
                 }
