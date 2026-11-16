@@ -90,6 +90,8 @@ final class EnvironmentSupervisor {
     private let secretStore = SecretStore()
     private var graph: ServiceGraph?
     private let processRunner = ProcessRunner()
+    /// The port cleanup reads listeners and kills through these tools.
+    @ObservationIgnored var portTools = PortTools.live
     private let preflightRunner = PreflightRunner()
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
@@ -474,12 +476,10 @@ final class EnvironmentSupervisor {
 
             await processRunner.stopAll()
 
-            // Kill any orphaned processes still bound to service ports
-            if let config {
-                for service in config.services where !service.shouldReuseIfRunning {
-                    if let port = service.probe?.port, isPortBound(port) {
-                        await killPortOccupants(port)
-                    }
+            // Kill any orphaned processes still bound to the ports of the profile's services
+            for service in killableServices {
+                if let port = service.probe?.port, isPortBound(port) {
+                    await killPortOccupants(port)
                 }
             }
 
@@ -2653,8 +2653,28 @@ final class EnvironmentSupervisor {
     /// Kills the process that listens on the port. `lsof -i :port` alone also matches
     /// the clients of the port (a browser tab, the Stripe CLI that forwards to the
     /// portal, another dev server), and those must stay alive.
+    /// A container runtime is never killed: its port helper serves every container.
     private func killPortOccupants(_ port: Int) async {
-        _ = await runShellCommand("lsof -ti TCP:\(port) -sTCP:LISTEN | xargs kill -9 2>/dev/null")
+        for listener in await portTools.listeners(port) {
+            if PortOwner.isContainerRuntime(listener.command) {
+                if let serviceID = sortedServiceIDs.first(where: { serviceStates[$0]?.definition.probe?.port == port }) {
+                    await logStore.append(
+                        serviceID: serviceID,
+                        entry: LogEntry(stream: .stderr, text: "[travel-runner] Port \(port) is published by \(listener.command) (a container). Not killed.")
+                    )
+                }
+                continue
+            }
+            portTools.kill(listener.pid)
+        }
+    }
+
+    /// Services whose port the cleanup may clear: in the profile, and not a
+    /// reuse_if_running service (e.g. Docker-managed Supabase).
+    private var killableServices: [ServiceDefinition] {
+        sortedServiceIDs
+            .compactMap { serviceStates[$0]?.definition }
+            .filter { isInProfile($0.id) && !$0.shouldReuseIfRunning }
     }
 
     /// Routes that must respond on a healthy server. "/" is wrong for
@@ -2684,7 +2704,7 @@ final class EnvironmentSupervisor {
     /// servers whose npm parent died during sleep. Without this, the replacement
     /// server silently binds port+1 while the zombie serves 404s on the real port.
     private func killWebServicePorts() async {
-        for serviceID in Self.wakeHealthPaths.keys.sorted() {
+        for serviceID in Self.wakeHealthPaths.keys.sorted() where isInProfile(serviceID) {
             guard let port = serviceStates[serviceID]?.definition.probe?.port else { continue }
             await lifecycle.withLock(serviceID) {
                 await processRunner.stop(serviceID: serviceID)
@@ -2694,14 +2714,11 @@ final class EnvironmentSupervisor {
     }
 
     /// Kill any stale processes from a previous session before starting the DAG.
-    /// Skips ports belonging to reuse_if_running services (e.g. Docker-managed Supabase).
-    private func cleanupStaleProcesses() async {
-        guard let config else { return }
-
-        // Kill by port — only non-reuse services (skip Docker-managed ports)
-        let killablePorts = config.services
-            .filter { !$0.shouldReuseIfRunning }
-            .compactMap { $0.probe?.port }
+    /// Skips ports belonging to reuse_if_running services (e.g. Docker-managed Supabase)
+    /// and to services outside the profile.
+    func cleanupStaleProcesses() async {
+        // Kill by port — only non-reuse services of the profile (skip Docker-managed ports)
+        let killablePorts = killableServices.compactMap { $0.probe?.port }
 
         var didKill = false
         for port in killablePorts {
@@ -2711,10 +2728,10 @@ final class EnvironmentSupervisor {
             }
         }
 
-        // Kill known command patterns that shouldn't be running outside of us
-        let patterns = ["stripe listen"]
-        for pattern in patterns {
-            _ = await runShellCommand("pkill -f '\(pattern)' 2>/dev/null")
+        // Kill a Stripe listener that an earlier session left. The pattern is the
+        // command of the service, so any other `stripe listen` stays alive.
+        if isInProfile("stripe"), let stripe = serviceStates["stripe"]?.definition {
+            await portTools.killCommands(PortOwner.commandPattern(for: stripe.cmd))
         }
 
         if didKill {

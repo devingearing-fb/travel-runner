@@ -379,4 +379,100 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains { $0.contains("http://localhost:\(port)") }, lines.joined(separator: "\n"))
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
     }
+
+    /// Tickets on the port cleanup: a start killed each listener on a known port, also
+    /// for a service outside the profile, and also the port helper of the container
+    /// runtime. It also killed each `stripe listen` on the Mac.
+    /// The test runs the cleanup step of a start with fake tools; no process is killed.
+    func testAStartDoesNotKillAListenerOutsideTheProfile() async throws {
+        let inProfile = try Self.listeningSocket()
+        let outside = try Self.listeningSocket()
+        let container = try Self.listeningSocket()
+        defer { for socket in [inProfile, outside, container] { close(socket.fd) } }
+
+        func service(_ id: String, _ cmd: [String], port: Int?) -> ServiceDefinition {
+            ServiceDefinition(
+                id: id, name: id, cmd: cmd, cwd: workDir.path,
+                probe: port.map { ProbeConfig(type: .tcp, port: $0, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30) },
+                type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+            )
+        }
+        let stripeCmd = ["stripe", "listen", "--forward-to", "http://localhost:\(inProfile.port)/hook"]
+        let services = [
+            service("travel-portal", ["sleep", "1"], port: inProfile.port),
+            service("partner-portal", ["sleep", "1"], port: outside.port),
+            service("universal-login", ["sleep", "1"], port: container.port),
+            service("stripe", stripeCmd, port: nil),
+        ]
+
+        let calls = PortToolCalls()
+        let commands = [inProfile.port: "node", outside.port: "node", container.port: "OrbStack Helper"]
+        supervisor.portTools = PortTools(
+            listeners: { port in commands[port].map { [PortOwner.Listener(pid: pid_t(port), command: $0)] } ?? [] },
+            kill: { calls.addKill($0) },
+            killCommands: { calls.addPattern($0) }
+        )
+
+        // The booking profile: the partner portal is outside it.
+        try supervisor.loadServices(services, profile: .booking)
+        XCTAssertFalse(supervisor.isInProfile("partner-portal"))
+        await supervisor.cleanupStaleProcesses()
+
+        XCTAssertEqual(calls.kills, [pid_t(inProfile.port)], "only the listener of the profile's service")
+        XCTAssertEqual(calls.patterns, [PortOwner.commandPattern(for: stripeCmd)])
+        let lines = await logLines("universal-login")
+        XCTAssertTrue(
+            lines.contains("[travel-runner] Port \(container.port) is published by OrbStack Helper (a container). Not killed."),
+            lines.joined(separator: "\n")
+        )
+
+        // The stop sweeps the same ports with the same rules.
+        calls.reset()
+        supervisor.health = .healthy
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(calls.kills, [pid_t(inProfile.port)])
+
+        // The partner profile: now the partner portal is in, and Stripe is out.
+        calls.reset()
+        try supervisor.loadServices(services, profile: .partner)
+        await supervisor.cleanupStaleProcesses()
+        XCTAssertEqual(calls.kills, [pid_t(outside.port)])
+        XCTAssertEqual(calls.patterns, [], "Stripe is outside the profile")
+    }
+
+    /// A socket of the test that listens on a free loopback port.
+    private static func listeningSocket() throws -> (fd: Int32, port: Int) {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = UInt32(INADDR_LOOPBACK).bigEndian
+        addr.sin_port = 0
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        guard sock >= 0, bound == 0, listen(sock, 8) == 0 else {
+            if sock >= 0 { close(sock) }
+            throw POSIXError(.EADDRNOTAVAIL)
+        }
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(sock, $0, &length) }
+        }
+        return (sock, Int(UInt16(bigEndian: addr.sin_port)))
+    }
+}
+
+/// What the fake port tools were asked to kill.
+private final class PortToolCalls: @unchecked Sendable {
+    private let lock = NSLock()
+    private var killed: [pid_t] = []
+    private var killedPatterns: [String] = []
+
+    var kills: [pid_t] { lock.withLock { killed } }
+    var patterns: [String] { lock.withLock { killedPatterns } }
+    func addKill(_ pid: pid_t) { lock.withLock { killed.append(pid) } }
+    func addPattern(_ pattern: String) { lock.withLock { killedPatterns.append(pattern) } }
+    func reset() { lock.withLock { killed = []; killedPatterns = [] } }
 }
