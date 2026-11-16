@@ -183,7 +183,8 @@ final class EnvironmentSupervisor {
         case exitedDuringStartup(String)
         /// The supervisor stopped the automatic restarts; the text says why.
         case autoRestartStopped(String)
-        case commandNotRunnable(name: String, command: String, code: Int32)
+        /// `searchedPath` is the PATH of the launch when the command is a tool that is not on it.
+        case commandNotRunnable(name: String, command: String, code: Int32, searchedPath: String? = nil)
         case localKeysMissing(name: String, envFile: String)
         case portHeldByOtherStack(port: Int, container: String)
 
@@ -193,7 +194,9 @@ final class EnvironmentSupervisor {
             case .probeTimeout(let id, let s): "'\(id)' health probe timed out after \(s)s"
             case .exitedDuringStartup(let id): "'\(id)' exited before it was ready — see its log"
             case .autoRestartStopped(let reason): reason
-            case .commandNotRunnable(let name, let command, let code):
+            case .commandNotRunnable(let name, let command, _, let searchedPath?):
+                "\(name) cannot start: \(ToolPath.notFoundText(tool: command, searchedPath: searchedPath))"
+            case .commandNotRunnable(let name, let command, let code, nil):
                 "\(name) cannot start: the shell could not run \(command) (exit \(code)). Does the current branch have it? Restart \(name) after the fix."
             case .localKeysMissing(let name, let envFile):
                 "\(name) was not started: the keys of the local Supabase stack could not be read (scripts/local-db.sh status -o env). Without them it would use the hosted dev values in \(envFile). Restart Supabase, then restart \(name)."
@@ -1888,7 +1891,7 @@ final class EnvironmentSupervisor {
                     break
                 }
                 if let exit = await processRunner.exit(of: launch.pid),
-                   try !shouldKeepWaiting(for: state, after: exit) {
+                   try await !shouldKeepWaiting(for: state, after: exit) {
                     return
                 }
                 try await Task.sleep(for: .seconds(2))
@@ -1927,7 +1930,7 @@ final class EnvironmentSupervisor {
 
     /// The process of a launch ended before its probe passed. Returns true to keep
     /// waiting and false to stop without an error. Throws when the start failed.
-    private func shouldKeepWaiting(for state: ServiceState, after exit: ProcessRunner.Termination) throws -> Bool {
+    private func shouldKeepWaiting(for state: ServiceState, after exit: ProcessRunner.Termination) async throws -> Bool {
         switch ServiceTermination.classify(exit) {
         case .stoppedByRunner:
             // Stop-all, or another operation replaced this process and owns the state.
@@ -1940,7 +1943,8 @@ final class EnvironmentSupervisor {
             throw ServiceError.exitedDuringStartup(state.id)
         case .commandNotRunnable(let code):
             throw ServiceError.commandNotRunnable(
-                name: state.definition.displayName, command: state.definition.cmd.first ?? "its command", code: code
+                name: state.definition.displayName, command: state.definition.cmd.first ?? "its command", code: code,
+                searchedPath: await searchedPath(forExit: code, of: state.definition)
             )
         case .killedExternally, .crashed:
             // Stripe degrades to skipped when its CLI fails.
@@ -1957,6 +1961,16 @@ final class EnvironmentSupervisor {
             if state.definition.resolvedRestart == .onFailure { return true }
             throw ServiceError.exitedDuringStartup(state.id)
         }
+    }
+
+    /// The PATH of the launch when exit 127 means that the tool of the service is
+    /// not on it. Nil for a script path, and when the shell finds the tool.
+    private func searchedPath(forExit code: Int32, of definition: ServiceDefinition) async -> String? {
+        guard code == 127, let tool = ToolPath.toolName(of: definition.cmd) else { return nil }
+        let cwd = definition.resolvedCwd
+        return await Task.detached {
+            await ToolPath.searchedPath(missing: tool, directories: ToolPath.directories(cwd: cwd))
+        }.value
     }
 
     private func handleTermination(serviceID: String, termination: ProcessRunner.Termination) {
@@ -2054,9 +2068,22 @@ final class EnvironmentSupervisor {
             // fails again, so there is no automatic restart.
             state.phase = .failed
             state.lastStopped = .now
-            lastError = ServiceError.commandNotRunnable(
-                name: name, command: state.definition.cmd.first ?? "its command", code: code
-            ).description
+            let command = state.definition.cmd.first ?? "its command"
+            let plain = ServiceError.commandNotRunnable(name: name, command: command, code: code).description
+            lastError = plain
+            let definition = state.definition
+            Task {
+                guard let path = await searchedPath(forExit: code, of: definition) else { return }
+                await logStore.append(serviceID: serviceID, entry: LogEntry(
+                    stream: .stderr, text: "[travel-runner] \(ToolPath.notFoundText(tool: command, searchedPath: path))"
+                ))
+                // A newer error stays.
+                if lastError == plain {
+                    lastError = ServiceError.commandNotRunnable(
+                        name: name, command: command, code: code, searchedPath: path
+                    ).description
+                }
+            }
             onServiceCrash?(name, code)
             Task { await captureDebugIssue(
                 trigger: "service_crash",

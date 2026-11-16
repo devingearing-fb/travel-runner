@@ -239,6 +239,23 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(supervisor.lastError?.contains("cannot start") == true, supervisor.lastError ?? "nil")
     }
 
+    /// Exit 127 for a tool, not a script: the error names the tool and the PATH
+    /// that the runner searched.
+    func testAMissingToolNamesThePathThatWasSearched() async throws {
+        let tool = "tr-no-such-tool-\(UUID().uuidString)"
+        try load(daemon("toolless", [tool, "dev"]))
+
+        supervisor.restartService("toolless")
+
+        let expected = "toolless cannot start: \(tool) was not found. Travel Runner looked in: "
+        let named = await waitUntil(30) {
+            self.state("toolless").phase == .failed && self.supervisor.lastError?.hasPrefix(expected) == true
+        }
+        XCTAssertTrue(named, supervisor.lastError ?? "nil")
+        XCTAssertTrue(supervisor.lastError?.contains("/usr/bin") == true, supervisor.lastError ?? "nil")
+        XCTAssertEqual(state("toolless").restartCount, 0)
+    }
+
     /// A stop-all while a service starts: the start's wait for the probe must not
     /// mark the service as failed after the stop.
     func testStopAllDuringAStartLeavesTheServiceStopped() async throws {

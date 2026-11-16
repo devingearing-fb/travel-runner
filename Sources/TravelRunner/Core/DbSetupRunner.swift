@@ -121,7 +121,7 @@ actor DbSetupRunner {
         let (exitCode, timedOut) = await withCheckedContinuation { (continuation: CheckedContinuation<(Int32, Bool), Never>) in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
+            process.arguments = ["-l", "-c", ToolPath.wrap(command, directories: ToolPath.directories(cwd: cwd))]
             process.currentDirectoryURL = URL(fileURLWithPath: cwd)
             process.environment = Self.environment(
                 parent: ProcessInfo.processInfo.environment,
@@ -356,7 +356,7 @@ actor DbSetupRunner {
         await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
+            process.arguments = ["-l", "-c", ToolPath.wrap(command, directories: ToolPath.directories(cwd: portalCwd))]
             process.currentDirectoryURL = URL(fileURLWithPath: portalCwd)
             process.environment = Self.environment(
                 parent: ProcessInfo.processInfo.environment,
