@@ -1214,7 +1214,7 @@ final class EnvironmentSupervisor {
                 await refreshLocalSupabaseKeys()
             } else if let failed = pipeline.firstFailed {
                 lastError = "DB setup failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
-                await captureDbSetupFailure(failed)
+                await captureDbSetupFailure(failed, runner: runner)
             }
         }
     }
@@ -1248,17 +1248,24 @@ final class EnvironmentSupervisor {
             dbResetRunning = false
             if !success {
                 lastError = "DB setup failed at \(step.name): \(step.errorMessage ?? "unknown error")"
-                await captureDbSetupFailure(step)
+                await captureDbSetupFailure(step, runner: runner)
             }
         }
     }
 
     /// The issue of a failed DB step. It names the step and holds the step's log.
-    func captureDbSetupFailure(_ step: DbSetupStep) async {
+    /// A run that the developer cancelled files no issue.
+    func captureDbSetupFailure(_ step: DbSetupStep, runner: DbSetupRunner? = nil) async {
+        if let runner, await runner.wasCancelled { return }
+        // The runner sends lines to the log store from detached tasks, so the last
+        // lines can still be on their way. The step's own list is complete by now.
+        let stored = await logStore.entries(for: step.logKey)
+        let log = step.logEntries.count > stored.count ? step.logEntries : stored
         await captureDebugIssue(
             trigger: "db_setup_failure",
-            serviceID: "db-setup-\(step.id)",
-            summary: "\(step.name) (\(step.id)): \(step.errorMessage ?? "unknown error")"
+            serviceID: step.logKey,
+            summary: "\(step.name) (\(step.id)): \(step.errorMessage ?? "unknown error")",
+            log: log
         )
     }
 
@@ -1855,12 +1862,26 @@ final class EnvironmentSupervisor {
             if !ready {
                 let seconds = probeConfig.timeout ?? 120
                 // Every start path throws from here, so one capture covers them all.
-                let alive = await processRunner.exit(of: launch.pid) == nil
+                // An automatic restart can replace this launch's process during the
+                // wait, so the answer comes from the service's current process.
+                var alive = "no"
+                if let pid = state.pid {
+                    if let exit = await processRunner.exit(of: pid) {
+                        if state.definition.shouldReuseIfRunning, ServiceTermination.classify(exit) == .cleanExit {
+                            alive = "no; the launcher ended cleanly and its containers may still run"
+                        }
+                    } else {
+                        alive = "yes"
+                    }
+                }
                 let name = state.definition.displayName
+                // The signature leaves out the details, so the waiters of one startup
+                // (the first launch and its restart) file one issue.
                 Task { await self.captureDebugIssue(
                     trigger: "probe_timeout",
                     serviceID: serviceID,
-                    summary: "\(name) did not pass its startup probe in \(seconds)s (process alive: \(alive ? "yes" : "no"))"
+                    summary: "\(name) did not pass its startup probe in \(seconds)s (process alive: \(alive))",
+                    signature: "startup probe timeout"
                 )}
                 throw ServiceError.probeTimeout(serviceID, seconds: seconds)
             }
@@ -2348,7 +2369,9 @@ final class EnvironmentSupervisor {
         serviceID: String?,
         summary: String,
         errorMessage: String? = nil,
-        recoveryGuidance: String? = nil
+        recoveryGuidance: String? = nil,
+        signature: String? = nil,
+        log: [LogEntry]? = nil
     ) async {
         guard let tracker = debugTracker else { return }
 
@@ -2367,7 +2390,7 @@ final class EnvironmentSupervisor {
         var logEntries: [DebugTracker.LogEntry] = []
         var likelyCause: String?
         if let sid = serviceID {
-            let raw = await logStore.entries(for: sid)
+            let raw: [LogEntry] = if let log { log } else { await logStore.entries(for: sid) }
             logEntries = raw.map { DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: sid, line: $0.text) }
             likelyCause = CrashCause.likelyCause(in: raw.map(\.text))
         }
@@ -2376,6 +2399,7 @@ final class EnvironmentSupervisor {
             trigger: trigger,
             serviceId: serviceID,
             errorMessage: errorMessage ?? summary,
+            signatureText: signature,
             likelyCause: likelyCause,
             logEntries: logEntries,
             stateSnapshots: snapshots
@@ -2623,7 +2647,7 @@ final class EnvironmentSupervisor {
         if pipeline.allRequiredPassed { await refreshLocalSupabaseKeys() }
         if let failed = pipeline.firstFailed {
             lastError = "DB reset failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
-            await captureDbSetupFailure(failed)
+            await captureDbSetupFailure(failed, runner: runner)
         }
         return pipeline.allRequiredPassed
     }

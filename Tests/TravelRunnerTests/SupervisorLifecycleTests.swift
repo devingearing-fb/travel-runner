@@ -280,6 +280,29 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(log.contains("slow-start"), log)
     }
 
+    /// A daemon that crashes once while it starts and then hangs has two waiters: the
+    /// one of the first launch and the one of the automatic restart. They file one
+    /// issue, and it describes the process that runs now.
+    func testACrashThenAHangFilesOneProbeTimeoutThatSaysAlive() async throws {
+        let issues = workDir.appendingPathComponent("issues")
+        try FileManager.default.createDirectory(at: issues, withIntermediateDirectories: true)
+        try #"{"enabled": true}"#.write(to: issues.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        supervisor.debugTracker = DebugTracker(baseDir: issues.path)
+        let script = "if [ -f ran-once ]; then sleep 60; else touch ran-once; exit 1; fi"
+        try load(daemon("flaky", ["sh", "-c", script], probeTimeout: 10))
+
+        supervisor.restartService("flaky")
+        let restarted = await waitUntil(20) { self.state("flaky").restartCount == 1 && self.state("flaky").pid != nil }
+        XCTAssertTrue(restarted, "restart count \(state("flaky").restartCount)")
+        // Past the deadline of both waiters: the first launch's and the restart's.
+        try await Task.sleep(for: .seconds(18))
+
+        let found = await supervisor.listDebugIssues().filter { $0.trigger == "probe_timeout" }
+        XCTAssertEqual(found.count, 1, "\(found.map(\.errorMessage))")
+        XCTAssertEqual(found.first?.errorMessage, "flaky did not pass its startup probe in 10s (process alive: yes)")
+        XCTAssertEqual(found.first?.recurrenceCount, 1, "the second waiter adds to the first issue")
+    }
+
     /// Supabase: `supabase start` ends with code 0 when the stack is up. The stack
     /// runs on, so the service must stay "running".
     func testALauncherThatEndsCleanlyLeavesAReusedServiceRunning() async throws {

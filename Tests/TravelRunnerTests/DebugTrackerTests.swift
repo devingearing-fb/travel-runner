@@ -117,7 +117,7 @@ final class DebugTrackerTests: XCTestCase {
         step.status = .failed
         step.errorMessage = "Exit code 1"
         await supervisor.logStore.append(
-            serviceID: "db-setup-load-hotels", entry: LogEntry(stream: .stdout, text: "hotel fetch failed: HTTP 401")
+            serviceID: step.logKey, entry: LogEntry(stream: .stdout, text: "hotel fetch failed: HTTP 401")
         )
         // The log of another step stays out of the step's file.
         await supervisor.logStore.append(
@@ -136,6 +136,97 @@ final class DebugTrackerTests: XCTestCase {
             contentsOf: root.appendingPathComponent("open/\(issue.id)/logs-db-setup-load-hotels.txt"), encoding: .utf8
         )
         XCTAssertEqual(log, "hotel fetch failed: HTTP 401")
+    }
+
+    /// The runner sends lines to the log store from detached tasks. When the last
+    /// lines are not there yet, the issue takes the step's own list.
+    @MainActor
+    func testADbSetupFailureTakesTheStepsOwnLinesWhenTheStoreIsBehind() async throws {
+        try writeConfig(#"{"enabled": true}"#)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DebugTrackerTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        supervisor.debugTracker = DebugTracker(baseDir: root.path)
+        let step = DbSetupStep(
+            id: "seed", name: "Seed", command: "true", healthCheckCommand: nil,
+            timeoutSeconds: 60, isOptional: false, stepNumber: 5
+        )
+        step.status = .failed
+        step.errorMessage = "Exit code 1"
+        step.logEntries = [
+            LogEntry(stream: .stdout, text: "seeding"),
+            LogEntry(stream: .stdout, text: "seed failed: no such table"),
+        ]
+        await supervisor.logStore.append(serviceID: step.logKey, entry: LogEntry(stream: .stdout, text: "seeding"))
+
+        await supervisor.captureDbSetupFailure(step)
+
+        let found = await supervisor.listDebugIssues()
+        let issue = try XCTUnwrap(found.first)
+        let log = try String(
+            contentsOf: root.appendingPathComponent("open/\(issue.id)/logs-\(step.logKey).txt"), encoding: .utf8
+        )
+        XCTAssertEqual(log, "seeding\nseed failed: no such table")
+    }
+
+    /// A cancel ends the step's process, so the step fails. That is not a fault:
+    /// a cancelled run files no issue. A run that was not cancelled does.
+    @MainActor
+    func testACancelledDbRunFilesNoIssue() async throws {
+        try writeConfig(#"{"enabled": true}"#)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DebugTrackerTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        supervisor.debugTracker = DebugTracker(baseDir: root.path)
+        let step = DbSetupStep(
+            id: "seed", name: "Seed", command: "true", healthCheckCommand: nil,
+            timeoutSeconds: 60, isOptional: false, stepNumber: 5
+        )
+        step.status = .failed
+        step.errorMessage = "Exit code 15"
+        let runner = DbSetupRunner(portalCwd: root.path, logStore: supervisor.logStore, seedScenarioID: "default")
+
+        await runner.cancel()
+        await supervisor.captureDbSetupFailure(step, runner: runner)
+        let afterCancel = await supervisor.listDebugIssues()
+        XCTAssertTrue(afterCancel.isEmpty)
+
+        let notCancelled = DbSetupRunner(portalCwd: root.path, logStore: supervisor.logStore, seedScenarioID: "default")
+        await supervisor.captureDbSetupFailure(step, runner: notCancelled)
+        let afterFailure = await supervisor.listDebugIssues()
+        XCTAssertEqual(afterFailure.count, 1)
+    }
+
+    /// The runner writes a step's output under the step's log key, the key the
+    /// issue reads. Each run starts with an empty log, so an issue shows one run.
+    @MainActor
+    func testTheRunnerLogsUnderTheStepsKeyAndEachRunStartsEmpty() async throws {
+        let store = LogStore()
+        let marker = root.appendingPathComponent("ran-once").path
+        let step = DbSetupStep(
+            id: "seed", name: "Seed",
+            command: "if [ -f '\(marker)' ]; then echo second-run; else touch '\(marker)'; echo first-run; fi; exit 1",
+            healthCheckCommand: nil, timeoutSeconds: 60, isOptional: false, stepNumber: 5
+        )
+        let runner = DbSetupRunner(portalCwd: root.path, logStore: store, seedScenarioID: "default")
+
+        func lines(until text: String) async -> [String] {
+            for _ in 0..<100 {
+                let lines = await store.entries(for: step.logKey).map(\.text)
+                if lines.contains(text) { return lines }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            return await store.entries(for: step.logKey).map(\.text)
+        }
+
+        let first = await runner.executeStepPublic(step)
+        XCTAssertFalse(first)
+        let firstLines = await lines(until: "first-run")
+        XCTAssertTrue(firstLines.contains("first-run"), "\(firstLines)")
+
+        let second = await runner.executeStepPublic(step)
+        XCTAssertFalse(second)
+        let secondLines = await lines(until: "second-run")
+        XCTAssertTrue(secondLines.contains("second-run"), "\(secondLines)")
+        XCTAssertFalse(secondLines.contains("first-run"), "\(secondLines)")
     }
 
     func testNothingIsCapturedWhenTrackingIsOff() async {

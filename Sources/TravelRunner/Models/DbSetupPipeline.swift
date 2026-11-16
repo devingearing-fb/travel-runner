@@ -33,6 +33,10 @@ final class DbSetupStep: Identifiable {
     nonisolated let isOptional: Bool
     nonisolated let stepNumber: Int
 
+    /// The log store key of this step's output. The runner writes under it and a
+    /// failure issue reads from it.
+    nonisolated var logKey: String { "db-setup-\(id)" }
+
     var status: DbStepStatus = .pending
     /// Fraction from 0 to 1.
     var progress: Double? = nil

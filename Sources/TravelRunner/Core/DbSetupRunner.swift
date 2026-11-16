@@ -89,6 +89,9 @@ actor DbSetupRunner {
         }
     }
 
+    /// True after `cancel()`: the developer stopped the run, so its failed step is not a fault.
+    var wasCancelled: Bool { cancelled }
+
     func cancel() {
         cancelled = true
         currentProcess?.terminate()
@@ -101,6 +104,8 @@ actor DbSetupRunner {
     }
 
     private func executeStep(_ step: DbSetupStep) async -> Bool {
+        // The stored log holds this run only, so a failure issue shows no older run.
+        await logStore.clear(serviceID: step.logKey)
         await MainActor.run {
             step.status = .running
             step.startedAt = .now
@@ -117,7 +122,7 @@ actor DbSetupRunner {
         let timeout = step.timeoutSeconds
         let cwd = self.portalCwd
         let logStore = self.logStore
-        let stepID = step.id
+        let logKey = step.logKey
 
         let (exitCode, timedOut) = await withCheckedContinuation { (continuation: CheckedContinuation<(Int32, Bool), Never>) in
             let process = Process()
@@ -151,7 +156,7 @@ actor DbSetupRunner {
                             step.logEntries.append(entry)
                         }
                         Task {
-                            await logStore.append(serviceID: "db-setup-\(stepID)", entry: entry)
+                            await logStore.append(serviceID: logKey, entry: entry)
                         }
                     }
                 }
@@ -176,7 +181,7 @@ actor DbSetupRunner {
                 if let remaining = lineBuffer.flush() {
                     let entry = LogEntry(stream: .stdout, text: remaining)
                     Task { @MainActor in step.logEntries.append(entry) }
-                    Task { await logStore.append(serviceID: "db-setup-\(stepID)", entry: entry) }
+                    Task { await logStore.append(serviceID: logKey, entry: entry) }
                 }
                 if guard_.claim() {
                     continuation.resume(returning: (proc.terminationStatus, false))

@@ -169,6 +169,7 @@ actor DebugTracker {
         trigger: String,
         serviceId: String?,
         errorMessage: String,
+        signatureText: String? = nil,
         severity: String = "error",
         category: String = "runtime",
         likelyCause: String? = nil,
@@ -177,7 +178,8 @@ actor DebugTracker {
     ) -> String? {
         guard isAutoCaptureEnabled(trigger: trigger) else { return nil }
 
-        let normalized = normalizeError(errorMessage)
+        // `signatureText` replaces the message for dedup when the message has details that vary.
+        let normalized = normalizeError(signatureText ?? errorMessage)
         let signatureInput = "\(trigger):\(serviceId ?? "all"):\(normalized)"
         let signature = sha256(signatureInput)
 
