@@ -53,27 +53,28 @@ struct SetupStep2View: View {
                     .buttonStyle(.bordered)
                     .controlSize(.regular)
                 Spacer()
-                if checker.allRequiredPassing {
+                // Only a required check decides. The way out is never disabled: a check that hangs
+                // or a long fix must not hold the wizard.
+                if checker.canFinish {
                     Button(action: onComplete) {
                         Label(startsOnComplete ? "Save & Start" : "Save", systemImage: "checkmark.circle")
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(checker.isChecking)
                     .controlSize(.regular)
                 } else {
                     Button("Continue anyway…") { confirmContinue = true }
                         .buttonStyle(.bordered)
-                        .disabled(checker.isChecking)
                         .controlSize(.regular)
                 }
             }
             .padding(14)
         }
-        .alert("Continue with failed checks?", isPresented: $confirmContinue) {
+        .alert(checker.blockers.isEmpty ? "Continue before the checks finish?" : "Continue with failed checks?",
+               isPresented: $confirmContinue) {
             Button(startsOnComplete ? "Save & Start" : "Save", action: onComplete)
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text(EnvironmentChecker.impactLines(for: checker.blockers).joined(separator: "\n"))
+            Text(EnvironmentChecker.impactLines(for: checker.unresolved).joined(separator: "\n"))
         }
         .task {
             checker.buildChecks()

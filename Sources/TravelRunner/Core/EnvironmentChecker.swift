@@ -75,15 +75,28 @@ final class EnvironmentChecker {
     /// The required checks that fail.
     var blockers: [HealthCheck] { Self.blockers(in: checks) }
 
-    /// True while a check or a fix still runs.
-    var isChecking: Bool {
-        checks.contains { $0.status == .pending || $0.status == .fixing }
-    }
+    /// True when the wizard can finish without a question. See `unresolved(in:)`.
+    var canFinish: Bool { unresolved.isEmpty }
+
+    /// The required checks that fail or have no result yet.
+    var unresolved: [HealthCheck] { Self.unresolved(in: checks) }
 
     static func blockers(in checks: [HealthCheck]) -> [HealthCheck] {
         checks.filter { check in
             guard check.isRequired, case .failing = check.status else { return false }
             return true
+        }
+    }
+
+    /// The required checks that fail, or that a check or a fix still works on.
+    /// An optional check is never here: it must not hold the wizard, also when it hangs.
+    static func unresolved(in checks: [HealthCheck]) -> [HealthCheck] {
+        checks.filter { check in
+            guard check.isRequired else { return false }
+            switch check.status {
+            case .failing, .pending, .fixing: return true
+            case .passing, .warning: return false
+            }
         }
     }
 
@@ -103,9 +116,17 @@ final class EnvironmentChecker {
     }
 
     /// One line per failing required check, for example "pnpm 10 — installs and both portals will not run".
+    /// A check without a result says so: "Docker (check not finished) — if it fails, the local database will not start".
     static func impactLines(for checks: [HealthCheck]) -> [String] {
         checks.map { check in
-            impact(of: check.id).map { "\(check.name) — \($0)" } ?? check.name
+            let impact = impact(of: check.id)
+            switch check.status {
+            case .pending, .fixing:
+                let name = "\(check.name) (check not finished)"
+                return impact.map { "\(name) — if it fails, \($0)" } ?? name
+            default:
+                return impact.map { "\(check.name) — \($0)" } ?? check.name
+            }
         }
     }
 
@@ -119,7 +140,8 @@ final class EnvironmentChecker {
         guard let root = try? JSONSerialization.jsonObject(with: Data(packageJSON.utf8)) as? [String: Any],
               let manager = root["packageManager"] as? String,
               manager.hasPrefix("pnpm@") else { return nil }
-        let version = manager.dropFirst("pnpm@".count).prefix { $0.isNumber || $0 == "." }
+        // The part after "+" is the hash of the package.
+        let version = manager.dropFirst("pnpm@".count).prefix { $0 != "+" }
         return toolVersion(String(version))
     }
 
@@ -130,10 +152,11 @@ final class EnvironmentChecker {
     }
 
     /// The last line of the output that is only a version, without the "v". Other lines are notices.
+    /// A prerelease such as "11.0.0-rc.1" is a version.
     nonisolated static func toolVersion(_ output: String) -> String? {
         output.split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
-            .last { $0.range(of: #"^v?\d+\.\d+(\.\d+)?$"#, options: .regularExpression) != nil }
+            .last { $0.range(of: #"^v?\d+\.\d+(\.\d+)?(-[0-9A-Za-z.-]+)?$"#, options: .regularExpression) != nil }
             .map { $0.hasPrefix("v") ? String($0.dropFirst()) : $0 }
     }
 
@@ -141,10 +164,16 @@ final class EnvironmentChecker {
         version.split(separator: ".").first.flatMap { Int($0) }
     }
 
+    /// The check prints this line when there is no pnpm on the PATH.
+    nonisolated static let pnpmNotFoundMarker = "travel-runner: pnpm not found"
+
     /// The pnpm check passes when the major of `pnpm --version`, run in the monorepo, is the pinned major.
     nonisolated static func pnpmStatus(output: String, ok: Bool, pin: String?) -> CheckStatus {
+        if output.contains(pnpmNotFoundMarker) { return .failing("Not installed") }
         guard ok, let version = toolVersion(output), let major = major(of: version) else {
-            return .failing("Not installed")
+            // pnpm is there but gave no version: in the monorepo it may have to download the pin first.
+            let wanted = pin.map { "pnpm \($0)" } ?? "another version"
+            return .failing("pnpm could not report its version in the monorepo (it may need to download \(wanted)) — check the network and re-run")
         }
         guard let pin, let pinnedMajor = Self.major(of: pin) else {
             return major == defaultPnpmMajor
@@ -161,19 +190,33 @@ final class EnvironmentChecker {
 
     /// The command of the pnpm check. In the monorepo, pnpm and corepack follow the pin.
     nonisolated static func pnpmCheckCommand(monorepo: String) -> String {
-        "cd \(ShellQuote.quote(monorepo)) 2>/dev/null; COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version"
+        "command -v pnpm >/dev/null 2>&1 || { echo '\(pnpmNotFoundMarker)'; exit 1; }; "
+            + "cd \(ShellQuote.quote(monorepo)) 2>/dev/null; COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version"
     }
 
-    /// Installs the pinned pnpm with the first tool that is there: corepack, Homebrew, npm.
+    /// Installs the pinned pnpm with the first tool that gives the pinned major in the monorepo: corepack, Homebrew, npm.
     /// A plain `brew install pnpm` gives the newest major, which the check does not accept.
-    nonisolated static func pnpmFixCommand(pin: String?) -> String {
+    /// An install that exits 0 is not enough: another pnpm earlier on the PATH can still win. So each
+    /// step but the last also asks pnpm for its version, and the next step runs when the major is wrong.
+    nonisolated static func pnpmFixCommand(pin: String?, monorepo: String) -> String {
         let major = pin.flatMap(Self.major(of:)) ?? defaultPnpmMajor
         let version = pin ?? "\(major)"
+        let verify = "(cd \(ShellQuote.quote(monorepo)) 2>/dev/null; COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version 2>/dev/null | grep -q '^\(major)\\.')"
         return [
-            "(command -v corepack >/dev/null 2>&1 && corepack enable pnpm && corepack prepare pnpm@\(version) --activate)",
-            "(command -v brew >/dev/null 2>&1 && brew install pnpm@\(major) && brew link --overwrite --force pnpm@\(major))",
+            "(command -v corepack >/dev/null 2>&1 && corepack enable pnpm && corepack prepare pnpm@\(version) --activate && \(verify))",
+            "(command -v brew >/dev/null 2>&1 && brew install pnpm@\(major) && brew link --overwrite --force pnpm@\(major) && \(verify))",
             "npm install -g pnpm@\(version)",
         ].joined(separator: " || ")
+    }
+
+    /// The result of the pnpm row after its fix ran. When pnpm still reports another version, the fix
+    /// installed the pin but another pnpm comes first on the PATH: the row names that one.
+    nonisolated static func pnpmStatusAfterFix(recheck: CheckStatus, fixSucceeded: Bool, firstOnPath: String?) -> CheckStatus {
+        guard case .failing(let detail) = recheck else { return recheck }
+        if detail.hasPrefix("v"), let firstOnPath, !firstOnPath.isEmpty {
+            return .failing("\(detail). Another pnpm is first on the PATH: \(firstOnPath) — remove it, then re-check")
+        }
+        return fixSucceeded ? recheck : .failing("Fix failed — try manually")
     }
 
     func buildChecks() {
@@ -311,7 +354,14 @@ final class EnvironmentChecker {
             check.status = await runCheck(checkID)
             return
         }
-        if success {
+        if checkID == "pnpm" {
+            let recheck = await runCheck(checkID)
+            let (path, _) = await shellOutput("command -v pnpm")
+            check.status = Self.pnpmStatusAfterFix(
+                recheck: recheck, fixSucceeded: success,
+                firstOnPath: path.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        } else if success {
             let newStatus = await runCheck(checkID)
             check.status = newStatus
         } else {
@@ -499,7 +549,7 @@ final class EnvironmentChecker {
             return false
 
         case "pnpm":
-            return await shell(Self.pnpmFixCommand(pin: Self.pnpmPin(monorepo: monorepoPath)))
+            return await shell(Self.pnpmFixCommand(pin: Self.pnpmPin(monorepo: monorepoPath), monorepo: monorepoPath))
 
         case "python-jwt":
             return await shell("pip3 install pyjwt")

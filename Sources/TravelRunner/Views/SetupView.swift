@@ -21,6 +21,7 @@ struct SetupView: View {
     @State private var loadTestPath: String = ""
     @State private var dropTargetHighlighted = false
     @State private var statusMessage: String? = nil
+    @State private var statusIsError = false
     @State private var loadedExistingPaths = false
 
     var body: some View {
@@ -34,8 +35,12 @@ struct SetupView: View {
                     startsOnComplete: isFirstRun,
                     onBack: { currentStep = .paths },
                     onComplete: {
-                        savePaths()
-                        onComplete(isFirstRun)
+                        if savePaths() {
+                            onComplete(isFirstRun)
+                        } else {
+                            // Step 1 shows the error.
+                            currentStep = .paths
+                        }
                     }
                 )
             }
@@ -79,7 +84,11 @@ struct SetupView: View {
 
                     if let msg = statusMessage {
                         HStack {
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                            if statusIsError {
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+                            } else {
+                                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                            }
                             Text(msg).font(.caption).foregroundStyle(.secondary)
                         }
                     }
@@ -104,7 +113,7 @@ struct SetupView: View {
                         .controlSize(.regular)
                         .disabled(!canProceed)
 
-                    Button(action: { savePaths(); onComplete(false) }) {
+                    Button(action: { if savePaths() { onComplete(false) } }) {
                         Label("Save", systemImage: "checkmark.circle")
                     }
                     .buttonStyle(.borderedProminent)
@@ -218,7 +227,8 @@ struct SetupView: View {
         currentStep = .environment
     }
 
-    private func savePaths() {
+    /// False when the config file could not be written. The message then names the file and the reason.
+    private func savePaths() -> Bool {
         let paths = RepoPaths(
             monorepo: monorepoPath,
             universalLogin: universalLoginPath,
@@ -228,8 +238,12 @@ struct SetupView: View {
         do {
             try ConfigLoader.generate(paths: paths)
             statusMessage = "Saved"
+            statusIsError = false
+            return true
         } catch {
-            statusMessage = "Error: \(error)"
+            statusMessage = "Could not save \(ConfigLoader.configPath): \(error.localizedDescription)"
+            statusIsError = true
+            return false
         }
     }
 
@@ -247,6 +261,7 @@ struct SetupView: View {
 
     private func applyDetected(_ detected: DetectedRepos) {
         var filled: [String] = []
+        statusIsError = false
 
         if let p = detected.monorepo, monorepoPath.isEmpty || !RepoDetector.validate(path: monorepoPath, role: .monorepo) {
             monorepoPath = p

@@ -79,14 +79,43 @@ final class EnvironmentCheckerTests: XCTestCase {
     }
 
     func testNoPnpmFails() {
-        XCTAssertEqual(EnvironmentChecker.pnpmStatus(output: "", ok: false, pin: "10.34.5"), .failing("Not installed"))
-        XCTAssertEqual(EnvironmentChecker.pnpmStatus(output: "no version here\n", ok: true, pin: "10.34.5"), .failing("Not installed"))
+        let output = EnvironmentChecker.pnpmNotFoundMarker + "\n"
+
+        XCTAssertEqual(EnvironmentChecker.pnpmStatus(output: output, ok: false, pin: "10.34.5"), .failing("Not installed"))
+    }
+
+    func testAPnpmThatGivesNoVersionIsNotCalledNotInstalled() {
+        let withPin = "pnpm could not report its version in the monorepo (it may need to download pnpm 10.34.5) — check the network and re-run"
+        let withoutPin = "pnpm could not report its version in the monorepo (it may need to download another version) — check the network and re-run"
+
+        XCTAssertEqual(EnvironmentChecker.pnpmStatus(output: "", ok: false, pin: "10.34.5"), .failing(withPin))
+        XCTAssertEqual(EnvironmentChecker.pnpmStatus(output: "no version here\n", ok: true, pin: "10.34.5"), .failing(withPin))
+        XCTAssertEqual(EnvironmentChecker.pnpmStatus(output: "", ok: false, pin: nil), .failing(withoutPin))
+    }
+
+    func testAPrereleaseIsAVersion() {
+        XCTAssertEqual(EnvironmentChecker.toolVersion("11.0.0-rc.1\n"), "11.0.0-rc.1")
+        XCTAssertEqual(EnvironmentChecker.pnpmPin(packageJSON: #"{ "packageManager": "pnpm@11.0.0-rc.1+sha512.abc" }"#), "11.0.0-rc.1")
+        XCTAssertEqual(
+            EnvironmentChecker.pnpmStatus(output: "11.0.0-rc.1\n", ok: true, pin: "11.0.0-rc.1"),
+            .passing("v11.0.0-rc.1 (pinned by the monorepo)")
+        )
+        XCTAssertEqual(
+            EnvironmentChecker.pnpmStatus(output: "11.0.0-rc.1\n", ok: true, pin: "10.34.5"),
+            .failing("v11.0.0-rc.1 — the monorepo pins 10.34.5")
+        )
+    }
+
+    func testTheCheckSaysWhenThereIsNoPnpm() {
+        let command = EnvironmentChecker.pnpmCheckCommand(monorepo: "/tmp/mono")
+
+        XCTAssertTrue(command.hasPrefix("command -v pnpm >/dev/null 2>&1 || { echo '\(EnvironmentChecker.pnpmNotFoundMarker)'; exit 1; }; cd /tmp/mono "))
     }
 
     // MARK: - pnpm fix
 
     func testTheFixInstallsThePinNotTheNewestMajor() {
-        let command = EnvironmentChecker.pnpmFixCommand(pin: "10.34.5")
+        let command = EnvironmentChecker.pnpmFixCommand(pin: "10.34.5", monorepo: "/tmp/mono")
 
         XCTAssertTrue(command.contains("corepack prepare pnpm@10.34.5 --activate"))
         XCTAssertTrue(command.contains("brew install pnpm@10 "))
@@ -95,16 +124,55 @@ final class EnvironmentCheckerTests: XCTestCase {
     }
 
     func testTheFixWithoutAPinInstallsTheDefaultMajor() {
-        let command = EnvironmentChecker.pnpmFixCommand(pin: nil)
+        let command = EnvironmentChecker.pnpmFixCommand(pin: nil, monorepo: "/tmp/mono")
 
         XCTAssertTrue(command.contains("corepack prepare pnpm@10 --activate"))
         XCTAssertTrue(command.hasSuffix("npm install -g pnpm@10"))
     }
 
+    func testAStepOfTheFixCountsOnlyWhenPnpmThenHasThePinnedMajor() {
+        let command = EnvironmentChecker.pnpmFixCommand(pin: "10.34.5", monorepo: "/tmp/my repo")
+        let verify = "(cd '/tmp/my repo' 2>/dev/null; COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm --version 2>/dev/null | grep -q '^10\\.')"
+
+        XCTAssertTrue(command.contains("corepack prepare pnpm@10.34.5 --activate && \(verify)) || "))
+        XCTAssertTrue(command.contains("brew link --overwrite --force pnpm@10 && \(verify)) || "))
+    }
+
+    func testAfterTheFixAWrongVersionNamesThePnpmThatIsFirstOnThePath() {
+        let recheck = CheckStatus.failing("v12.1.0 — the monorepo pins 10.34.5")
+        let named = CheckStatus.failing(
+            "v12.1.0 — the monorepo pins 10.34.5. Another pnpm is first on the PATH: /opt/homebrew/bin/pnpm — remove it, then re-check"
+        )
+
+        for fixSucceeded in [true, false] {
+            XCTAssertEqual(
+                EnvironmentChecker.pnpmStatusAfterFix(recheck: recheck, fixSucceeded: fixSucceeded, firstOnPath: "/opt/homebrew/bin/pnpm"),
+                named
+            )
+        }
+        XCTAssertEqual(EnvironmentChecker.pnpmStatusAfterFix(recheck: recheck, fixSucceeded: true, firstOnPath: ""), recheck)
+    }
+
+    func testAfterTheFixTheOtherResultsStay() {
+        let passing = CheckStatus.passing("v10.34.5 (pinned by the monorepo)")
+
+        XCTAssertEqual(EnvironmentChecker.pnpmStatusAfterFix(recheck: passing, fixSucceeded: true, firstOnPath: "/usr/local/bin/pnpm"), passing)
+        // A fix that failed and a pnpm that now passes: the row passes.
+        XCTAssertEqual(EnvironmentChecker.pnpmStatusAfterFix(recheck: passing, fixSucceeded: false, firstOnPath: "/usr/local/bin/pnpm"), passing)
+        XCTAssertEqual(
+            EnvironmentChecker.pnpmStatusAfterFix(recheck: .failing("Not installed"), fixSucceeded: false, firstOnPath: ""),
+            .failing("Fix failed — try manually")
+        )
+        XCTAssertEqual(
+            EnvironmentChecker.pnpmStatusAfterFix(recheck: .failing("Not installed"), fixSucceeded: true, firstOnPath: ""),
+            .failing("Not installed")
+        )
+    }
+
     func testTheCheckRunsInTheMonorepo() {
         let command = EnvironmentChecker.pnpmCheckCommand(monorepo: "/tmp/my repo")
 
-        XCTAssertTrue(command.hasPrefix("cd '/tmp/my repo'"))
+        XCTAssertTrue(command.contains("; cd '/tmp/my repo' 2>/dev/null; "))
         XCTAssertTrue(command.hasSuffix("pnpm --version"))
     }
 
@@ -142,9 +210,57 @@ final class EnvironmentCheckerTests: XCTestCase {
         XCTAssertTrue(EnvironmentChecker.blockers(in: checks).isEmpty)
     }
 
+    // MARK: - The buttons of the wizard
+
+    func testAPendingOptionalCheckDoesNotHoldTheWizard() {
+        let checks = [
+            check("docker", .passing("OrbStack")),
+            check("stripe-cli", required: false, .pending),
+            check("hotel-data", required: false, .fixing),
+        ]
+
+        XCTAssertTrue(EnvironmentChecker.unresolved(in: checks).isEmpty)
+    }
+
+    func testAPendingRequiredCheckAsksBeforeItContinues() {
+        let checks = [
+            check("docker", .pending),
+            check("pnpm", .fixing),
+            check("node", .failing("v18.0.0 — need 22+")),
+            check("login-env", .warning("Exists but may be incomplete")),
+            check("stripe-cli", required: false, .failing("Not installed")),
+        ]
+
+        XCTAssertEqual(EnvironmentChecker.unresolved(in: checks).map(\.id), ["docker", "pnpm", "node"])
+        // Not a blocker: only a result that fails is one.
+        XCTAssertEqual(EnvironmentChecker.blockers(in: checks).map(\.id), ["node"])
+    }
+
+    func testTheCheckerUsesTheRuleForItsOwnChecks() {
+        let checker = EnvironmentChecker(monorepoPath: "/nonexistent/mono", loginPath: "/nonexistent/login", streamServicesPath: "")
+        checker.buildChecks()
+        XCTAssertFalse(checker.canFinish, "all checks are pending")
+
+        for check in checker.checks where check.isRequired { check.status = .passing("ok") }
+        XCTAssertTrue(checker.canFinish, "the optional checks are still pending")
+        XCTAssertTrue(checker.checks.contains { !$0.isRequired && $0.status == .pending })
+    }
+
+    func testACheckWithoutAResultSaysSo() {
+        let docker = check("docker", .pending)
+        let unknown = check("new-check", .fixing)
+
+        XCTAssertEqual(
+            EnvironmentChecker.impactLines(for: [docker, unknown]),
+            ["docker (check not finished) — if it fails, the local database will not start", "new-check (check not finished)"]
+        )
+    }
+
     func testEachBlockerSaysWhatWillNotWork() {
         let pnpm = HealthCheck(id: "pnpm", name: "pnpm 10", section: .prerequisites)
         let unknown = HealthCheck(id: "new-check", name: "New check", section: .prerequisites)
+        pnpm.status = .failing("Not installed")
+        unknown.status = .failing("No")
 
         XCTAssertEqual(
             EnvironmentChecker.impactLines(for: [pnpm, unknown]),

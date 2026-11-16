@@ -38,8 +38,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// A second launch from Finder or Spotlight shows the window. The app has no Dock icon.
+    /// A window that is already open keeps its section.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        openPanel()
+        let panel = WorkshopPanel.shared
+        if panel.isVisible {
+            panel.open(section: panel.navigation.selectedSection ?? .status)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            openPanel()
+        }
         return false
     }
 
