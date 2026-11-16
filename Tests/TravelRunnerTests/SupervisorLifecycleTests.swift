@@ -18,6 +18,14 @@ final class SupervisorLifecycleTests: XCTestCase {
         workDir = FileManager.default.temporaryDirectory.appendingPathComponent("SupervisorLifecycleTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         crashes = []
+        // The port cleanup of a test kills only a process that the test started. A
+        // stranger can take the free port after `freePort` lets it go.
+        let ownedDirectory = workDir.lastPathComponent
+        supervisor.portTools = PortTools(
+            listeners: PortTools.live.listeners,
+            kill: { pid in if Self.process(pid, runsIn: ownedDirectory) { PortTools.live.kill(pid) } },
+            killCommands: { _ in }
+        )
         supervisor.onServiceCrash = { [weak self] name, code in
             self?.crashes.append((name, code))
         }
@@ -26,7 +34,9 @@ final class SupervisorLifecycleTests: XCTestCase {
     override func tearDown() async throws {
         supervisor.stopAll()
         _ = await waitUntil(10) { self.supervisor.health == .stopped }
-        for pid in Self.listeners(on: port) { kill(pid, SIGKILL) }
+        for pid in Self.listeners(on: port) where Self.process(pid, runsIn: workDir.lastPathComponent) {
+            kill(pid, SIGKILL)
+        }
         try? FileManager.default.removeItem(at: workDir)
     }
 
@@ -47,6 +57,21 @@ final class SupervisorLifecycleTests: XCTestCase {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(sock, $0, &length) }
         }
         return Int(UInt16(bigEndian: addr.sin_port))
+    }
+
+    /// True when the working directory of the process is the test's own folder. Each
+    /// service of a test starts there, and the folder has a new name for each test.
+    private nonisolated static func process(_ pid: pid_t, runsIn directory: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return false }
+        let text = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        process.waitUntilExit()
+        return text.split(separator: "\n").contains { $0.hasPrefix("n") && $0.hasSuffix("/" + directory) }
     }
 
     private static func listeners(on port: Int) -> [pid_t] {
@@ -247,12 +272,16 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         supervisor.restartService("toolless")
 
-        let expected = "toolless cannot start: \(tool) was not found. Travel Runner looked in: "
+        let expected = "toolless cannot start: \(tool) was not found. \(Flavor.current.displayName) looked in: "
         let named = await waitUntil(30) {
             self.state("toolless").phase == .failed && self.supervisor.lastError?.hasPrefix(expected) == true
         }
         XCTAssertTrue(named, supervisor.lastError ?? "nil")
         XCTAssertTrue(supervisor.lastError?.contains("/usr/bin") == true, supervisor.lastError ?? "nil")
+        XCTAssertTrue(
+            supervisor.lastError?.hasSuffix("Install \(tool) or add its folder to ~/.zprofile, then restart the service.") == true,
+            supervisor.lastError ?? "nil"
+        )
         XCTAssertEqual(state("toolless").restartCount, 0)
     }
 
@@ -311,10 +340,18 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.restartService("flaky")
         let restarted = await waitUntil(20) { self.state("flaky").restartCount == 1 && self.state("flaky").pid != nil }
         XCTAssertTrue(restarted, "restart count \(state("flaky").restartCount)")
-        // Past the deadline of both waiters: the first launch's and the restart's.
-        try await Task.sleep(for: .seconds(18))
+        // Both waiters end: the first launch's files the issue, and the restart's adds to it.
+        func probeTimeouts() async -> [DebugTracker.Issue] {
+            await supervisor.listDebugIssues().filter { $0.trigger == "probe_timeout" }
+        }
+        let deadline = Date().addingTimeInterval(40)
+        while await probeTimeouts().first?.recurrenceCount != 1, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(200))
+        }
+        // A third capture, or a second issue, would come soon after.
+        try await Task.sleep(for: .seconds(3))
 
-        let found = await supervisor.listDebugIssues().filter { $0.trigger == "probe_timeout" }
+        let found = await probeTimeouts()
         XCTAssertEqual(found.count, 1, "\(found.map(\.errorMessage))")
         XCTAssertEqual(found.first?.errorMessage, "flaky did not pass its startup probe in 10s (process alive: yes)")
         XCTAssertEqual(found.first?.recurrenceCount, 1, "the second waiter adds to the first issue")
@@ -456,6 +493,8 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// was not there, and the runner wiped the database.
     func testAFailedDatabaseQueryNeverStartsAReset() async throws {
         try loadSupabase()
+        // One question for each call: the wait for a late database has its own tests.
+        supervisor.databaseProbeRetry = (.milliseconds(10), .zero)
         var queries = 0
         var resets = 0
         var answer = DbQueryResult(exitCode: 1, stdout: "", stderr: "\nCannot connect to the Docker daemon\nIs it running?")
@@ -503,6 +542,89 @@ final class SupervisorLifecycleTests: XCTestCase {
         answer = DbQueryResult(exitCode: 0, stdout: "42", stderr: "")
         _ = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
         XCTAssertEqual(resets, 1)
+    }
+
+    /// A first run: the port of Supabase is open, but Postgres does not take queries
+    /// yet. The runner asks again, and the empty database still gets its setup.
+    func testADatabaseThatAnswersLateIsReset() async throws {
+        try loadSupabase()
+        supervisor.databaseProbeRetry = (.milliseconds(20), .seconds(20))
+        var queries = 0
+        var resets = 0
+        supervisor.databaseQuery = { _, _ in
+            queries += 1
+            return queries < 3
+                ? DbQueryResult(exitCode: 2, stdout: "", stderr: "psql: error: the database system is starting up")
+                : DbQueryResult(exitCode: 0, stdout: "0", stderr: "")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+
+        let didReset = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+
+        XCTAssertTrue(didReset)
+        XCTAssertEqual(queries, 3)
+        XCTAssertEqual(resets, 1)
+        XCTAssertNil(supervisor.lastError)
+        let lines = await logLines("supabase")
+        XCTAssertEqual(lines.filter { $0.contains("does not answer yet") }.count, 1, lines.joined(separator: "\n"))
+    }
+
+    /// A database that never answers is never reset: the wait ends with the message.
+    func testADatabaseThatNeverAnswersIsNotReset() async throws {
+        try loadSupabase()
+        supervisor.databaseProbeRetry = (.milliseconds(20), .milliseconds(300))
+        var queries = 0
+        var resets = 0
+        supervisor.databaseQuery = { _, _ in
+            queries += 1
+            return DbQueryResult(exitCode: 1, stdout: "", stderr: "Error response from daemon: No such container: x")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+
+        let didReset = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+
+        XCTAssertFalse(didReset)
+        XCTAssertGreaterThan(queries, 1, "the runner asks again before it gives up")
+        XCTAssertEqual(resets, 0)
+        XCTAssertEqual(
+            supervisor.lastError,
+            "Could not read the local database (Error response from daemon: No such container: x). Nothing was changed."
+        )
+    }
+
+    /// A stop during the wait for a late database ends the wait, without a message.
+    func testAStopEndsTheWaitForALateDatabase() async throws {
+        try loadSupabase()
+        supervisor.databaseProbeRetry = (.milliseconds(20), .seconds(30))
+        var queries = 0
+        var resets = 0
+        supervisor.databaseQuery = { _, _ in
+            queries += 1
+            return DbQueryResult(exitCode: 2, stdout: "", stderr: "psql: error: the database system is starting up")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+        let cwd = workDir.path
+        let check = Task { await self.supervisor.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true) }
+        let asking = await waitUntil(10) { queries >= 2 }
+        XCTAssertTrue(asking)
+
+        supervisor.stopAll()
+        let ended = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(ended)
+        let didReset = await check.value
+
+        XCTAssertFalse(didReset)
+        XCTAssertEqual(resets, 0)
+        XCTAssertNil(supervisor.lastError)
     }
 
     /// The reset keeps its own error, and a second reset does not start while one runs.
@@ -714,12 +836,59 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(stopped)
         XCTAssertEqual(calls.kills, [pid_t(inProfile.port)])
 
+        // A service that this session started stays in the sweep of the stop (and of
+        // the quit) after a change of profile puts it outside. The container stays alive.
+        calls.reset()
+        XCTAssertEqual(supervisor.sweepPorts.sorted(), [inProfile.port, container.port].sorted())
+        supervisor.serviceStates["partner-portal"]?.lastStarted = .now
+        XCTAssertEqual(supervisor.sweepPorts.sorted(), [inProfile.port, outside.port, container.port].sorted())
+        supervisor.health = .healthy
+        supervisor.stopAll()
+        let stoppedAgain = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stoppedAgain)
+        XCTAssertEqual(calls.kills.sorted(), [pid_t(inProfile.port), pid_t(outside.port)].sorted())
+        // The next start still leaves it alone.
+        calls.reset()
+        await supervisor.cleanupStaleProcesses()
+        XCTAssertEqual(calls.kills, [pid_t(inProfile.port)])
+
         // The partner profile: now the partner portal is in, and Stripe is out.
         calls.reset()
         try supervisor.loadServices(services, profile: .partner)
         await supervisor.cleanupStaleProcesses()
         XCTAssertEqual(calls.kills, [pid_t(outside.port)])
         XCTAssertEqual(calls.patterns, [], "Stripe is outside the profile")
+    }
+
+    /// A container publishes the port of a service. The runner does not kill the
+    /// container runtime, and it does not start the service: it would fail with
+    /// EADDRINUSE while its probe passes against the container.
+    func testAServiceDoesNotStartOnAPortThatAContainerPublishes() async throws {
+        let held = try Self.listeningSocket()
+        defer { close(held.fd) }
+        // Nothing accepts on this socket: room for each connection of the runner's port checks.
+        XCTAssertEqual(listen(held.fd, 128), 0)
+        port = held.port
+        let calls = PortToolCalls()
+        supervisor.portTools = PortTools(
+            listeners: { _ in [PortOwner.Listener(pid: 1, command: "OrbStack Helper")] },
+            kill: { calls.addKill($0) },
+            killCommands: { calls.addPattern($0) }
+        )
+        try load(daemon("held", ["sh", "-c", "echo held-start; sleep 30"]))
+
+        supervisor.restartService("held")
+
+        let failed = await waitUntil(30) { self.state("held").phase == .failed && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(failed, "held is \(state("held").phase.rawValue)")
+        XCTAssertEqual(
+            supervisor.lastError,
+            "held cannot start: port \(port) is published by a container (OrbStack Helper) — stop that container, then restart held"
+        )
+        let lines = await logLines("held")
+        XCTAssertFalse(lines.contains("held-start"), "the process must not start")
+        XCTAssertEqual(calls.kills, [])
+        XCTAssertEqual(state("held").restartCount, 0)
     }
 
     /// A socket of the test that listens on a free loopback port.

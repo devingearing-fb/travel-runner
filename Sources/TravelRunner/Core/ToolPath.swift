@@ -96,7 +96,7 @@ enum ToolPath {
     }
 
     /// What the user reads when a tool is not on PATH.
-    static func notFoundText(tool: String, searchedPath: String) -> String {
-        "\(tool) was not found. Travel Runner looked in: \(searchedPath)."
+    static func notFoundText(tool: String, searchedPath: String, appName: String = Flavor.current.displayName) -> String {
+        "\(tool) was not found. \(appName) looked in: \(searchedPath). Install \(tool) or add its folder to ~/.zprofile, then restart the service."
     }
 }

@@ -56,6 +56,44 @@ final class PortOwnerTests: XCTestCase {
         XCTAssertFalse(matches("stripe listen --forward-to http://localhost:4000/hooks"))
     }
 
+    /// The quit of the app killed each listener on its ports, also the port helper
+    /// of the container runtime.
+    func testTheQuitSweepLeavesAContainerRuntimeAlive() {
+        let listeners = [
+            PortOwner.Listener(pid: 10, command: "node"),
+            PortOwner.Listener(pid: 11, command: "OrbStack Helper"),
+            PortOwner.Listener(pid: 12, command: "com.docker.backend"),
+        ]
+
+        XCTAssertEqual(PortOwner.killable(listeners), [PortOwner.Listener(pid: 10, command: "node")])
+    }
+
+    /// The reader of the quit gives what the reader of the start gives.
+    func testTheReaderOfTheQuitFindsAListener() async throws {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        defer { close(sock) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = UInt32(INADDR_LOOPBACK).bigEndian
+        addr.sin_port = 0
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        XCTAssertEqual(bound, 0)
+        XCTAssertEqual(listen(sock, 8), 0)
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(sock, $0, &length) }
+        }
+        let port = Int(UInt16(bigEndian: addr.sin_port))
+
+        let now = PortOwner.listenersNow(on: port)
+
+        XCTAssertEqual(now.map(\.pid), [getpid()])
+        let viaAsync = await PortOwner.listeners(on: port)
+        XCTAssertEqual(now, viaAsync)
+    }
+
     func testCommandPatternMakesRegexCharactersLiteral() {
         XCTAssertEqual(PortOwner.commandPattern(for: ["a.b", "(c)*", "d|e"]), "a\\.b \\(c\\)\\* d\\|e")
     }

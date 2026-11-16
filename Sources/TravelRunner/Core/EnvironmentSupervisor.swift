@@ -133,6 +133,9 @@ final class EnvironmentSupervisor {
     private var wakePending = false
     /// Tests replace the database query and the reset with fakes.
     var databaseQuery: ((_ cwd: String, _ sql: String) async -> DbQueryResult)?
+    /// How long the automatic reset waits for a database that does not answer yet.
+    /// The port of Supabase opens before Postgres takes queries.
+    var databaseProbeRetry: (interval: Duration, timeout: Duration) = (.seconds(2), .seconds(60))
     var dbResetAction: ((_ cwd: String) async -> Bool)?
 
     init(userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil) {
@@ -193,6 +196,8 @@ final class EnvironmentSupervisor {
         case commandNotRunnable(name: String, command: String, code: Int32, searchedPath: String? = nil)
         case localKeysMissing(name: String, envFile: String)
         case portHeldByOtherStack(port: Int, container: String)
+        /// `owner` is the process name of the container runtime that listens on the port.
+        case portHeldByContainer(name: String, port: Int, owner: String)
 
         var description: String {
             switch self {
@@ -208,6 +213,8 @@ final class EnvironmentSupervisor {
                 "\(name) was not started: the keys of the local Supabase stack could not be read (scripts/local-db.sh status -o env). Without them it would use the hosted dev values in \(envFile). Restart Supabase, then restart \(name)."
             case .portHeldByOtherStack(let port, let container):
                 "Port \(port) is held by another Supabase stack (\(container)) — stop it, then start again"
+            case .portHeldByContainer(let name, let port, let owner):
+                "\(name) cannot start: port \(port) is published by a container (\(owner)) — stop that container, then restart \(name)"
             }
         }
     }
@@ -467,13 +474,13 @@ final class EnvironmentSupervisor {
                 serviceStates[serviceID]?.phase = .stopping
             }
 
+            // Read before the stop: the ports of the services that this session started.
+            let ports = sweepPorts
             await processRunner.stopAll()
 
-            // Kill any orphaned processes still bound to the ports of the profile's services
-            for service in killableServices {
-                if let port = service.probe?.port, isPortBound(port) {
-                    await killPortOccupants(port)
-                }
+            // Kill any orphaned processes still bound to those ports
+            for port in ports where isPortBound(port) {
+                await killPortOccupants(port)
             }
 
             for serviceID in sortedServiceIDs {
@@ -1734,6 +1741,12 @@ final class EnvironmentSupervisor {
                     try? await Task.sleep(for: .milliseconds(500))
                     if !isPortBound(port) { break }
                 }
+                // A container still has the port: the service would fail with
+                // EADDRINUSE while its TCP probe passes against the container.
+                if isPortBound(port),
+                   let owner = await portTools.listeners(port).first(where: { PortOwner.isContainerRuntime($0.command) }) {
+                    throw ServiceError.portHeldByContainer(name: definition.displayName, port: port, owner: owner.command)
+                }
             }
         }
 
@@ -2553,7 +2566,8 @@ final class EnvironmentSupervisor {
     }
 
     private func runShellCommand(_ command: String) async -> Bool {
-        await withCheckedContinuation { continuation in
+        let command = ToolPath.wrap(command, directories: ToolPath.directories(cwd: nil))
+        return await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-l", "-c", command]
@@ -2609,7 +2623,23 @@ final class EnvironmentSupervisor {
     @discardableResult
     func resetDatabaseIfNeeded(cwd: String, checkMigrations: Bool) async -> Bool {
         guard canAutoReset else { return false }
-        let probe = await probeDatabase(cwd: cwd)
+        var probe = await probeDatabase(cwd: cwd)
+        // Supabase counts as running when its port opens, and Postgres takes queries
+        // a little later (much later on a new volume). Ask again before giving up.
+        let deadline = ContinuousClock.now + databaseProbeRetry.timeout
+        var saidWaiting = false
+        while case .unknown(let detail) = probe, canAutoReset, ContinuousClock.now < deadline {
+            if !saidWaiting {
+                saidWaiting = true
+                await logStore.append(serviceID: "supabase", entry: LogEntry(
+                    stream: .stderr,
+                    text: "[travel-runner] The local database does not answer yet (\(detail)). Asking again…"
+                ))
+            }
+            try? await Task.sleep(for: databaseProbeRetry.interval)
+            guard canAutoReset else { return false }
+            probe = await probeDatabase(cwd: cwd)
+        }
         // The probe takes time: a stop can arrive while it runs.
         guard canAutoReset else { return false }
         let reason: String
@@ -2643,7 +2673,10 @@ final class EnvironmentSupervisor {
     private func queryDatabase(cwd: String, sql: String) async -> DbQueryResult {
         if let databaseQuery { return await databaseQuery(cwd, sql) }
         let container = SupabaseProject.dbContainerName(root: cwd)
-        let command = ShellQuote.join(["docker", "exec", container, "psql", "-U", "postgres", "-d", "postgres", "-tAc", sql])
+        let command = ToolPath.wrap(
+            ShellQuote.join(["docker", "exec", container, "psql", "-U", "postgres", "-d", "postgres", "-tAc", sql]),
+            directories: ToolPath.directories(cwd: cwd)
+        )
         return await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
@@ -2734,10 +2767,13 @@ final class EnvironmentSupervisor {
 
     /// Name of the Docker container that publishes this host port, if any.
     nonisolated static func containerPublishing(port: Int) async -> String? {
-        await withCheckedContinuation { continuation in
+        let command = ToolPath.wrap(
+            "docker ps --filter publish=\(port) --format '{{.Names}}'", directories: ToolPath.directories(cwd: nil)
+        )
+        return await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", "docker ps --filter publish=\(port) --format '{{.Names}}'"]
+            process.arguments = ["-l", "-c", command]
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = FileHandle.nullDevice
@@ -2804,6 +2840,20 @@ final class EnvironmentSupervisor {
         sortedServiceIDs
             .compactMap { serviceStates[$0]?.definition }
             .filter { isInProfile($0.id) && !$0.shouldReuseIfRunning }
+    }
+
+    /// The ports that Stop All and the quit of the app clear: those of `killableServices`,
+    /// and those of a service outside the profile that this session started. A change
+    /// of profile leaves such a service running until the next stop.
+    var sweepPorts: [Int] {
+        let killable = Set(killableServices.map(\.id))
+        return sortedServiceIDs
+            .compactMap { serviceStates[$0] }
+            .filter { state in
+                killable.contains(state.definition.id)
+                    || (state.lastStarted != nil && !state.definition.shouldReuseIfRunning)
+            }
+            .compactMap { $0.definition.probe?.port }
     }
 
     /// Routes that must respond on a healthy server. "/" is wrong for

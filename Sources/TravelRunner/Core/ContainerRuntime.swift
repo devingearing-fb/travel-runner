@@ -42,8 +42,10 @@ enum ContainerRuntime: Sendable {
         return false
     }
 
+    /// `docker` can be on a PATH that only `~/.zshrc` sets (see `ToolPath`).
     private static func shell(_ command: String) async -> Bool {
-        await withCheckedContinuation { continuation in
+        let command = ToolPath.wrap(command, directories: ToolPath.directories(cwd: nil))
+        return await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-l", "-c", command]

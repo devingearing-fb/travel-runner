@@ -81,6 +81,25 @@ enum PortOwner {
         return parse(output ?? "")
     }
 
+    /// The same answer without `await`, for the quit of the app.
+    static func listenersNow(on port: Int) -> [Listener] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = lsofArguments(port: port)
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return parse(String(decoding: data, as: UTF8.self))
+    }
+
+    /// The listeners that a port sweep may kill: all but a container runtime.
+    static func killable(_ listeners: [Listener]) -> [Listener] {
+        listeners.filter { !isContainerRuntime($0.command) }
+    }
+
     /// A `pkill -f` pattern that matches this command line and no other: the
     /// arguments joined by spaces, with each regex character made literal.
     static func commandPattern(for cmd: [String]) -> String {
@@ -111,8 +130,8 @@ enum PortOwner {
     }
 }
 
-/// The tools of the port cleanup. The lifecycle tests replace them with fakes, so
-/// a test never kills a real process.
+/// The tools of the port cleanup. The lifecycle tests replace them, so a test
+/// never kills a process that it did not start.
 struct PortTools: Sendable {
     var listeners: @Sendable (Int) async -> [PortOwner.Listener]
     var kill: @Sendable (pid_t) -> Void

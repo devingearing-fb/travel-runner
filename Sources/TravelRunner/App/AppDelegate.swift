@@ -88,13 +88,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             kill(pid, SIGKILL)
         }
 
-        // Phase 4: Kill by known service ports as a fallback. Only the Node dev servers:
-        // Docker-published ports (Supabase 54322, Sequin 7376) are held by the container
-        // runtime itself (OrbStack / Docker Desktop), and Supabase persists between sessions.
+        // Phase 4: Kill by service port as a fallback. Only the ports that Stop All
+        // clears: the services of the profile and those this session started, never a
+        // reuse_if_running service (Supabase persists between sessions).
         guard !siblingRunsStack else { return }
-        var ports = [3000, 3002, 3003, 3006, 8080]
-        ports += ServiceCatalog.forkAppPorts(of: supervisor.serviceStates.values.map(\.definition))
-        killProcessesOnPorts(ports)
+        killProcessesOnPorts(supervisor.sweepPorts)
     }
 
     private func collectDescendants(of pid: pid_t, into result: inout Set<pid_t>) {
@@ -119,26 +117,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {}
     }
 
+    /// A container runtime is never killed: its port helper serves every container.
     private func killProcessesOnPorts(_ ports: [Int]) {
         for port in ports {
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/lsof")
-            task.arguments = ["-ti", "TCP:\(port)", "-sTCP:LISTEN"]
-            let pipe = Pipe()
-            task.standardOutput = pipe
-            task.standardError = FileHandle.nullDevice
-            do {
-                try task.run()
-                task.waitUntilExit()
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                guard let text = String(data: data, encoding: .utf8) else { continue }
-                for pidStr in text.split(separator: "\n") {
-                    if let pid = pid_t(pidStr.trimmingCharacters(in: .whitespaces)) {
-                        kill(pid, SIGKILL)
-                    }
-                }
-            } catch {
-                continue
+            for listener in PortOwner.killable(PortOwner.listenersNow(on: port)) {
+                kill(listener.pid, SIGKILL)
             }
         }
     }

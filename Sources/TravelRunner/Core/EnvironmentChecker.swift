@@ -237,9 +237,9 @@ final class EnvironmentChecker {
                         checkCommand: "pnpm --version",
                         checkDescription: "The monorepo pins pnpm \(pnpmPin ?? "\(pnpmMajor)") (packageManager in package.json). The check runs in the monorepo."),
             HealthCheck(id: "python-jwt", name: "Python 3 + PyJWT", section: .prerequisites,
-                        isRequired: false, fixLabel: "pip3 install pyjwt",
+                        isRequired: false, fixLabel: "Install PyJWT",
                         checkCommand: "python3 -c 'import jwt'",
-                        checkDescription: "Optional — only the contract data copy script (copy-remote-data.py) needs it"),
+                        checkDescription: "Optional — this checkout is from before the .env dump scripts, and its contract data copy (copy-remote-data.py) still needs PyJWT. A newer checkout does not."),
             HealthCheck(id: "registry-auth", name: "GitHub Packages auth", section: .prerequisites,
                         checkCommand: "grep //npm.pkg.github.com/:_authToken ~/.npmrc",
                         checkDescription: "User-level token for @fastbreak-amateur packages. Set it once with: pnpm config set --location=user \"//npm.pkg.github.com/:_authToken\" <token>"),
@@ -292,7 +292,7 @@ final class EnvironmentChecker {
             HealthCheck(id: "hotel-data", name: "Hotel data cached", section: .supabase,
                         isRequired: false, fixLabel: "Download hotels",
                         checkCommand: "ls data/travel_organizations.sql",
-                        checkDescription: "~200K hotel records cached locally. First db:setup pulls from remote (~3-5 min). Reused on subsequent runs. The fix downloads the file only; it does not reset the database.",
+                        checkDescription: "~200K hotel records cached locally. First db:setup pulls from remote (~3-5 min). Reused on subsequent runs. The fix downloads the file only; it does not reset the database. \(Self.hotelDataFixNeeds)",
                         checkPath: (monorepoPath as NSString).appendingPathComponent("data/travel_organizations.sql")),
 
             // Optional
@@ -302,6 +302,9 @@ final class EnvironmentChecker {
                         checkDescription: "Links to the remote Supabase project. Only needed for drift detection and pulling remote schema changes.",
                         checkPath: (monorepoPath as NSString).appendingPathComponent("supabase/.temp/project-ref")),
         ]
+        if !Self.checkoutNeedsPyJWT(monorepo: monorepoPath) {
+            checks.removeAll { $0.id == "python-jwt" }
+        }
         if flavor.runsAgent { checks += agentChecks() }
     }
 
@@ -329,6 +332,28 @@ final class EnvironmentChecker {
                         checkDescription: "The event directory needs the env file of its Vercel project (`vercel env pull .env.local --environment=production` in \(RepoDetector.eventDirectory), or the file a teammate sent you: Import… copies it into place). The API token in that file stops after 12 hours. After that, the app gets a new one through your Vercel login (npx vercel login); the runner links the app to its Vercel project for that.",
                         checkPath: (eventDirectoryPath as NSString).appendingPathComponent(".env.local")),
         ]
+    }
+
+    /// True when the database scripts of the checkout still ask for PyJWT. The newer
+    /// scripts sign the token with Node, and then the row is not shown.
+    nonisolated static func checkoutNeedsPyJWT(monorepo: String) -> Bool {
+        let path = (monorepo as NSString).appendingPathComponent("scripts/db/check-prerequisites.mjs")
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
+        return content.contains("PyJWT")
+    }
+
+    /// A Homebrew Python refuses a plain `pip install`, so the second try passes the flag for that.
+    nonisolated static let pyJWTFixCommand =
+        "python3 -m pip install --user pyjwt || python3 -m pip install --user --break-system-packages pyjwt"
+
+    /// What a row shows when its fix failed.
+    nonisolated static func fixFailedText(for checkID: String) -> String {
+        switch checkID {
+        case "hotel-data":
+            "Download failed — start the stack first (the download needs the local Supabase and the shared apps/booking-portal/.env), then retry"
+        default:
+            "Fix failed — try manually"
+        }
     }
 
     func runAllChecks() async {
@@ -365,7 +390,7 @@ final class EnvironmentChecker {
             let newStatus = await runCheck(checkID)
             check.status = newStatus
         } else {
-            check.status = .failing("Fix failed — try manually")
+            check.status = .failing(Self.fixFailedText(for: checkID))
         }
     }
 
@@ -397,7 +422,7 @@ final class EnvironmentChecker {
 
         case "python-jwt":
             let ok = await shell("python3 -c 'import jwt' 2>/dev/null")
-            return ok ? .passing("Installed") : .warning("Not installed — only the contract data copy needs it")
+            return ok ? .passing("Installed") : .warning("Not installed — only monolith checkouts from before the .env dump script need it")
 
         case "registry-auth":
             let ok = await shell("grep -q '^//npm.pkg.github.com/:_authToken=.' ~/.npmrc 2>/dev/null")
@@ -538,6 +563,8 @@ final class EnvironmentChecker {
 
     /// Downloads the hotel dump when it is missing. It never resets the database.
     nonisolated static let hotelDataFixCommand = "pnpm db:hotels"
+    /// `pnpm db:hotels` stops when one of these is absent.
+    nonisolated static let hotelDataFixNeeds = "The fix needs the local Supabase running and the shared apps/booking-portal/.env."
 
     /// nil when the developer cancelled and nothing changed.
     private func runFix(_ id: String) async -> Bool? {
@@ -555,7 +582,7 @@ final class EnvironmentChecker {
             return await shell(Self.pnpmFixCommand(pin: Self.pnpmPin(monorepo: monorepoPath), monorepo: monorepoPath))
 
         case "python-jwt":
-            return await shell("pip3 install pyjwt")
+            return await shell(Self.pyJWTFixCommand)
 
         case "stripe-auth":
             // Can't run interactive login from here — open terminal
@@ -757,8 +784,10 @@ final class EnvironmentChecker {
         }
     }
 
+    /// The checks and the fixes get the PATH that the services get (see `ToolPath`).
     private func shell(_ command: String) async -> Bool {
-        await withCheckedContinuation { continuation in
+        let command = ToolPath.wrap(command, directories: ToolPath.directories(cwd: monorepoPath))
+        return await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-l", "-c", command]
@@ -770,7 +799,8 @@ final class EnvironmentChecker {
     }
 
     private func shellOutput(_ command: String) async -> (String, Bool) {
-        await withCheckedContinuation { continuation in
+        let command = ToolPath.wrap(command, directories: ToolPath.directories(cwd: monorepoPath))
+        return await withCheckedContinuation { continuation in
             let process = Process()
             let pipe = Pipe()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")

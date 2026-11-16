@@ -84,7 +84,7 @@ enum ServiceCatalog {
     static let agentNodeMajor = 24
     static let agentCommand = ["pnpm", "exec", "eve", "dev", "--no-ui"]
 
-    /// The ports of the fork's apps among these services. The runner frees them when it quits.
+    /// The ports of the fork's apps among these services.
     static func forkAppPorts(of services: [ServiceDefinition]) -> [Int] {
         services.filter { forkAppIDs.contains($0.id) }.compactMap { $0.probe?.port }.sorted()
     }

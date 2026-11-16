@@ -33,10 +33,18 @@ enum PreflightResult: Sendable {
 }
 
 struct PreflightRunner: Sendable {
+    /// The extra PATH directories of each check command, for the cwd of the check.
+    /// The services get the same ones (see `ToolPath`).
+    var toolDirectories: @Sendable (String?) -> [String] = { ToolPath.directories(cwd: $0) }
+
     func allChecks(for services: [ServiceDefinition]) -> [PreflightCheck] {
         var checks: [PreflightCheck] = [
             PreflightCheck(id: "docker", name: ContainerRuntime.detect().displayName),
-            PreflightCheck(id: "node-version", name: "Node.js \u{2265} 22"),
+            // The cwd of a portal: the Node of its `.nvmrc` is the one the services get.
+            PreflightCheck(
+                id: "node-version", name: "Node.js \u{2265} 22",
+                metadata: (nodeCwd(for: services)).map { ["cwd": $0] } ?? [:]
+            ),
             PreflightCheck(id: "stripe-auth", name: "Stripe CLI Auth"),
         ]
 
@@ -69,6 +77,10 @@ struct PreflightRunner: Sendable {
         return checks
     }
 
+    private func nodeCwd(for services: [ServiceDefinition]) -> String? {
+        services.first(where: { $0.id == "travel-portal" })?.resolvedCwd ?? services.compactMap(\.resolvedCwd).first
+    }
+
     func run(check: PreflightCheck) async -> PreflightResult {
         switch check.id {
         case "docker":
@@ -82,7 +94,7 @@ struct PreflightRunner: Sendable {
             return .failed(message: "\(runtime.displayName) not responding", fix: "Open \(runtime.appName) manually")
 
         case "node-version":
-            let output = await shellOutput("node --version")
+            let output = await shellOutput("node --version", cwd: check.metadata["cwd"])
             let version = output.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !version.isEmpty else {
                 return .failed(message: "Node.js not found", fix: "Install Node 22 via nvm or brew")
@@ -112,7 +124,7 @@ struct PreflightRunner: Sendable {
             let cwd = check.metadata["cwd"] ?? ""
             let app: SharedEnvFiles.App = id == "env-diff-partner-portal" ? .partner : .booking
             let monorepo = ((cwd as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
-            let output = await shellOutput(SharedEnvFiles.command(monorepo: monorepo, app: app))
+            let output = await shellOutput(SharedEnvFiles.command(monorepo: monorepo, app: app), cwd: monorepo)
             switch SharedEnvFiles.status(SharedEnvFiles.decode(output, app: app)) {
             case .passing(let detail): return .passed(detail: detail)
             case .warning(let message), .failing(let message): return .warning(message: message)
@@ -152,7 +164,8 @@ struct PreflightRunner: Sendable {
     }
 
     private func shellExitCode(_ command: String) async -> Int32 {
-        await withCheckedContinuation { continuation in
+        let command = ToolPath.wrap(command, directories: toolDirectories(nil))
+        return await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-l", "-c", command]
@@ -169,8 +182,10 @@ struct PreflightRunner: Sendable {
         }
     }
 
-    private func shellOutput(_ command: String) async -> String {
-        await withCheckedContinuation { continuation in
+    /// The output of a command in a login shell, with the tool directories on PATH.
+    func shellOutput(_ command: String, cwd: String? = nil) async -> String {
+        let command = ToolPath.wrap(command, directories: toolDirectories(cwd))
+        return await withCheckedContinuation { continuation in
             let process = Process()
             let pipe = Pipe()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")

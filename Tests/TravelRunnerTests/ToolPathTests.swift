@@ -71,6 +71,41 @@ final class ToolPathTests: XCTestCase {
         )
     }
 
+    /// The preflight of a start ran `node --version` in a bare login shell, so a Node
+    /// from `~/.zshrc` failed the start before any service ran.
+    func testAPreflightCommandFindsAToolInAnInjectedDirectory() async throws {
+        // A name that no Mac has, so the tools of this machine do not count.
+        let tool = "tr-fake-node-\(UUID().uuidString)"
+        try makeDirectory("tools")
+        let file = home.appendingPathComponent("tools/\(tool)")
+        try "#!/bin/sh\necho v98.1.0\n".write(to: file, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        let tools = home.appendingPathComponent("tools").path
+
+        let found = await PreflightRunner(toolDirectories: { _ in [tools] }).shellOutput("\(tool) --version")
+        XCTAssertEqual(found.trimmingCharacters(in: .whitespacesAndNewlines), "v98.1.0")
+
+        // Negative control: without the directory the shell does not find it.
+        let missing = await PreflightRunner(toolDirectories: { _ in [] }).shellOutput("\(tool) --version")
+        XCTAssertEqual(missing.trimmingCharacters(in: .whitespacesAndNewlines), "")
+    }
+
+    /// The Node check of the preflight asks in the cwd of a portal, so it gets the
+    /// Node that the services get.
+    func testTheNodeCheckOfThePreflightCarriesTheCwdOfThePortal() {
+        func service(_ id: String, cwd: String) -> ServiceDefinition {
+            ServiceDefinition(
+                id: id, name: id, cmd: ["true"], cwd: cwd, probe: nil, type: .daemon, restart: .never,
+                dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+            )
+        }
+        let services = [service("supabase", cwd: "/mono"), service("travel-portal", cwd: "/mono/apps/booking-portal")]
+
+        let checks = PreflightRunner().allChecks(for: services)
+
+        XCTAssertEqual(checks.first { $0.id == "node-version" }?.metadata["cwd"], "/mono/apps/booking-portal")
+    }
+
     func testOnlyABareCommandNameIsATool() {
         XCTAssertEqual(ToolPath.toolName(of: ["pnpm", "dev"]), "pnpm")
         XCTAssertNil(ToolPath.toolName(of: ["./scripts/dev.sh"]))
@@ -80,8 +115,13 @@ final class ToolPathTests: XCTestCase {
 
     func testTheNotFoundText() {
         XCTAssertEqual(
-            ToolPath.notFoundText(tool: "node", searchedPath: "/usr/bin:/bin"),
-            "node was not found. Travel Runner looked in: /usr/bin:/bin."
+            ToolPath.notFoundText(tool: "node", searchedPath: "/usr/bin:/bin", appName: "Travel Runner"),
+            "node was not found. Travel Runner looked in: /usr/bin:/bin. Install node or add its folder to ~/.zprofile, then restart the service."
+        )
+        // The hackathon app says its own name.
+        XCTAssertTrue(
+            ToolPath.notFoundText(tool: "node", searchedPath: "/bin", appName: Flavor.hackathon.displayName)
+                .contains("\(Flavor.hackathon.displayName) looked in: /bin.")
         )
     }
 }
