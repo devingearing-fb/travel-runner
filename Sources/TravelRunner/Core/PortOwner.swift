@@ -114,19 +114,9 @@ enum PortOwner {
     }
 
     private static func run(_ executable: String, _ arguments: [String]) async -> String? {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: executable)
-            process.arguments = arguments
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { _ in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                continuation.resume(returning: String(decoding: data, as: UTF8.self))
-            }
-            do { try process.run() } catch { continuation.resume(returning: nil) }
-        }
+        let result = await Shell.execute(executable, arguments, timeout: .seconds(10))
+        // -1: the tool did not start, or it did not end in time.
+        return result.exitCode == -1 ? nil : result.stdout
     }
 }
 

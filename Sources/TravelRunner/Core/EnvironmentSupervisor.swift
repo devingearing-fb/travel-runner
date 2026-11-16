@@ -91,7 +91,11 @@ final class EnvironmentSupervisor {
     let holdsViewer: HoldsViewerHost
     private let secretStore = SecretStore()
     private var graph: ServiceGraph?
-    private let processRunner = ProcessRunner()
+    private let processRunner: ProcessRunner
+    /// The PATH of the services and of every helper command.
+    @ObservationIgnored let tools: ToolEnvironment
+    /// Runs the helper commands of the supervisor. Tests can replace it.
+    @ObservationIgnored var shell: any CommandRunning
     /// The port cleanup reads listeners and kills through these tools.
     @ObservationIgnored var portTools = PortTools.live
     /// The check that the Stripe CLI is installed and logged in. Tests set it; nil
@@ -138,7 +142,12 @@ final class EnvironmentSupervisor {
     var databaseProbeRetry: (interval: Duration, timeout: Duration) = (.seconds(2), .seconds(60))
     var dbResetAction: ((_ cwd: String) async -> Bool)?
 
-    init(userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil) {
+    init(
+        userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil, tools: ToolEnvironment = .shared
+    ) {
+        self.tools = tools
+        self.processRunner = ProcessRunner(tools: tools)
+        self.shell = LoginShell(tools: tools)
         self.holdsViewer = holdsViewer ?? HoldsViewerHost()
         self.userDefaults = userDefaults
         self.selectedDbSeedScenarioID = userDefaults.string(forKey: "dbSeedScenarioID")
@@ -206,7 +215,7 @@ final class EnvironmentSupervisor {
             case .exitedDuringStartup(let id): "'\(id)' exited before it was ready — see its log"
             case .autoRestartStopped(let reason): reason
             case .commandNotRunnable(let name, let command, _, let searchedPath?):
-                "\(name) cannot start: \(ToolPath.notFoundText(tool: command, searchedPath: searchedPath))"
+                "\(name) cannot start: \(ToolEnvironment.notFoundText(tool: command, searchedPath: searchedPath))"
             case .commandNotRunnable(let name, let command, let code, nil):
                 "\(name) cannot start: the shell could not run \(command) (exit \(code)). Does the current branch have it? Restart \(name) after the fix."
             case .localKeysMissing(let name, let envFile):
@@ -903,21 +912,9 @@ final class EnvironmentSupervisor {
         }
     }
 
-    private func shellOutput(_ command: String) async -> (String, Bool) {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { p in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                continuation.resume(returning: (output, p.terminationStatus == 0))
-            }
-            do { try process.run() } catch { continuation.resume(returning: ("", false)) }
-        }
+    private func shellOutput(_ command: String, cwd: String? = nil) async -> (String, Bool) {
+        let result = await shell.run(command, cwd: cwd)
+        return (result.stdout, result.succeeded)
     }
 
     /// A restart that a person or the API asks for. It clears the failure history:
@@ -1392,7 +1389,8 @@ final class EnvironmentSupervisor {
         let hasPackages = FileManager.default.isExecutableFile(
             atPath: (cwd as NSString).appendingPathComponent("node_modules/.bin/eve")
         )
-        let (output, ok) = await shellOutput("node --version")
+        // In the folder of the agent, so the answer is the Node that its start gets.
+        let (output, ok) = await shellOutput("node --version", cwd: cwd)
         let installs = await Task.detached { NodeLocator.installs() }.value
         let sharedEnv = sharedEnvPath("travel-portal") ?? ""
         var plan = AgentEnv.plan(agentDirectory: cwd, sharedEnvFile: sharedEnv)
@@ -1600,7 +1598,7 @@ final class EnvironmentSupervisor {
                 // old travel-booking-portal one, say) on the same port is a different DB.
                 if serviceID == "supabase", let root = definition.resolvedCwd {
                     let expected = SupabaseProject.dbContainerName(root: root)
-                    if let occupant = await Self.containerPublishing(port: port), occupant != expected {
+                    if let occupant = await Self.containerPublishing(port: port, shell: shell), occupant != expected {
                         await logStore.append(serviceID: serviceID, entry: LogEntry(
                             stream: .stderr,
                             text: "[travel-runner] Port \(port) is held by \(occupant), not \(expected). Stop that stack (npx supabase stop in its checkout, or: docker stop $(docker ps -q --filter name=_\(occupant.replacingOccurrences(of: "supabase_db_", with: ""))$)) and start again."
@@ -1982,11 +1980,11 @@ final class EnvironmentSupervisor {
     /// The PATH of the launch when exit 127 means that the tool of the service is
     /// not on it. Nil for a script path, and when the shell finds the tool.
     private func searchedPath(forExit code: Int32, of definition: ServiceDefinition) async -> String? {
-        guard code == 127, let tool = ToolPath.toolName(of: definition.cmd) else { return nil }
-        let cwd = definition.resolvedCwd
-        return await Task.detached {
-            await ToolPath.searchedPath(missing: tool, directories: ToolPath.directories(cwd: cwd))
-        }.value
+        guard code == 127, let tool = ToolEnvironment.toolName(of: definition.cmd) else { return nil }
+        // The tool can be new on this Mac: read the shell again. The probe waits
+        // for it, and so does the next start of the service.
+        tools.refresh()
+        return await ToolEnvironment.searchedPath(missing: tool, cwd: definition.resolvedCwd, runner: shell)
     }
 
     private func handleTermination(serviceID: String, termination: ProcessRunner.Termination) {
@@ -2091,7 +2089,7 @@ final class EnvironmentSupervisor {
             Task {
                 guard let path = await searchedPath(forExit: code, of: definition) else { return }
                 await logStore.append(serviceID: serviceID, entry: LogEntry(
-                    stream: .stderr, text: "[travel-runner] \(ToolPath.notFoundText(tool: command, searchedPath: path))"
+                    stream: .stderr, text: "[travel-runner] \(ToolEnvironment.notFoundText(tool: command, searchedPath: path))"
                 ))
                 // A newer error stays.
                 if lastError == plain {
@@ -2565,19 +2563,8 @@ final class EnvironmentSupervisor {
         return groups
     }
 
-    private func runShellCommand(_ command: String) async -> Bool {
-        let command = ToolPath.wrap(command, directories: ToolPath.directories(cwd: nil))
-        return await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { proc in
-                continuation.resume(returning: proc.terminationStatus == 0)
-            }
-            do { try process.run() } catch { continuation.resume(returning: false) }
-        }
+    private func runShellCommand(_ command: String, timeout: Duration = Shell.defaultTimeout) async -> Bool {
+        await shell.run(command, timeout: timeout).succeeded
     }
 
     /// The line in the Stripe log for each case where Stripe ends as skipped.
@@ -2590,11 +2577,13 @@ final class EnvironmentSupervisor {
         // `stripe config --list` only proves that a credential is stored; it
         // still exits zero for expired API keys. Exercise the authenticated API
         // so invalid sessions are skipped before `stripe listen` can crash.
-        return await runShellCommand("which stripe >/dev/null 2>&1 && stripe balance retrieve >/dev/null 2>&1")
+        return await runShellCommand(
+            "which stripe >/dev/null 2>&1 && stripe balance retrieve >/dev/null 2>&1", timeout: .seconds(15)
+        )
     }
 
     private func canReachHost(_ host: String) async -> Bool {
-        await runShellCommand("nc -z -w 2 \(host) 443 >/dev/null 2>&1")
+        await runShellCommand("nc -z -w 2 \(host) 443 >/dev/null 2>&1", timeout: .seconds(10))
     }
 
     private func waitForNetwork(timeout: Duration = .seconds(30)) async -> Bool {
@@ -2673,46 +2662,23 @@ final class EnvironmentSupervisor {
     private func queryDatabase(cwd: String, sql: String) async -> DbQueryResult {
         if let databaseQuery { return await databaseQuery(cwd, sql) }
         let container = SupabaseProject.dbContainerName(root: cwd)
-        let command = ToolPath.wrap(
-            ShellQuote.join(["docker", "exec", container, "psql", "-U", "postgres", "-d", "postgres", "-tAc", sql]),
-            directories: ToolPath.directories(cwd: cwd)
-        )
-        return await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
-            let outPipe = Pipe()
-            let errPipe = Pipe()
-            process.standardInput = FileHandle.nullDevice
-            process.standardOutput = outPipe
-            process.standardError = errPipe
-            do { try process.run() } catch {
-                continuation.resume(returning: DbQueryResult(exitCode: -1, stdout: "", stderr: error.localizedDescription))
-                return
-            }
-            // Both pipes are read while the process runs, so a full pipe cannot block it.
-            DispatchQueue.global().async {
-                let errors = DispatchGroup()
-                // Written by one thread, and read only after `wait`.
-                final class Buffer: @unchecked Sendable { var data = Data() }
-                let errBuffer = Buffer()
-                errors.enter()
-                DispatchQueue.global().async {
-                    errBuffer.data = errPipe.fileHandleForReading.readDataToEndOfFile()
-                    errors.leave()
-                }
-                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
-                errors.wait()
-                let errData = errBuffer.data
-                process.waitUntilExit()
-                continuation.resume(returning: DbQueryResult(
-                    exitCode: process.terminationStatus,
-                    stdout: String(decoding: outData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines),
-                    stderr: String(decoding: errData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-                ))
-            }
+        let command = ShellQuote.join(["docker", "exec", container, "psql", "-U", "postgres", "-d", "postgres", "-tAc", sql])
+        let result = await shell.run(command, cwd: cwd, timeout: Self.databaseQueryTimeout)
+        if result.timedOut {
+            return DbQueryResult(
+                exitCode: -1, stdout: "",
+                stderr: "The database did not answer in \(Self.databaseQueryTimeout.components.seconds) s."
+            )
         }
+        return DbQueryResult(
+            exitCode: result.exitCode,
+            stdout: result.trimmedOutput,
+            stderr: result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
     }
+
+    /// A query that hangs counts as a failed query, never as an empty database.
+    nonisolated static let databaseQueryTimeout: Duration = .seconds(20)
 
     /// Automatic reset (empty database, migrations the database lacks, branch switch):
     /// the manifest's `reset` profile with the selected seed scenario, shown in the
@@ -2766,24 +2732,12 @@ final class EnvironmentSupervisor {
     }
 
     /// Name of the Docker container that publishes this host port, if any.
-    nonisolated static func containerPublishing(port: Int) async -> String? {
-        let command = ToolPath.wrap(
-            "docker ps --filter publish=\(port) --format '{{.Names}}'", directories: ToolPath.directories(cwd: nil)
+    nonisolated static func containerPublishing(port: Int, shell: any CommandRunning = LoginShell()) async -> String? {
+        let result = await shell.run(
+            "docker ps --filter publish=\(port) --format '{{.Names}}' 2>/dev/null", timeout: .seconds(10)
         )
-        return await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { proc in
-                let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                let name = output.split(separator: "\n").first.map(String.init)
-                continuation.resume(returning: proc.terminationStatus == 0 ? name : nil)
-            }
-            do { try process.run() } catch { continuation.resume(returning: nil) }
-        }
+        guard result.succeeded else { return nil }
+        return result.stdout.split(separator: "\n").first.map(String.init)
     }
 
     private func isPortBound(_ port: Int) -> Bool {

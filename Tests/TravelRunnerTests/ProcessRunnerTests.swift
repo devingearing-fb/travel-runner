@@ -131,7 +131,7 @@ final class ProcessRunnerTests: XCTestCase {
     }
 
     /// A tool that only `~/.zshrc` puts on PATH: the login shell does not see it.
-    /// The runner adds the directory, so the service starts. The directory has a
+    /// The tool environment adds the directory, so the service starts. The directory has a
     /// space, as `Application Support` has.
     func testAToolInAnInjectedDirectoryStarts() async throws {
         let directory = FileManager.default.temporaryDirectory
@@ -143,23 +143,28 @@ final class ProcessRunnerTests: XCTestCase {
         try "#!/bin/sh\nexit 0\n".write(to: file, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
 
+        // An empty home: only the tool directories of the system count.
+        let home = directory.appendingPathComponent("home").path
+
         // Without the directory the shell cannot find the tool.
-        let plain = ProcessRunner(toolDirectories: { _ in [] })
+        let bare = ToolEnvironment(home: home)
+        let plain = ProcessRunner(tools: bare)
         let missing = Box()
         _ = try await start(plain, service("svc", [tool]), missing)
         let notFound = await waitForTermination(missing)
         XCTAssertEqual(notFound.map(ServiceTermination.classify), .commandNotRunnable(code: 127))
 
-        let path = directory.path
-        let runner = ProcessRunner(toolDirectories: { _ in [path] })
+        // The PATH of the user's interactive shell has the directory.
+        let resolved = ToolEnvironment(home: home, capture: .init(shellPath: [directory.path]))
+        let runner = ProcessRunner(tools: resolved)
         let box = Box()
         _ = try await start(runner, service("svc", [tool]), box)
         let termination = await waitForTermination(box)
         XCTAssertEqual(termination.map(ServiceTermination.classify), .cleanExit)
 
-        let searched = await ToolPath.searchedPath(missing: tool, directories: [])
+        let searched = await ToolEnvironment.searchedPath(missing: tool, cwd: nil, runner: LoginShell(tools: bare))
         XCTAssertNotNil(searched, "the tool is not on the PATH of the shell")
-        let found = await ToolPath.searchedPath(missing: tool, directories: [path])
+        let found = await ToolEnvironment.searchedPath(missing: tool, cwd: nil, runner: LoginShell(tools: resolved))
         XCTAssertNil(found, "the shell finds the tool in the added directory")
     }
 

@@ -4,6 +4,8 @@ import AppKit
 struct WorkshopDiagnosticsView: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
     @State private var diagnosticCopied = false
+    /// Nil while the first read runs.
+    @State private var toolReports: [ToolReport]?
 
     var body: some View {
         ScrollView {
@@ -63,6 +65,10 @@ struct WorkshopDiagnosticsView: View {
 
                 Divider()
 
+                toolsSection
+
+                Divider()
+
                 sectionHeader("Debug Tracking")
 
                 if supervisor.debugTrackingEnabled {
@@ -96,6 +102,58 @@ struct WorkshopDiagnosticsView: View {
             }
             .padding(20)
         }
+        .task { await loadTools() }
+    }
+
+    /// Where each tool is and which version the services get.
+    @ViewBuilder
+    private var toolsSection: some View {
+        HStack {
+            sectionHeader("Tools")
+            Spacer()
+            Button("Look Again") {
+                Task {
+                    toolReports = nil
+                    await supervisor.tools.resolve(runner: supervisor.shell)
+                    await loadTools()
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+            .disabled(toolReports == nil)
+        }
+
+        if let toolReports {
+            ForEach(toolReports) { tool in
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: tool.isFound ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundStyle(tool.isFound ? .green : .red)
+                        .frame(width: 16)
+                    Text(tool.text())
+                        .font(.caption)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.vertical, 2)
+            }
+            if let note = supervisor.tools.capture.note {
+                Text("\(note) \(Flavor.current.displayName) uses the PATH of the login shell and the standard tool folders.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            ProgressView().controlSize(.small)
+        }
+    }
+
+    private func loadTools() async {
+        toolReports = await supervisor.tools.report(runner: supervisor.shell, cwd: toolsCwd)
+    }
+
+    /// The monorepo, so the Node is the one that its `.nvmrc` picks.
+    private var toolsCwd: String? {
+        guard let path = supervisor.monorepoPath, FileManager.default.fileExists(atPath: path) else { return nil }
+        return path
     }
 
     private func sectionHeader(_ title: String) -> some View {
@@ -105,20 +163,11 @@ struct WorkshopDiagnosticsView: View {
     }
 
     private func fetchGitBranch(_ path: String) async -> String? {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-            process.arguments = ["-C", path, "rev-parse", "--abbrev-ref", "HEAD"]
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { _ in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let branch = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-                continuation.resume(returning: branch?.isEmpty == false ? branch : nil)
-            }
-            do { try process.run() } catch { continuation.resume(returning: nil) }
-        }
+        let result = await Shell.execute(
+            "/usr/bin/git", ["-C", path, "rev-parse", "--abbrev-ref", "HEAD"], timeout: .seconds(5)
+        )
+        let branch = result.trimmedOutput
+        return result.succeeded && !branch.isEmpty ? branch : nil
     }
 
     private func copyDiagnosticBundle() async {
@@ -158,6 +207,12 @@ struct WorkshopDiagnosticsView: View {
             }
         }
         bundle["gitBranches"] = gitBranches
+
+        let tools = await supervisor.tools.report(runner: supervisor.shell, cwd: toolsCwd)
+        bundle["tools"] = Dictionary(uniqueKeysWithValues: tools.map { tool in
+            (tool.name, ["path": tool.path ?? "not found", "version": tool.version ?? "unknown"])
+        })
+        if let searched = tools.first?.searchedPath { bundle["toolsPath"] = searched }
 
         var logs: [String: [String]] = [:]
         for id in supervisor.sortedServiceIDs {

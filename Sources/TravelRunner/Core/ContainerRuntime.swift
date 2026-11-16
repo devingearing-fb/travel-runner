@@ -25,36 +25,20 @@ enum ContainerRuntime: Sendable {
         return .docker
     }
 
-    /// True when the Docker daemon answers.
-    static func isResponding() async -> Bool {
-        await shell("docker ps >/dev/null 2>&1")
+    /// True when the Docker daemon answers. A daemon that hangs counts as down.
+    static func isResponding(shell: any CommandRunning = LoginShell()) async -> Bool {
+        await shell.run("docker ps >/dev/null 2>&1", timeout: .seconds(10)).succeeded
     }
 
     /// Opens the runtime's app when the daemon does not answer, then waits for it
     /// (two seconds between checks). Returns false when it did not come up.
-    static func ensureRunning(checks: Int = 10) async -> Bool {
-        if await isResponding() { return true }
-        _ = await shell("open -a '\(detect().appName)'")
+    static func ensureRunning(checks: Int = 10, shell: any CommandRunning = LoginShell()) async -> Bool {
+        if await isResponding(shell: shell) { return true }
+        _ = await shell.run("open -a '\(detect().appName)'", timeout: .seconds(10))
         for _ in 0..<checks {
             try? await Task.sleep(for: .seconds(2))
-            if await isResponding() { return true }
+            if await isResponding(shell: shell) { return true }
         }
         return false
-    }
-
-    /// `docker` can be on a PATH that only `~/.zshrc` sets (see `ToolPath`).
-    private static func shell(_ command: String) async -> Bool {
-        let command = ToolPath.wrap(command, directories: ToolPath.directories(cwd: nil))
-        return await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { proc in
-                continuation.resume(returning: proc.terminationStatus == 0)
-            }
-            do { try process.run() } catch { continuation.resume(returning: false) }
-        }
     }
 }

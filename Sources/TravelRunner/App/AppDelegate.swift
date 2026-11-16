@@ -17,6 +17,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
 
+        // Read the PATH of the user's shell first. A command that starts while
+        // this runs waits for it.
+        ToolEnvironment.shared.beginResolve(runner: LoginShell())
+
         supervisor = EnvironmentSupervisor()
         supervisor.loadConfig()
 

@@ -62,7 +62,21 @@ final class EnvironmentChecker {
 
     private(set) var checks: [HealthCheck] = []
 
-    init(monorepoPath: String, loginPath: String, streamServicesPath: String, flavor: Flavor = .current) {
+    /// Runs the commands of the checks and the fixes.
+    private let commandRunner: any CommandRunning
+    private let tools: ToolEnvironment
+
+    /// A check command that hangs fails after this time.
+    nonisolated static let checkTimeout: Duration = .seconds(15)
+    /// A fix can install packages or load the hotels, so it gets a long time.
+    nonisolated static let fixTimeout: Duration = .seconds(20 * 60)
+
+    init(
+        monorepoPath: String, loginPath: String, streamServicesPath: String, flavor: Flavor = .current,
+        shell: any CommandRunning = LoginShell(), tools: ToolEnvironment = .shared
+    ) {
+        self.commandRunner = shell
+        self.tools = tools
         self.flavor = flavor
         self.monorepoPath = NSString(string: monorepoPath).expandingTildeInPath
         self.loginPath = NSString(string: loginPath).expandingTildeInPath
@@ -154,10 +168,7 @@ final class EnvironmentChecker {
     /// The last line of the output that is only a version, without the "v". Other lines are notices.
     /// A prerelease such as "11.0.0-rc.1" is a version.
     nonisolated static func toolVersion(_ output: String) -> String? {
-        output.split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .last { $0.range(of: #"^v?\d+\.\d+(\.\d+)?(-[0-9A-Za-z.-]+)?$"#, options: .regularExpression) != nil }
-            .map { $0.hasPrefix("v") ? String($0.dropFirst()) : $0 }
+        ToolVersion.parse(output)
     }
 
     nonisolated static func major(of version: String) -> Int? {
@@ -370,6 +381,13 @@ final class EnvironmentChecker {
         }
     }
 
+    /// "Re-check All": reads the shell of the user again, then runs the checks. A
+    /// tool that was installed a moment ago, or a new line in `~/.zshrc`, counts.
+    func recheckAll() async {
+        await tools.resolve(runner: commandRunner)
+        await runAllChecks()
+    }
+
     func fix(_ checkID: String) async {
         guard let check = checks.first(where: { $0.id == checkID }) else { return }
         check.status = .fixing
@@ -381,6 +399,8 @@ final class EnvironmentChecker {
         }
         if checkID == "pnpm" {
             let recheck = await runCheck(checkID)
+            // The fix can add pnpm to a folder that only a new shell has on its PATH.
+            await tools.resolve(runner: commandRunner)
             let (path, _) = await shellOutput("command -v pnpm")
             check.status = Self.pnpmStatusAfterFix(
                 recheck: recheck, fixSucceeded: success,
@@ -404,11 +424,14 @@ final class EnvironmentChecker {
         switch id {
         case "docker":
             let runtime = ContainerRuntime.detect()
-            let ok = await shell("docker ps >/dev/null 2>&1")
-            return ok ? .passing(runtime.displayName) : .failing("\(runtime.displayName) not responding")
+            let result = await runCommand("docker ps >/dev/null 2>&1")
+            if result.timedOut { return .failing(Shell.timeoutText("docker ps", after: Self.checkTimeout)) }
+            return result.succeeded ? .passing(runtime.displayName) : .failing("\(runtime.displayName) not responding")
 
         case "node":
-            let (output, ok) = await shellOutput("node --version")
+            let result = await runCommand("node --version")
+            if result.timedOut { return .failing(Shell.timeoutText("node --version", after: Self.checkTimeout)) }
+            let (output, ok) = (result.stdout, result.succeeded)
             if !ok { return .failing("Node.js not found") }
             let version = output.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "v", with: "")
             if let major = Int(version.split(separator: ".").first ?? "0"), major >= 22 {
@@ -433,8 +456,9 @@ final class EnvironmentChecker {
             return ok ? .passing("Found") : .warning("Not installed — webhooks won't work")
 
         case "stripe-auth":
-            let ok = await shell("stripe balance retrieve >/dev/null 2>&1")
-            return ok ? .passing("Authenticated") : .warning("Session invalid or expired — run: stripe login")
+            let result = await runCommand("stripe balance retrieve >/dev/null 2>&1")
+            if result.timedOut { return .warning(Shell.timeoutText("stripe balance retrieve", after: Self.checkTimeout)) }
+            return result.succeeded ? .passing("Authenticated") : .warning("Session invalid or expired — run: stripe login")
 
         case "workspace-modules":
             let path = (monorepoPath as NSString).appendingPathComponent("node_modules/.modules.yaml")
@@ -579,10 +603,10 @@ final class EnvironmentChecker {
             return false
 
         case "pnpm":
-            return await shell(Self.pnpmFixCommand(pin: Self.pnpmPin(monorepo: monorepoPath), monorepo: monorepoPath))
+            return await fixShell(Self.pnpmFixCommand(pin: Self.pnpmPin(monorepo: monorepoPath), monorepo: monorepoPath))
 
         case "python-jwt":
-            return await shell(Self.pyJWTFixCommand)
+            return await fixShell(Self.pyJWTFixCommand)
 
         case "stripe-auth":
             // Can't run interactive login from here — open terminal
@@ -590,13 +614,13 @@ final class EnvironmentChecker {
             return false
 
         case "workspace-modules":
-            return await shellInDir(monorepoPath, "pnpm install")
+            return await fixShellInDir(monorepoPath, "pnpm install")
 
         case "login-modules":
-            return await shellInDir(loginPath, "npm install")
+            return await fixShellInDir(loginPath, "npm install")
 
         case "stream-modules":
-            return await shellInDir(streamServicesPath, "npm install")
+            return await fixShellInDir(streamServicesPath, "npm install")
 
         case "booking-env":
             return await importSharedEnv(.booking)
@@ -608,10 +632,10 @@ final class EnvironmentChecker {
             return createLoginEnvLocal()
 
         case "hotel-data":
-            return await shellInDir(monorepoPath, Self.hotelDataFixCommand)
+            return await fixShellInDir(monorepoPath, Self.hotelDataFixCommand)
 
         case "agent-node":
-            return await shell("brew install node@\(ServiceCatalog.agentNodeMajor)")
+            return await fixShell("brew install node@\(ServiceCatalog.agentNodeMajor)")
 
         case "platform-env":
             return importPlatformCoreEnv()
@@ -624,7 +648,7 @@ final class EnvironmentChecker {
 
         case "sb-linked":
             let script = (monorepoPath as NSString).appendingPathComponent("scripts/setup/link-project.sh")
-            return await shellInDir(monorepoPath, "bash \(ShellQuote.quote(script))")
+            return await fixShellInDir(monorepoPath, "bash \(ShellQuote.quote(script))")
 
         default:
             return false
@@ -784,39 +808,34 @@ final class EnvironmentChecker {
         }
     }
 
-    /// The checks and the fixes get the PATH that the services get (see `ToolPath`).
+    /// The folder of the commands: the `.nvmrc` of the monorepo picks the Node,
+    /// as it does for the services. Nil before the folder exists.
+    private var commandCwd: String? {
+        var isDirectory: ObjCBool = false
+        return FileManager.default.fileExists(atPath: monorepoPath, isDirectory: &isDirectory) && isDirectory.boolValue
+            ? monorepoPath : nil
+    }
+
+    /// One command of a check. The checks and the fixes get the PATH that the
+    /// services get (see `ToolEnvironment`).
+    private func runCommand(_ command: String, timeout: Duration = EnvironmentChecker.checkTimeout) async -> CommandResult {
+        await commandRunner.run(command, cwd: commandCwd, timeout: timeout)
+    }
+
     private func shell(_ command: String) async -> Bool {
-        let command = ToolPath.wrap(command, directories: ToolPath.directories(cwd: monorepoPath))
-        return await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { p in continuation.resume(returning: p.terminationStatus == 0) }
-            do { try process.run() } catch { continuation.resume(returning: false) }
-        }
+        await runCommand(command).succeeded
     }
 
     private func shellOutput(_ command: String) async -> (String, Bool) {
-        let command = ToolPath.wrap(command, directories: ToolPath.directories(cwd: monorepoPath))
-        return await withCheckedContinuation { continuation in
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { p in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                let output = String(data: data, encoding: .utf8) ?? ""
-                continuation.resume(returning: (output, p.terminationStatus == 0))
-            }
-            do { try process.run() } catch { continuation.resume(returning: ("", false)) }
-        }
+        let result = await runCommand(command)
+        return (result.stdout, result.succeeded)
     }
 
-    private func shellInDir(_ dir: String, _ command: String) async -> Bool {
-        await shell("cd \(ShellQuote.quote(dir)) && \(command)")
+    private func fixShell(_ command: String) async -> Bool {
+        await runCommand(command, timeout: Self.fixTimeout).succeeded
+    }
+
+    private func fixShellInDir(_ dir: String, _ command: String) async -> Bool {
+        await fixShell("cd \(ShellQuote.quote(dir)) && \(command)")
     }
 }

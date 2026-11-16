@@ -87,7 +87,7 @@ struct SetupStep2View: View {
     private var summaryBar: some View {
         HStack(spacing: 12) {
             Button {
-                Task { await checker.runAllChecks() }
+                Task { await checker.recheckAll() }
             } label: {
                 Label("Re-check All", systemImage: "arrow.clockwise")
             }

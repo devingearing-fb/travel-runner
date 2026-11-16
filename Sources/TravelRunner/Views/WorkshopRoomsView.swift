@@ -85,7 +85,7 @@ struct WorkshopRoomsView: View {
         case .unavailable(.nodeNotFound):
             message(
                 "Node was not found",
-                "The holds viewer needs Node 22 or later in your login shell (zsh -l). The portals need it too."
+                "The holds viewer needs Node 22 or later on the PATH of your shell. The portals need it too. Diagnostics shows where each tool was found."
             )
         case .failed(let reason):
             message("The holds viewer stopped", reason)

@@ -12,12 +12,18 @@ final class SupervisorLifecycleTests: XCTestCase {
     private var crashes: [(name: String, code: Int32)] = []
 
     override func setUp() async throws {
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "SupervisorLifecycleTests-\(UUID().uuidString)"))
-        supervisor = EnvironmentSupervisor(userDefaults: defaults)
         port = Self.freePort()
         workDir = FileManager.default.temporaryDirectory.appendingPathComponent("SupervisorLifecycleTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         crashes = []
+        try makeSupervisor(tools: .shared)
+    }
+
+    /// The supervisor of a test. The shared tool environment is never resolved in
+    /// a test, so no test reads the shell of this Mac.
+    private func makeSupervisor(tools: ToolEnvironment) throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "SupervisorLifecycleTests-\(UUID().uuidString)"))
+        supervisor = EnvironmentSupervisor(userDefaults: defaults, tools: tools)
         // The port cleanup of a test kills only a process that the test started. A
         // stranger can take the free port after `freePort` lets it go.
         let ownedDirectory = workDir.lastPathComponent
@@ -155,6 +161,50 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("web").phase, .running)
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
         XCTAssertTrue(state("web").failureTimestamps.isEmpty)
+    }
+
+    /// "Exit code 127: command not found": the tool was installed, or added to
+    /// `~/.zshrc`, after the launch of the app. Exit 127 reads the shell again, so
+    /// the next start finds the tool. No relaunch of the app.
+    func testAfterExit127TheShellIsReadAgainAndTheRestartFindsTheTool() async throws {
+        // A tool that no Mac has, in a folder that only the "rc file" puts on PATH.
+        let toolDirectory = workDir.appendingPathComponent("rc tools")
+        try FileManager.default.createDirectory(at: toolDirectory, withIntermediateDirectories: true)
+        let tool = "tr-fake-server-\(UUID().uuidString)"
+        let file = toolDirectory.appendingPathComponent(tool)
+        try "#!/bin/sh\nexec python3 -u -m http.server \"$1\" --bind 127.0.0.1\n"
+            .write(to: file, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+
+        // At launch the shell of the user does not have the folder.
+        let userShell = FakeCommandRunner { _ in
+            FakeCommandRunner.ok("__TR_ENV_START__\nPATH=/usr/bin:/bin\n__TR_ENV_END__\n")
+        }
+        let tools = ToolEnvironment(home: workDir.appendingPathComponent("home").path)
+        await tools.resolve(runner: userShell)
+        try makeSupervisor(tools: tools)
+        try load(daemon("web", [tool, "\(port)"]))
+
+        // Later the user adds the folder to the rc file. The app does not know yet.
+        let path = toolDirectory.path
+        userShell.respond { _ in
+            FakeCommandRunner.ok("__TR_ENV_START__\nPATH=\(path):/usr/bin:/bin\n__TR_ENV_END__\n")
+        }
+
+        supervisor.restartService("web")
+        let failed = await waitUntil(20) { self.state("web").phase == .failed }
+        XCTAssertTrue(failed, "with the PATH of the launch the start ends with exit 127: \(state("web").phase.rawValue)")
+        XCTAssertEqual(state("web").exitCode, 127)
+
+        // Exit 127 asks the shell again.
+        let askedAgain = await waitUntil(20) { userShell.calls.count == 2 }
+        XCTAssertTrue(askedAgain, "\(userShell.calls.count) reads of the shell")
+        await tools.settled()
+        XCTAssertEqual(tools.capture.shellPath.first, path)
+
+        supervisor.restartService("web")
+        let ready = await waitUntil(40) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
     }
 
     /// Tickets with 32 and 41 recurrences: each automatic restart cleared the failure

@@ -21,11 +21,23 @@ actor DbSetupRunner {
     private let seedScenarioID: String
     private var currentProcess: Process?
     private var cancelled = false
+    /// The PATH of the step commands.
+    private let tools: ToolEnvironment
+    /// Runs the health checks of the steps.
+    private let shell: any CommandRunning
 
-    init(portalCwd: String, logStore: LogStore, seedScenarioID: String) {
+    /// A health check that hangs fails after this time.
+    static let healthCheckTimeout: Duration = .seconds(60)
+
+    init(
+        portalCwd: String, logStore: LogStore, seedScenarioID: String,
+        tools: ToolEnvironment = .shared, shell: (any CommandRunning)? = nil
+    ) {
         self.portalCwd = portalCwd
         self.logStore = logStore
         self.seedScenarioID = seedScenarioID
+        self.tools = tools
+        self.shell = shell ?? LoginShell(tools: tools)
     }
 
     nonisolated static func environment(
@@ -118,7 +130,9 @@ actor DbSetupRunner {
             step.progressLabel = nil
         }
 
-        let command = step.command
+        // A step that starts during a resolve waits for the new PATH.
+        await tools.settled()
+        let command = tools.wrap(step.command, cwd: portalCwd)
         let timeout = step.timeoutSeconds
         let cwd = self.portalCwd
         let logStore = self.logStore
@@ -127,7 +141,7 @@ actor DbSetupRunner {
         let (exitCode, timedOut) = await withCheckedContinuation { (continuation: CheckedContinuation<(Int32, Bool), Never>) in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", ToolPath.wrap(command, directories: ToolPath.directories(cwd: cwd))]
+            process.arguments = ["-l", "-c", command]
             process.currentDirectoryURL = URL(fileURLWithPath: cwd)
             process.environment = Self.environment(
                 parent: ProcessInfo.processInfo.environment,
@@ -230,13 +244,16 @@ actor DbSetupRunner {
         if let healthCmd = step.healthCheckCommand {
             await MainActor.run { step.status = .healthCheck }
 
-            let healthOk = await runHealthCheck(healthCmd)
+            let health = await runHealthCheck(healthCmd)
 
-            if !healthOk {
+            if !health.succeeded {
                 await MainActor.run {
                     step.status = .failed
                     step.completedAt = .now
-                    if step.errorMessage == nil {
+                    if health.timedOut {
+                        step.errorMessage = "Health check timed out after \(Self.healthCheckTimeout.components.seconds)s"
+                        step.recoveryGuidance = "The step ran, but its check did not answer. Retry the step."
+                    } else if step.errorMessage == nil {
                         step.errorMessage = "Health check failed after successful execution"
                         step.recoveryGuidance = "The step ran but the expected result was not found. Check the output."
                     }
@@ -366,26 +383,11 @@ actor DbSetupRunner {
 
     // MARK: - Health Check
 
-    private func runHealthCheck(_ command: String) async -> Bool {
-        await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", ToolPath.wrap(command, directories: ToolPath.directories(cwd: portalCwd))]
-            process.currentDirectoryURL = URL(fileURLWithPath: portalCwd)
-            process.environment = Self.environment(
-                parent: ProcessInfo.processInfo.environment,
-                seedScenarioID: seedScenarioID
-            )
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { proc in
-                continuation.resume(returning: proc.terminationStatus == 0)
-            }
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(returning: false)
-            }
-        }
+    private func runHealthCheck(_ command: String) async -> CommandResult {
+        await shell.run(
+            command, cwd: portalCwd,
+            environment: Self.environment(parent: [:], seedScenarioID: seedScenarioID),
+            timeout: Self.healthCheckTimeout
+        )
     }
 }

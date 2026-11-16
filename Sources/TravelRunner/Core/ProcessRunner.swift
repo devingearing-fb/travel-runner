@@ -42,11 +42,11 @@ actor ProcessRunner {
     private var exits: [pid_t: Termination] = [:]
     private var exitOrder: [pid_t] = []
     private let exitHistoryLimit = 64
-    /// The directories to add to PATH for a service with this cwd.
-    private let toolDirectories: @Sendable (String?) -> [String]
+    /// The PATH of each service command.
+    private let tools: ToolEnvironment
 
-    init(toolDirectories: @escaping @Sendable (String?) -> [String] = { ToolPath.directories(cwd: $0) }) {
-        self.toolDirectories = toolDirectories
+    init(tools: ToolEnvironment = .shared) {
+        self.tools = tools
     }
 
     func start(
@@ -54,7 +54,11 @@ actor ProcessRunner {
         onStdout: @escaping @Sendable ([String]) -> Void,
         onStderr: @escaping @Sendable ([String]) -> Void,
         onTermination: @escaping @Sendable (Termination) -> Void
-    ) throws -> Int32 {
+    ) async throws -> Int32 {
+        // A start during a resolve waits for the new PATH. The wait comes first:
+        // the rest of the start reads and changes `launches` in one step.
+        await tools.settled()
+
         // Two processes of one service fight for its port. Callers stop the old
         // process first; this covers a caller that did not.
         if let running = launches[service.id], running.process.isRunning {
@@ -73,9 +77,7 @@ actor ProcessRunner {
         }
 
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-l", "-c", ToolPath.wrap(
-            ShellQuote.join(service.cmd), directories: toolDirectories(service.resolvedCwd)
-        )]
+        process.arguments = ["-l", "-c", tools.wrap(ShellQuote.join(service.cmd), cwd: service.resolvedCwd)]
 
         var env = ProcessInfo.processInfo.environment
         if let overrides = service.env {

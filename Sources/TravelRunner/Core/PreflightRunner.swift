@@ -33,9 +33,10 @@ enum PreflightResult: Sendable {
 }
 
 struct PreflightRunner: Sendable {
-    /// The extra PATH directories of each check command, for the cwd of the check.
-    /// The services get the same ones (see `ToolPath`).
-    var toolDirectories: @Sendable (String?) -> [String] = { ToolPath.directories(cwd: $0) }
+    /// Runs the check commands. They get the PATH that the services get (see `ToolEnvironment`).
+    var shell: any CommandRunning = LoginShell()
+    /// A check command that hangs fails after this time and does not hold the start.
+    static let checkTimeout: Duration = .seconds(15)
 
     func allChecks(for services: [ServiceDefinition]) -> [PreflightCheck] {
         var checks: [PreflightCheck] = [
@@ -85,17 +86,23 @@ struct PreflightRunner: Sendable {
         switch check.id {
         case "docker":
             let runtime = ContainerRuntime.detect()
-            if await ContainerRuntime.isResponding() {
+            if await ContainerRuntime.isResponding(shell: shell) {
                 return .passed(detail: runtime.displayName)
             }
-            if await ContainerRuntime.ensureRunning() {
+            if await ContainerRuntime.ensureRunning(shell: shell) {
                 return .passed(detail: "\(runtime.displayName) — auto-started")
             }
             return .failed(message: "\(runtime.displayName) not responding", fix: "Open \(runtime.appName) manually")
 
         case "node-version":
-            let output = await shellOutput("node --version", cwd: check.metadata["cwd"])
-            let version = output.trimmingCharacters(in: .whitespacesAndNewlines)
+            let result = await run("node --version", cwd: check.metadata["cwd"])
+            if result.timedOut {
+                return .failed(
+                    message: Shell.timeoutText("node --version", after: Self.checkTimeout),
+                    fix: "Run node --version in a terminal to see what it waits for"
+                )
+            }
+            let version = result.trimmedOutput
             guard !version.isEmpty else {
                 return .failed(message: "Node.js not found", fix: "Install Node 22 via nvm or brew")
             }
@@ -110,10 +117,15 @@ struct PreflightRunner: Sendable {
             }
 
         case "stripe-auth":
-            let hasStripe = await shellExitCode("which stripe >/dev/null 2>&1") == 0
+            let hasStripe = await run("which stripe >/dev/null 2>&1").succeeded
             if !hasStripe { return .warning(message: "Not installed — Stripe will be skipped") }
-            let ok = await shellExitCode("stripe balance retrieve >/dev/null 2>&1") == 0
-            return ok
+            let auth = await run("stripe balance retrieve >/dev/null 2>&1")
+            if auth.timedOut {
+                return .warning(
+                    message: "\(Shell.timeoutText("stripe balance retrieve", after: Self.checkTimeout)) — Stripe will be skipped"
+                )
+            }
+            return auth.succeeded
                 ? .passed(detail: "Authenticated")
                 : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
 
@@ -163,41 +175,19 @@ struct PreflightRunner: Sendable {
         }
     }
 
-    private func shellExitCode(_ command: String) async -> Int32 {
-        let command = ToolPath.wrap(command, directories: toolDirectories(nil))
-        return await withCheckedContinuation { continuation in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { proc in
-                continuation.resume(returning: proc.terminationStatus)
-            }
-            do {
-                try process.run()
-            } catch {
-                continuation.resume(returning: -1)
-            }
+    /// One check command. A cwd that does not exist is left out: the check of
+    /// the folders reports it.
+    private func run(_ command: String, cwd: String? = nil) async -> CommandResult {
+        var isDirectory: ObjCBool = false
+        let folder = cwd.flatMap {
+            FileManager.default.fileExists(atPath: $0, isDirectory: &isDirectory) && isDirectory.boolValue ? $0 : nil
         }
+        return await shell.run(command, cwd: folder, timeout: Self.checkTimeout)
     }
 
-    /// The output of a command in a login shell, with the tool directories on PATH.
+    /// The output of a check command. Empty when the command timed out or did not start.
     func shellOutput(_ command: String, cwd: String? = nil) async -> String {
-        let command = ToolPath.wrap(command, directories: toolDirectories(cwd))
-        return await withCheckedContinuation { continuation in
-            let process = Process()
-            let pipe = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { _ in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                continuation.resume(returning: String(data: data, encoding: .utf8) ?? "")
-            }
-            do { try process.run() } catch { continuation.resume(returning: "") }
-        }
+        await run(command, cwd: cwd).stdout
     }
 
     private func portAvailable(_ port: Int) -> Bool {
