@@ -29,7 +29,7 @@ final class MigrationTrackerTests: XCTestCase {
         try migration(in: root.appendingPathComponent(".backend-baseline"), "20260101000000_base.sql")
         try migration(in: root, "20261014000000_change.sql")
         XCTAssertEqual(
-            MigrationTracker.expectedVersions(root: root.path, environment: [:]),
+            MigrationTracker.expectedVersions(root: root.path, environment: [:])?.versions,
             ["20260101000000", "20261014000000"]
         )
     }
@@ -54,7 +54,59 @@ final class MigrationTrackerTests: XCTestCase {
         try migration(in: sibling, "20260202000000_sibling.sql")
         try migration(in: root.appendingPathComponent(".backend-baseline"), "20260101000000_base.sql")
         XCTAssertEqual(MigrationTracker.backendBaselineDir(root: root.path, environment: [:]), sibling.path)
-        XCTAssertEqual(MigrationTracker.expectedVersions(root: root.path, environment: [:]), ["20260202000000"])
+        XCTAssertEqual(
+            MigrationTracker.expectedVersions(root: root.path, environment: [:])?.versions,
+            ["20260202000000"]
+        )
+    }
+
+    func testBootstrapFilesMapToLocalVersions() throws {
+        let baseline = root.appendingPathComponent(".backend-baseline")
+        try migration(in: baseline, "20260909184456_init-roles.sql")
+        try migration(in: baseline, "20260909184457_init-schema.sql")
+        try migration(in: baseline, "20260101000000_base.sql")
+        // A pending file of the monorepo is never renamed, whatever its name.
+        try migration(in: root, "20261014000000_init-roles.sql")
+        let expected = try XCTUnwrap(MigrationTracker.expectedVersions(root: root.path, environment: [:]))
+        XCTAssertEqual(expected.aliases, [
+            "20260909184456": "00000000000000",
+            "20260909184457": "00000000000001",
+        ])
+
+        // The database local-db.sh builds records the bootstraps under the local versions.
+        let applied = MigrationTracker.parseVersions(
+            "00000000000000\n00000000000001\n20260101000000\n20261014000000\n"
+        )
+        XCTAssertEqual(MigrationTracker.missing(expected: expected, applied: applied), [])
+        XCTAssertEqual(MigrationTracker.extra(expected: expected, applied: applied), [])
+
+        // A database that never got a bootstrap still misses it.
+        XCTAssertEqual(
+            MigrationTracker.missing(
+                expected: expected,
+                applied: ["00000000000000", "20260101000000", "20261014000000"]
+            ),
+            ["20260909184457"]
+        )
+    }
+
+    func testBootstrapAppliedUnderOriginalVersionIsNotMissing() throws {
+        let baseline = root.appendingPathComponent(".backend-baseline")
+        try migration(in: baseline, "20260909184456_init-roles.sql")
+        try migration(in: baseline, "20260909184457_init-schema.sql")
+        let expected = try XCTUnwrap(MigrationTracker.expectedVersions(root: root.path, environment: [:]))
+        let applied: Set<String> = ["20260909184456", "20260909184457"]
+        XCTAssertEqual(MigrationTracker.missing(expected: expected, applied: applied), [])
+        XCTAssertEqual(MigrationTracker.extra(expected: expected, applied: applied), [])
+    }
+
+    func testExtraListsAppliedVersionsNoFileExpects() throws {
+        try migration(in: root.appendingPathComponent(".backend-baseline"), "20260101000000_base.sql")
+        let expected = try XCTUnwrap(MigrationTracker.expectedVersions(root: root.path, environment: [:]))
+        XCTAssertEqual(
+            MigrationTracker.extra(expected: expected, applied: ["20260101000000", "20270101000000", "00000000000000"]),
+            ["00000000000000", "20270101000000"]
+        )
     }
 
     func testContainerNameComesFromProjectID() throws {

@@ -8,33 +8,65 @@ import Foundation
 /// The database is the record, not a hash file: a reset outside the runner
 /// (`pnpm db:reset`) or another runner build cannot make it stale, so a database that
 /// is up to date is never reset again.
+/// The migrations the database should have.
+struct ExpectedMigrations: Equatable {
+    /// Versions as the migration files name them (the timestamp before the first `_`).
+    var versions: Set<String>
+    /// Backend bootstrap version -> the local version `scripts/local-db.sh` applies it under.
+    var aliases: [String: String] = [:]
+}
+
 enum MigrationTracker {
-    /// Migration versions (the timestamp before the first `_`) the database should have,
-    /// or nil when the backend baseline checkout is not there.
+    /// `scripts/local-db.sh` renames the two backend bootstraps (`*_init-roles.sql`,
+    /// `*_init-schema.sql`) to these local versions before it applies them, so the
+    /// database records them under these versions, not the ones in the file names.
+    static let bootstrapAliases = ["init-roles": "00000000000000", "init-schema": "00000000000001"]
+
+    /// The migrations the database should have, or nil when the backend baseline
+    /// checkout is not there.
     static func expectedVersions(
         root: String,
         environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> Set<String>? {
+    ) -> ExpectedMigrations? {
         guard let backend = backendBaselineDir(root: root, environment: environment) else { return nil }
+        let backendDir = (backend as NSString).appendingPathComponent("supabase/migrations")
         let dirs = [
-            (backend as NSString).appendingPathComponent("supabase/migrations"),
+            backendDir,
             (root as NSString).appendingPathComponent("supabase/migrations"),
         ]
-        var versions = Set<String>()
+        var expected = ExpectedMigrations(versions: [])
         for dir in dirs {
             let files = (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []
             for file in files where file.hasSuffix(".sql") {
-                if let version = file.split(separator: "_", maxSplits: 1).first, !version.isEmpty {
-                    versions.insert(String(version))
+                let parts = file.split(separator: "_", maxSplits: 1)
+                guard let version = parts.first, !version.isEmpty else { continue }
+                expected.versions.insert(String(version))
+                // Only the backend bootstraps are renamed.
+                if dir == backendDir, parts.count == 2,
+                   let alias = bootstrapAliases[String(parts[1].dropLast(".sql".count))] {
+                    expected.aliases[String(version)] = alias
                 }
             }
         }
-        return versions
+        return expected
     }
 
-    /// Expected versions the database has not applied, oldest first.
-    static func missing(expected: Set<String>, applied: Set<String>) -> [String] {
-        expected.subtracting(applied).sorted()
+    /// Expected versions the database has not applied, oldest first. A bootstrap counts
+    /// as applied under its original version or its local alias.
+    static func missing(expected: ExpectedMigrations, applied: Set<String>) -> [String] {
+        expected.versions.subtracting(applied)
+            .filter { version in
+                guard let alias = expected.aliases[version] else { return true }
+                return !applied.contains(alias)
+            }
+            .sorted()
+    }
+
+    /// Applied versions that no migration file expects, oldest first.
+    static func extra(expected: ExpectedMigrations, applied: Set<String>) -> [String] {
+        applied.subtracting(expected.versions)
+            .subtracting(expected.aliases.values)
+            .sorted()
     }
 
     /// The backend checkout `scripts/local-db.sh` replays, in the script's resolution
