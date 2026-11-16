@@ -17,6 +17,8 @@ final class EnvironmentSupervisor {
     var controlAPIError: String? = nil
     /// One line for each service of services.json that the last load left out.
     var configIssues: [String] = []
+    /// Set when a release copy runs outside an Applications folder, until the person closes it.
+    var misplacedCopyNotice: InstanceGuard.MisplacedNotice? = nil
     var startupBeganAt: Date? = nil
     /// Migrations the local database has not applied (from the last check).
     var pendingMigrations: [String] = []
@@ -86,6 +88,13 @@ final class EnvironmentSupervisor {
 
     func dismissBehindBanner() {
         behindBannerDismissed = true
+    }
+
+    /// The banner does not come back for this place.
+    func dismissMisplacedCopyNotice() {
+        guard let notice = misplacedCopyNotice else { return }
+        InstanceGuard.dismiss(notice, defaults: userDefaults)
+        misplacedCopyNotice = nil
     }
 
     var rootCauseDescription: String? {

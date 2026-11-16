@@ -156,6 +156,20 @@ struct WorkshopHeaderBar: View {
                     })
                 )
             }
+            if let notice = supervisor.misplacedCopyNotice {
+                alertBanner(
+                    icon: "folder.badge.questionmark",
+                    color: .orange,
+                    text: notice.text,
+                    subtitle: notice.advice,
+                    action: notice.revealPath.map { path in
+                        ("Show in Finder", {
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                        })
+                    },
+                    onDismiss: { supervisor.dismissMisplacedCopyNotice() }
+                )
+            }
             if supervisor.migrationsBannerVisible {
                 alertBanner(
                     icon: "arrow.triangle.2.circlepath",

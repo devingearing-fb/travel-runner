@@ -124,6 +124,8 @@ Requires Swift 6+ (Xcode or Command Line Tools).
 ./build.sh --install    # Build + copy to /Applications
 ```
 
+Only one copy of the app runs at a time. A second copy says where the first one runs from, and quits. A release copy outside `/Applications` (or `~/Applications`) shows a banner once for each place: move the app to `/Applications`, so that updates install and old copies do not start by mistake.
+
 ## Tech Stack
 
 Swift 6, SwiftUI, [FlyingFox](https://github.com/swhitty/FlyingFox) (embedded HTTP server), SPM

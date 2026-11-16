@@ -13,11 +13,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastIconHealth: HealthStatus?
     private var pulseState: Bool = false
     private var updateController: UpdateController!
+    /// Another copy of the app ran first. This copy only says so and quits: it has no
+    /// supervisor, and it must not touch the env, the processes or the ports of the other.
+    private var yieldsToRunningCopy = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
 
+        // Before the supervisor: it would take the control port and write the config.
+        if let running = InstanceGuard.runningCopyNow() {
+            yieldsToRunningCopy = true
+            InstanceGuard.refuse(running) { NSApplication.shared.terminate(nil) }
+            return
+        }
+
         supervisor = EnvironmentSupervisor()
+        supervisor.misplacedCopyNotice = InstanceGuard.misplacedNotice(
+            bundlePath: Bundle.main.bundlePath,
+            build: .current,
+            defaults: .standard
+        )
         supervisor.loadConfig()
 
         supervisor.onServiceCrash = { [weak self] serviceName, exitCode in
@@ -40,6 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// A second launch from Finder or Spotlight shows the window. The app has no Dock icon.
     /// A window that is already open keeps its section.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !yieldsToRunningCopy else { return false }
         let panel = WorkshopPanel.shared
         if panel.isVisible {
             panel.open(section: panel.navigation.selectedSection ?? .status)
@@ -51,6 +67,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        guard !yieldsToRunningCopy else { return }
         if let monitor = rightClickMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = globalHotkeyMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = localHotkeyMonitor { NSEvent.removeMonitor(monitor) }
