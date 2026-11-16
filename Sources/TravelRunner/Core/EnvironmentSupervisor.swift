@@ -640,9 +640,7 @@ final class EnvironmentSupervisor {
                 ),
                 logStore: logStore
             ) ?? []
-            if !failures.isEmpty {
-                controlAPIError = failures.map(\.message).joined(separator: "\n")
-            }
+            controlAPIError = ControlServer.BindFailure.summary(failures)
         }
     }
 

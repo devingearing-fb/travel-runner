@@ -21,7 +21,25 @@ actor ControlServer {
         let reason: String
 
         var message: String {
-            "Control API is not listening on \(host):\(port): \(reason). Another app or another copy of the runner may hold the port."
+            "Control API is not listening on \(host):\(port): \(reason)."
+        }
+
+        /// One line for all failed addresses, or nil when there are none.
+        /// Addresses that failed for the same reason share one sentence.
+        static func summary(_ failures: [BindFailure]) -> String? {
+            guard let first = failures.first else { return nil }
+            guard failures.count > 1 else { return first.message }
+            if failures.allSatisfy({ $0.reason == first.reason }) {
+                let addresses = failures.map { "\($0.host):\($0.port)" }.joined(separator: " or ")
+                return "Control API is not listening on \(addresses): \(first.reason)."
+            }
+            let addresses = failures.map { "\($0.host):\($0.port) (\($0.reason))" }.joined(separator: " or ")
+            return "Control API is not listening on \(addresses)."
+        }
+
+        /// The likely cause and what to do. The runner binds only at launch, so the fix needs a relaunch.
+        static func advice(appName: String = Flavor.current.displayName) -> String {
+            "Another app or another copy of the runner may hold the port. Quit it, then quit and reopen \(appName)."
         }
     }
 
@@ -77,8 +95,8 @@ actor ControlServer {
         }
 
         boundPort = servers.isEmpty ? nil : actualPort
-        for failure in failures {
-            print("[ControlAPI] \(failure.message)")
+        if let summary = BindFailure.summary(failures) {
+            print("[ControlAPI] \(summary) \(BindFailure.advice())")
         }
         if !servers.isEmpty {
             print("[ControlAPI] Listening on http://localhost:\(actualPort)")

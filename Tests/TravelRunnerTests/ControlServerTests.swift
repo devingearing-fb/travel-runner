@@ -128,12 +128,48 @@ final class ControlServerTests: XCTestCase {
         XCTAssertEqual(failures.map(\.host), ["127.0.0.1"])
         XCTAssertEqual(
             failures.first?.message,
-            "Control API is not listening on 127.0.0.1:\(port): Address already in use. Another app or another copy of the runner may hold the port."
+            "Control API is not listening on 127.0.0.1:\(port): Address already in use."
         )
+        XCTAssertEqual(ControlServer.BindFailure.summary(failures), failures.first?.message)
         let boundPort = await server.boundPort
         XCTAssertEqual(boundPort, port)
         let v6 = await status(host: "[::1]", port: port)
         XCTAssertEqual(v6, "v6 only")
+    }
+
+    // MARK: - Banner text
+
+    func testNoFailuresGiveNoBannerText() {
+        XCTAssertNil(ControlServer.BindFailure.summary([]))
+    }
+
+    func testTwoAddressesWithOneReasonShareOneLine() {
+        let failures = [
+            ControlServer.BindFailure(host: "[::1]", port: 19900, reason: "Address already in use"),
+            ControlServer.BindFailure(host: "127.0.0.1", port: 19900, reason: "Address already in use"),
+        ]
+        XCTAssertEqual(
+            ControlServer.BindFailure.summary(failures),
+            "Control API is not listening on [::1]:19900 or 127.0.0.1:19900: Address already in use."
+        )
+    }
+
+    func testTwoAddressesWithDifferentReasonsKeepBothReasons() {
+        let failures = [
+            ControlServer.BindFailure(host: "[::1]", port: 19900, reason: "Address already in use"),
+            ControlServer.BindFailure(host: "127.0.0.1", port: 19900, reason: "Permission denied"),
+        ]
+        XCTAssertEqual(
+            ControlServer.BindFailure.summary(failures),
+            "Control API is not listening on [::1]:19900 (Address already in use) or 127.0.0.1:19900 (Permission denied)."
+        )
+    }
+
+    func testAdviceSaysWhatToDo() {
+        XCTAssertEqual(
+            ControlServer.BindFailure.advice(appName: "Travel Runner"),
+            "Another app or another copy of the runner may hold the port. Quit it, then quit and reopen Travel Runner."
+        )
     }
 
     func testStopFreesBothAddresses() async throws {

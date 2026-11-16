@@ -138,7 +138,7 @@ struct WorkshopHeaderBar: View {
                     icon: "exclamationmark.triangle.fill",
                     color: .orange,
                     text: error,
-                    subtitle: nil,
+                    subtitle: ControlServer.BindFailure.advice(),
                     action: nil
                 )
             }
