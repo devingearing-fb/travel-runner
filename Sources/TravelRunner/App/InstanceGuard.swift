@@ -10,7 +10,7 @@ enum InstanceGuard {
     /// One running copy of this app.
     struct Copy: Equatable, Sendable {
         let pid: pid_t
-        /// `nil` when the system did not start the copy as an app.
+        /// When the process started. `nil` only when neither the kernel nor the system knows.
         let launchDate: Date?
         /// The path of the app bundle.
         let path: String?
@@ -22,7 +22,7 @@ enum InstanceGuard {
 
     /// The copy that ran before this one. `nil` when this copy is the first.
     /// Two copies that start together must not both quit, so only the later one yields:
-    /// the later launch date, or the higher pid when the dates do not decide.
+    /// the later start, or the higher pid when the dates do not decide.
     static func runningCopy(own: Copy, all: [Copy]) -> Copy? {
         all.filter { $0.pid != own.pid && ranFirst($0, before: own) }
             .min { ranFirst($0, before: $1) }
@@ -44,6 +44,18 @@ enum InstanceGuard {
     static let detail = "Two copies fight over the same ports and config."
     static let showButton = "Show the running copy"
     static let quitButton = "Quit"
+
+    // MARK: - A launch that nobody watches
+
+    /// The release smoke test sets this (plan item T1). Nobody is there to answer an alert.
+    static let smokeKey = "TRAVEL_RUNNER_SMOKE"
+    /// The exit code of a smoke launch that found a running copy (EX_TEMPFAIL: try again later).
+    static let smokeExitCode: Int32 = 75
+
+    /// A smoke launch must not wait on an alert: it prints the message and exits.
+    static func skipsAlert(environment: [String: String] = ProcessInfo.processInfo.environment) -> Bool {
+        environment[smokeKey] == "1"
+    }
 
     /// The two lines as one text.
     static func message(for copy: Copy, flavor: Flavor = .current, home: String = NSHomeDirectory()) -> String {
@@ -139,6 +151,18 @@ enum InstanceGuard {
         return (first, app)
     }
 
+    /// When the kernel started the process. `NSRunningApplication.launchDate` is `nil`
+    /// for a copy that someone ran from a shell, and then the pid would decide. Pids
+    /// start again from a low number, so both copies could stay.
+    static func processStart(of pid: pid_t) -> Date? {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
+        return Date(
+            timeIntervalSince1970: TimeInterval(info.pbi_start_tvsec) + TimeInterval(info.pbi_start_tvusec) / 1_000_000
+        )
+    }
+
     private static func copy(of app: NSRunningApplication) -> Copy {
         // Read the file: `Bundle` keeps the first Info.plist it saw for a path.
         let info = app.bundleURL
@@ -146,10 +170,36 @@ enum InstanceGuard {
             .flatMap { NSDictionary(contentsOf: $0) as? [String: Any] }
         return Copy(
             pid: app.processIdentifier,
-            launchDate: app.launchDate,
+            launchDate: processStart(of: app.processIdentifier) ?? app.launchDate,
             path: app.bundleURL?.path,
             version: BuildInfo.resolve(info: info, flavor: .current).version
         )
+    }
+
+    /// The request to show the window, for one process. It is the event that a second
+    /// launch from Finder sends (`applicationShouldHandleReopen`).
+    static func reopenEvent(pid: pid_t) -> NSAppleEventDescriptor {
+        NSAppleEventDescriptor(
+            eventClass: AEEventClass(kCoreEventClass),
+            eventID: AEEventID(kAEReopenApplication),
+            targetDescriptor: NSAppleEventDescriptor(processIdentifier: pid),
+            returnID: AEReturnID(kAutoGenerateReturnID),
+            transactionID: AETransactionID(kAnyTransactionID)
+        )
+    }
+
+    /// Ask that process to show its window. `false` when it did not take the request.
+    @MainActor
+    private static func show(_ app: NSRunningApplication) -> Bool {
+        guard !app.isTerminated else { return false }
+        do {
+            let reply = try reopenEvent(pid: app.processIdentifier).sendEvent(options: [.waitForReply], timeout: 2)
+            if let error = reply.paramDescriptor(forKeyword: keyErrorNumber), error.int32Value != 0 { return false }
+        } catch {
+            return false
+        }
+        app.activate(options: [.activateAllWindows])
+        return true
     }
 
     /// Tell the person, then return. The caller quits. Returns after the running copy
@@ -164,12 +214,22 @@ enum InstanceGuard {
         alert.addButton(withTitle: quitButton)
         NSApp.activate(ignoringOtherApps: true)
 
-        guard alert.runModal() == .alertFirstButtonReturn, let url = running.app.bundleURL else {
+        guard alert.runModal() == .alertFirstButtonReturn else {
             quit()
             return
         }
-        // The app has no Dock icon, so only a reopen shows its window
-        // (`applicationShouldHandleReopen`). Opening a running app sends one.
+        // The app has no Dock icon, so only a reopen shows its window. The request goes
+        // to the process, not to the bundle path: two copies can run from one path, and
+        // the system could then give the request to this copy.
+        if show(running.app) {
+            quit()
+            return
+        }
+        // The process did not take the request. Opening a running app sends a reopen too.
+        guard let url = running.app.bundleURL else {
+            quit()
+            return
+        }
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
         configuration.createsNewApplicationInstance = false

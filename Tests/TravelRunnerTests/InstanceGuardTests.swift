@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 import XCTest
 @testable import TravelRunner
 
@@ -79,6 +79,7 @@ final class InstanceGuardTests: XCTestCase {
         XCTAssertEqual(InstanceGuard.runningCopy(own: b, all: [a, b]), a)
     }
 
+    /// Only when no start time is known. `processStart` knows it for a copy run from a shell.
     func testWithoutALaunchDateThePidDecides() {
         let a = copy(400)
         let b = copy(500, launched: 100)
@@ -87,12 +88,48 @@ final class InstanceGuardTests: XCTestCase {
         XCTAssertEqual(InstanceGuard.runningCopy(own: b, all: [a, b]), a)
     }
 
+    /// The kernel knows the start of every process, also of one that no app launcher started.
+    func testTheKernelKnowsWhenAProcessStarted() throws {
+        let start = try XCTUnwrap(InstanceGuard.processStart(of: getpid()))
+
+        XCTAssertLessThanOrEqual(start, Date())
+        XCTAssertGreaterThan(start, Date().addingTimeInterval(-24 * 60 * 60))
+        XCTAssertEqual(InstanceGuard.processStart(of: getpid()), start)
+    }
+
+    /// Negative control: no process, no start time.
+    func testAPidWithoutAProcessHasNoStartTime() {
+        XCTAssertNil(InstanceGuard.processStart(of: -1))
+    }
+
     func testTheThirdCopyNamesTheOneThatRanFirst() {
         let first = copy(400, launched: 100)
         let second = copy(500, launched: 200)
         let own = copy(600, launched: 300)
 
         XCTAssertEqual(InstanceGuard.runningCopy(own: own, all: [second, own, first]), first)
+    }
+
+    // MARK: - Show the running copy
+
+    /// The request goes to one process, not to a bundle path.
+    func testTheReopenRequestIsForOneProcess() {
+        let event = InstanceGuard.reopenEvent(pid: 4321)
+
+        XCTAssertEqual(event.eventClass, AEEventClass(kCoreEventClass))
+        XCTAssertEqual(event.eventID, AEEventID(kAEReopenApplication))
+        let target = event.attributeDescriptor(forKeyword: keyAddressAttr)
+        XCTAssertEqual(target?.descriptorType, typeKernelProcessID)
+        XCTAssertEqual(target?.data.withUnsafeBytes { $0.loadUnaligned(as: pid_t.self) }, 4321)
+    }
+
+    // MARK: - A launch that nobody watches
+
+    func testASmokeLaunchSkipsTheAlert() {
+        XCTAssertTrue(InstanceGuard.skipsAlert(environment: ["TRAVEL_RUNNER_SMOKE": "1"]))
+        XCTAssertFalse(InstanceGuard.skipsAlert(environment: [:]))
+        XCTAssertFalse(InstanceGuard.skipsAlert(environment: ["TRAVEL_RUNNER_SMOKE": "0"]))
+        XCTAssertNotEqual(InstanceGuard.smokeExitCode, 0)
     }
 
     // MARK: - The message

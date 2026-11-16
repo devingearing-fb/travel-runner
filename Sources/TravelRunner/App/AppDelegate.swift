@@ -23,6 +23,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Before the supervisor: it would take the control port and write the config.
         if let running = InstanceGuard.runningCopyNow() {
             yieldsToRunningCopy = true
+            if InstanceGuard.skipsAlert() {
+                FileHandle.standardError.write(Data((InstanceGuard.message(for: running.copy) + "\n").utf8))
+                exit(InstanceGuard.smokeExitCode)
+            }
             InstanceGuard.refuse(running) { NSApplication.shared.terminate(nil) }
             return
         }

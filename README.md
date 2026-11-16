@@ -126,6 +126,13 @@ Requires Swift 6+ (Xcode or Command Line Tools).
 
 Only one copy of the app runs at a time. A second copy says where the first one runs from, and quits. A release copy outside `/Applications` (or `~/Applications`) shows a banner once for each place: move the app to `/Applications`, so that updates install and old copies do not start by mistake.
 
+No test starts two real copies. Check these by hand in a built app before a release:
+
+- With one copy open, open a second copy from another folder. The second copy shows the alert with the path and the version of the first.
+- "Show the running copy" opens the window of the first copy, and the second copy quits.
+- "Quit" in the alert leaves the services and the ports of the first copy up.
+- With `TRAVEL_RUNNER_SMOKE=1`, the second copy shows no alert: it prints the message and exits with code 75.
+
 ## Tech Stack
 
 Swift 6, SwiftUI, [FlyingFox](https://github.com/swhitty/FlyingFox) (embedded HTTP server), SPM
