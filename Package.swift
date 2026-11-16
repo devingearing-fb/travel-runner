@@ -13,6 +13,7 @@ let package = Package(
             name: "TravelRunner",
             dependencies: [
                 .product(name: "FlyingFox", package: "FlyingFox"),
+                .product(name: "FlyingSocks", package: "FlyingFox"),
                 .product(name: "Sparkle", package: "Sparkle"),
             ],
             path: "Sources/TravelRunner",

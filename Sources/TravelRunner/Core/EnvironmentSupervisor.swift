@@ -13,6 +13,8 @@ final class EnvironmentSupervisor {
     var completedPhases: Set<String> = []
     var sortedServiceIDs: [String] = []
     var lastError: String? = nil
+    /// Set when the control API could not listen on a loopback address.
+    var controlAPIError: String? = nil
     var startupBeganAt: Date? = nil
     /// Migrations the local database has not applied (from the last check).
     var pendingMigrations: [String] = []
@@ -511,7 +513,7 @@ final class EnvironmentSupervisor {
         let logStore = self.logStore
         controlServer = ControlServer()
         Task {
-            try await controlServer?.start(
+            let failures = await controlServer?.start(
                 actions: ControlServer.Actions(
                     getStatus: { [weak self] in
                         guard let self else { return "{}" }
@@ -637,7 +639,10 @@ final class EnvironmentSupervisor {
                     }
                 ),
                 logStore: logStore
-            )
+            ) ?? []
+            if !failures.isEmpty {
+                controlAPIError = failures.map(\.message).joined(separator: "\n")
+            }
         }
     }
 

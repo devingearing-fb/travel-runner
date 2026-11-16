@@ -45,7 +45,7 @@ The same source makes a second app, Travel Runner Hackathon, for the hackathon f
 
 ## Control API
 
-When running, travel-runner exposes an HTTP API on `http://[::1]:19900` for programmatic control (useful from Claude Code, scripts, or CI):
+When running, travel-runner exposes an HTTP API on `http://localhost:19900` (it listens on both `127.0.0.1` and `[::1]`) for programmatic control (useful from Claude Code, scripts, or CI):
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|

@@ -133,6 +133,15 @@ struct WorkshopHeaderBar: View {
                     action: headerOffersRetry ? nil : ("Retry", { supervisor.retryStartAll() })
                 )
             }
+            if let error = supervisor.controlAPIError {
+                alertBanner(
+                    icon: "exclamationmark.triangle.fill",
+                    color: .orange,
+                    text: error,
+                    subtitle: nil,
+                    action: nil
+                )
+            }
             if supervisor.migrationsBannerVisible {
                 alertBanner(
                     icon: "arrow.triangle.2.circlepath",

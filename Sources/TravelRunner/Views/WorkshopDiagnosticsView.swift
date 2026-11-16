@@ -133,6 +133,7 @@ struct WorkshopDiagnosticsView: View {
         ]
 
         if let error = supervisor.lastError { bundle["lastError"] = error }
+        if let error = supervisor.controlAPIError { bundle["controlAPIError"] = error }
         if let rootCause = supervisor.rootCauseDescription { bundle["rootCause"] = rootCause }
 
         var services: [String: [String: Any]] = [:]

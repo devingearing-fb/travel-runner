@@ -1,9 +1,29 @@
 import Foundation
 import FlyingFox
+import FlyingSocks
 
 actor ControlServer {
-    private var server: HTTPServer?
-    private let port: UInt16 = Flavor.current.controlPort
+    private var servers: [HTTPServer] = []
+    private let port: UInt16
+    /// The port the API listens on. Differs from the requested port only when that was 0.
+    private(set) var boundPort: UInt16?
+    /// Why a server stopped before it listened, by host.
+    private var runErrors: [String: String] = [:]
+
+    init(port: UInt16 = Flavor.current.controlPort) {
+        self.port = port
+    }
+
+    /// One loopback address the API could not listen on.
+    struct BindFailure: Sendable, Equatable {
+        let host: String
+        let port: UInt16
+        let reason: String
+
+        var message: String {
+            "Control API is not listening on \(host):\(port): \(reason). Another app or another copy of the runner may hold the port."
+        }
+    }
 
     struct Actions: Sendable {
         let getStatus: @Sendable () async -> String
@@ -29,9 +49,74 @@ actor ControlServer {
         let setProfile: @Sendable (String) async -> Bool
     }
 
-    func start(actions: Actions, logStore: LogStore) async throws {
-        let server = HTTPServer(address: .loopback(port: port))
+    /// Listens on `[::1]` and on `127.0.0.1`, so `localhost` works whichever family the
+    /// client picks. Returns the addresses that failed; the other address keeps serving.
+    @discardableResult
+    func start(actions: Actions, logStore: LogStore) async -> [BindFailure] {
+        var failures: [BindFailure] = []
 
+        let v6 = HTTPServer(address: .loopback(port: port))
+        await addRoutes(to: v6, actions: actions)
+        var actualPort = port
+        if let failure = await listen(v6, host: "[::1]", port: port) {
+            failures.append(failure)
+        } else if case .ip6(_, let listening)? = await v6.listeningAddress {
+            actualPort = listening
+        }
+
+        do {
+            let v4 = HTTPServer(address: try .inet(ip4: "127.0.0.1", port: actualPort))
+            await addRoutes(to: v4, actions: actions)
+            if let failure = await listen(v4, host: "127.0.0.1", port: actualPort) {
+                failures.append(failure)
+            } else if case .ip4(_, let listening)? = await v4.listeningAddress {
+                actualPort = listening
+            }
+        } catch {
+            failures.append(BindFailure(host: "127.0.0.1", port: actualPort, reason: Self.reason(error)))
+        }
+
+        boundPort = servers.isEmpty ? nil : actualPort
+        for failure in failures {
+            print("[ControlAPI] \(failure.message)")
+        }
+        if !servers.isEmpty {
+            print("[ControlAPI] Listening on http://localhost:\(actualPort)")
+        }
+        return failures
+    }
+
+    /// Runs the server and waits until it listens. Returns the failure when it cannot.
+    private func listen(_ server: HTTPServer, host: String, port: UInt16) async -> BindFailure? {
+        runErrors[host] = nil
+        Task {
+            do {
+                try await server.run()
+            } catch {
+                self.runErrors[host] = Self.reason(error)
+            }
+        }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if await server.isListening {
+                servers.append(server)
+                return nil
+            }
+            if let reason = runErrors[host] {
+                return BindFailure(host: host, port: port, reason: reason)
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        await server.stop()
+        return BindFailure(host: host, port: port, reason: "the server did not start in 5 seconds")
+    }
+
+    private static func reason(_ error: any Error) -> String {
+        if case .failed(_, _, let message)? = error as? SocketError { return message }
+        return error.localizedDescription
+    }
+
+    private func addRoutes(to server: HTTPServer, actions: Actions) async {
         await server.appendRoute("GET /api/status") { _ in
             let json = await actions.getStatus()
             return HTTPResponse(statusCode: .ok, headers: [.contentType: "application/json"], body: Data(json.utf8))
@@ -193,13 +278,13 @@ actor ControlServer {
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
 
-        self.server = server
-        Task { try await server.run() }
-        print("[ControlAPI] Listening on http://127.0.0.1:\(port)")
     }
 
     func stop() async {
-        await server?.stop()
-        server = nil
+        for server in servers {
+            await server.stop()
+        }
+        servers = []
+        boundPort = nil
     }
 }
