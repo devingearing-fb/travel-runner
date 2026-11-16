@@ -119,8 +119,9 @@ final class EnvironmentSupervisor {
     /// The ports that the secret registry tries. Tests give port 0, so the
     /// system picks a free one.
     @ObservationIgnored var secretRegistryPorts: ClosedRange<UInt16> = LiveSecretRegistry.defaultPorts
-    /// The preflight checks run their commands in the shell of the supervisor.
-    private var preflightRunner: PreflightRunner { PreflightRunner(shell: shell) }
+    /// The preflight checks run their commands in the shell of the supervisor and
+    /// wait on its clock.
+    private var preflightRunner: PreflightRunner { PreflightRunner(shell: shell, clock: clock) }
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
     private var sleepWakeObserver: SleepWakeObserver?
@@ -164,7 +165,8 @@ final class EnvironmentSupervisor {
     var databaseProbeRetry: (interval: Duration, timeout: Duration) = (.seconds(2), .seconds(60))
     var dbResetAction: ((_ cwd: String) async -> Bool)?
     /// Tests give the pipeline of a DB setup, so no manifest and no seed scenario
-    /// is read. Nil from the closure starts nothing, like a missing scenario.
+    /// is read. Nil from the closure starts nothing and sets `lastError`, like a
+    /// missing scenario.
     var dbPipelineFactory: ((_ cwd: String, _ profile: String) -> DbSetupPipeline?)?
 
     init(
@@ -2254,7 +2256,7 @@ final class EnvironmentSupervisor {
                     stream: .stdout,
                     text: "[travel-runner] \(runtime.displayName) is not running — starting it before the restart of \(name)"
                 ))
-                guard await ContainerRuntime.ensureRunning() else {
+                guard await ContainerRuntime.ensureRunning(clock: clock) else {
                     state.isCircuitBroken = true
                     lastError = "\(runtime.displayName) is not running — open \(runtime.appName), then restart \(name)"
                     return
@@ -2752,7 +2754,13 @@ final class EnvironmentSupervisor {
     /// A pipeline for the manifest profile with the selected seed scenario, or nil (and
     /// `lastError` set) when no valid scenario is selected.
     private func makeDbSetupPipeline(cwd: String, profile: String) -> DbSetupPipeline? {
-        if let dbPipelineFactory { return dbPipelineFactory(cwd, profile) }
+        if let dbPipelineFactory {
+            guard let pipeline = dbPipelineFactory(cwd, profile) else {
+                lastError = "No DB setup pipeline for the profile \(profile)."
+                return nil
+            }
+            return pipeline
+        }
         reloadDbSeedScenarios()
         guard let seedScenario = selectedDbSeedScenario else {
             lastError = dbSeedScenarioLoadError

@@ -32,11 +32,13 @@ enum ContainerRuntime: Sendable {
 
     /// Opens the runtime's app when the daemon does not answer, then waits for it
     /// (two seconds between checks). Returns false when it did not come up.
-    static func ensureRunning(checks: Int = 10, shell: any CommandRunning = LoginShell()) async -> Bool {
+    static func ensureRunning(
+        checks: Int = 10, shell: any CommandRunning = LoginShell(), clock: RunnerClock = .live
+    ) async -> Bool {
         if await isResponding(shell: shell) { return true }
         _ = await shell.run("open -a '\(detect().appName)'", timeout: .seconds(10))
         for _ in 0..<checks {
-            try? await Task.sleep(for: .seconds(2))
+            try? await clock.sleep(for: .seconds(2))
             if await isResponding(shell: shell) { return true }
         }
         return false

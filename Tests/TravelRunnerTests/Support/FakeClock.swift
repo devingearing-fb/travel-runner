@@ -3,6 +3,11 @@ import Foundation
 
 /// The time of a test. It moves only when code waits on the clock, so a wait
 /// of a minute takes no real time.
+///
+/// Give `clock` only to code where every awaited thing is a fake. A wait
+/// returns at once, so a loop that waits for something real (a process, a
+/// port, a probe) runs out before the real thing answers, and a loop without
+/// an end spins. A test with a real process takes `stampsOnly`.
 final class FakeClock: @unchecked Sendable {
     private let lock = NSLock()
     private let start: Date
@@ -59,5 +64,11 @@ final class FakeClock: @unchecked Sendable {
                 await Task.yield()
             }
         )
+    }
+
+    /// The clock for a test with a real process: the time stamps come from the
+    /// test, the waits and the deadlines stay real.
+    var stampsOnly: RunnerClock {
+        RunnerClock(date: { self.now }, uptime: RunnerClock.live.uptime, wait: RunnerClock.live.wait)
     }
 }

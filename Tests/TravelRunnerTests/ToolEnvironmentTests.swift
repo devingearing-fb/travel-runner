@@ -575,6 +575,26 @@ final class ToolEnvironmentTests: XCTestCase {
         XCTAssertTrue(runner.calls.allSatisfy { $0.timeout == .seconds(15) }, "each check command has a timeout")
     }
 
+    /// The wait for a container runtime that does not come up (10 checks, 2 s
+    /// apart) runs on the clock of the preflight, so it takes no real time.
+    func testTheDockerCheckWaitsOnTheClockOfThePreflight() async {
+        let runner = FakeCommandRunner { call in
+            call.command.hasPrefix("docker ps") ? FakeCommandRunner.failed() : FakeCommandRunner.ok()
+        }
+        let time = FakeClock()
+        let preflight = PreflightRunner(shell: runner, clock: time.clock)
+
+        let began = Date()
+        let docker = await preflight.run(check: PreflightCheck(id: "docker", name: "Docker"))
+
+        guard case .failed(let message, _) = docker else { return XCTFail("\(docker)") }
+        XCTAssertTrue(message.hasSuffix("not responding"), message)
+        XCTAssertEqual(time.sleeps, Array(repeating: .seconds(2), count: 10))
+        XCTAssertEqual(runner.commands.filter { $0.hasPrefix("docker ps") }.count, 12)
+        XCTAssertEqual(runner.commands.filter { $0.hasPrefix("open -a") }.count, 1)
+        XCTAssertLessThan(Date().timeIntervalSince(began), 10)
+    }
+
     /// Negative control: a Node that answers passes, so the timeout branch is not the only path.
     func testAPreflightNodeCheckThatAnswersPasses() async {
         let preflight = PreflightRunner(shell: FakeCommandRunner { _ in FakeCommandRunner.ok("v22.11.0\n") })

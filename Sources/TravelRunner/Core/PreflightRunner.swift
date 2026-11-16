@@ -35,6 +35,8 @@ enum PreflightResult: Sendable {
 struct PreflightRunner: Sendable {
     /// Runs the check commands. They get the PATH that the services get (see `ToolEnvironment`).
     var shell: any CommandRunning = LoginShell()
+    /// The time of the wait for a container runtime that starts.
+    var clock = RunnerClock.live
     /// A check command that hangs fails after this time and does not hold the start.
     static let checkTimeout: Duration = .seconds(15)
 
@@ -89,7 +91,7 @@ struct PreflightRunner: Sendable {
             if await ContainerRuntime.isResponding(shell: shell) {
                 return .passed(detail: runtime.displayName)
             }
-            if await ContainerRuntime.ensureRunning(shell: shell) {
+            if await ContainerRuntime.ensureRunning(shell: shell, clock: clock) {
                 return .passed(detail: "\(runtime.displayName) — auto-started")
             }
             return .failed(message: "\(runtime.displayName) not responding", fix: "Open \(runtime.appName) manually")

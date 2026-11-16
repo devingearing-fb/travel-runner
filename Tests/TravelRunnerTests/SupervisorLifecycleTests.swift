@@ -1193,7 +1193,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(done)
         XCTAssertEqual(asked, [[workDir.path, "full"]])
         XCTAssertEqual(steps.map(\.status), [.passed, .failed, .pending])
-        XCTAssertEqual(steps[0].logEntries.map(\.text), ["first-ran"])
+        // The step runs in a real login shell, and a profile can print lines of its own.
+        XCTAssertTrue(steps[0].logEntries.map(\.text).contains("first-ran"), "\(steps[0].logEntries.map(\.text))")
         XCTAssertEqual(shell.calls.filter { $0.command == "check-first" }.map(\.cwd), [workDir.path])
         let error = try XCTUnwrap(supervisor.lastError)
         XCTAssertTrue(error.hasPrefix("DB setup failed at second: "), error)
@@ -1208,6 +1209,7 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         XCTAssertFalse(supervisor.dbResetRunning)
         XCTAssertNil(supervisor.dbSetupPipeline)
+        XCTAssertEqual(supervisor.lastError, "No DB setup pipeline for the profile reset.")
     }
 
     // MARK: - Time from the clock of the test
@@ -1247,7 +1249,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     func testAStartStampsTheServiceWithTheClockOfTheSupervisor() async throws {
         let time = FakeClock()
         // Only the time stamps: the waits of a real process stay real.
-        supervisor.clock = RunnerClock(date: { time.now }, uptime: RunnerClock.live.uptime, wait: RunnerClock.live.wait)
+        supervisor.clock = time.stampsOnly
         try load(daemon("web", webServer))
 
         supervisor.restartService("web")
