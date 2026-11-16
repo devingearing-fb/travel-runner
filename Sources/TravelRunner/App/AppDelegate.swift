@@ -26,7 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         updateController = UpdateController()
 
-        WorkshopPanel.shared.configure(supervisor: supervisor)
+        WorkshopPanel.shared.configure(supervisor: supervisor, updateController: updateController)
 
         setupNotifications()
         setupStatusItem()
@@ -214,6 +214,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let buildItem = NSMenuItem(title: BuildInfo.current.menuTitle, action: nil, keyEquivalent: "")
         buildItem.isEnabled = false
         menu.addItem(buildItem)
+
+        if let pending = updateController.pending {
+            // The panel has the pill, with the restart question.
+            let pendingItem = NSMenuItem(title: UpdatePolicy.pillText(pending), action: #selector(openPanel), keyEquivalent: "")
+            pendingItem.target = self
+            menu.addItem(pendingItem)
+        }
 
         let updateItem = NSMenuItem(title: "Check for Updates...", action: #selector(checkForUpdates), keyEquivalent: "")
         updateItem.target = self

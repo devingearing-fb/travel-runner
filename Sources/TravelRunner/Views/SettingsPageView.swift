@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsPageView: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
+    @Environment(UpdateController.self) var updates: UpdateController?
     let onDismiss: () -> Void
     let onReconfigureRepos: () -> Void
 
@@ -228,6 +229,22 @@ struct SettingsPageView: View {
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
+                    }
+                }
+
+                if let updates {
+                    Divider().padding(.leading, 32)
+
+                    settingsRow {
+                        HStack {
+                            Label("Updates", systemImage: "arrow.down.circle")
+                                .font(.system(.caption, design: .monospaced))
+                            Spacer()
+                            UpdatePill()
+                            Button("Check for Updates…") { updates.checkForUpdates() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        }
                     }
                 }
 

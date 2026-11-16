@@ -52,6 +52,7 @@ final class WorkshopPanel {
 
     private var panel: KeyablePanel?
     private var supervisor: EnvironmentSupervisor?
+    private var updateController: UpdateController?
     private var panelDelegate: PanelDelegate?
     let navigation = WorkshopNavigation()
     let toastCenter = ToastCenter()
@@ -60,8 +61,9 @@ final class WorkshopPanel {
         panel?.isVisible ?? false
     }
 
-    func configure(supervisor: EnvironmentSupervisor) {
+    func configure(supervisor: EnvironmentSupervisor, updateController: UpdateController? = nil) {
         self.supervisor = supervisor
+        self.updateController = updateController
         supervisor.onActionFeedback = { [weak toastCenter] message, success in
             toastCenter?.show(message, style: success ? .success : .error)
         }
@@ -88,6 +90,7 @@ final class WorkshopPanel {
 
         let workshopView = WorkshopView(navigation: navigation, toastCenter: toastCenter)
             .environment(supervisor)
+            .environment(updateController)
 
         let hostingView = NSHostingView(rootView: workshopView)
 
