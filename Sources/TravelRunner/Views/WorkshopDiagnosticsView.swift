@@ -63,7 +63,7 @@ struct WorkshopDiagnosticsView: View {
 
                 Divider()
 
-                sectionHeader("Debug Tracking")
+                sectionHeader("Issue Capture")
 
                 if supervisor.debugTrackingEnabled {
                     HStack {
@@ -80,7 +80,7 @@ struct WorkshopDiagnosticsView: View {
                         }
                     }
                 } else {
-                    Text("Debug tracking is not enabled")
+                    Text("Issue capture is off")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

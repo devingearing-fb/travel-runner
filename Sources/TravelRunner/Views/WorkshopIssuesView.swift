@@ -19,7 +19,17 @@ struct WorkshopIssuesView: View {
             toolbar
             Divider()
 
-            if issues.isEmpty && !isLoading {
+            if !supervisor.debugTrackingEnabled {
+                ContentUnavailableView {
+                    Label("Issue capture is off", systemImage: "ant")
+                } description: {
+                    Text("Failure details are not saved. When it is on, they stay on this Mac.")
+                } actions: {
+                    Button("Turn On") {
+                        Task { await supervisor.setIssueCaptureEnabled(true) }
+                    }
+                }
+            } else if issues.isEmpty && !isLoading {
                 ContentUnavailableView(
                     statusFilter == "open" ? "No Open Issues" : "No Closed Issues",
                     systemImage: statusFilter == "open" ? "checkmark.seal" : "archivebox",
@@ -52,7 +62,7 @@ struct WorkshopIssuesView: View {
                 }
             }
         }
-        .task(id: statusFilter) { await reload() }
+        .task(id: "\(statusFilter)-\(supervisor.debugTrackingEnabled)") { await reload() }
     }
 
     private var toolbar: some View {

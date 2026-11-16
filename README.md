@@ -29,7 +29,7 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 
 The same source makes a second app, Travel Runner Hackathon, for the hackathon fork (`SnapBuild-2026/fb-travel-monolith-hackathon`). `FLAVOR=hackathon ./build.sh` builds it; `FLAVOR=hackathon ./release.sh <version>` releases it (tag `hackathon-v<version>`, never the latest release; its update feed is the fixed release `hackathon-appcast`).
 
-- **Own state**: bundle ID `ai.fastbreak.travel-runner-hackathon`, config in `~/.config/travel-runner-hackathon/`, control API on port **19901**, tickets in `~/Desktop/debug-tracking-hackathon`, hotkey Control-Shift-H. A person can have the two apps
+- **Own state**: bundle ID `ai.fastbreak.travel-runner-hackathon`, config in `~/.config/travel-runner-hackathon/`, control API on port **19901**, issues in `~/Library/Application Support/Travel Runner Hackathon/issues`, hotkey Control-Shift-H. A person can have the two apps
 - **One stack at a time**: the two apps use the same service ports. An app does not start a stack while the other app runs one
 - **Setup** takes only a checkout that has `apps/amateur-agent`, so a folder with the two repos gives each app its own repo
 - **Amateur Agent** (`amateur-agent`, port 2000): the runner starts `pnpm exec eve dev --no-ui` in `apps/amateur-agent`. An `eve dev` (`pnpm dev`) in a terminal then opens the REPL on that server. eve needs Node 24 or later: when the default Node is older, the runner uses one from nvm, fnm, mise, Volta, asdf or Homebrew (`node@24`) for the agent only. With no such Node, or without the packages, the agent is skipped and the portals start

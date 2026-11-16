@@ -24,7 +24,9 @@ After fixing something:
 curl -sf http://localhost:19900/api/debug/issues > /dev/null 2>&1 && echo "available" || echo "not available"
 ```
 
-If not available, travel-runner may not be running. Fall back to reading on-disk files directly (see On-disk structure below). Debug tracking is only active when `~/Desktop/debug-tracking/config.json` exists with `"enabled": true`; otherwise the list endpoint returns `[]` and close returns `{"ok":false,"error":"debug tracking not enabled"}`.
+If not available, travel-runner may not be running. Fall back to reading on-disk files directly (see On-disk structure below). Issue capture is on by default. It is off only when `config.json` in the issue folder has `"enabled": false` (the "Issue capture" switch in Settings writes it); then the list endpoint returns `[]` and close returns `{"ok":false,"error":"debug tracking not enabled"}`.
+
+**The issue folder.** A Mac that has `~/Desktop/debug-tracking/config.json` (the author's Mac) keeps `~/Desktop/debug-tracking`. Every other Mac uses `~/Library/Application Support/Travel Runner/issues`. Settings → Issue capture → Show Folder opens it. The paths below say `~/Desktop/debug-tracking`; put the Application Support folder in its place when there is no Desktop config.
 
 ## Endpoints
 
@@ -55,7 +57,7 @@ curl -s http://localhost:19900/api/debug/issues | python3 -m json.tool
 ]
 ```
 
-The ID is `yyyyMMdd'T'HHmmss` (local time) + `_` + the trigger (underscores as dashes) + `-<service_id>` when there is one. `service_id` is `""` when the issue has no service (e.g. manual captures). A repeat of the same error within the dedup window (7 days by default) bumps `recurrence_count` on the open issue instead of creating a new one.
+The ID is `yyyyMMdd'T'HHmmss` (local time) + `_` + the trigger (underscores as dashes) + `-<service_id>` when there is one. `service_id` is `""` when the issue has no service (e.g. manual captures). A repeat of the same error within the dedup window (7 days by default) bumps `recurrence_count` on the open issue instead of creating a new one. A repeat within 60 seconds of the last capture of the same error is dropped: it is not counted and files nothing. `recurrence_timestamps` keeps the newest 20 times; the count keeps all.
 
 When the service's output shows why it failed, `summary` ends with ` — <likely cause>`, for example `service_crash [travel-portal]: Travel Portal exited with code 1 — Error: listen EADDRINUSE: address already in use :::3002`. The same text is in `likely_cause` in `issue.json`. The cause is not part of the dedup signature.
 
@@ -168,7 +170,8 @@ Issues live at `~/Desktop/debug-tracking/open/` and `~/Desktop/debug-tracking/cl
 
 ```
 ~/Desktop/debug-tracking/
-  config.json             # enabled flag, auto_capture toggles, log_lines, dedup_window_seconds
+  config.json             # enabled flag, auto_capture toggles, log_lines, dedup_window_seconds, closed_retention_days
+  events.jsonl            # One JSON line for each event that files no issue (see below)
   open/
     20260510T143200_service-crash-travel-portal/
       issue.json            # Full issue metadata (error_message, likely_cause, trigger, recurrence, resolution)
@@ -182,6 +185,10 @@ Issues live at `~/Desktop/debug-tracking/open/` and `~/Desktop/debug-tracking/cl
       logs-all.txt
       state-snapshot.json
 ```
+
+Closed issues older than 30 days are deleted in the Application Support folder. The Desktop folder keeps them all, unless its `config.json` has `closed_retention_days` (`0` keeps all, in any folder).
+
+`events.jsonl` counts what files no issue: `stripe_skip` (Stripe ended as skipped), `outside_kill` (a service was stopped from outside the runner) and `breaker_trip` (auto-restart stopped). Each line has `at`, `kind`, `service_id`, `message` and `app_version`, with secrets redacted. At 1 MB the file moves to `events.1.jsonl`. Nothing is written while capture is off.
 
 Read the files directly for anything beyond the open-issue list, or when the API is not available (travel-runner not running):
 

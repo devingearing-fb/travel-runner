@@ -70,7 +70,8 @@ enum Flavor: String, Sendable, CaseIterable {
         }
     }
 
-    /// Folder on the Desktop for the debug tickets.
+    /// The Desktop folder of the debug tickets, from before capture was on by
+    /// default. It is used only when it has a config (`DebugTracker.resolveLocation`).
     var debugTrackingFolder: String {
         switch self {
         case .standard: "debug-tracking"
