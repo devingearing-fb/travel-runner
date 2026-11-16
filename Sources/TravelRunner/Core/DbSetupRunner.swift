@@ -108,6 +108,7 @@ actor DbSetupRunner {
             step.errorMessage = nil
             step.recoveryGuidance = nil
             step.healthResult = nil
+            step.healthFailures = []
             step.progress = nil
             step.progressLabel = nil
         }
@@ -262,7 +263,12 @@ actor DbSetupRunner {
                 let message = parts.count > 2
                     ? parts[2]
                     : (value.count > 7 ? String(value.dropFirst(7)) : "Unknown error")
-                step.errorMessage = message
+                // The script's summary can be only a count ("2 prerequisite(s) missing").
+                // Keep the details that the health lines gave.
+                let details = step.healthFailures.filter { !message.contains($0) }
+                step.errorMessage = details.isEmpty
+                    ? message
+                    : "\(message): \(details.joined(separator: "; "))"
             }
 
         case "progress":
@@ -280,7 +286,8 @@ actor DbSetupRunner {
                 step.healthResult = detail
             } else {
                 step.healthResult = nil
-                step.errorMessage = "Health check: \(detail)"
+                if !detail.isEmpty { step.healthFailures.append(detail) }
+                step.errorMessage = "Health check: \(step.healthFailures.joined(separator: "; "))"
             }
 
         default:

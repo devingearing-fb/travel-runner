@@ -65,4 +65,56 @@ final class DbSetupProtocolTests: XCTestCase {
         XCTAssertEqual(step.errorMessage, "Migration error")
         XCTAssertEqual(step.healthResult, "42 tables")
     }
+
+    func testAFailedStatusNamesEveryHealthFailure() {
+        let step = makeStep()
+        DbSetupRunner.parseProtocolLine("health:fail:Docker is not running", step: step)
+        DbSetupRunner.parseProtocolLine("health:fail:PyJWT not installed", step: step)
+        DbSetupRunner.parseProtocolLine("status:failed:2 prerequisite(s) missing", step: step)
+        XCTAssertEqual(step.errorMessage,
+                       "2 prerequisite(s) missing: Docker is not running; PyJWT not installed")
+    }
+
+    func testHealthFailuresAloneAreAllKept() {
+        let step = makeStep()
+        DbSetupRunner.parseProtocolLine("health:fail:Docker is not running", step: step)
+        DbSetupRunner.parseProtocolLine("health:fail:PyJWT not installed", step: step)
+        XCTAssertEqual(step.errorMessage, "Health check: Docker is not running; PyJWT not installed")
+        XCTAssertNil(step.healthResult)
+    }
+
+    func testAFailedStatusThatAlreadyNamesTheFailuresIsNotRepeated() {
+        let step = makeStep()
+        DbSetupRunner.parseProtocolLine("health:fail:Docker is not running", step: step)
+        DbSetupRunner.parseProtocolLine("health:fail:PyJWT not installed", step: step)
+        DbSetupRunner.parseProtocolLine(
+            "status:failed:Missing: Docker is not running; PyJWT not installed", step: step)
+        XCTAssertEqual(step.errorMessage, "Missing: Docker is not running; PyJWT not installed")
+    }
+
+    func testAFailedStatusWithoutHealthFailuresIsUnchanged() {
+        let step = makeStep()
+        DbSetupRunner.parseProtocolLine("status:failed:Migration error", step: step)
+        XCTAssertEqual(step.errorMessage, "Migration error")
+    }
+
+    // MARK: - Environment checks
+
+    func testPyJWTIsNotARequiredCheck() throws {
+        let checker = EnvironmentChecker(monorepoPath: "/nonexistent/mono", loginPath: "/nonexistent/login",
+                                         streamServicesPath: "/nonexistent/stream")
+        checker.buildChecks()
+        let check = try XCTUnwrap(checker.checks.first { $0.id == "python-jwt" })
+        XCTAssertFalse(check.isRequired)
+        // Negative control: a real prerequisite stays required.
+        let node = try XCTUnwrap(checker.checks.first { $0.id == "node" })
+        XCTAssertTrue(node.isRequired)
+    }
+
+    func testTheHotelFixDoesNotResetTheDatabase() {
+        let command = EnvironmentChecker.hotelDataFixCommand
+        XCTAssertEqual(command, "pnpm db:hotels")
+        XCTAssertFalse(command.contains("reset"))
+        XCTAssertFalse(command.contains("db:setup"))
+    }
 }

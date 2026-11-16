@@ -92,9 +92,9 @@ final class EnvironmentChecker {
                         checkCommand: "pnpm --version",
                         checkDescription: "The monorepo pins pnpm 10 (packageManager in package.json)"),
             HealthCheck(id: "python-jwt", name: "Python 3 + PyJWT", section: .prerequisites,
-                        fixLabel: "pip3 install pyjwt",
+                        isRequired: false, fixLabel: "pip3 install pyjwt",
                         checkCommand: "python3 -c 'import jwt'",
-                        checkDescription: "Required by the contract data copy script (copy-remote-data.py)"),
+                        checkDescription: "Optional — only the contract data copy script (copy-remote-data.py) needs it"),
             HealthCheck(id: "registry-auth", name: "GitHub Packages auth", section: .prerequisites,
                         checkCommand: "grep //npm.pkg.github.com/:_authToken ~/.npmrc",
                         checkDescription: "User-level token for @fastbreak-amateur packages. Set it once with: pnpm config set --location=user \"//npm.pkg.github.com/:_authToken\" <token>"),
@@ -145,9 +145,9 @@ final class EnvironmentChecker {
                         checkDescription: "Must contain Supabase URL/keys and ALLOW_LOCALHOST_REDIRECTS=true for local auth flow",
                         checkPath: (loginPath as NSString).appendingPathComponent(".env.local")),
             HealthCheck(id: "hotel-data", name: "Hotel data cached", section: .supabase,
-                        isRequired: false, fixLabel: "Run db:setup",
+                        isRequired: false, fixLabel: "Download hotels",
                         checkCommand: "ls data/travel_organizations.sql",
-                        checkDescription: "~200K hotel records cached locally. First db:setup pulls from remote (~3-5 min). Reused on subsequent runs.",
+                        checkDescription: "~200K hotel records cached locally. First db:setup pulls from remote (~3-5 min). Reused on subsequent runs. The fix downloads the file only; it does not reset the database.",
                         checkPath: (monorepoPath as NSString).appendingPathComponent("data/travel_organizations.sql")),
 
             // Optional
@@ -247,7 +247,7 @@ final class EnvironmentChecker {
 
         case "python-jwt":
             let ok = await shell("python3 -c 'import jwt' 2>/dev/null")
-            return ok ? .passing("Installed") : .failing("Run: pip3 install pyjwt")
+            return ok ? .passing("Installed") : .warning("Not installed — only the contract data copy needs it")
 
         case "registry-auth":
             let ok = await shell("grep -q '^//npm.pkg.github.com/:_authToken=.' ~/.npmrc 2>/dev/null")
@@ -386,6 +386,9 @@ final class EnvironmentChecker {
 
     // MARK: - Fix implementations
 
+    /// Downloads the hotel dump when it is missing. It never resets the database.
+    nonisolated static let hotelDataFixCommand = "pnpm db:hotels"
+
     /// nil when the developer cancelled and nothing changed.
     private func runFix(_ id: String) async -> Bool? {
         switch id {
@@ -428,7 +431,7 @@ final class EnvironmentChecker {
             return createLoginEnvLocal()
 
         case "hotel-data":
-            return await shellInDir(monorepoPath, "pnpm db:setup:reset")
+            return await shellInDir(monorepoPath, Self.hotelDataFixCommand)
 
         case "agent-node":
             return await shell("brew install node@\(ServiceCatalog.agentNodeMajor)")

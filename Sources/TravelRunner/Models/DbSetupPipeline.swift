@@ -38,6 +38,8 @@ final class DbSetupStep: Identifiable {
     var progress: Double? = nil
     var progressLabel: String? = nil
     var healthResult: String? = nil
+    /// Every `health:fail` detail of this run, in order.
+    var healthFailures: [String] = []
     var errorMessage: String? = nil
     var recoveryGuidance: String? = nil
     var logEntries: [LogEntry] = []
