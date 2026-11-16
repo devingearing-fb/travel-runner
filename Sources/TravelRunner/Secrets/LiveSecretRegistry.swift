@@ -7,7 +7,10 @@ actor LiveSecretRegistry {
     private let portRange: ClosedRange<UInt16>
     private(set) var activePort: UInt16?
 
-    init(secretStore: SecretStore, portRange: ClosedRange<UInt16> = 19999...20009) {
+    /// The ports that the app tries, in order.
+    static let defaultPorts: ClosedRange<UInt16> = 19999...20009
+
+    init(secretStore: SecretStore, portRange: ClosedRange<UInt16> = LiveSecretRegistry.defaultPorts) {
         self.secretStore = secretStore
         self.portRange = portRange
     }

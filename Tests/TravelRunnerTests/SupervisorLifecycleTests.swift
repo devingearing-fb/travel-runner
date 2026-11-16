@@ -1057,6 +1057,206 @@ final class SupervisorLifecycleTests: XCTestCase {
         }
         return (sock, Int(UInt16(bigEndian: addr.sin_port)))
     }
+
+    // MARK: - Start All with fakes
+
+    /// A supervisor whose Start All reads no tool of this Mac, asks no other app,
+    /// and opens no fixed port. `node --version` gives `node`.
+    private func fakeTheOutsideOfStartAll(node: String = "v22.3.0\n") -> FakeCommandRunner {
+        let shell = FakeCommandRunner { call in
+            call.command == "node --version" ? FakeCommandRunner.ok(node) : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        supervisor.siblingActiveServices = { [] }
+        supervisor.secretRegistryPorts = 0...0
+        return shell
+    }
+
+    /// Start All needs only a loaded graph: no services.json.
+    func testStartAllStartsALoadedGraph() async throws {
+        let shell = fakeTheOutsideOfStartAll()
+        try supervisor.loadServices([daemon("web", webServer)])
+
+        supervisor.startAll()
+
+        let healthy = await waitUntil(40) { self.supervisor.health == .healthy }
+        XCTAssertTrue(healthy, "health is \(supervisor.health), error: \(supervisor.lastError ?? "none")")
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertEqual(supervisor.currentPhase, .running)
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertEqual(Self.listeners(on: port).count, 1)
+        // The preflight ran, with the shell of the supervisor.
+        XCTAssertTrue(supervisor.completedPhases.contains("PREFLIGHT"))
+        XCTAssertEqual(
+            supervisor.preflightChecks.map(\.id),
+            ["docker", "node-version", "stripe-auth", "port-\(port)", "dir-\(workDir.lastPathComponent)"]
+        )
+        XCTAssertFalse(supervisor.preflightChecks.contains { $0.result.isFailed })
+        XCTAssertTrue(shell.commands.contains("node --version"), "\(shell.commands)")
+    }
+
+    func testStartAllStartsNothingWhileTheOtherAppRunsAStack() async throws {
+        let shell = fakeTheOutsideOfStartAll()
+        supervisor.siblingActiveServices = { ["supabase", "travel-portal"] }
+        try supervisor.loadServices([daemon("web", webServer)])
+
+        supervisor.startAll()
+
+        let refused = await waitUntil(10) { self.supervisor.health == .degraded }
+        XCTAssertTrue(refused)
+        XCTAssertEqual(supervisor.lastError, SiblingRunner.refusal(activeServices: ["supabase", "travel-portal"]))
+        XCTAssertNil(state("web").lastStarted)
+        XCTAssertTrue(supervisor.preflightChecks.isEmpty)
+        XCTAssertEqual(shell.commands, [])
+        XCTAssertEqual(Self.listeners(on: port), [])
+    }
+
+    func testAFailedPreflightStartsNothing() async throws {
+        // `node --version` prints nothing: Node is not there.
+        _ = fakeTheOutsideOfStartAll(node: "")
+        try supervisor.loadServices([daemon("web", webServer)])
+
+        supervisor.startAll()
+
+        let failed = await waitUntil(10) { self.supervisor.health == .degraded }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(supervisor.lastError, "Preflight failed — Node.js \u{2265} 22: Node.js not found")
+        XCTAssertEqual(supervisor.currentPhase, .idle)
+        XCTAssertNil(state("web").lastStarted)
+        XCTAssertEqual(Self.listeners(on: port), [])
+    }
+
+    /// After the GROUND phase Start All asks the fake database. A database with
+    /// tables is left alone.
+    func testStartAllAsksTheDatabaseAfterGround() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        var questions: [String] = []
+        var resets = 0
+        supervisor.databaseQuery = { cwd, sql in
+            questions.append(cwd)
+            return DbQueryResult(exitCode: 0, stdout: sql.contains("pg_tables") ? "42" : "", stderr: "")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+        try supervisor.loadServices([daemon("supabase", webServer)])
+
+        supervisor.startAll()
+
+        let healthy = await waitUntil(40) { self.supervisor.health == .healthy }
+        XCTAssertTrue(healthy, "health is \(supervisor.health), error: \(supervisor.lastError ?? "none")")
+        XCTAssertTrue(supervisor.completedPhases.contains("GROUND"), "\(supervisor.completedPhases)")
+        XCTAssertFalse(questions.isEmpty)
+        XCTAssertEqual(Set(questions), [workDir.path])
+        XCTAssertEqual(resets, 0)
+    }
+
+    // MARK: - DB setup with a pipeline from the test
+
+    private func pipeline(_ steps: [DbSetupStep]) -> DbSetupPipeline {
+        let scenario = DbSeedScenario(id: "test", name: "Test", description: "", fileSummary: "", variables: [])
+        let pipeline = DbSetupPipeline(profile: "reset", seedScenario: scenario)
+        pipeline.steps = steps
+        return pipeline
+    }
+
+    private func step(_ id: String, _ command: String, healthCheck: String? = nil) -> DbSetupStep {
+        DbSetupStep(
+            id: id, name: id, command: command, healthCheckCommand: healthCheck,
+            timeoutSeconds: 30, isOptional: false, stepNumber: 1
+        )
+    }
+
+    /// The DB setup runs the pipeline that the test gives: no manifest, no seed
+    /// scenario. The health check of a step runs in the shell of the supervisor.
+    func testADbSetupRunsThePipelineOfTheFactory() async throws {
+        try loadSupabase()
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        let steps = [
+            step("first", "echo first-ran", healthCheck: "check-first"),
+            step("second", "echo second-ran; exit 3"),
+            step("third", "echo third-ran"),
+        ]
+        var asked: [[String]] = []
+        supervisor.dbPipelineFactory = { cwd, profile in
+            asked.append([cwd, profile])
+            return self.pipeline(steps)
+        }
+
+        supervisor.runDbSetup(profile: "full")
+
+        XCTAssertTrue(supervisor.dbResetRunning)
+        let done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+        XCTAssertEqual(asked, [[workDir.path, "full"]])
+        XCTAssertEqual(steps.map(\.status), [.passed, .failed, .pending])
+        XCTAssertEqual(steps[0].logEntries.map(\.text), ["first-ran"])
+        XCTAssertEqual(shell.calls.filter { $0.command == "check-first" }.map(\.cwd), [workDir.path])
+        let error = try XCTUnwrap(supervisor.lastError)
+        XCTAssertTrue(error.hasPrefix("DB setup failed at second: "), error)
+    }
+
+    /// A factory that gives no pipeline starts nothing, like a missing seed scenario.
+    func testADbSetupWithoutAPipelineStartsNothing() async throws {
+        try loadSupabase()
+        supervisor.dbPipelineFactory = { _, _ in nil }
+
+        supervisor.runDbSetup()
+
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertNil(supervisor.dbSetupPipeline)
+    }
+
+    // MARK: - Time from the clock of the test
+
+    /// The wait for a late database with the times of the app (2 s between
+    /// questions, 60 s in all) takes no real time with the clock of the test.
+    func testTheWaitForALateDatabaseUsesTheClockOfTheSupervisor() async throws {
+        try loadSupabase()
+        let time = FakeClock()
+        supervisor.clock = time.clock
+        var queries = 0
+        var resets = 0
+        supervisor.databaseQuery = { _, _ in
+            queries += 1
+            return DbQueryResult(exitCode: 1, stdout: "", stderr: "No such container: x")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+
+        let began = Date()
+        let didReset = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+
+        XCTAssertFalse(didReset)
+        XCTAssertEqual(time.sleeps, Array(repeating: .seconds(2), count: 30))
+        XCTAssertEqual(queries, 31)
+        XCTAssertEqual(resets, 0)
+        XCTAssertLessThan(Date().timeIntervalSince(began), 10)
+        XCTAssertEqual(
+            supervisor.lastError,
+            "Could not read the local database (No such container: x). Nothing was changed."
+        )
+    }
+
+    /// The time stamps of a service come from the same clock.
+    func testAStartStampsTheServiceWithTheClockOfTheSupervisor() async throws {
+        let time = FakeClock()
+        // Only the time stamps: the waits of a real process stay real.
+        supervisor.clock = RunnerClock(date: { time.now }, uptime: RunnerClock.live.uptime, wait: RunnerClock.live.wait)
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+
+        let ready = await waitUntil(40) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(state("web").lastStarted, time.now)
+        XCTAssertEqual(state("web").readyAt, time.now)
+    }
 }
 
 /// What the fake port tools were asked to kill.

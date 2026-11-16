@@ -57,6 +57,15 @@ final class EnvironmentSupervisor {
         return ServiceCatalog.expand(path)
     }
 
+    /// The services of the loaded graph, in start order.
+    private var loadedServices: [ServiceDefinition] {
+        guard let graph else { return [] }
+        return sortedServiceIDs.compactMap { graph.nodes[$0] }
+    }
+
+    /// The folder of the Supabase service: the checkout that the DB scripts run in.
+    private var supabaseCwd: String? { graph?.nodes["supabase"]?.resolvedCwd }
+
     enum DatabaseMode: String, Sendable { case local, remote }
 
     var totalBehindCount: Int {
@@ -101,7 +110,17 @@ final class EnvironmentSupervisor {
     /// The check that the Stripe CLI is installed and logged in. Tests set it; nil
     /// runs the CLI.
     @ObservationIgnored var stripeAvailability: (@Sendable () async -> Bool)?
-    private let preflightRunner = PreflightRunner()
+    /// The time of every wait, deadline and time stamp of the supervisor. Tests
+    /// set a fake.
+    @ObservationIgnored var clock = RunnerClock.live
+    /// The services that the other runner app runs now. Tests set it; nil asks
+    /// that app.
+    @ObservationIgnored var siblingActiveServices: (@Sendable () async -> [String])?
+    /// The ports that the secret registry tries. Tests give port 0, so the
+    /// system picks a free one.
+    @ObservationIgnored var secretRegistryPorts: ClosedRange<UInt16> = LiveSecretRegistry.defaultPorts
+    /// The preflight checks run their commands in the shell of the supervisor.
+    private var preflightRunner: PreflightRunner { PreflightRunner(shell: shell) }
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
     private var sleepWakeObserver: SleepWakeObserver?
@@ -144,6 +163,9 @@ final class EnvironmentSupervisor {
     /// The port of Supabase opens before Postgres takes queries.
     var databaseProbeRetry: (interval: Duration, timeout: Duration) = (.seconds(2), .seconds(60))
     var dbResetAction: ((_ cwd: String) async -> Bool)?
+    /// Tests give the pipeline of a DB setup, so no manifest and no seed scenario
+    /// is read. Nil from the closure starts nothing, like a missing scenario.
+    var dbPipelineFactory: ((_ cwd: String, _ profile: String) -> DbSetupPipeline?)?
 
     init(
         userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil, tools: ToolEnvironment = .shared
@@ -339,12 +361,12 @@ final class EnvironmentSupervisor {
     // MARK: - Start / Stop
 
     func startAll(skipPreflight: Bool = false) {
-        guard startTask == nil, let graph, let config else { return }
+        guard startTask == nil, let graph else { return }
         // A start that a person asks for begins a new failure series for each service.
         for serviceID in serviceStates.keys { clearFailureHistory(serviceID) }
         health = .starting
         lastError = nil
-        startupBeganAt = .now
+        startupBeganAt = clock.date()
         phaseTimings = [:]
 
         startTask = Task { [weak self] in
@@ -358,7 +380,12 @@ final class EnvironmentSupervisor {
 
             // The other runner app uses the same ports, and this start stops what it
             // finds on them.
-            let siblingServices = await SiblingRunner.activeServices()
+            let siblingServices: [String]
+            if let siblingActiveServices = self.siblingActiveServices {
+                siblingServices = await siblingActiveServices()
+            } else {
+                siblingServices = await SiblingRunner.activeServices()
+            }
             if !siblingServices.isEmpty {
                 await MainActor.run {
                     self.health = .degraded
@@ -371,7 +398,7 @@ final class EnvironmentSupervisor {
             // Preflight
             if !skipPreflight {
                 self.currentPhase = .preflight
-                let profileServices = config.services.filter { self.isInProfile($0.id) }
+                let profileServices = self.loadedServices.filter { self.isInProfile($0.id) }
                 let checks = self.preflightRunner.allChecks(for: profileServices)
                 await MainActor.run { self.preflightChecks = checks }
 
@@ -408,7 +435,7 @@ final class EnvironmentSupervisor {
             await self.cleanupStaleProcesses()
 
             // Start registry
-            self.registry = LiveSecretRegistry(secretStore: self.secretStore)
+            self.registry = LiveSecretRegistry(secretStore: self.secretStore, portRange: self.secretRegistryPorts)
             do {
                 try await self.registry?.start()
             } catch {
@@ -427,7 +454,7 @@ final class EnvironmentSupervisor {
                 let phase = self.resolvePhase(for: level)
                 await MainActor.run {
                     self.currentPhase = phase
-                    self.phaseStartedAt = .now
+                    self.phaseStartedAt = self.clock.date()
                 }
 
                 await withTaskGroup(of: Void.self) { group in
@@ -448,7 +475,7 @@ final class EnvironmentSupervisor {
 
                 _ = await MainActor.run {
                     if let started = self.phaseStartedAt {
-                        self.phaseTimings[phase.rawValue] = Date.now.timeIntervalSince(started)
+                        self.phaseTimings[phase.rawValue] = self.clock.date().timeIntervalSince(started)
                     }
                     self.completedPhases.insert(phase.rawValue)
                 }
@@ -461,8 +488,7 @@ final class EnvironmentSupervisor {
                     didMigrationCheck = true
                     // Supabase is up: write its keys before any portal starts.
                     await self.refreshLocalSupabaseKeys()
-                    let portalCwd = config.services.first(where: { $0.id == "supabase" })?.resolvedCwd
-                    if let cwd = portalCwd {
+                    if let cwd = self.supabaseCwd {
                         await self.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true)
                         await self.refreshPendingMigrations(cwd: cwd)
                     }
@@ -743,7 +769,7 @@ final class EnvironmentSupervisor {
                     let nextCachePath = (cwd as NSString).appendingPathComponent(".next")
                     try? FileManager.default.removeItem(atPath: nextCachePath)
                     await self.logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: "[travel-runner] Cleared .next cache"))
-                    try? await Task.sleep(for: .seconds(1))
+                    try? await self.clock.sleep(for: .seconds(1))
                 })
             } catch {
                 serviceStates[serviceID]?.phase = .failed
@@ -935,7 +961,7 @@ final class EnvironmentSupervisor {
             do {
                 try await replaceProcess(serviceID, stoppedPhase: .pending, prepare: {
                     self.queuedRestarts.remove(serviceID)
-                    try? await Task.sleep(for: .seconds(1))
+                    try? await self.clock.sleep(for: .seconds(1))
                 })
                 if serviceStates[serviceID]?.phase == .skipped {
                     onActionFeedback?("\(name) skipped — see its log", false)
@@ -1053,7 +1079,7 @@ final class EnvironmentSupervisor {
                 }
 
                 // After Supabase comes back, check if DB is empty and auto-reset
-                if id == "supabase", let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd {
+                if id == "supabase", let cwd = supabaseCwd {
                     if await resetDatabaseIfNeeded(cwd: cwd, checkMigrations: false) {
                         await refreshPendingMigrations(cwd: cwd)
                     }
@@ -1081,7 +1107,7 @@ final class EnvironmentSupervisor {
             return
         }
         profile = newProfile
-        profileMembers = newProfile.members(of: config?.services ?? [])
+        profileMembers = newProfile.members(of: loadedServices)
         onActionFeedback?("Profile: \(newProfile.displayName)", true)
     }
 
@@ -1089,7 +1115,7 @@ final class EnvironmentSupervisor {
         while !Task.isCancelled {
             let stale = await watcher.check()
             await MainActor.run { self.npmStaleServices = stale }
-            try? await Task.sleep(for: .seconds(30))
+            try? await clock.sleep(for: .seconds(30))
         }
     }
 
@@ -1104,7 +1130,7 @@ final class EnvironmentSupervisor {
         }
 
         while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(5))
+            try? await clock.sleep(for: .seconds(5))
             let changed = await watcher.check()
             await watcher.fetchAndCount()
             let allBranches = await watcher.branches
@@ -1154,7 +1180,7 @@ final class EnvironmentSupervisor {
     }
 
     func reloadDbSeedScenarios() {
-        guard let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd else {
+        guard let cwd = supabaseCwd else {
             dbSeedScenarios = []
             dbSeedScenarioLoadError = "Cannot load seed scenarios because the Supabase service directory is unavailable."
             return
@@ -1206,7 +1232,7 @@ final class EnvironmentSupervisor {
 
     func runDbSetup(from stepId: String? = nil, profile: String = "reset") {
         guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return }
-        guard let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd else {
+        guard let cwd = supabaseCwd else {
             lastError = "Cannot find supabase service cwd in config"
             return
         }
@@ -1223,11 +1249,7 @@ final class EnvironmentSupervisor {
         dbResetRunning = true
         lastError = nil
 
-        let runner = DbSetupRunner(
-            portalCwd: cwd,
-            logStore: logStore,
-            seedScenarioID: pipeline.seedScenario.id
-        )
+        let runner = makeDbSetupRunner(cwd: cwd, pipeline: pipeline)
         dbSetupRunner = runner
 
         Task {
@@ -1246,7 +1268,7 @@ final class EnvironmentSupervisor {
 
     func runDbSetupStep(_ stepId: String) {
         guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return }
-        guard let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd else {
+        guard let cwd = supabaseCwd else {
             lastError = "Cannot find supabase service cwd in config"
             return
         }
@@ -1259,11 +1281,7 @@ final class EnvironmentSupervisor {
         guard let pipeline = dbSetupPipeline,
               let step = pipeline.steps.first(where: { $0.id == stepId }) else { return }
 
-        let runner = DbSetupRunner(
-            portalCwd: cwd,
-            logStore: logStore,
-            seedScenarioID: pipeline.seedScenario.id
-        )
+        let runner = makeDbSetupRunner(cwd: cwd, pipeline: pipeline)
         dbSetupRunner = runner
         dbResetRunning = true
         lastError = nil
@@ -1613,8 +1631,8 @@ final class EnvironmentSupervisor {
                     }
                 }
                 state.phase = .running
-                state.lastStarted = .now
-                state.readyAt = .now
+                state.lastStarted = clock.date()
+                state.readyAt = clock.date()
                 return nil
             }
         }
@@ -1742,7 +1760,7 @@ final class EnvironmentSupervisor {
             if let port = definition.probe?.port, definition.resolvedType == .daemon, isPortBound(port) {
                 await killPortOccupants(port)
                 for _ in 0..<10 {
-                    try? await Task.sleep(for: .milliseconds(500))
+                    try? await clock.sleep(for: .milliseconds(500))
                     if !isPortBound(port) { break }
                 }
                 // A container still has the port: the service would fail with
@@ -1763,11 +1781,11 @@ final class EnvironmentSupervisor {
             let stripeAvailable = await isStripeAvailable()
             if stripeAvailable {
                 state.phase = .starting
-                state.lastStarted = .now
+                state.lastStarted = clock.date()
                 // Wait up to 30s for Stripe to capture its secret
                 for _ in 0..<60 {
                     if let _ = await secretStore.get("STRIPE_WEBHOOK_SECRET") { break }
-                    try? await Task.sleep(for: .milliseconds(500))
+                    try? await clock.sleep(for: .milliseconds(500))
                 }
             }
         }
@@ -1784,7 +1802,7 @@ final class EnvironmentSupervisor {
         }
 
         state.phase = .starting
-        state.lastStarted = .now
+        state.lastStarted = clock.date()
         state.readyAt = nil
         state.exitCode = nil
         // No pid until the new process has one: handleTermination compares it.
@@ -1823,11 +1841,12 @@ final class EnvironmentSupervisor {
                         for line in lines {
                             if line.contains("Session expired, reconnecting") {
                                 await MainActor.run {
+                                    guard let now = self?.clock.date() else { return }
                                     if self?.stripeReconnectingSince == nil {
-                                        self?.stripeReconnectingSince = .now
+                                        self?.stripeReconnectingSince = now
                                     }
                                     if let since = self?.stripeReconnectingSince,
-                                       Date.now.timeIntervalSince(since) > 120 {
+                                       now.timeIntervalSince(since) > 120 {
                                         self?.stripeReconnectingSince = nil
                                         self?.restartService("stripe")
                                     }
@@ -1878,16 +1897,16 @@ final class EnvironmentSupervisor {
                 // Stopped before it finished: stop-all, or a new run replaced this one.
                 if isShuttingDown || state.phase == .stopping || state.phase == .stopped { return }
                 if let exit = await processRunner.exit(of: launch.pid), exit.stoppedByRunner { return }
-                try await Task.sleep(for: .milliseconds(250))
+                try await clock.sleep(for: .milliseconds(250))
             }
         }
 
         // Daemons: wait for the probe (the launch's definition has the LAN-aware host)
         if let probeConfig = launch.definition.probe {
             let probe: Probe = if let sp = launch.stdoutProbe { sp } else { ProbeFactory.makeProbe(for: probeConfig) }
-            let deadline = ContinuousClock.now + probeConfig.resolvedTimeout
+            let deadline = clock.uptime() + probeConfig.resolvedTimeout
             var ready = false
-            while ContinuousClock.now < deadline {
+            while clock.uptime() < deadline {
                 if await probe.check() {
                     ready = true
                     break
@@ -1896,7 +1915,7 @@ final class EnvironmentSupervisor {
                    try await !shouldKeepWaiting(for: state, after: exit) {
                     return
                 }
-                try await Task.sleep(for: .seconds(2))
+                try await clock.sleep(for: .seconds(2))
             }
             if !ready {
                 let seconds = probeConfig.timeout ?? 120
@@ -1931,7 +1950,7 @@ final class EnvironmentSupervisor {
         // dependents. The onChange observer fires async, so we do a direct write here.
         if let name = launch.artifactName {
             // Brief wait for the async secretStore.set() Task to complete
-            try? await Task.sleep(for: .milliseconds(200))
+            try? await clock.sleep(for: .milliseconds(200))
             if let value = await secretStore.get(name) {
                 recordArtifact(name, value: value)
                 state.capturedArtifact = value
@@ -1950,7 +1969,7 @@ final class EnvironmentSupervisor {
         }
 
         state.phase = .running
-        if state.readyAt == nil { state.readyAt = .now }
+        if state.readyAt == nil { state.readyAt = clock.date() }
     }
 
     /// The process of a launch ended before its probe passed. Returns true to keep
@@ -2031,7 +2050,7 @@ final class EnvironmentSupervisor {
             state.phase = .skipped
             state.exitCode = termination.status
             state.pid = nil
-            state.lastStopped = .now
+            state.lastStopped = clock.date()
             state.failureTimestamps.removeAll()
             let cause = "the Stripe CLI \(ServiceTermination.describe(termination)) — see the lines above "
                 + "(401: run stripe login), then start it from its row"
@@ -2049,10 +2068,10 @@ final class EnvironmentSupervisor {
         }
 
         state.exitCode = termination.status
-        let uptime = state.lastStarted.map { Date.now.timeIntervalSince($0) }
+        let uptime = state.lastStarted.map { clock.date().timeIntervalSince($0) }
         // Time in the ready state. A service that never became ready has none, so a
         // slow failure (two minutes to give up) does not start a new series each time.
-        let stableFor = state.readyAt.map { Date.now.timeIntervalSince($0) }
+        let stableFor = state.readyAt.map { clock.date().timeIntervalSince($0) }
         let restarts = state.definition.resolvedRestart == .onFailure
 
         switch kind {
@@ -2070,7 +2089,7 @@ final class EnvironmentSupervisor {
             // the environment degraded; "stopped" left it at "starting" with no end.
             // It is not a crash: no notification and no debug issue.
             state.phase = .failed
-            state.lastStopped = .now
+            state.lastStopped = clock.date()
             Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
                 stream: .stderr, text: "[travel-runner] \(name) exited (code 0) — not restarted"
             ))}
@@ -2081,7 +2100,7 @@ final class EnvironmentSupervisor {
             // debug issue. It still counts toward the circuit breaker: three kills
             // in a minute mean that something else wants the port.
             state.phase = .failed
-            state.lastStopped = .now
+            state.lastStopped = clock.date()
             noteFailure(state, stableFor: stableFor)
             let action = restarts ? "restarting it" : "it stays stopped"
             Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
@@ -2096,7 +2115,7 @@ final class EnvironmentSupervisor {
             // Exit 126/127: the shell could not run the command. The same command
             // fails again, so there is no automatic restart.
             state.phase = .failed
-            state.lastStopped = .now
+            state.lastStopped = clock.date()
             let command = state.definition.cmd.first ?? "its command"
             let plain = ServiceError.commandNotRunnable(name: name, command: command, code: code).description
             lastError = plain
@@ -2124,7 +2143,7 @@ final class EnvironmentSupervisor {
 
         case .crashed:
             state.phase = .failed
-            state.lastStopped = .now
+            state.lastStopped = clock.date()
             noteFailure(state, stableFor: stableFor)
             if !state.isCircuitBroken {
                 onServiceCrash?(name, termination.status)
@@ -2148,7 +2167,7 @@ final class EnvironmentSupervisor {
             state.restartCount = 0
         }
         if countsTowardBreaker {
-            state.failureTimestamps.append(.now)
+            state.failureTimestamps.append(clock.date())
         }
     }
 
@@ -2156,7 +2175,7 @@ final class EnvironmentSupervisor {
         guard let state = serviceStates[serviceID] else { return }
         let name = state.definition.displayName
 
-        state.failureTimestamps = AutoRestart.recentFailures(state.failureTimestamps, now: .now)
+        state.failureTimestamps = AutoRestart.recentFailures(state.failureTimestamps, now: clock.date())
         let baseDelay: TimeInterval
         switch AutoRestart.decide(recentFailureCount: state.failureTimestamps.count, restartCount: state.restartCount) {
         case .crashLoop:
@@ -2196,7 +2215,7 @@ final class EnvironmentSupervisor {
 
         let delay = (serviceID == "stripe" && wasEarlyExit) ? max(baseDelay, 15.0) : baseDelay
         Task {
-            try? await Task.sleep(for: .seconds(delay))
+            try? await clock.sleep(for: .seconds(delay))
             guard serviceStates[serviceID]?.phase == .failed else { return }
 
             if serviceID == "stripe" {
@@ -2285,7 +2304,7 @@ final class EnvironmentSupervisor {
         if isHandlingWake {
             // A notification that comes long after the pass started is a new wake:
             // the machine slept again in the middle of the pass.
-            if let started = wakePassStartedAt, Date.now.timeIntervalSince(started) > 30 {
+            if let started = wakePassStartedAt, clock.date().timeIntervalSince(started) > 30 {
                 wakePending = true
             }
             return
@@ -2295,7 +2314,7 @@ final class EnvironmentSupervisor {
         Task {
             repeat {
                 wakePending = false
-                wakePassStartedAt = .now
+                wakePassStartedAt = clock.date()
                 await runWakeChecks()
             } while wakePending && (health == .healthy || health == .degraded)
             isHandlingWake = false
@@ -2304,7 +2323,7 @@ final class EnvironmentSupervisor {
     }
 
     private func runWakeChecks() async {
-        try? await Task.sleep(for: .seconds(3))
+        try? await clock.sleep(for: .seconds(3))
 
         // LAN mode: the network may have changed during sleep. Probing or
         // restarting against a stale IP causes false probe failures and
@@ -2318,7 +2337,7 @@ final class EnvironmentSupervisor {
                 let (output, ok) = await shellOutput("ipconfig getifaddr en0")
                 currentIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : ""
                 if !currentIP.isEmpty { break }
-                try? await Task.sleep(for: .seconds(3))
+                try? await clock.sleep(for: .seconds(3))
             }
             if currentIP.isEmpty {
                 await logStore.append(
@@ -2353,7 +2372,7 @@ final class EnvironmentSupervisor {
             // A restart or a stop can start while the probe runs; it owns the state then.
             guard state.phase == .running else { continue }
             if !ok {
-                noteFailure(state, stableFor: state.readyAt.map { Date.now.timeIntervalSince($0) }, countsTowardBreaker: false)
+                noteFailure(state, stableFor: state.readyAt.map { clock.date().timeIntervalSince($0) }, countsTowardBreaker: false)
                 state.phase = .failed
                 recalculateHealth()
                 scheduleRestart(serviceID: serviceID)
@@ -2376,7 +2395,7 @@ final class EnvironmentSupervisor {
                         serviceID: serviceID,
                         entry: LogEntry(stream: .stderr, text: "[travel-runner] \(state.definition.displayName) answers TCP but fails HTTP check after wake — killing port \(port) and restarting")
                     )
-                    noteFailure(state, stableFor: state.readyAt.map { Date.now.timeIntervalSince($0) }, countsTowardBreaker: false)
+                    noteFailure(state, stableFor: state.readyAt.map { clock.date().timeIntervalSince($0) }, countsTowardBreaker: false)
                     state.phase = .failed
                     recalculateHealth()
                     await lifecycle.withLock(serviceID) {
@@ -2435,7 +2454,7 @@ final class EnvironmentSupervisor {
 
         Task {
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(30))
+                try? await clock.sleep(for: .seconds(30))
                 let tracker = DebugTracker()
                 let enabled = await tracker.isEnabled()
                 let count = enabled ? await tracker.openIssueCount() : 0
@@ -2467,7 +2486,7 @@ final class EnvironmentSupervisor {
                 exitCode: state.exitCode,
                 restartCount: state.restartCount,
                 isCircuitBroken: state.isCircuitBroken,
-                uptimeSeconds: state.lastStarted.map { Int(Date.now.timeIntervalSince($0)) }
+                uptimeSeconds: state.lastStarted.map { Int(clock.date().timeIntervalSince($0)) }
             )
         }
 
@@ -2604,10 +2623,10 @@ final class EnvironmentSupervisor {
     }
 
     private func waitForNetwork(timeout: Duration = .seconds(30)) async -> Bool {
-        let deadline = ContinuousClock.now + timeout
-        while ContinuousClock.now < deadline {
+        let deadline = clock.uptime() + timeout
+        while clock.uptime() < deadline {
             if await canReachHost("api.stripe.com") { return true }
-            try? await Task.sleep(for: .seconds(2))
+            try? await clock.sleep(for: .seconds(2))
         }
         return false
     }
@@ -2632,9 +2651,9 @@ final class EnvironmentSupervisor {
         var probe = await probeDatabase(cwd: cwd)
         // Supabase counts as running when its port opens, and Postgres takes queries
         // a little later (much later on a new volume). Ask again before giving up.
-        let deadline = ContinuousClock.now + databaseProbeRetry.timeout
+        let deadline = clock.uptime() + databaseProbeRetry.timeout
         var saidWaiting = false
-        while case .unknown(let detail) = probe, canAutoReset, ContinuousClock.now < deadline {
+        while case .unknown(let detail) = probe, canAutoReset, clock.uptime() < deadline {
             if !saidWaiting {
                 saidWaiting = true
                 await logStore.append(serviceID: "supabase", entry: LogEntry(
@@ -2642,7 +2661,7 @@ final class EnvironmentSupervisor {
                     text: "[travel-runner] The local database does not answer yet (\(detail)). Asking again…"
                 ))
             }
-            try? await Task.sleep(for: databaseProbeRetry.interval)
+            try? await clock.sleep(for: databaseProbeRetry.interval)
             guard canAutoReset else { return false }
             probe = await probeDatabase(cwd: cwd)
         }
@@ -2719,7 +2738,7 @@ final class EnvironmentSupervisor {
     private func runDbResetPipeline(cwd: String) async -> Bool {
         guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "reset") else { return false }
         dbSetupPipeline = pipeline
-        let runner = DbSetupRunner(portalCwd: cwd, logStore: logStore, seedScenarioID: pipeline.seedScenario.id)
+        let runner = makeDbSetupRunner(cwd: cwd, pipeline: pipeline)
         dbSetupRunner = runner
         await runner.run(pipeline: pipeline, from: nil)
         if pipeline.allRequiredPassed { await refreshLocalSupabaseKeys() }
@@ -2733,6 +2752,7 @@ final class EnvironmentSupervisor {
     /// A pipeline for the manifest profile with the selected seed scenario, or nil (and
     /// `lastError` set) when no valid scenario is selected.
     private func makeDbSetupPipeline(cwd: String, profile: String) -> DbSetupPipeline? {
+        if let dbPipelineFactory { return dbPipelineFactory(cwd, profile) }
         reloadDbSeedScenarios()
         guard let seedScenario = selectedDbSeedScenario else {
             lastError = dbSeedScenarioLoadError
@@ -2746,6 +2766,15 @@ final class EnvironmentSupervisor {
         let pipeline = DbSetupPipeline(profile: profile, seedScenario: seedScenario)
         pipeline.steps = steps
         return pipeline
+    }
+
+    /// The runner of a DB setup. Its steps and its health checks get the PATH and
+    /// the shell of the supervisor.
+    private func makeDbSetupRunner(cwd: String, pipeline: DbSetupPipeline) -> DbSetupRunner {
+        DbSetupRunner(
+            portalCwd: cwd, logStore: logStore, seedScenarioID: pipeline.seedScenario.id,
+            tools: tools, shell: shell
+        )
     }
 
     /// Name of the Docker container that publishes this host port, if any.
@@ -2840,7 +2869,7 @@ final class EnvironmentSupervisor {
     /// after wake, which can take >10s and must not count as failure.
     private func httpServesPages(host: String, port: Int, path: String) async -> Bool {
         for attempt in 0..<2 {
-            if attempt > 0 { try? await Task.sleep(for: .seconds(3)) }
+            if attempt > 0 { try? await clock.sleep(for: .seconds(3)) }
             let (output, ok) = await shellOutput(
                 "curl -s -o /dev/null -w '%{http_code}' --max-time 20 http://\(host):\(port)\(path)"
             )
@@ -2885,7 +2914,7 @@ final class EnvironmentSupervisor {
         }
 
         if didKill {
-            try? await Task.sleep(for: .milliseconds(500))
+            try? await clock.sleep(for: .milliseconds(500))
         }
     }
 }
