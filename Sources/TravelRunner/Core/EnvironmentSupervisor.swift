@@ -51,6 +51,16 @@ final class EnvironmentSupervisor {
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
+    /// The row shows Start for a daemon with no process while the environment runs:
+    /// skipped (Stripe without its CLI or its session) or stopped. A service outside
+    /// the profile cannot start.
+    func canStartFromRow(_ state: ServiceState) -> Bool {
+        state.definition.resolvedType != .oneshot
+            && (state.phase == .skipped || state.phase == .stopped)
+            && health != .stopped
+            && isInProfile(state.id)
+    }
+
     /// The fb-travel-monolith checkout that the runner runs, or nil before setup.
     var monorepoPath: String? {
         guard let path = config?.paths?.monorepo, !path.isEmpty else { return nil }
@@ -131,6 +141,8 @@ final class EnvironmentSupervisor {
     private var networkReapplyPending = false
     private var wakePassStartedAt: Date?
     private var wakePending = false
+    /// The last question "which PATH did the launch search" and the process it is for.
+    private var missingToolQuestion: (pid: Int32, answer: Task<String?, Never>)?
     /// Tests replace the database query and the reset with fakes.
     var databaseQuery: ((_ cwd: String, _ sql: String) async -> DbQueryResult)?
     /// How long the automatic reset waits for a database that does not answer yet.
@@ -501,6 +513,27 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// The answer of `/api/status`.
+    func statusJSON(buildInfo: BuildInfo = .current) -> String {
+        let states = serviceStates.mapValues { s in
+            ["phase": s.phase.rawValue, "pid": s.pid.map(String.init) ?? "nil"]
+        }
+        var dict: [String: Any] = [
+            "app": Flavor.current.rawValue,
+            "health": health.rawValue, "services": states, "lan": networkMode, "ip": localIP ?? "none",
+            "profile": profile.rawValue,
+            "db_mode": dbMode.rawValue,
+            "branches": gitBranches,
+            "gitBehind": gitBehindCounts,
+            "npmStale": Array(npmStaleServices)
+        ]
+        // version, build, commit, build_kind
+        dict.merge(buildInfo.statusFields) { current, _ in current }
+        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+           let str = String(data: data, encoding: .utf8) { return str }
+        return "{}"
+    }
+
     private func startControlServer() {
         let logStore = self.logStore
         controlServer = ControlServer()
@@ -509,33 +542,7 @@ final class EnvironmentSupervisor {
                 actions: ControlServer.Actions(
                     getStatus: { [weak self] in
                         guard let self else { return "{}" }
-                        let states = await MainActor.run {
-                            self.serviceStates.mapValues { s in
-                                ["phase": s.phase.rawValue, "pid": s.pid.map(String.init) ?? "nil"]
-                            }
-                        }
-                        let health = await MainActor.run { self.health.rawValue }
-                        let lan = await MainActor.run { self.networkMode }
-                        let ip = await MainActor.run { self.localIP ?? "none" }
-                        let profile = await MainActor.run { self.profile.rawValue }
-                        let dbMode = await MainActor.run { self.dbMode.rawValue }
-                        let branches = await MainActor.run { self.gitBranches }
-                        let behind = await MainActor.run { self.gitBehindCounts }
-                        let npmStale = await MainActor.run { Array(self.npmStaleServices) }
-                        var dict: [String: Any] = [
-                            "app": Flavor.current.rawValue,
-                            "health": health, "services": states, "lan": lan, "ip": ip,
-                            "profile": profile,
-                            "db_mode": dbMode,
-                            "branches": branches,
-                            "gitBehind": behind,
-                            "npmStale": npmStale
-                        ]
-                        // version, build, commit, build_kind
-                        dict.merge(BuildInfo.current.statusFields) { current, _ in current }
-                        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
-                           let str = String(data: data, encoding: .utf8) { return str }
-                        return "{}"
+                        return await MainActor.run { self.statusJSON() }
                     },
                     getLogs: { [weak self] serviceId, lines in
                         guard let self else { return "[]" }
@@ -1736,10 +1743,13 @@ final class EnvironmentSupervisor {
 
             // Kill any stale occupant on the port
             if let port = definition.probe?.port, definition.resolvedType == .daemon, isPortBound(port) {
-                await killPortOccupants(port)
-                for _ in 0..<10 {
-                    try? await Task.sleep(for: .milliseconds(500))
-                    if !isPortBound(port) { break }
+                // The port frees only when a listener was killed. With none killed
+                // (a container holds it) there is nothing to wait for.
+                if await killPortOccupants(port) {
+                    for _ in 0..<10 {
+                        try? await Task.sleep(for: .milliseconds(500))
+                        if !isPortBound(port) { break }
+                    }
                 }
                 // A container still has the port: the service would fail with
                 // EADDRINUSE while its TCP probe passes against the container.
@@ -1958,9 +1968,13 @@ final class EnvironmentSupervisor {
             if state.id == "stripe" { return false }
             throw ServiceError.exitedDuringStartup(state.id)
         case .commandNotRunnable(let code):
+            let path = await searchedPath(forExit: code, pid: exit.pid, of: state.definition)
+            // The question takes time. A stop, or a newer launch, owns the state now.
+            if isShuttingDown || state.phase == .stopping || state.phase == .stopped { return false }
+            if let current = state.pid, current != exit.pid { return false }
             throw ServiceError.commandNotRunnable(
                 name: state.definition.displayName, command: state.definition.cmd.first ?? "its command", code: code,
-                searchedPath: await searchedPath(forExit: code, of: state.definition)
+                searchedPath: path
             )
         case .killedExternally, .crashed:
             // Stripe degrades to skipped when its CLI fails.
@@ -1981,12 +1995,17 @@ final class EnvironmentSupervisor {
 
     /// The PATH of the launch when exit 127 means that the tool of the service is
     /// not on it. Nil for a script path, and when the shell finds the tool.
-    private func searchedPath(forExit code: Int32, of definition: ServiceDefinition) async -> String? {
+    /// The wait for the probe and the end of the process both ask, so the answer for
+    /// one process comes from one shell.
+    private func searchedPath(forExit code: Int32, pid: Int32, of definition: ServiceDefinition) async -> String? {
         guard code == 127, let tool = ToolPath.toolName(of: definition.cmd) else { return nil }
+        if let asked = missingToolQuestion, asked.pid == pid { return await asked.answer.value }
         let cwd = definition.resolvedCwd
-        return await Task.detached {
+        let answer = Task.detached {
             await ToolPath.searchedPath(missing: tool, directories: ToolPath.directories(cwd: cwd))
-        }.value
+        }
+        missingToolQuestion = (pid, answer)
+        return await answer.value
     }
 
     private func handleTermination(serviceID: String, termination: ProcessRunner.Termination) {
@@ -2020,8 +2039,8 @@ final class EnvironmentSupervisor {
             state.pid = nil
             state.lastStopped = .now
             state.failureTimestamps.removeAll()
-            let cause = "the Stripe CLI \(ServiceTermination.describe(termination)) — see the lines above "
-                + "(401: run stripe login), then start it from its row"
+            let cause = "the Stripe CLI \(ServiceTermination.describe(termination)) — see the lines above. "
+                + "If they show 401, run: stripe login. Then start it from its row."
             Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
                 stream: .stderr, text: Self.stripeStoppedLine(cause)
             ))}
@@ -2058,6 +2077,8 @@ final class EnvironmentSupervisor {
             // It is not a crash: no notification and no debug issue.
             state.phase = .failed
             state.lastStopped = .now
+            // The header shows the banner only with a text: say which service ended.
+            lastError = "\(name) exited (code 0) and was not restarted — restart it from its row"
             Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
                 stream: .stderr, text: "[travel-runner] \(name) exited (code 0) — not restarted"
             ))}
@@ -2089,7 +2110,7 @@ final class EnvironmentSupervisor {
             lastError = plain
             let definition = state.definition
             Task {
-                guard let path = await searchedPath(forExit: code, of: definition) else { return }
+                guard let path = await searchedPath(forExit: code, pid: termination.pid, of: definition) else { return }
                 await logStore.append(serviceID: serviceID, entry: LogEntry(
                     stream: .stderr, text: "[travel-runner] \(ToolPath.notFoundText(tool: command, searchedPath: path))"
                 ))
@@ -2619,7 +2640,8 @@ final class EnvironmentSupervisor {
 
     /// After Supabase starts: resets an empty database and, with `checkMigrations`,
     /// one that lacks migrations. It changes nothing when Supabase does not run,
-    /// after a stop, or when the database cannot be read. True when a reset ran.
+    /// after a stop, or when the database cannot be read. True when a reset ran;
+    /// false when another reset or setup already runs.
     @discardableResult
     func resetDatabaseIfNeeded(cwd: String, checkMigrations: Bool) async -> Bool {
         guard canAutoReset else { return false }
@@ -2655,6 +2677,8 @@ final class EnvironmentSupervisor {
             guard !missing.isEmpty, canAutoReset else { return false }
             reason = "\(missing.count) new migration\(missing.count == 1 ? "" : "s") — running db:reset..."
         }
+        // `runDbReset` does nothing while another reset or setup runs.
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return false }
         _ = await runDbReset(cwd: cwd, reason: reason)
         return true
     }
@@ -2729,9 +2753,17 @@ final class EnvironmentSupervisor {
         } else {
             ok = await runDbResetPipeline(cwd: cwd)
         }
-        if ok { lastError = nil }
+        if ok {
+            lastError = nil
+        } else if lastError == reason {
+            // The run ended with no failed step: it was cancelled between two steps.
+            lastError = Self.dbResetCancelledMessage
+        }
         return ok
     }
+
+    nonisolated static let dbResetCancelledMessage =
+        "The database reset stopped before it finished. Click Reset DB to run it again."
 
     private func runDbResetPipeline(cwd: String) async -> Bool {
         guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "reset") else { return false }
@@ -2819,7 +2851,10 @@ final class EnvironmentSupervisor {
     /// the clients of the port (a browser tab, the Stripe CLI that forwards to the
     /// portal, another dev server), and those must stay alive.
     /// A container runtime is never killed: its port helper serves every container.
-    private func killPortOccupants(_ port: Int) async {
+    /// True when it killed a listener.
+    @discardableResult
+    private func killPortOccupants(_ port: Int) async -> Bool {
+        var killed = false
         for listener in await portTools.listeners(port) {
             if PortOwner.isContainerRuntime(listener.command) {
                 if let serviceID = sortedServiceIDs.first(where: { serviceStates[$0]?.definition.probe?.port == port }) {
@@ -2831,7 +2866,9 @@ final class EnvironmentSupervisor {
                 continue
             }
             portTools.kill(listener.pid)
+            killed = true
         }
+        return killed
     }
 
     /// Services whose port the cleanup may clear: in the profile, and not a
@@ -2882,7 +2919,7 @@ final class EnvironmentSupervisor {
     /// Kill anything holding the web service ports — including orphaned dev
     /// servers whose npm parent died during sleep. Without this, the replacement
     /// server silently binds port+1 while the zombie serves 404s on the real port.
-    private func killWebServicePorts() async {
+    func killWebServicePorts() async {
         for serviceID in Self.wakeHealthPaths.keys.sorted() where isInProfile(serviceID) {
             guard let port = serviceStates[serviceID]?.definition.probe?.port else { continue }
             await lifecycle.withLock(serviceID) {

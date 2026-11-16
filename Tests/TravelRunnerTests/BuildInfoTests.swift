@@ -100,6 +100,54 @@ final class BuildInfoTests: XCTestCase {
         XCTAssertEqual(issue["app_flavor"] as? String, "standard")
     }
 
+    /// `/api/status` carries the build fields, next to the fields it had before.
+    @MainActor
+    func testTheStatusAnswerCarriesTheBuildFields() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "BuildInfoTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+
+        let json = supervisor.statusJSON(buildInfo: BuildInfo.resolve(info: releaseInfo, flavor: .standard))
+
+        let status = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(status["version"] as? String, "0.13.5")
+        XCTAssertEqual(status["build"] as? String, "20261116120000")
+        XCTAssertEqual(status["commit"] as? String, "a1b2c3d")
+        XCTAssertEqual(status["build_kind"] as? String, "release")
+        // Control: the fields from before are still there.
+        XCTAssertEqual(status["app"] as? String, Flavor.current.rawValue)
+        XCTAssertNotNil(status["health"])
+        XCTAssertNotNil(status["services"])
+    }
+
+    /// A ticket from 0.13.5 that recurs on 0.13.6 said only 0.13.5, so it looked fixed
+    /// in the newer version.
+    func testARecurrenceRecordsTheBuildThatSawItLast() async throws {
+        try #"{"enabled": true}"#.write(to: root.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
+        let first = DebugTracker(baseDir: root.path, buildInfo: BuildInfo.resolve(info: releaseInfo, flavor: .standard))
+        let captured = await first.captureIssue(trigger: "manual", serviceId: nil, errorMessage: "Something is wrong")
+        let id = try XCTUnwrap(captured)
+        let url = root.appendingPathComponent("open/\(id)/issue.json")
+        // Control: an issue that did not recur has no "last" build.
+        let fresh = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        XCTAssertNil(fresh["last_app_version"])
+
+        var newer = releaseInfo
+        newer["CFBundleShortVersionString"] = "0.13.6"
+        newer["CFBundleVersion"] = "20261120120000"
+        newer[BuildInfo.commitKey] = "e4f5a6b"
+        let second = DebugTracker(baseDir: root.path, buildInfo: BuildInfo.resolve(info: newer, flavor: .standard))
+        let again = await second.captureIssue(trigger: "manual", serviceId: nil, errorMessage: "Something is wrong")
+        XCTAssertNil(again, "the same error bumps the open issue")
+
+        let issue = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        XCTAssertEqual(issue["recurrence_count"] as? Int, 1)
+        XCTAssertEqual(issue["app_version"] as? String, "0.13.5", "the first capture stays")
+        XCTAssertEqual(issue["app_commit"] as? String, "a1b2c3d")
+        XCTAssertEqual(issue["last_app_version"] as? String, "0.13.6")
+        XCTAssertEqual(issue["last_app_build"] as? String, "20261120120000")
+        XCTAssertEqual(issue["last_app_commit"] as? String, "e4f5a6b")
+    }
+
     func testATicketFromBeforeTheBuildFieldsStillLoads() async throws {
         let id = "20260821T141601_manual"
         let folder = root.appendingPathComponent("open/\(id)")

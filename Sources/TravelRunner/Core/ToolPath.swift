@@ -74,24 +74,63 @@ enum ToolPath {
     }
 
     /// The PATH that a command from `wrap` gets, when `tool` is not on it. Nil when
-    /// the shell finds the tool, or when the shell itself cannot run.
-    static func searchedPath(missing tool: String, directories: [String]) async -> String? {
+    /// the shell finds the tool, when the shell itself cannot run, or when the login
+    /// profile does not end within `timeout`.
+    static func searchedPath(
+        missing tool: String,
+        directories: [String],
+        timeout: TimeInterval = 10,
+        shellArguments: [String] = ["-l", "-c"]
+    ) async -> String? {
         let probe = "command -v -- \(ShellQuote.quote(tool)) >/dev/null 2>&1 && exit 0; print -r -- \"$PATH\"; exit 3"
         let command = wrap(probe, directories: directories)
         return await withCheckedContinuation { continuation in
             let process = Process()
             let pipe = Pipe()
+            let answer = OneAnswer(continuation)
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
+            process.arguments = shellArguments + [command]
             process.standardInput = FileHandle.nullDevice
             process.standardOutput = pipe
             process.standardError = FileHandle.nullDevice
             process.terminationHandler = { proc in
-                let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-                let path = output.split(separator: "\n").last.map(String.init)
-                continuation.resume(returning: proc.terminationStatus == 3 ? path : nil)
+                // Status 3 means that the PATH is in the pipe. `availableData` does not
+                // wait for the end of the pipe, which a background process of the
+                // profile can hold open.
+                guard proc.terminationStatus == 3, proc.terminationReason == .exit else {
+                    answer.give(nil)
+                    return
+                }
+                let output = String(decoding: pipe.fileHandleForReading.availableData, as: UTF8.self)
+                answer.give(output.split(separator: "\n").last.map(String.init))
             }
-            do { try process.run() } catch { continuation.resume(returning: nil) }
+            do { try process.run() } catch {
+                answer.give(nil)
+                return
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                guard answer.give(nil) else { return }
+                process.terminate()
+            }
+        }
+    }
+
+    /// Resumes the continuation once: with the answer of the shell or with the timeout.
+    private final class OneAnswer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<String?, Never>?
+
+        init(_ continuation: CheckedContinuation<String?, Never>) { self.continuation = continuation }
+
+        /// False when the answer was already given.
+        @discardableResult
+        func give(_ value: String?) -> Bool {
+            let waiting = lock.withLock { () -> CheckedContinuation<String?, Never>? in
+                defer { continuation = nil }
+                return continuation
+            }
+            waiting?.resume(returning: value)
+            return waiting != nil
         }
     }
 

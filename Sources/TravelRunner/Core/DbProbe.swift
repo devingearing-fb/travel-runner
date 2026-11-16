@@ -6,12 +6,17 @@ struct DbQueryResult: Sendable, Equatable {
     var stdout: String
     var stderr: String
 
-    /// The first line of the error, for a message to the person.
+    /// The last line of the error, for a message to the person. Docker and psql put
+    /// the error last; a line that the login profile prints comes before it.
     var failureDetail: String {
-        let line = stderr.split(whereSeparator: \.isNewline)
+        Self.lastLine(of: stderr) ?? "exit code \(exitCode)"
+    }
+
+    /// The last line of `text` that is not empty.
+    static func lastLine(of text: String) -> String? {
+        text.split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
-            .first { !$0.isEmpty }
-        return line ?? "exit code \(exitCode)"
+            .last { !$0.isEmpty }
     }
 }
 
@@ -25,10 +30,12 @@ enum DbProbe: Sendable, Equatable {
     /// Reads the answer to a `SELECT count(*)` of the travel tables.
     static func classify(_ result: DbQueryResult) -> DbProbe {
         guard result.exitCode == 0 else { return .unknown(result.failureDetail) }
-        let text = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let count = Int(text) else {
-            return .unknown(text.isEmpty ? "the query gave no answer" : "unexpected answer: \(text.prefix(80))")
+        // The query runs in a login shell, and a profile can print before it. The
+        // count is the last line.
+        guard let answer = DbQueryResult.lastLine(of: result.stdout) else {
+            return .unknown("the query gave no answer")
         }
+        guard let count = Int(answer) else { return .unknown("unexpected answer: \(answer.prefix(80))") }
         return count > 0 ? .hasTables : .empty
     }
 

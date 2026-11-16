@@ -113,6 +113,42 @@ final class ToolPathTests: XCTestCase {
         XCTAssertNil(ToolPath.toolName(of: []))
     }
 
+    /// A login profile that hangs must not hold the start of a service.
+    func testTheQuestionForThePathEndsWhenTheShellHangs() async {
+        let started = Date()
+
+        let path = await ToolPath.searchedPath(
+            missing: "tr-no-such-tool", directories: [], timeout: 0.3, shellArguments: ["-c", "sleep 20"]
+        )
+
+        XCTAssertNil(path)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 10)
+    }
+
+    /// A background process of the profile keeps the pipe open after the shell ends.
+    /// The answer does not wait for it.
+    func testTheQuestionForThePathDoesNotWaitForABackgroundProcess() async {
+        let started = Date()
+
+        let path = await ToolPath.searchedPath(
+            missing: "tr-no-such-tool", directories: [], timeout: 15,
+            shellArguments: ["-c", "sleep 8 & print -r -- /searched/a:/searched/b; exit 3"]
+        )
+
+        XCTAssertEqual(path, "/searched/a:/searched/b")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 6)
+    }
+
+    /// Control: the real question still gives the PATH for a tool that no Mac has,
+    /// and nil for a tool that every Mac has.
+    func testTheQuestionForThePathNamesItOnlyForAMissingTool() async {
+        let missing = await ToolPath.searchedPath(missing: "tr-no-such-tool-\(UUID().uuidString)", directories: ["/tr-extra"])
+        XCTAssertTrue(missing?.hasSuffix(":/tr-extra") == true, missing ?? "nil")
+
+        let found = await ToolPath.searchedPath(missing: "ls", directories: [])
+        XCTAssertNil(found)
+    }
+
     func testTheNotFoundText() {
         XCTAssertEqual(
             ToolPath.notFoundText(tool: "node", searchedPath: "/usr/bin:/bin", appName: "Travel Runner"),

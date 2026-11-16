@@ -52,9 +52,15 @@ fi
 GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || true)"
 if [ -z "${VERSION:-}" ]; then
     if [ "$FLAVOR" = "hackathon" ]; then TAG_MATCH="hackathon-v[0-9]*"; else TAG_MATCH="v[0-9]*"; fi
-    VERSION="$(git describe --tags --always --dirty --match "$TAG_MATCH" 2>/dev/null || true)"
+    VERSION="$(git describe --tags --dirty --match "$TAG_MATCH" 2>/dev/null || true)"
     VERSION="${VERSION#hackathon-v}"
     VERSION="${VERSION#v}"
+    # A checkout with no release tag (a shallow clone) has only the commit. A bare
+    # hash is not a version, so it goes behind 0.0.0.
+    if [ -z "$VERSION" ]; then
+        UNTAGGED="$(git describe --always --dirty 2>/dev/null || true)"
+        if [ -n "$UNTAGGED" ]; then VERSION="0.0.0-g$UNTAGGED"; fi
+    fi
     VERSION="${VERSION:-0.1.0}"
 fi
 BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M%S)}"

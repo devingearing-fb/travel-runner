@@ -41,6 +41,16 @@ final class DbSetupStep: Identifiable {
     /// Fraction from 0 to 1.
     var progress: Double? = nil
     var progressLabel: String? = nil
+
+    /// The value of the progress bar, whose total is 1.
+    nonisolated static func barValue(_ progress: Double) -> Double {
+        progress.isFinite ? min(max(progress, 0), 1) : 0
+    }
+
+    /// "42%" for 0.42. Rounded: 0.29 * 100 is a little under 29.
+    nonisolated static func percentLabel(_ progress: Double) -> String {
+        "\(Int((barValue(progress) * 100).rounded()))%"
+    }
     var healthResult: String? = nil
     /// Every `health:fail` detail of this run, in order.
     var healthFailures: [String] = []
