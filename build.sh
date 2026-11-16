@@ -47,7 +47,16 @@ if [ "$FLAVOR" = "hackathon" ]; then
 else
     FEED_URL="https://github.com/$GITHUB_REPO/releases/latest/download/appcast.xml"
 fi
-VERSION="${VERSION:-0.1.0}"
+# A source build takes its version from git: the last release tag of this app, the
+# number of commits after it, the commit, and "-dirty" for changes that are not committed.
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || true)"
+if [ -z "${VERSION:-}" ]; then
+    if [ "$FLAVOR" = "hackathon" ]; then TAG_MATCH="hackathon-v[0-9]*"; else TAG_MATCH="v[0-9]*"; fi
+    VERSION="$(git describe --tags --always --dirty --match "$TAG_MATCH" 2>/dev/null || true)"
+    VERSION="${VERSION#hackathon-v}"
+    VERSION="${VERSION#v}"
+    VERSION="${VERSION:-0.1.0}"
+fi
 BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M%S)}"
 
 INSTALL=false
@@ -58,6 +67,17 @@ for arg in "$@"; do
         --run) RUN=true ;;
     esac
 done
+
+# --install replaces the app in /Applications. That is not safe while a copy runs.
+refuse_install_while_running() {
+    if pgrep -f "$APP_BUNDLE/Contents/MacOS/$PRODUCT_NAME" >/dev/null 2>&1; then
+        echo ""
+        echo "  ✗ $DISPLAY_NAME is running. Quit it first (menu bar icon → Quit), then run ./build.sh --install again."
+        echo ""
+        exit 1
+    fi
+}
+if $INSTALL; then refuse_install_while_running; fi
 
 # ── Check prerequisites ─────────────────────────────────────────────────────
 
@@ -189,6 +209,10 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <string>$DISPLAY_NAME</string>
     <key>TRFlavor</key>
     <string>$FLAVOR</string>
+    <key>TRGitCommit</key>
+    <string>$GIT_COMMIT</string>
+    <key>TRBuildKind</key>
+    <string>dev</string>
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>
@@ -220,15 +244,20 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
 PLIST
 
 # Ad-hoc codesign with entitlements
-codesign --force --deep --sign - \
+if ! SIGN_LOG=$(codesign --force --deep --sign - \
     --entitlements TravelRunner.entitlements \
-    "$APP_BUNDLE" 2>/dev/null
+    "$APP_BUNDLE" 2>&1); then
+    echo "  ✗ Code signing failed:"
+    echo "$SIGN_LOG" | sed 's/^/    /'
+    exit 1
+fi
 
-echo "  ✓ $APP_BUNDLE ready"
+echo "  ✓ $APP_BUNDLE ready (v$VERSION${GIT_COMMIT:+ $GIT_COMMIT}, dev build)"
 
 # ── Optional: install to /Applications ───────────────────────────────────────
 
 if $INSTALL; then
+    refuse_install_while_running
     echo ""
     echo "  Installing to /Applications..."
     rm -rf "/Applications/$APP_BUNDLE"

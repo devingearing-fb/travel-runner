@@ -2,8 +2,12 @@ import SwiftUI
 
 struct SetupStep2View: View {
     let checker: EnvironmentChecker
+    /// True in the first run, where the end of the wizard starts the stack.
+    var startsOnComplete = true
     let onBack: () -> Void
     let onComplete: () -> Void
+
+    @State private var confirmContinue = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -49,14 +53,28 @@ struct SetupStep2View: View {
                     .buttonStyle(.bordered)
                     .controlSize(.regular)
                 Spacer()
-                Button(action: onComplete) {
-                    Label("Save & Start", systemImage: "checkmark.circle")
+                // Only a required check decides. The way out is never disabled: a check that hangs
+                // or a long fix must not hold the wizard.
+                if checker.canFinish {
+                    Button(action: onComplete) {
+                        Label(startsOnComplete ? "Save & Start" : "Save", systemImage: "checkmark.circle")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.regular)
+                } else {
+                    Button("Continue anyway…") { confirmContinue = true }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(!checker.allRequiredPassing)
-                .controlSize(.regular)
             }
             .padding(14)
+        }
+        .alert(checker.blockers.isEmpty ? "Continue before the checks finish?" : "Continue with failed checks?",
+               isPresented: $confirmContinue) {
+            Button(startsOnComplete ? "Save & Start" : "Save", action: onComplete)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(EnvironmentChecker.impactLines(for: checker.unresolved).joined(separator: "\n"))
         }
         .task {
             checker.buildChecks()

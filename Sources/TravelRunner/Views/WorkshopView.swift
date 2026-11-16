@@ -21,9 +21,10 @@ struct WorkshopView: View {
         ZStack {
             VStack(spacing: 0) {
                 if showSetup || isFirstRun {
-                    SetupView(isFirstRun: isFirstRun) {
+                    SetupView(isFirstRun: isFirstRun) { start in
                         showSetup = false
                         supervisor.loadConfig()
+                        if start { supervisor.startAll() }
                     }
                 } else {
                     WorkshopHeaderBar()
@@ -72,7 +73,7 @@ struct WorkshopSettingsView: View {
 
     var body: some View {
         if showSetup {
-            SetupView(isFirstRun: false) {
+            SetupView(isFirstRun: false) { _ in
                 showSetup = false
             }
         } else {

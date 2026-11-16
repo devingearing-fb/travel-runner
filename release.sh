@@ -173,6 +173,10 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << PLIST
     <string>$DISPLAY_NAME</string>
     <key>TRFlavor</key>
     <string>$FLAVOR</string>
+    <key>TRGitCommit</key>
+    <string>$(git rev-parse --short "$RELEASE_COMMIT")</string>
+    <key>TRBuildKind</key>
+    <string>release</string>
     <key>CFBundleIdentifier</key>
     <string>$BUNDLE_ID</string>
     <key>CFBundleVersion</key>

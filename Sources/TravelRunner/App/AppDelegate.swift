@@ -26,14 +26,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         updateController = UpdateController()
 
-        WorkshopPanel.shared.configure(supervisor: supervisor)
+        WorkshopPanel.shared.configure(supervisor: supervisor, updateController: updateController)
 
         setupNotifications()
         setupStatusItem()
         setupGlobalHotkey()
 
         // `open -a … --args --open-panel` shows the window at once (scripts, screenshots).
-        if CommandLine.arguments.contains("--open-panel") { openPanel() }
+        // Without a usable config, the setup wizard is the only way forward: show it.
+        if CommandLine.arguments.contains("--open-panel") || ConfigLoader.needsSetup { openPanel() }
+    }
+
+    /// A second launch from Finder or Spotlight shows the window. The app has no Dock icon.
+    /// A window that is already open keeps its section.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        let panel = WorkshopPanel.shared
+        if panel.isVisible {
+            panel.open(section: panel.navigation.selectedSection ?? .status)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            openPanel()
+        }
+        return false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -210,6 +224,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let terminalsItem = NSMenuItem(title: "Open Terminals", action: #selector(openTerminals), keyEquivalent: "")
         terminalsItem.target = self
         menu.addItem(terminalsItem)
+
+        let buildItem = NSMenuItem(title: BuildInfo.current.menuTitle, action: nil, keyEquivalent: "")
+        buildItem.isEnabled = false
+        menu.addItem(buildItem)
+
+        if let pending = updateController.pending {
+            // The panel has the pill, with the restart question.
+            let pendingItem = NSMenuItem(title: UpdatePolicy.pillText(pending), action: #selector(openPanel), keyEquivalent: "")
+            pendingItem.target = self
+            menu.addItem(pendingItem)
+        }
 
         let updateItem = NSMenuItem(title: "Check for Updates...", action: #selector(checkForUpdates), keyEquivalent: "")
         updateItem.target = self

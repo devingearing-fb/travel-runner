@@ -515,7 +515,7 @@ final class EnvironmentSupervisor {
                         let branches = await MainActor.run { self.gitBranches }
                         let behind = await MainActor.run { self.gitBehindCounts }
                         let npmStale = await MainActor.run { Array(self.npmStaleServices) }
-                        let dict: [String: Any] = [
+                        var dict: [String: Any] = [
                             "app": Flavor.current.rawValue,
                             "health": health, "services": states, "lan": lan, "ip": ip,
                             "profile": profile,
@@ -524,6 +524,8 @@ final class EnvironmentSupervisor {
                             "gitBehind": behind,
                             "npmStale": npmStale
                         ]
+                        // version, build, commit, build_kind
+                        dict.merge(BuildInfo.current.statusFields) { current, _ in current }
                         if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
                            let str = String(data: data, encoding: .utf8) { return str }
                         return "{}"
