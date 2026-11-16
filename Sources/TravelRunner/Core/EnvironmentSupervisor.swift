@@ -2024,8 +2024,12 @@ final class EnvironmentSupervisor {
             state.lastStopped = .now
             state.failureTimestamps.removeAll()
             let exit = "the Stripe CLI \(ServiceTermination.describe(termination))"
+            // The log keeps the lines of earlier launches. An old 401 is not the
+            // cause of this exit.
+            let launched = state.lastStarted ?? .distantPast
             Task {
-                let output = await logStore.entries(for: serviceID).map(\.text)
+                let output = await logStore.entries(for: serviceID)
+                    .filter { $0.timestamp >= launched }.map(\.text)
                 let cause = if let known = CrashCause.knownCause(in: output, serviceID: serviceID) {
                     "\(exit) — \(known)"
                 } else {

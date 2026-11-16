@@ -202,10 +202,27 @@ final class ServiceTerminationTests: XCTestCase {
         let expected = "Stripe session expired — run `stripe login`, then restart Stripe"
         let cli = ["Error while authenticating with Stripe: Authorization failed, status=401"]
         XCTAssertEqual(CrashCause.likelyCause(in: cli, serviceID: "stripe"), expected)
-        // The Stripe error code names the cause in the output of any service.
-        XCTAssertEqual(CrashCause.likelyCause(in: [#"  "code": "api_key_expired","#]), expected)
+        XCTAssertEqual(CrashCause.likelyCause(in: [#"  "code": "api_key_expired","#], serviceID: "stripe"), expected)
         // A 401 in the output of another service is not a Stripe session.
         XCTAssertEqual(CrashCause.likelyCause(in: ["Error: hotel API status=401"], serviceID: "travel-portal"), "Error: hotel API status=401")
+    }
+
+    /// In a portal, `api_key_expired` means the key in its env file is rejected.
+    /// `stripe login` does not fix that, and the text hid the real crash line.
+    func testAnExpiredStripeKeyInAPortalIsNotAStripeSession() {
+        let code = #"  "code": "api_key_expired","#
+        XCTAssertEqual(CrashCause.likelyCause(in: [code], serviceID: "travel-portal"), #""code": "api_key_expired","#)
+        XCTAssertEqual(CrashCause.likelyCause(in: [code]), #""code": "api_key_expired","#)
+        XCTAssertNil(CrashCause.knownCause(in: [code], serviceID: "travel-portal"))
+
+        let key = "sk_" + "test_" + "123"
+        XCTAssertEqual(
+            CrashCause.likelyCause(in: [#"  message: 'Expired API Key provided: \#(key)',"#, code], serviceID: "travel-portal"),
+            "message: 'Expired API Key provided: ‹redacted:stripe-key›',"
+        )
+        // A port that is in use is the cause of the exit.
+        let port = "Error: listen EADDRINUSE: address already in use :::3002"
+        XCTAssertEqual(CrashCause.likelyCause(in: [code, port], serviceID: "travel-portal"), port)
     }
 
     func testNoNetworkOrDNS() {

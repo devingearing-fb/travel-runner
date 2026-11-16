@@ -116,15 +116,16 @@ enum CrashCause {
     private static let stripeAuthMarkers = ["status=401", "Authorization failed", "api_key_expired"]
 
     /// A failure with one cause and one fix, when the last lines show one.
-    /// A 401 means an expired Stripe session only in the output of the Stripe CLI.
+    /// A 401 or `api_key_expired` means an expired session only in the output of
+    /// the Stripe CLI. In a portal it means that the key in its env file is
+    /// rejected, and `stripe login` does not fix that.
     static func knownCause(in lines: [String], serviceID: String? = nil) -> String? {
         let tail = lines.suffix(window)
         if tail.contains(where: { $0.localizedCaseInsensitiveContains(containerRuntimeDown) }) {
             return "The container runtime is not running (\(containerRuntimeDown))"
         }
-        if tail.contains(where: { line in
-            line.contains("api_key_expired")
-                || (serviceID == "stripe" && stripeAuthMarkers.contains { line.localizedCaseInsensitiveContains($0) })
+        if serviceID == "stripe", tail.contains(where: { line in
+            stripeAuthMarkers.contains { line.localizedCaseInsensitiveContains($0) }
         }) {
             return stripeSessionExpired
         }
@@ -160,6 +161,11 @@ enum CrashCause {
         }
 
         let candidates = tail.filter(isCandidate)
+        // Stripe rejected the key of this service. The line says so; the key is redacted.
+        if let line = candidates.last(where: { $0.contains("Expired API Key") })
+            ?? candidates.last(where: { $0.contains("api_key_expired") }) {
+            return clean(line, redactor)
+        }
         if let line = candidates.last(where: { line in strongMarkers.contains { line.contains($0) } }) {
             return clean(line, redactor)
         }

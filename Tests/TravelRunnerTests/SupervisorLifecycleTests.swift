@@ -791,6 +791,30 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains(expected), lines.joined(separator: "\n"))
     }
 
+    /// The Stripe log is not cleared on a restart. A 401 from an earlier launch
+    /// labelled a later exit as an expired session.
+    func testAnOld401InTheStripeLogIsNotTheCauseOfALaterExit() async throws {
+        try load(stripe("echo stripe-start; sleep 2; exit 1"))
+        supervisor.stripeAvailability = { true }
+        await supervisor.logStore.append(serviceID: "stripe", entry: LogEntry(
+            timestamp: Date().addingTimeInterval(-600), stream: .stderr, text: "Authorization failed, status=401"
+        ))
+
+        supervisor.restartService("stripe")
+
+        let skipped = await waitUntil(20) { self.state("stripe").phase == .skipped }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        let prefix = "[travel-runner] Stripe stopped: the Stripe CLI exited with code 1"
+        var lines: [String] = []
+        for _ in 0..<100 where !lines.contains(where: { $0.hasPrefix(prefix) }) {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines("stripe")
+        }
+        let stopped = lines.first { $0.hasPrefix(prefix) }
+        XCTAssertNotNil(stopped, lines.joined(separator: "\n"))
+        XCTAssertEqual(stopped?.contains("Stripe session expired"), false, stopped ?? "")
+    }
+
     /// The row showed the first 20 characters of the webhook secret.
     func testTheRowShowsOnlyTheEndOfTheWebhookSecret() {
         let state = ServiceState(definition: stripe("true"))
