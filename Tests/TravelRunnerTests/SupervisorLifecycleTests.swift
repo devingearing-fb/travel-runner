@@ -379,4 +379,129 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains { $0.contains("http://localhost:\(port)") }, lines.joined(separator: "\n"))
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
     }
+
+    // MARK: - Automatic database reset
+
+    /// A stand-in for Supabase that counts as running, with a fake database behind it.
+    private func loadSupabase() throws {
+        try load(daemon("supabase", ["sleep", "60"]))
+        state("supabase").phase = .running
+    }
+
+    /// Finding "failed query treated as empty DB": Docker was down, or the container
+    /// was not there, and the runner wiped the database.
+    func testAFailedDatabaseQueryNeverStartsAReset() async throws {
+        try loadSupabase()
+        var queries = 0
+        var resets = 0
+        var answer = DbQueryResult(exitCode: 1, stdout: "", stderr: "\nCannot connect to the Docker daemon\nIs it running?")
+        supervisor.databaseQuery = { _, _ in
+            queries += 1
+            return answer
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+
+        let failedQuery = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+
+        XCTAssertFalse(failedQuery)
+        XCTAssertEqual(queries, 1)
+        XCTAssertEqual(resets, 0)
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertEqual(
+            supervisor.lastError,
+            "Could not read the local database (Cannot connect to the Docker daemon). Nothing was changed."
+        )
+
+        // An answer that is not a number is not an empty database.
+        answer = DbQueryResult(exitCode: 0, stdout: "", stderr: "")
+        _ = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+        XCTAssertEqual(resets, 0)
+
+        // Supabase does not run: the runner does not ask, and does not reset.
+        answer = DbQueryResult(exitCode: 0, stdout: "0", stderr: "")
+        state("supabase").phase = .failed
+        _ = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+        XCTAssertEqual(queries, 2)
+        XCTAssertEqual(resets, 0)
+
+        // Control: a database that answers with no tables is reset, as before.
+        state("supabase").phase = .running
+        supervisor.lastError = nil
+        let emptyDatabase = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+        XCTAssertTrue(emptyDatabase)
+        XCTAssertEqual(resets, 1)
+        XCTAssertNil(supervisor.lastError)
+
+        // A database with tables is left alone.
+        answer = DbQueryResult(exitCode: 0, stdout: "42", stderr: "")
+        _ = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
+        XCTAssertEqual(resets, 1)
+    }
+
+    /// The reset keeps its own error, and a second reset does not start while one runs.
+    func testAFailedResetKeepsItsErrorAndASecondResetDoesNotStart() async throws {
+        try loadSupabase()
+        var resets = 0
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "0", stderr: "") }
+        supervisor.dbResetAction = { [supervisor] cwd in
+            resets += 1
+            // The same request while this one runs.
+            await supervisor?.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: false)
+            supervisor?.lastError = "DB reset failed at Load hotels: HTTP 401"
+            return false
+        }
+
+        await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
+
+        XCTAssertEqual(resets, 1)
+        XCTAssertEqual(supervisor.lastError, "DB reset failed at Load hotels: HTTP 401")
+        XCTAssertFalse(supervisor.dbResetRunning)
+    }
+
+    /// Finding "reset runs after Stop": the stop arrived while the runner asked the
+    /// database, the answer was "no tables" (or an error), and a reset started.
+    func testStopDuringGroundDoesNotStartAReset() async throws {
+        try loadSupabase()
+        var resets = 0
+        var asked = false
+        var release: CheckedContinuation<Void, Never>?
+        supervisor.databaseQuery = { _, _ in
+            asked = true
+            await withCheckedContinuation { release = $0 }
+            return DbQueryResult(exitCode: 0, stdout: "0", stderr: "")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+        let cwd = workDir.path
+        let check = Task { await self.supervisor.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true) }
+        let waiting = await waitUntil(10) { asked && release != nil }
+        XCTAssertTrue(waiting)
+
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        release?.resume()
+        let didReset = await check.value
+
+        XCTAssertFalse(didReset)
+        XCTAssertEqual(resets, 0)
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertNil(supervisor.lastError)
+    }
+
+    func testOnlyAnAnswerOfZeroIsAnEmptyDatabase() {
+        XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "0", stderr: "")), .empty)
+        XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "17\n", stderr: "warning")), .hasTables)
+        XCTAssertEqual(
+            DbProbe.classify(DbQueryResult(exitCode: 1, stdout: "", stderr: "Error response from daemon: No such container: x")),
+            .unknown("Error response from daemon: No such container: x")
+        )
+        XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 127, stdout: "", stderr: "")), .unknown("exit code 127"))
+        XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "", stderr: "")), .unknown("the query gave no answer"))
+    }
 }

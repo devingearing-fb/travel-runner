@@ -123,6 +123,9 @@ final class EnvironmentSupervisor {
     private var networkReapplyPending = false
     private var wakePassStartedAt: Date?
     private var wakePending = false
+    /// Tests replace the database query and the reset with fakes.
+    var databaseQuery: ((_ cwd: String, _ sql: String) async -> DbQueryResult)?
+    var dbResetAction: ((_ cwd: String) async -> Bool)?
 
     init(userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil) {
         self.holdsViewer = holdsViewer ?? HoldsViewerHost()
@@ -427,26 +430,7 @@ final class EnvironmentSupervisor {
                     await self.refreshLocalSupabaseKeys()
                     let portalCwd = config.services.first(where: { $0.id == "supabase" })?.resolvedCwd
                     if let cwd = portalCwd {
-                        let dbEmpty = !(await self.databaseHasAppTables(portalCwd: cwd))
-                        let missing = dbEmpty ? [] : (await self.missingMigrations(cwd: cwd) ?? [])
-                        if dbEmpty || !missing.isEmpty {
-                            let reason = dbEmpty
-                                ? "Empty database detected — running db:reset..."
-                                : "\(missing.count) new migration\(missing.count == 1 ? "" : "s") — running db:reset..."
-                            await MainActor.run {
-                                self.lastError = reason
-                                self.dbResetRunning = true
-                            }
-                            let ok = await self.runDbReset(cwd: cwd)
-                            await MainActor.run {
-                                self.dbResetRunning = false
-                                if ok {
-                                    self.lastError = nil
-                                } else {
-                                    self.lastError = "db:reset failed — expand logs or click Reset DB to retry"
-                                }
-                            }
-                        }
+                        await self.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true)
                         await self.refreshPendingMigrations(cwd: cwd)
                     }
                 }
@@ -1044,17 +1028,7 @@ final class EnvironmentSupervisor {
 
                 // After Supabase comes back, check if DB is empty and auto-reset
                 if id == "supabase", let cwd = config?.services.first(where: { $0.id == "supabase" })?.resolvedCwd {
-                    let hasTables = await databaseHasAppTables(portalCwd: cwd)
-                    if !hasTables {
-                        dbResetRunning = true
-                        lastError = "Empty database detected — running db:reset..."
-                        let ok = await runDbReset(cwd: cwd)
-                        dbResetRunning = false
-                        if ok {
-                            lastError = nil
-                        } else {
-                            lastError = "db:reset failed — check logs"
-                        }
+                    if await resetDatabaseIfNeeded(cwd: cwd, checkMigrations: false) {
                         await refreshPendingMigrations(cwd: cwd)
                     }
                 }
@@ -1133,19 +1107,7 @@ final class EnvironmentSupervisor {
             if changed.contains("supabase") || changed.contains("travel-portal") {
                 if let cwd = serviceCwd("supabase") ?? serviceCwd("travel-portal") {
                     if let missing = await missingMigrations(cwd: cwd), !missing.isEmpty {
-                        await MainActor.run {
-                            self.lastError = "Branch switch: new migrations detected — running db:reset..."
-                            self.dbResetRunning = true
-                        }
-                        let ok = await runDbReset(cwd: cwd)
-                        await MainActor.run {
-                            self.dbResetRunning = false
-                            if ok {
-                                self.lastError = nil
-                            } else {
-                                self.lastError = "db:reset failed after branch switch"
-                            }
-                        }
+                        _ = await runDbReset(cwd: cwd, reason: "Branch switch: new migrations detected — running db:reset...")
                     }
                     await refreshPendingMigrations(cwd: cwd)
                 }
@@ -2530,49 +2492,114 @@ final class EnvironmentSupervisor {
     }
 
     /// Whether the local database has the travel tables. A fresh Docker volume has
-    /// none, and then the startup check runs a reset.
-    private func databaseHasAppTables(portalCwd: String) async -> Bool {
-        let output = await queryDatabase(cwd: portalCwd, sql: "SELECT count(*) FROM pg_tables WHERE schemaname = 'fb_travel'")
-        return (Int(output ?? "") ?? 0) > 0
+    /// none. A query that fails gives `unknown`, never `empty`.
+    private func probeDatabase(cwd: String) async -> DbProbe {
+        DbProbe.classify(await queryDatabase(cwd: cwd, sql: "SELECT count(*) FROM pg_tables WHERE schemaname = 'fb_travel'"))
+    }
+
+    /// An automatic reset needs a start that is still wanted and a Supabase that runs.
+    private var canAutoReset: Bool {
+        !Task.isCancelled && !isShuttingDown && serviceStates["supabase"]?.phase == .running
+    }
+
+    /// After Supabase starts: resets an empty database and, with `checkMigrations`,
+    /// one that lacks migrations. It changes nothing when Supabase does not run,
+    /// after a stop, or when the database cannot be read. True when a reset ran.
+    @discardableResult
+    func resetDatabaseIfNeeded(cwd: String, checkMigrations: Bool) async -> Bool {
+        guard canAutoReset else { return false }
+        let probe = await probeDatabase(cwd: cwd)
+        // The probe takes time: a stop can arrive while it runs.
+        guard canAutoReset else { return false }
+        let reason: String
+        switch probe {
+        case .unknown(let detail):
+            lastError = DbProbe.unreadableMessage(detail)
+            return false
+        case .empty:
+            reason = "Empty database detected — running db:reset..."
+        case .hasTables:
+            guard checkMigrations else { return false }
+            let missing = await missingMigrations(cwd: cwd) ?? []
+            guard !missing.isEmpty, canAutoReset else { return false }
+            reason = "\(missing.count) new migration\(missing.count == 1 ? "" : "s") — running db:reset..."
+        }
+        _ = await runDbReset(cwd: cwd, reason: reason)
+        return true
     }
 
     /// Migrations the local database has not applied, oldest first; nil when that
     /// cannot be read (database down, no backend baseline checkout).
     private func missingMigrations(cwd: String) async -> [String]? {
-        guard let expected = MigrationTracker.expectedVersions(root: cwd),
-              let output = await queryDatabase(cwd: cwd, sql: "SELECT version FROM supabase_migrations.schema_migrations")
-        else { return nil }
-        return MigrationTracker.missing(expected: expected, applied: MigrationTracker.parseVersions(output))
+        guard let expected = MigrationTracker.expectedVersions(root: cwd) else { return nil }
+        let result = await queryDatabase(cwd: cwd, sql: "SELECT version FROM supabase_migrations.schema_migrations")
+        guard result.exitCode == 0 else { return nil }
+        return MigrationTracker.missing(expected: expected, applied: MigrationTracker.parseVersions(result.stdout))
     }
 
-    /// One query against the local database (`psql -tA`), or nil when it fails.
-    private func queryDatabase(cwd: String, sql: String) async -> String? {
+    /// One query against the local database (`psql -tA`), with its exit status and
+    /// its error text.
+    private func queryDatabase(cwd: String, sql: String) async -> DbQueryResult {
+        if let databaseQuery { return await databaseQuery(cwd, sql) }
         let container = SupabaseProject.dbContainerName(root: cwd)
-        let command = ShellQuote.join(["docker", "exec", container, "psql", "-U", "postgres", "-d", "postgres", "-tAc", sql]) + " 2>/dev/null"
+        let command = ShellQuote.join(["docker", "exec", container, "psql", "-U", "postgres", "-d", "postgres", "-tAc", sql])
         return await withCheckedContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/zsh")
             process.arguments = ["-l", "-c", command]
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = FileHandle.nullDevice
-            process.terminationHandler = { proc in
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                guard proc.terminationStatus == 0 else {
-                    continuation.resume(returning: nil)
-                    return
-                }
-                let output = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-                continuation.resume(returning: output)
+            let outPipe = Pipe()
+            let errPipe = Pipe()
+            process.standardInput = FileHandle.nullDevice
+            process.standardOutput = outPipe
+            process.standardError = errPipe
+            do { try process.run() } catch {
+                continuation.resume(returning: DbQueryResult(exitCode: -1, stdout: "", stderr: error.localizedDescription))
+                return
             }
-            do { try process.run() } catch { continuation.resume(returning: nil) }
+            // Both pipes are read while the process runs, so a full pipe cannot block it.
+            DispatchQueue.global().async {
+                let errors = DispatchGroup()
+                // Written by one thread, and read only after `wait`.
+                final class Buffer: @unchecked Sendable { var data = Data() }
+                let errBuffer = Buffer()
+                errors.enter()
+                DispatchQueue.global().async {
+                    errBuffer.data = errPipe.fileHandleForReading.readDataToEndOfFile()
+                    errors.leave()
+                }
+                let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                errors.wait()
+                let errData = errBuffer.data
+                process.waitUntilExit()
+                continuation.resume(returning: DbQueryResult(
+                    exitCode: process.terminationStatus,
+                    stdout: String(decoding: outData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines),
+                    stderr: String(decoding: errData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+                ))
+            }
         }
     }
 
     /// Automatic reset (empty database, migrations the database lacks, branch switch):
     /// the manifest's `reset` profile with the selected seed scenario, shown in the
-    /// DB setup panel like a manual reset.
-    private func runDbReset(cwd: String) async -> Bool {
+    /// DB setup panel like a manual reset. It does nothing while another reset or
+    /// setup runs. On failure `lastError` names the step that failed.
+    private func runDbReset(cwd: String, reason: String) async -> Bool {
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return false }
+        dbResetRunning = true
+        defer { dbResetRunning = false }
+        lastError = reason
+        let ok: Bool
+        if let dbResetAction {
+            ok = await dbResetAction(cwd)
+        } else {
+            ok = await runDbResetPipeline(cwd: cwd)
+        }
+        if ok { lastError = nil }
+        return ok
+    }
+
+    private func runDbResetPipeline(cwd: String) async -> Bool {
         guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "reset") else { return false }
         dbSetupPipeline = pipeline
         let runner = DbSetupRunner(portalCwd: cwd, logStore: logStore, seedScenarioID: pipeline.seedScenario.id)
