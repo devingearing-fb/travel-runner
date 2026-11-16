@@ -59,6 +59,8 @@ The ID is `yyyyMMdd'T'HHmmss` (local time) + `_` + the trigger (underscores as d
 
 When the service's output shows why it failed, `summary` ends with ` — <likely cause>`, for example `service_crash [travel-portal]: Travel Portal exited with code 1 — Error: listen EADDRINUSE: address already in use :::3002`. The same text is in `likely_cause` in `issue.json`. The cause is not part of the dedup signature.
 
+`issue.json` also records the Travel Runner that filed the issue: `app_version`, `app_build`, `app_commit`, `app_build_kind` (`release` or `dev`) and `app_flavor`. Issues from before these fields have none. Check them first: a fix may already be in a newer version.
+
 `dedup_window_seconds` in `config.json` overrides the 7-day default. A config file from before July 2026 can still have `300`; remove the key to get the default.
 
 ### POST /api/debug/issues

@@ -215,9 +215,19 @@ struct SettingsPageView: View {
                         Label("Version", systemImage: "info.circle")
                             .font(.system(.caption, design: .monospaced))
                         Spacer()
-                        Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+                        if BuildInfo.current.isDev {
+                            Text("DEV")
+                                .font(.system(.caption2, design: .monospaced).weight(.bold))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Color.orange, in: Capsule())
+                                .help("Built from source with build.sh. This copy does not come from a release.")
+                        }
+                        Text(BuildInfo.current.summary)
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
                     }
                 }
 

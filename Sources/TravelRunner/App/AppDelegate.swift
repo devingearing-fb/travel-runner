@@ -211,6 +211,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalsItem.target = self
         menu.addItem(terminalsItem)
 
+        let buildItem = NSMenuItem(title: BuildInfo.current.menuTitle, action: nil, keyEquivalent: "")
+        buildItem.isEnabled = false
+        menu.addItem(buildItem)
+
         let updateItem = NSMenuItem(title: "Check for Updates...", action: #selector(checkForUpdates), keyEquivalent: "")
         updateItem.target = self
         updateItem.isEnabled = updateController.canCheckForUpdates

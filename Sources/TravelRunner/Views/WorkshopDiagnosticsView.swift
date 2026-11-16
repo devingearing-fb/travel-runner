@@ -89,9 +89,8 @@ struct WorkshopDiagnosticsView: View {
 
                 sectionHeader("About")
 
-                let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
-                let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
-                Text("\(Flavor.current.displayName) v\(version) (build \(build))")
+                let info = BuildInfo.current
+                Text("\(info.flavor.displayName) \(info.summary) (build \(info.build ?? "?"))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

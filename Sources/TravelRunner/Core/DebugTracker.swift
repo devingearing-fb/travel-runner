@@ -60,6 +60,13 @@ actor DebugTracker {
         /// The line of the service's output that best explains the failure. Issues
         /// from before this field have none.
         var likelyCause: String?
+        /// The build of the app that filed the issue. Issues from before these
+        /// fields have none.
+        var appVersion: String?
+        var appBuild: String?
+        var appCommit: String?
+        var appBuildKind: String?
+        var appFlavor: String?
         var createdAt: String
         var updatedAt: String
         var resolvedAt: String?
@@ -73,6 +80,11 @@ actor DebugTracker {
             case errorSignature = "error_signature"
             case errorMessage = "error_message"
             case likelyCause = "likely_cause"
+            case appVersion = "app_version"
+            case appBuild = "app_build"
+            case appCommit = "app_commit"
+            case appBuildKind = "app_build_kind"
+            case appFlavor = "app_flavor"
             case createdAt = "created_at"
             case updatedAt = "updated_at"
             case resolvedAt = "resolved_at"
@@ -96,6 +108,7 @@ actor DebugTracker {
     private let configPath: String
     private let openDir: String
     private let closedDir: String
+    private let buildInfo: BuildInfo
 
     private let fm = FileManager.default
     private let jsonEncoder: JSONEncoder = {
@@ -128,7 +141,8 @@ actor DebugTracker {
 
     // MARK: - Init
 
-    init(baseDir: String? = nil) {
+    init(baseDir: String? = nil, buildInfo: BuildInfo = .current) {
+        self.buildInfo = buildInfo
         let root = baseDir ?? NSString(string: "~/Desktop/\(Flavor.current.debugTrackingFolder)").expandingTildeInPath
         self.baseDir = root
         self.configPath = (root as NSString).appendingPathComponent("config.json")
@@ -216,6 +230,11 @@ actor DebugTracker {
             errorSignature: signature,
             errorMessage: errorMessage,
             likelyCause: likelyCause,
+            appVersion: buildInfo.version,
+            appBuild: buildInfo.build,
+            appCommit: buildInfo.commit,
+            appBuildKind: buildInfo.kind.rawValue,
+            appFlavor: buildInfo.flavor.rawValue,
             createdAt: iso,
             updatedAt: iso,
             resolvedAt: nil,

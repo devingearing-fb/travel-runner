@@ -35,6 +35,9 @@ curl -s http://localhost:19900/api/status | python3 -m json.tool
 ```json
 {
   "branches": { "travel-portal": "dev", "partner-portal": "dev" },
+  "build": "20261116120000",
+  "build_kind": "release",
+  "commit": "a1b2c3d",
   "db_mode": "local",
   "gitBehind": { "travel-portal": 0 },
   "health": "HEALTHY",
@@ -49,9 +52,12 @@ curl -s http://localhost:19900/api/status | python3 -m json.tool
     "travel-portal":   { "phase": "RUNNING", "pid": "62147" },
     "partner-portal":  { "phase": "RUNNING", "pid": "62190" },
     "stream-services": { "phase": "SKIPPED", "pid": "nil" }
-  }
+  },
+  "version": "0.13.5"
 }
 ```
+
+- `version`, `build`, `commit`, `build_kind`: which Travel Runner answers. `build_kind` is `release` (from `release.sh`) or `dev` (built from source with `build.sh`; its `version` comes from `git describe`). A value that the build does not know is `""`.
 
 - `profile`: the active run profile (`booking`, `partner`, `both`, `full`) — see `/api/profile`
 - `db_mode`: `local` (local Supabase) or `remote` (hosted dev, from the apps' shared `.env` files) — see `/api/toggle-db-mode`
