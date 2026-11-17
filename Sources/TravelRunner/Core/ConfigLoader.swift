@@ -66,14 +66,7 @@ enum ConfigLoader {
     /// Writes a config for these paths. Custom services and the profile of an
     /// existing config are kept.
     static func generate(paths: RepoPaths) throws {
-        var root: [String: Any] = [:]
-        if let data = FileManager.default.contents(atPath: configPath),
-           let existing = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-            root = existing
-        }
-        root["paths"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(paths))
-        root["services"] = root["services"] ?? []
-        let data = try upgradedData(JSONSerialization.data(withJSONObject: root))
+        let data = try generatedData(paths: paths, existing: FileManager.default.contents(atPath: configPath))
 
         let fm = FileManager.default
         if !fm.fileExists(atPath: configDir) {
@@ -81,6 +74,21 @@ enum ConfigLoader {
         }
         try data.write(to: URL(fileURLWithPath: configPath), options: .atomic)
         print("[Config] Generated services.json at \(configPath)")
+    }
+
+    /// The config for these paths, on top of the `existing` file.
+    static func generatedData(paths: RepoPaths, existing: Data?) throws -> Data {
+        var root: [String: Any] = [:]
+        if let existing, let object = try? JSONSerialization.jsonObject(with: existing) as? [String: Any] {
+            root = object
+        }
+        root["paths"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(paths))
+        // The wizard's paths win. Without this, a path that the wizard leaves unset
+        // comes back from the cwd of the old canonical service.
+        let canonical = ServiceCatalog.canonicalIDs.union(ServiceCatalog.retiredIDs)
+        root["services"] = (root["services"] as? [[String: Any]] ?? [])
+            .filter { !canonical.contains($0["id"] as? String ?? "") }
+        return try upgradedData(JSONSerialization.data(withJSONObject: root))
     }
 
     /// Sets the profile in the config file.

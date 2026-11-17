@@ -774,6 +774,26 @@ final class SupervisorLifecycleTests: XCTestCase {
         }
     }
 
+    /// A service whose folder services.json does not set has the cwd "". Started on
+    /// its own, it must not run in the app's own folder.
+    func testAServiceWithNoFolderFailsWithAMessageAndStartsNothing() async throws {
+        try load(ServiceDefinition(
+            id: "custom", name: "Custom", cmd: ["sh", "-c", "echo custom-start; sleep 30"], cwd: "",
+            probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        ))
+
+        supervisor.restartService("custom")
+
+        let failed = await waitUntil(20) {
+            self.state("custom").phase == .failed && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(failed, "custom is \(state("custom").phase.rawValue)")
+        XCTAssertEqual(supervisor.lastError, "Custom cannot start: no folder is set — open Settings → Reconfigure Repos")
+        let lines = await logLines("custom")
+        XCTAssertFalse(lines.contains("custom-start"), "the process must not start")
+        XCTAssertNil(state("custom").pid)
+    }
+
     /// Ticket "failed wake probe" with a recurrence five seconds later: two wake
     /// notifications ran two passes, and both restarted the service.
     func testTwoWakeNotificationsRestartAFailedServiceOnce() async throws {

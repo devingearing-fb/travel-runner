@@ -92,7 +92,8 @@ struct SetupView: View {
                     dropZone
 
                     repoRow(role: .monorepo, path: $monorepoPath)
-                    if monorepoCheckouts.count > 1 {
+                    // Only when the list holds the path: a radio group with no match selects nothing.
+                    if monorepoCheckouts.count > 1, monorepoCheckouts.contains(where: { $0.path == monorepoPath }) {
                         checkoutChooser
                     }
                     repoRow(role: .universalLogin, path: $universalLoginPath)
@@ -325,7 +326,12 @@ struct SetupView: View {
         var filled: [String] = []
 
         monorepoCheckouts = detected.monorepoCheckouts
-        if let p = detected.monorepo, monorepoPath.isEmpty || !RepoDetector.validate(path: monorepoPath, role: .monorepo) {
+        // A drop with several checkouts that do not include the current path also
+        // replaces it, so the chooser has the path selected.
+        let notAChoice = detected.monorepoCheckouts.count > 1
+            && !detected.monorepoCheckouts.contains(where: { $0.path == monorepoPath })
+        if let p = detected.monorepo,
+           monorepoPath.isEmpty || notAChoice || !RepoDetector.validate(path: monorepoPath, role: .monorepo) {
             monorepoPath = p
             filled.append(detected.monorepoCheckouts.count > 1
                 ? "Monorepo (\(detected.monorepoCheckouts.count) checkouts — choose one below)"

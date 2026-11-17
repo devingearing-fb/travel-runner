@@ -120,6 +120,28 @@ final class ConfigLoaderTests: XCTestCase {
         XCTAssertEqual(missingMessage, "Directory not found — open Settings → Reconfigure Repos")
     }
 
+    /// Reconfigure that clears a path: the old services.json still has the path in
+    /// `paths` and in the cwd of the canonical service. The wizard's paths win.
+    func testAPathTheWizardClearsDoesNotComeBackFromTheOldFile() throws {
+        let old: [String: Any] = [
+            "version": 3,
+            "paths": ["monorepo": monorepo, "stream_services": "/work/stream-services"],
+            "services": [
+                service(id: "stream-services", cwd: "/work/stream-services"),
+                service(id: "custom-local-tool"),
+            ],
+        ]
+        let data = try ConfigLoader.generatedData(
+            paths: RepoPaths(monorepo: monorepo, streamServices: nil),
+            existing: JSONSerialization.data(withJSONObject: old)
+        )
+        let config = try JSONDecoder().decode(ServiceConfig.self, from: data)
+
+        XCTAssertNil(config.paths?.streamServices)
+        XCTAssertEqual(config.services.first { $0.id == "stream-services" }?.resolvedCwd, "")
+        XCTAssertNotNil(config.services.first { $0.id == "custom-local-tool" }, "custom services are kept")
+    }
+
     // MARK: - A custom service that cannot run
 
     private func load(customServices: [[String: Any]]) throws -> (config: ServiceConfig, data: Data) {

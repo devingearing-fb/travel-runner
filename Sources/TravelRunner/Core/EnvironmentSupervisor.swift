@@ -285,6 +285,8 @@ final class EnvironmentSupervisor {
         case portHeldByContainer(name: String, port: Int, owner: String)
         /// `reason` is `ProbeConfig.problem`.
         case badProbe(name: String, reason: String)
+        /// services.json does not set the folder of the service's repo.
+        case folderUnset(name: String)
 
         var description: String {
             switch self {
@@ -303,6 +305,8 @@ final class EnvironmentSupervisor {
                 "\(name) cannot start: \(reason). Correct its probe in services.json, then quit \(Flavor.current.displayName) and open it again."
             case .portHeldByContainer(let name, let port, let owner):
                 "\(name) cannot start: port \(port) is published by a container (\(owner)) — stop that container, then restart \(name)"
+            case .folderUnset(let name):
+                "\(name) cannot start: no folder is set — open Settings → Reconfigure Repos"
             }
         }
     }
@@ -475,7 +479,7 @@ final class EnvironmentSupervisor {
         // Initialize git branch watcher for all repos with cwds
         var repoMap: [String: String] = [:]
         for service in config.services {
-            if let cwd = service.resolvedCwd {
+            if let cwd = service.resolvedCwd, !cwd.isEmpty {
                 repoMap[service.id] = cwd
             }
         }
@@ -489,7 +493,7 @@ final class EnvironmentSupervisor {
         // Initialize dependency (npm install) freshness watcher
         var depsMap: [String: String] = [:]
         for service in config.services {
-            if let cwd = service.resolvedCwd, service.resolvedType == .daemon {
+            if let cwd = service.resolvedCwd, !cwd.isEmpty, service.resolvedType == .daemon {
                 depsMap[service.id] = cwd
             }
         }
@@ -918,7 +922,7 @@ final class EnvironmentSupervisor {
 
     /// universal-login is an external repo; its `.env.local` keeps the key-by-key writes.
     private func writeLoginEnv(host: String) {
-        guard let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd else { return }
+        guard let loginCwd = graph?.nodes["universal-login"]?.resolvedCwd, !loginCwd.isEmpty else { return }
         let env = EnvCompatLayer(envFilePaths: [loginCwd + "/.env.local"])
         env.write(key: "NEXT_PUBLIC_SITE_URL", value: "http://\(host):3000")
         env.write(key: "NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", value: "http://\(host):3000")
@@ -2043,6 +2047,11 @@ final class EnvironmentSupervisor {
         // A probe with a missing or wrong field: say so, and start nothing.
         if let problem = definition.probe?.problem {
             throw ServiceError.badProbe(name: definition.displayName, reason: problem)
+        }
+
+        // An unset folder is "". A process there would run in the app's own folder.
+        if definition.resolvedCwd == "" {
+            throw ServiceError.folderUnset(name: definition.displayName)
         }
 
         // Reuse-if-running: Docker-managed services (Supabase) persist between sessions.
