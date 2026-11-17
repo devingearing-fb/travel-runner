@@ -15,6 +15,8 @@ enum FixAction: Equatable, Sendable {
     case navigate(app: String, waitFor: Duration)
     /// Says what to do. The runner runs nothing.
     case guidance(text: String, copyCommand: String?, url: URL?)
+    /// Asks for the GitHub Packages token in a secure field, tests it, and saves it.
+    case enterToken
 
     /// What "Copy command" copies, or nil.
     var copyCommand: String? {
@@ -23,12 +25,12 @@ enum FixAction: Equatable, Sendable {
         case .terminal(let command, _): command
         case .navigate(let app, _): "open -a \(ShellQuote.quote(app))"
         case .guidance(_, let command, _): command
-        case .importFile, .inApp: nil
+        case .importFile, .inApp, .enterToken: nil
         }
     }
 
-    /// An import shows its own file panel; every other fix shows the fix sheet.
-    var showsSheet: Bool { self != .importFile }
+    /// An import shows its own file panel and the token its own sheet; every other fix shows the fix sheet.
+    var showsSheet: Bool { self != .importFile && self != .enterToken }
 }
 
 /// One run of a fix: the lines that the fix sheet shows, and how it ended.
@@ -95,4 +97,10 @@ final class FixRun: Identifiable {
         let seconds = max(0, seconds)
         return "\(seconds / 60):" + String(format: "%02d", seconds % 60)
     }
+}
+
+/// Why the token sheet did not save a token. The sheet shows the text.
+struct RegistryTokenError: Error, Equatable, Sendable {
+    let text: String
+    init(_ text: String) { self.text = text }
 }

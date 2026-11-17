@@ -65,11 +65,16 @@ final class EnvironmentChecker {
     /// The fix that the fix sheet shows. Nil when the sheet is closed.
     var activeFix: FixRun?
 
+    /// True while the sheet that asks for the GitHub Packages token is open.
+    var tokenEntryOpen = false
+
     /// Runs the commands of the checks and the fixes.
     private let commandRunner: any CommandRunning
     private let tools: ToolEnvironment
     /// The time stamps of a fix, and the waits of a fix that polls its check.
     private let clock: RunnerClock
+    /// Reads, tests and saves the GitHub Packages token.
+    private let registry: RegistryAuth
 
     /// A check command that hangs fails after this time.
     nonisolated static let checkTimeout: Duration = .seconds(20)
@@ -86,9 +91,11 @@ final class EnvironmentChecker {
 
     init(
         monorepoPath: String, loginPath: String, streamServicesPath: String, flavor: Flavor = .current,
-        shell: any CommandRunning = LoginShell(), tools: ToolEnvironment = .shared, clock: RunnerClock = .live
+        shell: any CommandRunning = LoginShell(), tools: ToolEnvironment = .shared, clock: RunnerClock = .live,
+        registry: RegistryAuth = RegistryAuth()
     ) {
         self.commandRunner = shell
+        self.registry = registry
         self.tools = tools
         self.clock = clock
         self.flavor = flavor
@@ -275,8 +282,9 @@ final class EnvironmentChecker {
                         checkCommand: "python3 -c 'import jwt'",
                         checkDescription: "Optional — this checkout is from before the .env dump scripts, and its contract data copy (copy-remote-data.py) still needs PyJWT. A newer checkout does not."),
             HealthCheck(id: "registry-auth", name: "GitHub Packages auth", section: .prerequisites,
-                        checkCommand: "grep //npm.pkg.github.com/:_authToken ~/.npmrc",
-                        checkDescription: "User-level token for @fastbreak-amateur packages. Set it once with: pnpm config set --location=user \"//npm.pkg.github.com/:_authToken\" <token>"),
+                        fixLabel: "Set token",
+                        checkCommand: "pnpm config get --location=user \(RegistryAuth.tokenKey)",
+                        checkDescription: "User-level token for the @fastbreak-amateur packages. The check reads it from your user config and asks GitHub Packages for @fastbreak-amateur/fb-toolkit with it. The token needs read:packages, and SSO for the org. Set token saves it in ~/.npmrc, after a copy of the file."),
             HealthCheck(id: "stripe-cli", name: "Stripe CLI", section: .prerequisites,
                         isRequired: false,
                         checkCommand: "which stripe",
@@ -463,6 +471,9 @@ final class EnvironmentChecker {
         case .guidance:
             activeFix = FixRun(checkID: checkID, checkName: check.name, action: action, startedAt: clock.date(), state: .guidance)
             return
+        case .enterToken:
+            tokenEntryOpen = true
+            return
         case .importFile:
             check.status = .fixing
             let imported = await runImport(checkID)
@@ -562,10 +573,7 @@ final class EnvironmentChecker {
             return ok ? .passing("Installed") : .warning("Not installed — only monolith checkouts from before the .env dump script need it")
 
         case "registry-auth":
-            let ok = try await check(
-                "grep -q '^//npm.pkg.github.com/:_authToken=.' ~/.npmrc 2>/dev/null", label: "grep ~/.npmrc"
-            ).succeeded
-            return ok ? .passing("Configured") : .failing("No token in ~/.npmrc — see the description")
+            return RegistryAuth.status(await registryOutcome(token: try await registryToken()))
 
         case "stripe-cli":
             let ok = try await check("which stripe >/dev/null 2>&1", label: "which stripe").succeeded
@@ -754,6 +762,8 @@ final class EnvironmentChecker {
             return .importFile
         case "login-env":
             return .inApp
+        case "registry-auth":
+            return .enterToken
         case "hotel-data":
             return .command(inFolder(monorepoPath, Self.hotelDataFixCommand), timeout: Self.fixTimeout)
         case "agent-node":
@@ -805,7 +815,7 @@ final class EnvironmentChecker {
         case .inApp:
             return performInApp(checkID, run: run)
 
-        case .importFile, .guidance:
+        case .importFile, .guidance, .enterToken:
             return .succeeded
         }
     }
@@ -870,6 +880,62 @@ final class EnvironmentChecker {
         case "agent-env": importAgentEnv()
         default: false
         }
+    }
+
+    // MARK: - GitHub Packages token
+
+    /// The token of the user config. pnpm reads it as an install does; when pnpm
+    /// gives none (it is not installed yet, or hides the value), the file decides.
+    private func registryToken() async throws -> String? {
+        let result = try await check(RegistryAuth.readCommand, label: "pnpm config get")
+        if result.succeeded, let token = RegistryAuth.token(fromConfigGet: result.stdout) { return token }
+        let path = registry.npmrcPath
+        return await Task.detached {
+            (try? String(contentsOfFile: path, encoding: .utf8)).flatMap(RegistryAuth.token(fromNpmrc:))
+        }.value
+    }
+
+    private func registryOutcome(token: String?) async -> RegistryAuth.Outcome {
+        guard let token else { return .noToken }
+        if let name = RegistryAuth.environmentReference(token) { return .fromEnvironment(name) }
+        return await registry.test(token: token)
+    }
+
+    /// The token of the GitHub CLI login, or the text of why there is none.
+    func ghToken() async -> Result<String, RegistryTokenError> {
+        let result = await runCommand(RegistryAuth.ghTokenCommand)
+        let token = result.trimmedOutput
+        guard result.succeeded, !token.isEmpty, !token.contains(where: \.isWhitespace) else {
+            if result.exitCode == 127 { return .failure(RegistryTokenError("The GitHub CLI is not installed — brew install gh")) }
+            return .failure(RegistryTokenError("gh has no token — run gh auth login, then try again"))
+        }
+        return .success(token)
+    }
+
+    /// Tests the token and saves it in the user config. A token that GitHub Packages
+    /// refuses is not saved: the sheet stays open with the reason. Nil when it was saved.
+    func saveRegistryToken(_ input: String) async -> RegistryTokenError? {
+        let token = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty, !token.contains(where: \.isWhitespace) else {
+            return RegistryTokenError("Paste the token: one word, without spaces")
+        }
+        let outcome = await registry.test(token: token)
+        if RegistryAuth.isRejection(outcome), case .failing(let text) = RegistryAuth.status(outcome) {
+            return RegistryTokenError("\(text) Nothing was saved.")
+        }
+        do {
+            let registry = registry
+            let now = clock.date()
+            _ = try await Task.detached { try registry.save(token: token, now: now) }.value
+        } catch {
+            return RegistryTokenError("Could not write \(registry.npmrcPath): \(error.localizedDescription)")
+        }
+        tokenEntryOpen = false
+        if let check = checks.first(where: { $0.id == "registry-auth" }) {
+            check.status = .pending
+            check.status = await runCheck("registry-auth")
+        }
+        return nil
     }
 
     // MARK: - Helpers
@@ -1047,21 +1113,7 @@ final class EnvironmentChecker {
         }
         guard !missing.isEmpty else { return LoginEnvReport(backup: nil, added: [], kept: kept) }
 
-        var backup: String?
-        if content != nil {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            formatter.dateFormat = "yyyyMMdd-HHmmss"
-            let base = "\(path).bak-\(formatter.string(from: now))"
-            var target = base
-            var counter = 2
-            while fileManager.fileExists(atPath: target) {
-                target = "\(base)-\(counter)"
-                counter += 1
-            }
-            try fileManager.copyItem(atPath: path, toPath: target)
-            backup = (target as NSString).lastPathComponent
-        }
+        let backup = content != nil ? try BackupCopy.make(of: path, now: now) : nil
         let added = try EnvCompatLayer(envFilePaths: [path]).addMissing(missing)
         return LoginEnvReport(backup: backup, added: added, kept: kept)
     }

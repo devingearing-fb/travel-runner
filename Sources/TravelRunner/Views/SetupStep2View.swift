@@ -31,6 +31,13 @@ struct SetupStep2View: View {
 
             // Summary bar
             summaryBar
+                // The token sheet hangs here: the view itself has the fix sheet.
+                .sheet(isPresented: Binding(
+                    get: { checker.tokenEntryOpen },
+                    set: { checker.tokenEntryOpen = $0 }
+                )) {
+                    RegistryTokenSheet(checker: checker)
+                }
             Divider()
 
             ScrollView {

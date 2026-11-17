@@ -281,12 +281,19 @@ final class EnvironmentCheckerTests: XCTestCase {
 
     /// A checker whose commands go to `runner`. It has its own tool environment,
     /// so no test reads the shell of this Mac.
+    /// The registry of a test: no network, and no ~/.npmrc of this Mac.
+    private nonisolated static func offlineRegistry(npmrcPath: String = "/nonexistent/home/.npmrc") -> RegistryAuth {
+        RegistryAuth(npmrcPath: npmrcPath, session: StubURLProtocol.session { _ in .failure(URLError(.notConnectedToInternet)) }.session)
+    }
+
     private func makeChecker(
-        _ runner: FakeCommandRunner, loginPath: String = "/nonexistent/login", clock: RunnerClock = .live
+        _ runner: FakeCommandRunner, loginPath: String = "/nonexistent/login", clock: RunnerClock = .live,
+        registry: RegistryAuth = offlineRegistry()
     ) -> EnvironmentChecker {
         let checker = EnvironmentChecker(
             monorepoPath: "/nonexistent/mono", loginPath: loginPath, streamServicesPath: "/nonexistent/stream",
-            flavor: .standard, shell: runner, tools: ToolEnvironment(home: "/nonexistent/home"), clock: clock
+            flavor: .standard, shell: runner, tools: ToolEnvironment(home: "/nonexistent/home"), clock: clock,
+            registry: registry
         )
         checker.buildChecks()
         return checker
@@ -326,7 +333,7 @@ final class EnvironmentCheckerTests: XCTestCase {
         XCTAssertEqual(status("docker", in: checker), .failing("docker ps did not answer in 20 s"))
         XCTAssertEqual(status("node", in: checker), .failing("node --version did not answer in 20 s"))
         XCTAssertEqual(status("pnpm", in: checker), .failing("pnpm --version did not answer in 20 s"))
-        XCTAssertEqual(status("registry-auth", in: checker), .failing("grep ~/.npmrc did not answer in 20 s"))
+        XCTAssertEqual(status("registry-auth", in: checker), .failing("pnpm config get did not answer in 20 s"))
         // An optional check warns, so it does not block the wizard.
         XCTAssertEqual(status("stripe-cli", in: checker), .warning("which stripe did not answer in 20 s"))
         XCTAssertEqual(status("stripe-auth", in: checker), .warning("stripe balance retrieve did not answer in 20 s"))
@@ -353,7 +360,7 @@ final class EnvironmentCheckerTests: XCTestCase {
         let checker = EnvironmentChecker(
             monorepoPath: "/nonexistent/mono", loginPath: "/nonexistent/login", streamServicesPath: "",
             flavor: .hackathon, shell: FakeCommandRunner { _ in FakeCommandRunner.timedOut },
-            tools: ToolEnvironment(home: "/nonexistent/home")
+            tools: ToolEnvironment(home: "/nonexistent/home"), registry: Self.offlineRegistry()
         )
         checker.buildChecks()
 
@@ -675,6 +682,204 @@ final class EnvironmentCheckerTests: XCTestCase {
         await checker.fix("login-env")
         XCTAssertEqual(checker.activeFix?.lines, ["Every key is there. Nothing was changed."])
         XCTAssertEqual(status("login-env", in: checker), .passing("Configured"))
+    }
+
+    // MARK: - GitHub Packages token
+
+    private static let token = "ghp_testTOKEN123"
+
+    func testTheTokenComesFromPnpmConfigGet() {
+        XCTAssertEqual(RegistryAuth.token(fromConfigGet: "ghp_abc\n"), "ghp_abc")
+        XCTAssertEqual(RegistryAuth.token(fromConfigGet: "Update available!\nghp_abc\n"), "ghp_abc")
+        XCTAssertNil(RegistryAuth.token(fromConfigGet: "undefined\n"))
+        XCTAssertNil(RegistryAuth.token(fromConfigGet: ""))
+        XCTAssertNil(RegistryAuth.token(fromConfigGet: "(protected)\n"))
+    }
+
+    func testTheTokenOfAnNpmrcFile() {
+        let npmrc = "@fastbreak-amateur:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken = \"ghp_abc\"\n"
+
+        XCTAssertEqual(RegistryAuth.token(fromNpmrc: npmrc), "ghp_abc")
+        XCTAssertNil(RegistryAuth.token(fromNpmrc: "@fastbreak-amateur:registry=https://npm.pkg.github.com\n"))
+        XCTAssertNil(RegistryAuth.token(fromNpmrc: "//npm.pkg.github.com/:_authToken=\n"))
+        XCTAssertNil(RegistryAuth.token(fromNpmrc: "//registry.npmjs.org/:_authToken=npm_abc\n"), "another registry")
+        XCTAssertEqual(RegistryAuth.environmentReference("${GITHUB_TOKEN}"), "GITHUB_TOKEN")
+        XCTAssertNil(RegistryAuth.environmentReference("ghp_abc"))
+    }
+
+    func testEachAnswerOfGitHubPackagesHasItsText() {
+        XCTAssertEqual(RegistryAuth.status(.http(200)), .passing("Token works"))
+        XCTAssertEqual(RegistryAuth.status(.http(401)), .failing("Token expired or revoked."))
+        XCTAssertEqual(RegistryAuth.status(.http(403)), .failing("Token lacks read:packages or org SSO is not authorised."))
+        XCTAssertEqual(RegistryAuth.status(.http(404)), .failing("Token lacks read:packages or org SSO is not authorised."))
+        XCTAssertEqual(RegistryAuth.status(.noToken), .failing(RegistryAuth.noTokenText))
+        // Offline, or an answer that says nothing about the token, only warns.
+        guard case .warning = RegistryAuth.status(.unreachable("offline")) else { return XCTFail("offline must warn") }
+        guard case .warning = RegistryAuth.status(.http(500)) else { return XCTFail("a 500 must warn") }
+        guard case .warning = RegistryAuth.status(.fromEnvironment("GITHUB_TOKEN")) else { return XCTFail("an env reference must warn") }
+    }
+
+    /// A runner whose `pnpm config get` prints `token`.
+    private func tokenRunner(_ token: String) -> FakeCommandRunner {
+        FakeCommandRunner { call in
+            call.command == RegistryAuth.readCommand ? FakeCommandRunner.ok(token + "\n") : FakeCommandRunner.ok()
+        }
+    }
+
+    /// The check sends the token to GitHub Packages; a 401 fails the row with its text.
+    func testTheCheckTestsTheTokenWithGitHubPackages() async throws {
+        let stub = StubURLProtocol.session { _ in .success(401) }
+        let checker = makeChecker(tokenRunner(Self.token), registry: RegistryAuth(npmrcPath: "/nonexistent/home/.npmrc", session: stub.session))
+
+        await checker.runAllChecks()
+
+        XCTAssertEqual(status("registry-auth", in: checker), .failing("Token expired or revoked."))
+        let request = try XCTUnwrap(stub.requests().first)
+        XCTAssertEqual(request.url?.absoluteString, "https://npm.pkg.github.com/@fastbreak-amateur%2Ffb-toolkit")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer \(Self.token)")
+    }
+
+    func testAWorkingTokenPasses() async {
+        let stub = StubURLProtocol.session { _ in .success(200) }
+        let checker = makeChecker(tokenRunner(Self.token), registry: RegistryAuth(npmrcPath: "/nonexistent/home/.npmrc", session: stub.session))
+
+        await checker.runAllChecks()
+
+        XCTAssertEqual(status("registry-auth", in: checker), .passing("Token works"))
+    }
+
+    func testATokenWithoutAccessFails() async {
+        let stub = StubURLProtocol.session { _ in .success(403) }
+        let checker = makeChecker(tokenRunner(Self.token), registry: RegistryAuth(npmrcPath: "/nonexistent/home/.npmrc", session: stub.session))
+
+        await checker.runAllChecks()
+
+        XCTAssertEqual(status("registry-auth", in: checker), .failing("Token lacks read:packages or org SSO is not authorised."))
+    }
+
+    /// Offline the token cannot be tested. The row warns and does not block the wizard.
+    func testOfflineTheRowWarnsAndDoesNotBlock() async {
+        let checker = makeChecker(tokenRunner(Self.token))
+
+        await checker.runAllChecks()
+
+        guard case .warning(let text) = status("registry-auth", in: checker) else {
+            return XCTFail("offline must warn, got \(String(describing: status("registry-auth", in: checker)))")
+        }
+        XCTAssertTrue(text.contains("offline"), text)
+        XCTAssertFalse(checker.blockers.contains { $0.id == "registry-auth" })
+    }
+
+    /// No token: nothing goes to the network.
+    func testNoTokenFailsWithoutARequest() async {
+        let stub = StubURLProtocol.session { _ in .success(200) }
+        let checker = makeChecker(tokenRunner("undefined"), registry: RegistryAuth(npmrcPath: "/nonexistent/home/.npmrc", session: stub.session))
+
+        await checker.runAllChecks()
+
+        XCTAssertEqual(status("registry-auth", in: checker), .failing(RegistryAuth.noTokenText))
+        XCTAssertTrue(stub.requests().isEmpty)
+    }
+
+    /// Without pnpm the row reads the token from the file.
+    func testWithoutPnpmTheFileGivesTheToken() async throws {
+        let directory = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let npmrc = directory.appendingPathComponent(".npmrc").path
+        try "//npm.pkg.github.com/:_authToken=\(Self.token)\n".write(toFile: npmrc, atomically: true, encoding: .utf8)
+        let stub = StubURLProtocol.session { _ in .success(200) }
+        let runner = FakeCommandRunner { call in
+            call.command == RegistryAuth.readCommand ? FakeCommandRunner.failed(127, stderr: "zsh: command not found: pnpm") : FakeCommandRunner.ok()
+        }
+        let checker = makeChecker(runner, registry: RegistryAuth(npmrcPath: npmrc, session: stub.session))
+
+        await checker.runAllChecks()
+
+        XCTAssertEqual(status("registry-auth", in: checker), .passing("Token works"))
+        XCTAssertEqual(stub.requests().first?.value(forHTTPHeaderField: "Authorization"), "Bearer \(Self.token)")
+    }
+
+    func testTheFixAsksForTheTokenInItsOwnSheet() async {
+        let runner = FakeCommandRunner()
+        let checker = makeChecker(runner)
+
+        XCTAssertEqual(checker.fixAction(for: "registry-auth"), .enterToken)
+        await checker.fix("registry-auth")
+
+        XCTAssertTrue(checker.tokenEntryOpen)
+        XCTAssertNil(checker.activeFix, "the fix sheet stays closed")
+        XCTAssertTrue(runner.commands.isEmpty, "nothing ran")
+    }
+
+    /// A good token is saved in the file, after a copy. It never goes on a command line.
+    func testAWorkingTokenIsSavedWithoutACommandLine() async throws {
+        let directory = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let npmrc = directory.appendingPathComponent(".npmrc").path
+        let original = "@other:registry=https://example.invalid\n//npm.pkg.github.com/:_authToken=ghp_old\nsave-exact=true\n"
+        try original.write(toFile: npmrc, atomically: true, encoding: .utf8)
+        let stub = StubURLProtocol.session { _ in .success(200) }
+        let runner = FakeCommandRunner()
+        let checker = makeChecker(runner, registry: RegistryAuth(npmrcPath: npmrc, session: stub.session))
+        await checker.fix("registry-auth")
+
+        let error = await checker.saveRegistryToken("  \(Self.token)\n")
+
+        XCTAssertNil(error)
+        XCTAssertFalse(checker.tokenEntryOpen)
+        XCTAssertEqual(
+            try String(contentsOfFile: npmrc, encoding: .utf8),
+            "@other:registry=https://example.invalid\n//npm.pkg.github.com/:_authToken=\(Self.token)\nsave-exact=true\n"
+        )
+        let permissions = try FileManager.default.attributesOfItem(atPath: npmrc)[.posixPermissions] as? Int
+        XCTAssertEqual(permissions, 0o600)
+        let backups = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasPrefix(".npmrc.bak-") }
+        XCTAssertEqual(backups.count, 1)
+        XCTAssertEqual(try String(contentsOfFile: directory.appendingPathComponent(backups[0]).path, encoding: .utf8), original)
+        for call in runner.calls {
+            XCTAssertFalse(call.command.contains(Self.token), call.command)
+            XCTAssertFalse(call.environment.values.contains(Self.token), call.command)
+        }
+        // The row runs again. pnpm of the fake gives no token, so the file decides.
+        XCTAssertEqual(status("registry-auth", in: checker), .passing("Token works"))
+    }
+
+    /// A token that GitHub Packages refuses is not saved.
+    func testARejectedTokenIsNotSaved() async throws {
+        let directory = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let npmrc = directory.appendingPathComponent(".npmrc").path
+        let stub = StubURLProtocol.session { _ in .success(401) }
+        let checker = makeChecker(FakeCommandRunner(), registry: RegistryAuth(npmrcPath: npmrc, session: stub.session))
+        checker.tokenEntryOpen = true
+
+        let error = await checker.saveRegistryToken(Self.token)
+
+        XCTAssertEqual(error, RegistryTokenError("Token expired or revoked. Nothing was saved."))
+        XCTAssertTrue(checker.tokenEntryOpen, "the sheet stays open")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: npmrc))
+    }
+
+    func testANewFileGetsTheTokenLine() {
+        XCTAssertEqual(RegistryAuth.settingToken("ghp_new", in: ""), "//npm.pkg.github.com/:_authToken=ghp_new\n")
+        XCTAssertEqual(
+            RegistryAuth.settingToken("ghp_new", in: "save-exact=true"),
+            "save-exact=true\n//npm.pkg.github.com/:_authToken=ghp_new\n"
+        )
+    }
+
+    func testUseMyGhTokenReadsTheGitHubCLI() async {
+        let runner = FakeCommandRunner { call in
+            call.command == RegistryAuth.ghTokenCommand ? FakeCommandRunner.ok("gho_fromgh\n") : FakeCommandRunner.ok()
+        }
+        let checker = makeChecker(runner)
+
+        let token = await checker.ghToken()
+
+        XCTAssertEqual(try? token.get(), "gho_fromgh")
+        let missing = makeChecker(FakeCommandRunner { _ in FakeCommandRunner.failed(127) })
+        guard case .failure(let error) = await missing.ghToken() else { return XCTFail("no gh must fail") }
+        XCTAssertEqual(error.text, "The GitHub CLI is not installed — brew install gh")
     }
 
     func testTheElapsedTimeHasMinutesAndSeconds() {
