@@ -321,6 +321,7 @@ actor DbSetupRunner {
             step.logEntries = []
             step.errorMessage = nil
             step.recoveryGuidance = nil
+            step.recoveryAction = nil
             step.healthResult = nil
             step.healthFailures = []
             step.progress = nil
@@ -352,22 +353,24 @@ actor DbSetupRunner {
                     lastLine: step.logEntries.last?.text
                 )
                 step.recoveryGuidance = timeout.guidance
+                step.recoveryAction = .retryFromStep
             }
             return false
         }
 
         if exitCode != 0 {
-            let stepId = step.id
-            let output = await MainActor.run { step.logEntries.map(\.text) }
-            let (msg, guidance) = Self.parseError(stepId: stepId, output: output, exitCode: exitCode)
             await MainActor.run {
+                // The script's own message stays; the table adds the guidance and the action.
+                let diagnosis = DbSetupDiagnostics.diagnose(
+                    stepID: step.id, output: step.logEntries.map(\.text), exitCode: exitCode,
+                    scriptMessage: step.errorMessage
+                )
                 step.status = .failed
                 step.completedAt = .now
                 step.exitCode = exitCode
-                if step.errorMessage == nil {
-                    step.errorMessage = msg
-                    step.recoveryGuidance = guidance
-                }
+                step.errorMessage = diagnosis.message
+                step.recoveryGuidance = diagnosis.guidance
+                step.recoveryAction = diagnosis.action
             }
             return false
         }
@@ -398,7 +401,10 @@ actor DbSetupRunner {
                     } else if step.errorMessage == nil {
                         step.errorMessage = "Health check failed after successful execution"
                         step.recoveryGuidance = "The step ran but the expected result was not found. Check the output."
+                    } else {
+                        step.recoveryGuidance = "The step ran, but its check found a problem. Read the log, then retry the step."
                     }
+                    step.recoveryAction = .retryFromStep
                 }
                 return false
             }
@@ -418,6 +424,7 @@ actor DbSetupRunner {
             step.completedAt = .now
             step.errorMessage = nil
             step.recoveryGuidance = nil
+            step.recoveryAction = nil
         }
     }
 
@@ -576,70 +583,6 @@ actor DbSetupRunner {
         default:
             break
         }
-    }
-
-    // MARK: - Error Diagnostics
-
-    private nonisolated static func parseError(
-        stepId: String, output: [String], exitCode: Int32
-    ) -> (message: String, guidance: String) {
-        let combined = output.joined(separator: "\n").lowercased()
-
-        switch stepId {
-        case "reset-database":
-            if let migLine = output.first(where: {
-                $0.contains("Applying migration") && $0.lowercased().contains("error")
-            }) {
-                let filename = migLine.split(separator: " ")
-                    .first(where: { $0.hasSuffix(".sql") })
-                    .map(String.init) ?? "unknown"
-                if combined.contains("violates foreign key") {
-                    return ("Migration \(filename): FK constraint violation",
-                            "Pull the latest monorepo and fb-amateur-backend, then retry")
-                }
-                if combined.contains("already exists") {
-                    return ("Migration \(filename): object already exists",
-                            "Run pnpm db:stop && pnpm db:start at the monorepo root for a clean slate")
-                }
-                return ("Migration \(filename) failed",
-                        "Check the migration file for errors (supabase/migrations or the backend baseline).")
-            }
-            if combined.contains("could not connect") {
-                return ("Database connection refused",
-                        "Re-run from Start Supabase step")
-            }
-
-        case "load-hotels":
-            if combined.contains("no such file") {
-                return ("Hotel dump file not found",
-                        "Run full setup to fetch hotel data from remote")
-            }
-
-        case "copy-event-data":
-            if combined.contains("urlerror") || combined.contains("connection refused") {
-                return ("Cannot reach remote Supabase API",
-                        "Check internet connection")
-            }
-            if combined.contains("401") || combined.contains("403") {
-                return ("Authentication failed",
-                        "Check the remote Supabase credentials used by copy-remote-data.py")
-            }
-
-        case "start-supabase":
-            if combined.contains("port") && combined.contains("already in use") {
-                return ("Port already in use",
-                        "Another Supabase instance may be running. Stop it (old checkouts: npx supabase stop; monorepo: pnpm db:stop) first.")
-            }
-
-        default:
-            break
-        }
-
-        let lastLine = output.last(where: {
-            !$0.trimmingCharacters(in: .whitespaces).isEmpty
-        }) ?? "Unknown error"
-        return ("Exit code \(exitCode): \(String(lastLine.prefix(100)))",
-                "Check the full output for details")
     }
 
     // MARK: - Health Check

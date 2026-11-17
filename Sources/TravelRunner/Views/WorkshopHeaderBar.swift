@@ -3,7 +3,6 @@ import SwiftUI
 struct WorkshopHeaderBar: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
     @Environment(UpdateController.self) var updates: UpdateController?
-    @State private var confirmingReset = false
     @State private var confirmingResetWithoutHotels = false
 
     private var healthLabel: String {
@@ -197,19 +196,9 @@ struct WorkshopHeaderBar: View {
                     text: notice.headline,
                     subtitle: supervisor.migrationApplyError ?? notice.detail,
                     action: canChange && notice.offersApply ? ("Apply migrations", { supervisor.applyMigrations() }) : nil,
-                    secondaryAction: canChange ? ("Reset and reseed…", { confirmingReset = true }) : nil,
+                    secondaryAction: canChange ? ("\(DbResetPolicy.resetAndReseedTitle)…", { supervisor.askToResetDatabase() }) : nil,
                     onDismiss: { supervisor.dismissMigrationsBanner() }
                 )
-                .confirmationDialog(
-                    DbResetPolicy.resetConfirmationTitle,
-                    isPresented: $confirmingReset,
-                    titleVisibility: .visible
-                ) {
-                    Button("Reset and reseed", role: .destructive) { supervisor.resetDatabase() }
-                    Button("Cancel", role: .cancel) {}
-                } message: {
-                    Text(notice.resetConfirmation)
-                }
             }
             if let notice = supervisor.hotelSourceNotice {
                 let isDbSetupRunning = supervisor.dbResetRunning || supervisor.dbSetupPipeline?.isRunning == true
@@ -247,6 +236,16 @@ struct WorkshopHeaderBar: View {
                     subtitle: nil,
                     action: canLoad ? (HotelCatalog.loadHotelsTitle, { supervisor.loadHotels() }) : nil,
                     onDismiss: { supervisor.dismissHotelCatalogBanner() }
+                )
+            }
+            if let note = supervisor.portalRestartNotice {
+                alertBanner(
+                    icon: "arrow.clockwise.circle.fill",
+                    color: .blue,
+                    text: note,
+                    subtitle: nil,
+                    action: (EnvironmentSupervisor.restartPortalsTitle, { supervisor.restartPortals() }),
+                    onDismiss: { supervisor.dismissPortalRestartNotice() }
                 )
             }
             if let note = supervisor.migrationsAppliedNotice {

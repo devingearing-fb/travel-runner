@@ -204,6 +204,21 @@ enum DbResetPolicy {
         let resetConfirmation: String
     }
 
+    /// A reset that waits for the person to confirm it.
+    struct ResetRequest: Equatable, Sendable {
+        let message: String
+        /// The branch has a reset without hotels (the `fast` profile).
+        let offersWithoutHotels: Bool
+    }
+
+    /// The body of the reset confirmation of DB Tools and the banners.
+    static func resetRequestText(scenario: String, hotels: HotelCatalog.DumpState, otherCheckout: String?) -> String {
+        let body = "Every local booking, block and user is deleted. Scenario: \(scenario). Hotels: \(hotels.resetLine)."
+        return [body, otherCheckout].compactMap { $0 }.joined(separator: " ")
+    }
+
+    static let resetAndReseedTitle = "Reset and reseed"
+
     static let resetConfirmationTitle = "Reset the local database?"
     static let resetConfirmationBody = "Every local booking, block and user is deleted, and the database is rebuilt from this checkout."
 

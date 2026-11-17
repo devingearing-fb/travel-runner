@@ -4,53 +4,118 @@ import Foundation
 enum DbManifestLoader {
     static let supportedSeedScenarioVersions: Set<Int> = [3, 4]
 
+    /// Why the steps of a profile cannot be read from the manifest. Nothing runs then:
+    /// a bad manifest never falls back to the built-in steps.
+    enum ManifestError: LocalizedError, Equatable {
+        case unreadable(String)
+        case unknownProfile(String)
+        case unknownStep(profile: String, step: String)
+        case emptyProfile(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .unreadable(let reason):
+                return "Cannot read scripts/db/manifest.json: \(reason). Nothing was run."
+            case .unknownProfile(let profile):
+                return "Profile '\(profile)' is not defined on this branch"
+            case .unknownStep(let profile, let step):
+                return "Profile '\(profile)' names step '\(step)', which scripts/db/manifest.json does not define. Nothing was run."
+            case .emptyProfile(let profile):
+                return "Profile '\(profile)' has no steps in scripts/db/manifest.json. Nothing was run."
+            }
+        }
+    }
+
+    /// The steps of `profile`. Keys the runner does not know are ignored, so a newer
+    /// manifest still loads. With no manifest file the built-in steps run
+    /// (`DbSetupPipeline.builtInStepsLabel`); any other problem throws.
     @MainActor
-    static func load(from manifestPath: String, profile: String) -> [DbSetupStep] {
-        guard let data = FileManager.default.contents(atPath: manifestPath),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let stepsArray = json["steps"] as? [[String: Any]],
-              let profiles = json["profiles"] as? [String: [String]] else {
+    static func load(from manifestPath: String, profile: String) throws -> [DbSetupStep] {
+        guard FileManager.default.fileExists(atPath: manifestPath) else {
             return DbSetupPipeline.buildDefault()
         }
-
-        let profileStepIDs = profiles[profile]
-            ?? profiles["reset"]
-            ?? stepsArray.map { $0["id"] as? String ?? "" }
-        var stepMap: [String: [String: Any]] = [:]
-        for step in stepsArray {
-            if let id = step["id"] as? String { stepMap[id] = step }
+        let manifest = try readManifest(manifestPath)
+        guard let profileStepIDs = manifest.profiles[profile] else {
+            throw ManifestError.unknownProfile(profile)
         }
+        guard !profileStepIDs.isEmpty else { throw ManifestError.emptyProfile(profile) }
 
         // `idleTimeoutMs` of a step, else of the manifest, else 180 s.
-        let defaultIdleMs = (json["idleTimeoutMs"] as? Int) ?? DbSetupStep.defaultIdleTimeoutSeconds * 1000
+        let defaultIdleMs = manifest.idleTimeoutMs ?? DbSetupStep.defaultIdleTimeoutSeconds * 1000
 
         var result: [DbSetupStep] = []
         for (index, stepID) in profileStepIDs.enumerated() {
-            guard let definition = stepMap[stepID] else { continue }
-            let step = DbSetupStep(
+            guard let definition = manifest.steps[stepID] else {
+                throw ManifestError.unknownStep(profile: profile, step: stepID)
+            }
+            guard let command = definition["command"] as? String,
+                  !command.trimmingCharacters(in: .whitespaces).isEmpty else {
+                throw ManifestError.unreadable("step '\(stepID)' has no command")
+            }
+            result.append(DbSetupStep(
                 id: stepID,
                 name: definition["name"] as? String ?? stepID,
-                command: definition["command"] as? String ?? "",
+                command: command,
                 healthCheckCommand: definition["healthCheck"] as? String,
                 timeoutSeconds: ((definition["timeoutMs"] as? Int) ?? 60000) / 1000,
                 isOptional: definition["optional"] as? Bool ?? false,
                 stepNumber: index + 1,
                 idleTimeoutSeconds: max(1, ((definition["idleTimeoutMs"] as? Int) ?? defaultIdleMs) / 1000)
-            )
-            result.append(step)
+            ))
         }
+        return result
+    }
 
-        return result.isEmpty ? DbSetupPipeline.buildDefault() : result
+    /// The parts of the manifest that name the steps.
+    private struct StepManifest {
+        let steps: [String: [String: Any]]
+        let profiles: [String: [String]]
+        let idleTimeoutMs: Int?
+    }
+
+    private static func readManifest(_ manifestPath: String) throws -> StepManifest {
+        let data: Data
+        do {
+            data = try Data(contentsOf: URL(fileURLWithPath: manifestPath))
+        } catch {
+            throw ManifestError.unreadable(error.localizedDescription)
+        }
+        let raw: Any
+        do {
+            raw = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw ManifestError.unreadable("it is not valid JSON")
+        }
+        guard let json = raw as? [String: Any] else {
+            throw ManifestError.unreadable("the root must be an object")
+        }
+        guard let stepsArray = json["steps"] as? [[String: Any]] else {
+            throw ManifestError.unreadable("steps must be a list of objects")
+        }
+        guard let profiles = json["profiles"] as? [String: [String]] else {
+            throw ManifestError.unreadable("profiles must map each name to a list of step ids")
+        }
+        var steps: [String: [String: Any]] = [:]
+        for step in stepsArray {
+            guard let id = step["id"] as? String, !id.isEmpty else {
+                throw ManifestError.unreadable("a step has no id")
+            }
+            steps[id] = step
+        }
+        return StepManifest(steps: steps, profiles: profiles, idleTimeoutMs: json["idleTimeoutMs"] as? Int)
     }
 
     /// The profile names of the manifest, or nil when it is absent or unreadable.
-    /// `load` falls back to `reset` for a profile that is not there, so a caller that
-    /// must never reset (Apply migrations) asks this first.
+    /// A caller that offers a profile asks this first, so the button is hidden when
+    /// the branch lacks it.
     static func profileNames(from manifestPath: String) -> Set<String>? {
-        guard let data = FileManager.default.contents(atPath: manifestPath),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let profiles = json["profiles"] as? [String: [String]] else { return nil }
-        return Set(profiles.keys)
+        profiles(from: manifestPath).map { Set($0.keys) }
+    }
+
+    /// Profile name to step ids, or nil when the manifest is absent or unreadable.
+    static func profiles(from manifestPath: String) -> [String: [String]]? {
+        guard FileManager.default.fileExists(atPath: manifestPath) else { return nil }
+        return try? readManifest(manifestPath).profiles
     }
 
     static func loadSeedScenarios(from manifestPath: String) throws -> DbSeedScenarioCatalog {
@@ -87,11 +152,11 @@ enum DbManifestLoader {
         guard supportedSeedScenarioVersions.contains(version) else {
             throw SeedScenarioError.unsupportedVersion(version)
         }
+        // Keys this runner does not know are ignored: a newer checkout can add some.
         guard let section = manifest["seedScenarios"] as? [String: Any],
-              Set(section.keys) == ["directory"],
               let directory = section["directory"] as? String else {
             throw SeedScenarioError.malformedMetadata(
-                "seedScenarios must contain only a string directory"
+                "seedScenarios must contain a string directory"
             )
         }
 

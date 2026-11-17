@@ -2219,6 +2219,123 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertFalse(supervisor.dbResetRunning)
     }
 
+    // MARK: - D5: DB Tools confirm, choose, recover
+
+    /// "Re-download hotels" runs the fetch step alone with `--force`, never the reset.
+    func testReDownloadHotelsRunsOnlyTheFetchWithForce() async throws {
+        try loadSupabase()
+        supervisor.shell = FakeCommandRunner()
+        supervisor.hotelDumpPath = workDir.appendingPathComponent("hotels/travel_organizations.sql").path
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let marker = workDir.appendingPathComponent("reset-ran")
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([
+                self.step("reset-database", "touch '\(marker.path)'"),
+                self.step(HotelCatalog.fetchStepID, "echo fetch"),
+            ], profile: profile)
+        }
+
+        supervisor.redownloadHotels()
+        let done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+
+        let pipeline = try XCTUnwrap(supervisor.dbSetupPipeline)
+        let fetch = try XCTUnwrap(pipeline.steps.first { $0.id == HotelCatalog.fetchStepID })
+        XCTAssertEqual(fetch.status, .passed)
+        XCTAssertEqual(fetch.command, "echo fetch --force")
+        XCTAssertEqual(fetch.logEntries.map(\.text), ["fetch --force"])
+        XCTAssertEqual(pipeline.steps.first { $0.id == "reset-database" }?.status, .pending)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "nothing was reset")
+        XCTAssertEqual(supervisor.hotelDump, .missing, "the dump is read again after a fetch")
+
+        // Control: "Load hotels only" adds no flag.
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([self.step(HotelCatalog.loadStepID, "echo load")], profile: profile)
+        }
+        supervisor.loadHotels()
+        let loaded = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(loaded)
+        XCTAssertEqual(supervisor.dbSetupPipeline?.steps.first?.command, "echo load")
+    }
+
+    /// Finding seed-no-post-reset-refresh: after a reset the running portals hold the
+    /// old data. The runner says so and offers "Restart portals".
+    func testAResetWhilePortalsRunOffersToRestartThem() async throws {
+        let portal = ServiceDefinition(
+            id: "travel-portal", name: "Travel Portal", cmd: ["sleep", "60"], cwd: workDir.path, probe: nil,
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: "portal", reuseIfRunning: nil
+        )
+        try supervisor.loadServices([daemon("supabase", ["sleep", "60"]), portal])
+        state("supabase").phase = .running
+        state("travel-portal").phase = .running
+        supervisor.shell = FakeCommandRunner()
+        supervisor.hotelDumpPath = workDir.appendingPathComponent("hotels/travel_organizations.sql").path
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([self.step("reset-database", "true")], profile: profile)
+        }
+
+        supervisor.resetDatabase()
+        let done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+        XCTAssertEqual(supervisor.portalRestartNotice, "Database reset — restart portals to pick up fresh data")
+        XCTAssertEqual(supervisor.runningPortalIDs, ["travel-portal"])
+
+        // Negative control: with no portal running there is nothing to restart.
+        state("travel-portal").phase = .stopped
+        supervisor.resetDatabase()
+        XCTAssertNil(supervisor.portalRestartNotice, "a new setup clears the old notice")
+        let again = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(again)
+        XCTAssertNil(supervisor.portalRestartNotice)
+    }
+
+    /// Finding seed-reset-button-ux: Reset Database asks first. The question names the
+    /// scenario, the hotels and another checkout's data, and runs nothing.
+    func testTheResetButtonAsksFirstAndNamesWhatHappens() async throws {
+        try loadSupabase()
+        _ = try checkoutLackingAMigration(
+            profiles: ["reset", HotelCatalog.withoutHotelsProfile],
+            builtFrom: #"{"checkout_path":"/elsewhere/mono","branch":"dev"}"#
+        )
+        supervisor.dbSeedScenarios = [DbSeedScenario(
+            id: "sold-out", name: "Sold out", description: "", fileSummary: "", variables: []
+        )]
+        supervisor.selectedDbSeedScenarioID = "sold-out"
+        supervisor.hotelDump = .cached("Cached — 209,823 rows, 2026-08-11")
+
+        supervisor.askToResetDatabase()
+        let asked = await waitUntil(10) { self.supervisor.resetConfirmation != nil }
+        XCTAssertTrue(asked)
+
+        let request = try XCTUnwrap(supervisor.resetConfirmation)
+        XCTAssertTrue(request.message.hasPrefix(
+            "Every local booking, block and user is deleted. Scenario: Sold out. Hotels: reload from cache (about 3 min)."
+        ), request.message)
+        XCTAssertTrue(request.message.contains("This database was last built from /elsewhere/mono (dev)."), request.message)
+        XCTAssertTrue(request.offersWithoutHotels)
+        XCTAssertFalse(supervisor.dbResetRunning, "a question runs nothing")
+        XCTAssertNil(supervisor.dbSetupPipeline)
+
+        supervisor.cancelResetConfirmation()
+        XCTAssertNil(supervisor.resetConfirmation)
+
+        // Control: a branch without the fast profile offers no reset without hotels,
+        // and a dump that is not cached is downloaded first.
+        _ = try checkoutLackingAMigration(profiles: ["reset"])
+        supervisor.hotelDump = .missing
+        supervisor.askToResetDatabase()
+        let askedAgain = await waitUntil(10) { self.supervisor.resetConfirmation != nil }
+        XCTAssertTrue(askedAgain)
+        XCTAssertEqual(supervisor.resetConfirmation?.offersWithoutHotels, false)
+        XCTAssertEqual(
+            supervisor.resetConfirmation?.message,
+            "Every local booking, block and user is deleted. Scenario: Sold out. Hotels: download from dev, then load (about 8 min)."
+        )
+    }
+
     // MARK: - DB setup with a pipeline from the test
 
     private func pipeline(_ steps: [DbSetupStep], profile: String = "reset") -> DbSetupPipeline {

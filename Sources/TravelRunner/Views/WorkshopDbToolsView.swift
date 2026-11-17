@@ -45,6 +45,13 @@ struct WorkshopDbToolsView: View {
                     onReload: { supervisor.reloadDbSeedScenarios() }
                 )
 
+                if let notice = supervisor.dbSeedScenarioNotice {
+                    Label(notice, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
                 Divider()
 
                 sectionHeader("Actions")
@@ -52,7 +59,7 @@ struct WorkshopDbToolsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 12) {
                         Button {
-                            supervisor.resetDatabase()
+                            supervisor.askToResetDatabase()
                         } label: {
                             HStack(spacing: 8) {
                                 if isDbSetupRunning {
@@ -91,7 +98,25 @@ struct WorkshopDbToolsView: View {
                         .font(.caption2)
                         .foregroundStyle(canResetDatabase ? Color.secondary : Color.orange)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    if let note = supervisor.portalRestartNotice {
+                        HStack(spacing: 8) {
+                            Label(note, systemImage: "arrow.clockwise.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.blue)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Button(EnvironmentSupervisor.restartPortalsTitle) { supervisor.restartPortals() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        }
+                    }
                 }
+
+                Divider()
+
+                sectionHeader("Hotels")
+
+                hotelActions
 
                 Divider()
 
@@ -104,7 +129,10 @@ struct WorkshopDbToolsView: View {
                         isRunning: supervisor.dbResetRunning,
                         onRetryFrom: { supervisor.runDbSetup(from: $0) },
                         onCancel: { supervisor.cancelDbSetup() },
-                        onDismiss: { supervisor.dismissDbSetup() }
+                        onDismiss: { supervisor.dismissDbSetup() },
+                        onCopy: { supervisor.copyDbStepReport($0) },
+                        actionTitle: { title(for: $0) },
+                        onAction: { perform($0, step: $1) }
                     )
                 } else {
                     Text("No pipeline running")
@@ -113,6 +141,80 @@ struct WorkshopDbToolsView: View {
                 }
             }
             .padding(20)
+        }
+        // The verify reads the whole dump, so it runs once; a DB step that writes the
+        // dump reads it again.
+        .task { if supervisor.hotelDump == .unknown { await supervisor.refreshHotelDump() } }
+    }
+
+    // MARK: - Hotels
+
+    private var canChangeDatabase: Bool {
+        !isDbSetupRunning && supervisor.compatibilityNotice == nil
+    }
+
+    @ViewBuilder
+    private var hotelActions: some View {
+        let canLoad = supervisor.manifestProfileHasStep("reset", HotelCatalog.loadStepID)
+        let canDownload = supervisor.manifestProfileHasStep("reset", HotelCatalog.fetchStepID)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                if canLoad {
+                    Button(HotelCatalog.loadHotelsOnlyTitle) { supervisor.loadHotels() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .disabled(!canChangeDatabase)
+                        .help("Load the hotels into the database as it is. Nothing is deleted.")
+                }
+                if canDownload {
+                    Button(HotelCatalog.redownloadTitle) { supervisor.redownloadHotels() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .disabled(!canChangeDatabase)
+                        .help("Download the hotel dump from dev again. The database is not changed.")
+                }
+                Text(supervisor.hotelDump.label)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            if !canLoad && !canDownload {
+                Text("This branch has no hotel steps in scripts/db/manifest.json.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// The text of the fix button of a failed step, or nil when DB Tools has no
+    /// button for it. Retry is on every failed row already.
+    private func title(for action: RecoveryAction) -> String? {
+        switch action {
+        case .importSharedEnv: HotelCatalog.importButtonTitle
+        case .redownloadHotels: HotelCatalog.redownloadTitle
+        case .resetWithoutHotels: "\(HotelCatalog.resetWithoutHotelsTitle)…"
+        case .openContainerRuntime: "Open \(ContainerRuntime.detect().appName)"
+        case .openLog: "Open in Terminals"
+        default: nil
+        }
+    }
+
+    /// Runs the fix button of a failed step. A reset of any kind asks first.
+    private func perform(_ action: RecoveryAction, step: DbSetupStep) {
+        switch action {
+        case .importSharedEnv:
+            supervisor.importSharedEnvForHotels()
+        case .redownloadHotels:
+            supervisor.redownloadHotels()
+        case .resetWithoutHotels:
+            supervisor.askToResetDatabase()
+        case .openContainerRuntime:
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/\(ContainerRuntime.detect().appName).app"))
+        case .openLog:
+            WorkshopPanel.shared.navigation.selectedLogServiceID = step.logKey
+            WorkshopPanel.shared.navigation.selectedSection = .logs
+        default:
+            break
         }
     }
 

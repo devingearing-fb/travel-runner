@@ -6,6 +6,11 @@ struct DbSetupPipelineView: View {
     let onRetryFrom: (String) -> Void
     let onCancel: () -> Void
     let onDismiss: () -> Void
+    /// "Copy error + log" of a step.
+    var onCopy: (DbSetupStep) -> Void = { _ in }
+    /// The text of the fix button for an action, or nil for no button.
+    var actionTitle: (RecoveryAction) -> String? = { _ in nil }
+    var onAction: (RecoveryAction, DbSetupStep) -> Void = { _, _ in }
 
     private var isActivelyRunning: Bool {
         isRunning || pipeline.isRunning
@@ -39,7 +44,8 @@ struct DbSetupPipelineView: View {
                 Text("Database Setup")
                     .font(.system(.callout, design: .monospaced))
                     .fontWeight(.medium)
-                Text("Scenario: \(pipeline.seedScenario.name)  •  Profile: \(pipeline.profile)")
+                Text("Scenario: \(pipeline.seedScenario.name)  •  Profile: \(pipeline.profile)"
+                     + (pipeline.stepsSource.map { "  •  \($0)" } ?? ""))
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -147,7 +153,10 @@ struct DbSetupPipelineView: View {
                         onToggleExpand: {
                             expandedStepID = expandedStepID == step.id ? nil : step.id
                         },
-                        onRetry: { onRetryFrom(step.id) }
+                        onRetry: { onRetryFrom(step.id) },
+                        onCopy: { onCopy(step) },
+                        actionTitle: actionTitle,
+                        onAction: { onAction($0, step) }
                     )
                 }
             }
@@ -173,6 +182,21 @@ struct DbSetupStepRow: View {
     let isExpanded: Bool
     let onToggleExpand: () -> Void
     let onRetry: () -> Void
+    var onCopy: () -> Void = {}
+    var actionTitle: (RecoveryAction) -> String? = { _ in nil }
+    var onAction: (RecoveryAction) -> Void = { _ in }
+
+    /// The height of the log pane. The person can drag its bottom edge.
+    @State private var logHeight: CGFloat = DbSetupStepRow.logPaneHeight
+    @State private var dragStartHeight: CGFloat?
+
+    /// The log pane of a step (plan 4.0, item 17): 220 pt, resizable.
+    static let logPaneHeight: CGFloat = 220
+    static let logPaneHeightRange: ClosedRange<CGFloat> = 100...800
+
+    private var hasFailed: Bool {
+        step.status == .failed || step.status == .timedOut
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -182,9 +206,12 @@ struct DbSetupStepRow: View {
             errorRow
 
             if isExpanded && !step.logEntries.isEmpty {
-                stepLogView
-                    .frame(height: 100)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                VStack(spacing: 0) {
+                    stepLogView
+                        .frame(height: logHeight)
+                        .clipShape(RoundedRectangle(cornerRadius: 4))
+                    resizeHandle
+                }
             }
         }
         .padding(.vertical, 4)
@@ -204,7 +231,6 @@ struct DbSetupStepRow: View {
             Text(step.name)
                 .font(.system(.caption, design: .monospaced))
                 .fontWeight(.medium)
-                .lineLimit(1)
 
             if step.isOptional {
                 Text("OPTIONAL")
@@ -232,11 +258,7 @@ struct DbSetupStepRow: View {
 
             Spacer()
 
-            if let elapsed = step.elapsed, step.completedAt != nil {
-                Text(formatStepElapsed(elapsed))
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
+            elapsedLabel
 
             if step.status == .failed || step.status == .timedOut || step.status == .cancelled {
                 Button("Retry") { onRetry() }
@@ -345,30 +367,92 @@ struct DbSetupStepRow: View {
         }
     }
 
+    // MARK: - Elapsed
+
+    /// The time of the step against its hard cap ("1m 05s / 15m"). It counts while
+    /// the step runs.
+    @ViewBuilder
+    private var elapsedLabel: some View {
+        if step.startedAt != nil {
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                let seconds = Int(step.elapsed ?? 0)
+                Text(DbSetupDiagnostics.elapsedLabel(seconds: seconds, capSeconds: step.hardCapSeconds))
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .help("Time of the step, and the longest it may run")
+            }
+        }
+    }
+
     // MARK: - Error Row
 
     @ViewBuilder
     private var errorRow: some View {
         if let error = step.errorMessage {
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 4) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .top, spacing: 4) {
                     Spacer().frame(width: 24)
                     Text(error)
                         .font(.system(.caption2, design: .monospaced))
                         .foregroundStyle(.red)
-                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
                 }
                 if let guidance = step.recoveryGuidance {
-                    HStack(spacing: 4) {
+                    HStack(alignment: .top, spacing: 4) {
                         Spacer().frame(width: 24)
                         Text(guidance)
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.orange)
-                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .textSelection(.enabled)
+                    }
+                }
+                if hasFailed {
+                    HStack(spacing: 6) {
+                        Spacer().frame(width: 24)
+                        if let action = step.recoveryAction, let title = actionTitle(action) {
+                            Button(title) { onAction(action) }
+                                .buttonStyle(.bordered)
+                                .controlSize(.mini)
+                        }
+                        Button("Copy error + log") { onCopy() }
+                            .buttonStyle(.bordered)
+                            .controlSize(.mini)
+                            .help("Copy the error, what to do and the whole log, with secrets removed")
+                        if !step.logEntries.isEmpty, let title = actionTitle(.openLog) {
+                            Button(title) { onAction(.openLog) }
+                                .buttonStyle(.borderless)
+                                .controlSize(.mini)
+                        }
                     }
                 }
             }
         }
+    }
+
+    // MARK: - Resize Handle
+
+    private var resizeHandle: some View {
+        Rectangle()
+            .fill(Color.secondary.opacity(0.25))
+            .frame(height: 4)
+            .frame(maxWidth: .infinity)
+            .contentShape(Rectangle().inset(by: -3))
+            .onHover { inside in
+                if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+            }
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { value in
+                        let start = dragStartHeight ?? logHeight
+                        dragStartHeight = start
+                        let range = Self.logPaneHeightRange
+                        logHeight = min(max(start + value.translation.height, range.lowerBound), range.upperBound)
+                    }
+                    .onEnded { _ in dragStartHeight = nil }
+            )
+            .help("Drag to resize the log")
     }
 
     // MARK: - Log View
@@ -403,12 +487,5 @@ struct DbSetupStepRow: View {
         case .passed: Color.green.opacity(0.03)
         default: Color.clear
         }
-    }
-
-    private func formatStepElapsed(_ interval: TimeInterval) -> String {
-        let totalSeconds = Int(interval)
-        let minutes = totalSeconds / 60
-        let seconds = totalSeconds % 60
-        return minutes > 0 ? "\(minutes)m \(seconds)s" : "\(seconds)s"
     }
 }

@@ -54,6 +54,14 @@ final class EnvironmentSupervisor {
     var dbSeedScenarios: [DbSeedScenario] = []
     var selectedDbSeedScenarioID: String?
     var dbSeedScenarioLoadError: String?
+    /// Set when the saved scenario is not on this branch and the default one is used.
+    var dbSeedScenarioNotice: String?
+    /// The reset that waits for the person to confirm it, or nil.
+    var resetConfirmation: DbResetPolicy.ResetRequest? = nil
+    /// The cached hotel dump, as `fetch-hotels.mjs --verify` sees it.
+    var hotelDump: HotelCatalog.DumpState = .unknown
+    /// Set after a reset passed while portals ran, until a restart or a dismiss.
+    var portalRestartNotice: String? = nil
 
     var selectedDbSeedScenario: DbSeedScenario? {
         guard let selectedDbSeedScenarioID else { return nil }
@@ -234,6 +242,8 @@ final class EnvironmentSupervisor {
     var dbPipelineFactory: ((_ cwd: String, _ profile: String) -> DbSetupPipeline?)?
     /// How a DB step command starts. Tests give a shell that reads no startup files.
     var dbStepLauncher: StepLauncher = .loginShell
+    /// Where the app keeps the hotel dump. Tests give their own folder.
+    @ObservationIgnored var hotelDumpPath = DbSetupRunner.hotelDumpPath()
     /// The version that the checkout's `runner.minVersion` is compared with. Nil is
     /// never blocked. Tests set it.
     @ObservationIgnored var runnerVersion: String? = Compatibility.comparableVersion(of: .current)
@@ -1480,23 +1490,21 @@ final class EnvironmentSupervisor {
         do {
             let catalog = try DbManifestLoader.loadSeedScenarios(from: manifestPath)
             dbSeedScenarios = catalog.items
-            do {
-                let resolvedID = try DbSeedScenarioSelection.resolve(
-                    catalog: catalog,
-                    savedID: savedID
-                )
-                selectedDbSeedScenarioID = resolvedID
-                if savedID == nil {
-                    userDefaults.set(resolvedID, forKey: "dbSeedScenarioID")
-                }
-                dbSeedScenarioLoadError = nil
-            } catch {
-                selectedDbSeedScenarioID = savedID
-                dbSeedScenarioLoadError = error.localizedDescription
+            let resolution = DbSeedScenarioSelection.resolve(catalog: catalog, savedID: savedID)
+            selectedDbSeedScenarioID = resolution.id
+            // A saved scenario that this branch lacks stays saved: it comes back on a
+            // branch that has it. Until then the reset uses the default one.
+            if savedID == nil {
+                userDefaults.set(resolution.id, forKey: "dbSeedScenarioID")
             }
+            dbSeedScenarioNotice = resolution.staleID.map {
+                DbSeedScenarioSelection.staleNotice(id: $0, using: catalog.defaultScenario?.name ?? resolution.id)
+            }
+            dbSeedScenarioLoadError = nil
         } catch {
             dbSeedScenarios = []
             selectedDbSeedScenarioID = savedID
+            dbSeedScenarioNotice = nil
             dbSeedScenarioLoadError = "Seed scenarios cannot be loaded: \(error.localizedDescription)"
         }
     }
@@ -1510,6 +1518,7 @@ final class EnvironmentSupervisor {
         selectedDbSeedScenarioID = id
         userDefaults.set(id, forKey: "dbSeedScenarioID")
         dbSeedScenarioLoadError = nil
+        dbSeedScenarioNotice = nil
     }
 
     func resetDatabase(profile: String = "reset") {
@@ -1655,9 +1664,11 @@ final class EnvironmentSupervisor {
     /// The checks and the guard. Nil when nothing may start; the reason is then in
     /// `lastError`, or another setup runs.
     /// `reusePipeline` false builds a new pipeline for a step, also when one is shown.
+    /// `stepArguments` go after the command of the step `stepId` ("Re-download
+    /// hotels": `--force`).
     private func beginDbSetup(
         cwd: String?, profile: String, reason: String?, origin: DbSetupOrigin, from stepId: String?,
-        singleStep: Bool = false, reusePipeline: Bool = true
+        singleStep: Bool = false, reusePipeline: Bool = true, stepArguments: String? = nil
     ) -> DbSetupRun? {
         guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return nil }
         guard let cwd else {
@@ -1677,6 +1688,9 @@ final class EnvironmentSupervisor {
                 pipeline = newPipeline
             }
             if singleStep, pipeline?.steps.contains(where: { $0.id == stepId }) != true { return nil }
+            if let stepArguments, let pipeline, let index = pipeline.steps.firstIndex(where: { $0.id == stepId }) {
+                pipeline.steps[index] = pipeline.steps[index].appending(arguments: stepArguments)
+            }
             if let pipeline {
                 runner = makeDbSetupRunner(cwd: cwd, pipeline: pipeline)
                 dbSetupRunner = runner
@@ -1688,6 +1702,8 @@ final class EnvironmentSupervisor {
         migrationApplyError = nil
         migrationsAppliedNotice = nil
         hotelSourceNotice = nil
+        portalRestartNotice = nil
+        resetConfirmation = nil
         return DbSetupRun(
             cwd: cwd, profile: pipeline?.profile ?? profile, reason: reason, origin: origin,
             stepId: stepId, singleStep: singleStep, pipeline: pipeline, runner: runner
@@ -1730,6 +1746,9 @@ final class EnvironmentSupervisor {
             } else if dbSetupFailedAtStart, !run.singleStep {
                 // The start stays halted until Retry, so the header says what to do.
                 lastError = DbResetPolicy.setUpAfterHaltText
+            } else if Self.isReset(run.pipeline), !runningPortalIDs.isEmpty {
+                // The portals still hold the old data (sessions, caches).
+                portalRestartNotice = Self.portalRestartText
             }
         } else if let failed {
             let message = failed.errorMessage ?? "unknown error"
@@ -1762,7 +1781,114 @@ final class EnvironmentSupervisor {
             await refreshPendingMigrations(cwd: run.cwd)
             if ok { await refreshHotelCatalog(cwd: run.cwd) }
         }
+        // A fetch, or a load that found a stale dump, can have written a new dump.
+        let dumpSteps: Set<String> = [HotelCatalog.fetchStepID, HotelCatalog.loadStepID]
+        if run.pipeline?.steps.contains(where: { dumpSteps.contains($0.id) && $0.status != .pending }) == true {
+            await refreshHotelDump()
+        }
         return ok
+    }
+
+    // MARK: - After a reset
+
+    nonisolated static let portalRestartText = "Database reset — restart portals to pick up fresh data"
+    nonisolated static let restartPortalsTitle = "Restart portals"
+
+    /// True when the pipeline reset the database: its reset step passed.
+    private static func isReset(_ pipeline: DbSetupPipeline?) -> Bool {
+        pipeline?.steps.contains { $0.id == "reset-database" && $0.status == .passed } == true
+    }
+
+    /// The portal services that run now.
+    var runningPortalIDs: [String] {
+        sortedServiceIDs.filter { id in
+            guard let state = serviceStates[id] else { return false }
+            return state.definition.phase == "portal" && (state.phase == .running || state.phase == .starting)
+        }
+    }
+
+    /// "Restart portals": each portal that runs restarts on the fresh data.
+    func restartPortals() {
+        portalRestartNotice = nil
+        for id in runningPortalIDs { restartService(id) }
+    }
+
+    func dismissPortalRestartNotice() {
+        portalRestartNotice = nil
+    }
+
+    // MARK: - Reset confirmation
+
+    /// Every reset button asks first. The confirmation names the scenario, what
+    /// happens to the hotels, and another checkout that built the database.
+    func askToResetDatabase() {
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return }
+        let scenario = selectedDbSeedScenario?.name ?? "none selected"
+        let cwd = supabaseCwd
+        Task {
+            var other: String?
+            if let cwd {
+                other = DbResetPolicy.otherCheckoutLine(
+                    await readBuiltFrom(cwd: cwd),
+                    current: DbResetPolicy.Checkout(path: cwd, branch: gitBranches["supabase"]),
+                    project: SupabaseProject.projectName(root: cwd)
+                )
+            }
+            resetConfirmation = DbResetPolicy.ResetRequest(
+                message: DbResetPolicy.resetRequestText(scenario: scenario, hotels: hotelDump, otherCheckout: other),
+                offersWithoutHotels: manifestHasProfile(HotelCatalog.withoutHotelsProfile)
+            )
+        }
+    }
+
+    func cancelResetConfirmation() {
+        resetConfirmation = nil
+    }
+
+    // MARK: - Hotel dump
+
+    /// Reads the cached hotel dump again, for DB Tools and the reset confirmation.
+    func refreshHotelDump() async {
+        guard let cwd = supabaseCwd else {
+            hotelDump = .unknown
+            return
+        }
+        let detail = await HotelCatalog.readCachedDump(
+            monorepo: cwd, dumpPath: hotelDumpPath, shell: shell, cwd: cwd
+        )
+        hotelDump = detail.map { .cached($0) } ?? .missing
+    }
+
+    /// "Re-download hotels": the fetch step alone, with `--force`. It never resets.
+    func redownloadHotels() {
+        guard let run = beginDbSetup(
+            cwd: supabaseCwd, profile: "reset", reason: nil, origin: .singleStep, from: HotelCatalog.fetchStepID,
+            singleStep: true, reusePipeline: false, stepArguments: HotelCatalog.forceArgument
+        ) else { return }
+        Task { await completeDbSetup(run) }
+    }
+
+    /// True when the profile of the checkout's manifest has the step. A button for one
+    /// step is hidden when the branch lacks it.
+    func manifestProfileHasStep(_ profile: String, _ stepID: String) -> Bool {
+        guard let cwd = supabaseCwd else { return false }
+        let manifest = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
+        return DbManifestLoader.profiles(from: manifest)?[profile]?.contains(stepID) == true
+    }
+
+    // MARK: - Copy error + log
+
+    /// "Copy error + log": the error, what to do and the whole log of the step,
+    /// redacted, on the clipboard.
+    func copyDbStepReport(_ step: DbSetupStep) {
+        let report = DbSetupDiagnostics.report(
+            stepName: step.name, stepID: step.id, status: step.status.rawValue, exitCode: step.exitCode,
+            error: step.errorMessage, guidance: step.recoveryGuidance, log: step.logEntries.map(\.text)
+        )
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(makeRedactor().redact(report), forType: .string)
+        onActionFeedback?("Copied the error and log of \(step.name)", true)
     }
 
     /// One step from DB Tools, on its own. It goes through the same guard, event and
@@ -3445,11 +3571,20 @@ final class EnvironmentSupervisor {
                 ?? "Choose a valid seed scenario before resetting the database."
             return nil
         }
-        let steps = FileManager.default.fileExists(atPath: manifestPath)
-            ? DbManifestLoader.load(from: manifestPath, profile: profile)
-            : DbSetupPipeline.buildDefault()
+        // A bad manifest or a profile it lacks runs nothing. Only a checkout with no
+        // manifest runs the built-in steps, and the pipeline says so.
+        let steps: [DbSetupStep]
+        do {
+            steps = try DbManifestLoader.load(from: manifestPath, profile: profile)
+        } catch {
+            lastError = error.localizedDescription
+            return nil
+        }
         let pipeline = DbSetupPipeline(profile: profile, seedScenario: seedScenario)
         pipeline.steps = steps
+        if !FileManager.default.fileExists(atPath: manifestPath) {
+            pipeline.stepsSource = DbSetupPipeline.builtInStepsLabel
+        }
         return pipeline
     }
 

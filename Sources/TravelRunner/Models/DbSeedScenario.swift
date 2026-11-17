@@ -23,19 +23,25 @@ struct DbSeedScenarioCatalog: Equatable, Sendable {
 }
 
 enum DbSeedScenarioSelection {
-    struct StaleSelectionError: LocalizedError, Equatable {
+    /// The scenario of the next reset, and the saved one that this branch lacks.
+    struct Resolution: Equatable {
         let id: String
-
-        var errorDescription: String? {
-            "Saved seed scenario ‘\(id)’ is not available on this branch. Choose a seed scenario before resetting the database."
-        }
+        /// The saved scenario that is not on this branch. The reset uses the default
+        /// scenario, and the saved choice comes back on a branch that has it.
+        let staleID: String?
     }
 
-    static func resolve(catalog: DbSeedScenarioCatalog, savedID: String?) throws -> String {
-        guard let savedID else { return catalog.defaultID }
+    /// The saved scenario when this branch has it, else the default one.
+    static func resolve(catalog: DbSeedScenarioCatalog, savedID: String?) -> Resolution {
+        guard let savedID else { return Resolution(id: catalog.defaultID, staleID: nil) }
         guard catalog.items.contains(where: { $0.id == savedID }) else {
-            throw StaleSelectionError(id: savedID)
+            return Resolution(id: catalog.defaultID, staleID: savedID)
         }
-        return savedID
+        return Resolution(id: savedID, staleID: nil)
+    }
+
+    /// The note when the saved scenario is not on this branch.
+    static func staleNotice(id: String, using name: String) -> String {
+        "Scenario '\(id)' is not on this branch — using \(name)"
     }
 }

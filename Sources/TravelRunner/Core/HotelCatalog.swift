@@ -94,6 +94,68 @@ enum HotelCatalog {
             .map { String($0.dropFirst(prefix.count)) }
     }
 
+    /// "Cached — 209,823 rows, 2026-08-11" for a valid dump, or nil. It reads the dump
+    /// of the app, or one still in the checkout (the next fetch moves it). The
+    /// checkout's script decides if it is whole; a checkout without the script takes
+    /// any file.
+    static func readCachedDump(
+        monorepo: String, dumpPath: String, shell: any CommandRunning, cwd: String?
+    ) async -> String? {
+        let exists = { FileManager.default.fileExists(atPath: $0) }
+        let paths = [dumpPath, DbSetupRunner.checkoutHotelDumpPath(root: monorepo)]
+        let script = (monorepo as NSString).appendingPathComponent("scripts/db/fetch-hotels.mjs")
+        guard exists(script) else { return paths.contains(where: exists) ? "Cached" : nil }
+        for path in paths where exists(path) {
+            let result = await shell.run(
+                EnvironmentChecker.hotelVerifyCommand(monorepo: monorepo, dump: path),
+                cwd: cwd, timeout: EnvironmentChecker.checkTimeout
+            )
+            if let detail = cachedDetail(verifyOutput: result.stdout, succeeded: result.succeeded) {
+                return detail
+            }
+        }
+        return nil
+    }
+
+    /// The cached dump, for DB Tools and the reset confirmation.
+    enum DumpState: Equatable, Sendable {
+        /// Not read yet.
+        case unknown
+        /// A valid dump: the detail of `fetch-hotels.mjs --verify`.
+        case cached(String)
+        /// No valid dump: the next reset downloads one.
+        case missing
+
+        /// The hotel part of the reset confirmation. The minutes are estimates: the
+        /// load of about 200,000 rows, and the download from dev before it.
+        var resetLine: String {
+            switch self {
+            case .cached: "reload from cache (about \(HotelCatalog.reloadMinutes) min)"
+            case .missing: "download from dev, then load (about \(HotelCatalog.downloadMinutes) min)"
+            case .unknown:
+                "reload from cache, or download first when none is cached (\(HotelCatalog.reloadMinutes)–\(HotelCatalog.downloadMinutes) min)"
+            }
+        }
+
+        /// The text beside "Re-download hotels".
+        var label: String {
+            switch self {
+            case .cached(let detail): detail
+            case .missing: "No cached hotel dump"
+            case .unknown: "Hotel dump not checked yet"
+            }
+        }
+    }
+
+    static let reloadMinutes = 3
+    static let downloadMinutes = 8
+
+    static let loadHotelsOnlyTitle = "Load hotels only"
+    static let redownloadTitle = "Re-download hotels"
+    /// The step that downloads the dump, and the flag that makes it download again.
+    static let fetchStepID = "fetch-hotels"
+    static let forceArgument = "--force"
+
     static let noSourceText =
         "No cached hotel dump, and no dev keys in the shared .env (AMATEUR_SUPABASE_URL, ANON_KEY, SIGNING_KEY) — import apps/booking-portal/.env"
     static let keysOnlyText = "Not cached — the shared .env has the dev keys; the first reset downloads the hotels (3–5 min)"

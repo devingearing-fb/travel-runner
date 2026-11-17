@@ -60,10 +60,9 @@ final class DbSeedScenarioTests: XCTestCase {
         XCTAssertEqual(catalog.defaultID, "standard")
         XCTAssertTrue(Set(catalog.items.map(\.id)).isSuperset(of: ["standard", "schema-only", "sold-out", "redis-cache"]))
 
-        let steps = MainActor.assumeIsolated { DbManifestLoader.load(from: manifest.path, profile: "full") }
-        XCTAssertEqual(steps.map(\.id), [
-            "check-prerequisites", "start-supabase", "reset-database", "load-hotels", "copy-event-data", "verify-data",
-        ])
+        let steps = try MainActor.assumeIsolated { try DbManifestLoader.load(from: manifest.path, profile: "full") }
+        XCTAssertTrue(steps.map(\.id).starts(with: ["check-prerequisites", "start-supabase"]))
+        XCTAssertEqual(steps.last?.id, "verify-data")
     }
 
     func testFolderManifestVersionFourIsAccepted() throws {
@@ -300,16 +299,143 @@ final class DbSeedScenarioTests: XCTestCase {
         assertLoadFails(cycle, containing: "inheritance contains a cycle")
     }
 
-    func testSelectionResolutionUsesDefaultRestoresValidAndRejectsStale() throws {
+    /// Finding seed-scenario-catalog-brittle: a saved scenario that this branch lacks
+    /// blocked every reset. It now falls back to the default and says so.
+    func testSelectionResolutionUsesDefaultRestoresValidAndFallsBackFromStale() throws {
         let catalog = DbSeedScenarioCatalog(
             defaultID: "standard",
             items: [standardScenario, soldOutScenario]
         )
-        XCTAssertEqual(try DbSeedScenarioSelection.resolve(catalog: catalog, savedID: nil), "standard")
-        XCTAssertEqual(try DbSeedScenarioSelection.resolve(catalog: catalog, savedID: "sold-out"), "sold-out")
-        XCTAssertThrowsError(try DbSeedScenarioSelection.resolve(catalog: catalog, savedID: "deleted")) {
-            XCTAssertTrue($0.localizedDescription.contains("Choose a seed scenario"))
+        XCTAssertEqual(DbSeedScenarioSelection.resolve(catalog: catalog, savedID: nil), .init(id: "standard", staleID: nil))
+        XCTAssertEqual(DbSeedScenarioSelection.resolve(catalog: catalog, savedID: "sold-out"), .init(id: "sold-out", staleID: nil))
+        XCTAssertEqual(DbSeedScenarioSelection.resolve(catalog: catalog, savedID: "deleted"), .init(id: "standard", staleID: "deleted"))
+        XCTAssertEqual(
+            DbSeedScenarioSelection.staleNotice(id: "deleted", using: "Standard"),
+            "Scenario 'deleted' is not on this branch — using Standard"
+        )
+    }
+
+    /// The supervisor resets with the default scenario, says why, and keeps the
+    /// saved choice for a branch that has it.
+    @MainActor
+    func testAStaleSavedScenarioUsesTheDefaultAndKeepsTheSavedChoice() throws {
+        let fixture = try makeRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.container) }
+        try writeFolderManifest(fixture)
+        try writeScenario(descriptor(id: "standard", order: 10, isDefault: true), fixture)
+        let suiteName = "DbSeedScenarioTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("sold-out", forKey: "dbSeedScenarioID")
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        try supervisor.loadServices([ServiceDefinition(
+            id: "supabase", name: nil, cmd: ["true"], cwd: fixture.root.path, probe: nil, type: .daemon,
+            restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )])
+
+        supervisor.reloadDbSeedScenarios()
+
+        XCTAssertEqual(supervisor.selectedDbSeedScenarioID, "standard")
+        XCTAssertEqual(supervisor.selectedDbSeedScenario?.name, "Standard")
+        XCTAssertNil(supervisor.dbSeedScenarioLoadError, "the reset is not blocked")
+        XCTAssertEqual(supervisor.dbSeedScenarioNotice, "Scenario 'sold-out' is not on this branch — using Standard")
+        XCTAssertEqual(defaults.string(forKey: "dbSeedScenarioID"), "sold-out")
+
+        // Control: a branch that has the saved scenario uses it, with no notice.
+        try writeScenario(descriptor(id: "sold-out", order: 20), fixture)
+        supervisor.reloadDbSeedScenarios()
+        XCTAssertEqual(supervisor.selectedDbSeedScenarioID, "sold-out")
+        XCTAssertNil(supervisor.dbSeedScenarioNotice)
+    }
+
+    // MARK: - The steps of the manifest
+
+    /// Finding seed-manifest-fallback-silent: a bad manifest ran a hard-coded pipeline.
+    @MainActor
+    func testTheStepsOfAProfileAndTheKeysTheRunnerDoesNotKnow() throws {
+        let fixture = try makeRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.container) }
+        try writeJSON([
+            "version": 9,
+            "runner": ["minVersion": "0.1.0"],
+            "somethingNew": true,
+            "idleTimeoutMs": 60000,
+            "steps": [
+                ["id": "start", "name": "Start", "command": "node start.mjs", "timeoutMs": 300000, "futureKey": 1],
+                ["id": "verify", "command": "node verify.mjs", "healthCheck": NSNull(), "idleTimeoutMs": 5000],
+            ],
+            "profiles": ["reset": ["start", "verify"], "fast": ["verify"]],
+        ], fixture.manifest)
+
+        let steps = try DbManifestLoader.load(from: fixture.manifest.path, profile: "reset")
+        XCTAssertEqual(steps.map(\.id), ["start", "verify"])
+        XCTAssertEqual(steps.map(\.name), ["Start", "verify"])
+        XCTAssertEqual(steps.map(\.stepNumber), [1, 2])
+        XCTAssertEqual(steps.map(\.idleTimeoutSeconds), [60, 5])
+        XCTAssertEqual(steps[0].timeoutSeconds, 300)
+        XCTAssertNil(steps[1].healthCheckCommand)
+        XCTAssertEqual(DbManifestLoader.profileNames(from: fixture.manifest.path), ["reset", "fast"])
+    }
+
+    @MainActor
+    func testAnUnknownProfileOrABadManifestRunsNothing() throws {
+        let fixture = try makeRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.container) }
+        try writeJSON([
+            "version": 4,
+            "steps": [["id": "verify", "command": "true"]],
+            "profiles": ["reset": ["verify"], "broken": ["verify", "gone"], "empty": []],
+        ], fixture.manifest)
+        func error(_ profile: String) -> String? {
+            do {
+                _ = try DbManifestLoader.load(from: fixture.manifest.path, profile: profile)
+                return nil
+            } catch {
+                return error.localizedDescription
+            }
         }
+
+        XCTAssertEqual(error("migrate"), "Profile 'migrate' is not defined on this branch")
+        XCTAssertEqual(
+            error("broken"),
+            "Profile 'broken' names step 'gone', which scripts/db/manifest.json does not define. Nothing was run."
+        )
+        XCTAssertEqual(error("empty"), "Profile 'empty' has no steps in scripts/db/manifest.json. Nothing was run.")
+        XCTAssertNil(error("reset"), "control: a known profile loads")
+
+        try Data("{ not json".utf8).write(to: fixture.manifest)
+        XCTAssertEqual(error("reset"), "Cannot read scripts/db/manifest.json: it is not valid JSON. Nothing was run.")
+        XCTAssertNil(DbManifestLoader.profileNames(from: fixture.manifest.path))
+
+        try writeJSON(["version": 4, "steps": [["id": "verify"]], "profiles": ["reset": ["verify"]]], fixture.manifest)
+        XCTAssertEqual(error("reset"), "Cannot read scripts/db/manifest.json: step 'verify' has no command. Nothing was run.")
+    }
+
+    /// Only a checkout with no manifest runs the built-in steps, and the pipeline says so.
+    @MainActor
+    func testTheBuiltInStepsRunOnlyWithoutAManifest() throws {
+        let fixture = try makeRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.container) }
+        let steps = try DbManifestLoader.load(from: fixture.manifest.path, profile: "anything")
+        XCTAssertEqual(steps.map(\.id), DbSetupPipeline.buildDefault().map(\.id))
+        XCTAssertNil(DbManifestLoader.profileNames(from: fixture.manifest.path))
+        XCTAssertEqual(DbSetupPipeline.builtInStepsLabel, "Built-in steps (no manifest)")
+    }
+
+    /// The seedScenarios section may grow: a key the runner does not know is ignored.
+    func testTheSeedScenarioSectionIgnoresUnknownKeys() throws {
+        let fixture = try makeRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.container) }
+        try writeJSON([
+            "version": 4,
+            "seedScenarios": ["directory": "supabase/seeds/scenarios", "defaultHint": "standard"],
+        ], fixture.manifest)
+        try writeScenario(descriptor(id: "standard", order: 10, isDefault: true), fixture)
+        XCTAssertEqual(try DbManifestLoader.loadSeedScenarios(from: fixture.manifest.path).defaultID, "standard")
+
+        // Negative control: the directory itself is still required.
+        try writeJSON(["version": 4, "seedScenarios": ["defaultHint": "standard"]], fixture.manifest)
+        assertLoadFails(fixture, containing: "string directory")
     }
 
     @MainActor

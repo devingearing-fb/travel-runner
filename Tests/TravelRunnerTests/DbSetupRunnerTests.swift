@@ -320,7 +320,7 @@ final class DbSetupRunnerTests: XCTestCase {
            {"id": "c", "name": "C", "command": "true", "timeoutMs": 1000}
          ]}
         """#.utf8).write(to: manifest)
-        let steps = DbManifestLoader.load(from: manifest.path, profile: "reset")
+        let steps = try DbManifestLoader.load(from: manifest.path, profile: "reset")
         XCTAssertEqual(steps.map(\.idleTimeoutSeconds), [240, 60, 240])
 
         // Without the key the default is 180 s.
@@ -328,7 +328,7 @@ final class DbSetupRunnerTests: XCTestCase {
         {"version": 4, "profiles": {"reset": ["a"]},
          "steps": [{"id": "a", "name": "A", "command": "true", "timeoutMs": 1000}]}
         """#.utf8).write(to: manifest)
-        XCTAssertEqual(DbManifestLoader.load(from: manifest.path, profile: "reset").map(\.idleTimeoutSeconds), [180])
+        XCTAssertEqual(try DbManifestLoader.load(from: manifest.path, profile: "reset").map(\.idleTimeoutSeconds), [180])
     }
 
     // MARK: - Ordered output

@@ -671,16 +671,9 @@ final class EnvironmentChecker {
     /// The dump of the app, or one still in the checkout (the next fetch moves it). The
     /// checkout's script decides if it is whole. A checkout without the script takes any file.
     private func readHotelCache() async -> String? {
-        let paths = [hotelDumpPath, DbSetupRunner.checkoutHotelDumpPath(root: monorepoPath)]
-        let script = (monorepoPath as NSString).appendingPathComponent("scripts/db/fetch-hotels.mjs")
-        guard exists(script) else { return paths.contains(where: exists) ? "Cached" : nil }
-        for path in paths where exists(path) {
-            let result = await runCommand(Self.hotelVerifyCommand(monorepo: monorepoPath, dump: path))
-            if let detail = HotelCatalog.cachedDetail(verifyOutput: result.stdout, succeeded: result.succeeded) {
-                return detail
-            }
-        }
-        return nil
+        await HotelCatalog.readCachedDump(
+            monorepo: monorepoPath, dumpPath: hotelDumpPath, shell: commandRunner, cwd: commandCwd
+        )
     }
 
     /// The checkout that `scripts/local-db.sh` replays, as its login shell picks it. Its

@@ -41,7 +41,8 @@ final class DbSetupStep: Identifiable {
 
     /// The log store key of this step's output. The runner writes under it and a
     /// failure issue reads from it.
-    nonisolated var logKey: String { "db-setup-\(id)" }
+    nonisolated var logKey: String { "\(Self.logKeyPrefix)\(id)" }
+    nonisolated static let logKeyPrefix = "db-setup-"
 
     /// A step with no `idleTimeoutMs` in the manifest is stopped after 180 s with no output.
     nonisolated static let defaultIdleTimeoutSeconds = 180
@@ -83,6 +84,8 @@ final class DbSetupStep: Identifiable {
     /// it (10 to 13: the hotels cannot be had).
     var exitCode: Int32? = nil
     var recoveryGuidance: String? = nil
+    /// The fix that the step row offers for the failure.
+    var recoveryAction: RecoveryAction? = nil
     var logEntries: [LogEntry] = []
     var startedAt: Date? = nil
     var completedAt: Date? = nil
@@ -104,6 +107,16 @@ final class DbSetupStep: Identifiable {
         self.isOptional = isOptional
         self.stepNumber = stepNumber
     }
+
+    /// The same step with `arguments` after its command ("Re-download hotels" adds
+    /// `--force` to the fetch). The health check stays as it is.
+    nonisolated func appending(arguments: String) -> DbSetupStep {
+        DbSetupStep(
+            id: id, name: name, command: "\(command) \(arguments)", healthCheckCommand: healthCheckCommand,
+            timeoutSeconds: timeoutSeconds, isOptional: isOptional, stepNumber: stepNumber,
+            idleTimeoutSeconds: idleTimeoutSeconds
+        )
+    }
 }
 
 @Observable
@@ -113,6 +126,8 @@ final class DbSetupPipeline {
     nonisolated let seedScenario: DbSeedScenario
 
     var steps: [DbSetupStep] = []
+    /// Where the steps come from when it is not the checkout's manifest.
+    var stepsSource: String? = nil
     var isRunning = false
     var startedAt: Date? = nil
     var completedAt: Date? = nil
@@ -134,6 +149,9 @@ final class DbSetupPipeline {
     var firstCancelled: DbSetupStep? {
         steps.first { $0.status == .cancelled }
     }
+
+    /// The label of a pipeline that runs `buildDefault()`: the checkout has no manifest.
+    nonisolated static let builtInStepsLabel = "Built-in steps (no manifest)"
 
     /// What the pipeline shows after a cancel.
     nonisolated static let cancelledMessage = "Cancelled. The database may be half-built — Run All to finish."

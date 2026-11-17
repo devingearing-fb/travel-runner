@@ -66,6 +66,24 @@ struct WorkshopView: View {
             ToastOverlay(center: toastCenter)
         }
         .preferredColorScheme(.dark)
+        // One confirmation for every reset button: DB Tools and the banners.
+        .confirmationDialog(
+            DbResetPolicy.resetConfirmationTitle,
+            isPresented: Binding(
+                get: { supervisor.resetConfirmation != nil },
+                set: { if !$0 { supervisor.cancelResetConfirmation() } }
+            ),
+            titleVisibility: .visible,
+            presenting: supervisor.resetConfirmation
+        ) { request in
+            Button(DbResetPolicy.resetAndReseedTitle, role: .destructive) { supervisor.resetDatabase() }
+            if request.offersWithoutHotels {
+                Button(HotelCatalog.resetWithoutHotelsTitle, role: .destructive) { supervisor.resetWithoutHotels() }
+            }
+            Button("Cancel", role: .cancel) { supervisor.cancelResetConfirmation() }
+        } message: { request in
+            Text(request.message)
+        }
     }
 }
 
