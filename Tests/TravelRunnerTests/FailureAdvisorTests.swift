@@ -19,6 +19,16 @@ final class FailureAdvisorTests: XCTestCase {
         FailureAdvisor.advise(kind, context, now: now)
     }
 
+    /// A failed install before the start offers the install again, not a restart.
+    func testAFailedInstallOffersTheInstall() {
+        let text = "Booking Portal cannot start: its packages are not installed and pnpm install --frozen-lockfile failed (exit 1) — see its log"
+        let condition = advise(.installFailed(text), portal())
+        XCTAssertEqual(condition.headline, text)
+        XCTAssertEqual(condition.actions, [.installDependencies, .openLog])
+        // Negative control: a plain message gets Restart.
+        XCTAssertEqual(advise(.message(text), portal()).actions, [.openLog, .restart])
+    }
+
     func testAProbeTimeoutWithTheProcessAliveSaysItMayStillCompile() {
         let condition = advise(.probeTimeout(seconds: 240, processAlive: true, lastProbe: .refused), portal())
         XCTAssertEqual(condition.headline, "Booking Portal did not answer on port 3002 within 240s.")

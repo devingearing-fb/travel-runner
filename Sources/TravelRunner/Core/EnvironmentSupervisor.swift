@@ -179,6 +179,11 @@ final class EnvironmentSupervisor {
     private var gitBranchWatcher: GitBranchWatcher?
     private var gitRepoRoots: [String: String] = [:]
     private var dependencyWatcher: DependencyWatcher?
+    /// `deps.json`: the lockfile hash of each install folder at its last install.
+    /// Tests give a file in their own folder.
+    @ObservationIgnored var dependencyRecord = DependencyRecord.live
+    /// The install that runs in each install folder. A second caller waits for it.
+    private var installTasks: [String: Task<CommandResult, Never>] = [:]
     private var gitWatcherTask: Task<Void, Never>?
     private var depsWatcherTask: Task<Void, Never>?
     private var isTogglingNetwork = false
@@ -287,6 +292,8 @@ final class EnvironmentSupervisor {
         case badProbe(name: String, reason: String)
         /// services.json does not set the folder of the service's repo.
         case folderUnset(name: String)
+        /// The packages were missing and their install failed. `why` comes from `installFailure`.
+        case installFailed(name: String, command: String, why: String)
 
         var description: String {
             switch self {
@@ -307,6 +314,8 @@ final class EnvironmentSupervisor {
                 "\(name) cannot start: port \(port) is published by a container (\(owner)) — stop that container, then restart \(name)"
             case .folderUnset(let name):
                 "\(name) cannot start: no folder is set — open Settings → Reconfigure Repos"
+            case .installFailed(let name, let command, let why):
+                "\(name) cannot start: its packages are not installed and \(command) \(why)"
             }
         }
     }
@@ -498,7 +507,7 @@ final class EnvironmentSupervisor {
             }
         }
         if !depsMap.isEmpty {
-            let depsWatcher = DependencyWatcher(repoPaths: depsMap)
+            let depsWatcher = DependencyWatcher(repoPaths: depsMap, record: dependencyRecord)
             dependencyWatcher = depsWatcher
             depsWatcherTask = Task { await startDepsWatching(watcher: depsWatcher) }
         }
@@ -1243,8 +1252,9 @@ final class EnvironmentSupervisor {
         }
     }
 
-    /// `pnpm install` at the root of the pnpm workspace of the service (`npm install`
-    /// in a repo without one), with its output in the service's log, then a restart.
+    /// `pnpm install --frozen-lockfile` at the root of the pnpm workspace of the
+    /// service (`npm install` in a repo without one), with its output in the
+    /// service's log, then a restart.
     private func installDependenciesAndRestart(_ serviceID: String) {
         guard let cwd = serviceCwd(serviceID) else { return }
         let name = displayName(serviceID)
@@ -1252,27 +1262,121 @@ final class EnvironmentSupervisor {
         Task {
             beginAction(serviceID)
             defer { endAction(serviceID) }
-            let logStore = logStore
+            let result = await installPackages(
+                serviceID, cwd: cwd, announce: "[travel-runner] Running \(command) in \(folder)"
+            )
+            guard result.succeeded else {
+                let why = Self.installFailure(result)
+                lastError = "\(command) for \(name) \(why)"
+                onActionFeedback?("\(command) \(why)", false)
+                return
+            }
+            restartService(serviceID)
+        }
+    }
+
+    /// Installs the packages of the service's repo, with the output in the service's
+    /// log. One install runs per install folder: a second caller writes one line and
+    /// waits for the install that runs. A successful install records the lockfile
+    /// hash in `deps.json`.
+    private func installPackages(_ serviceID: String, cwd: String, announce: String) async -> CommandResult {
+        let (folder, command) = DependencyWatcher.installTarget(for: cwd)
+        let logStore = logStore
+        if let running = installTasks[folder] {
             await logStore.append(serviceID: serviceID, entry: LogEntry(
-                stream: .stdout, text: "[travel-runner] Running \(command) in \(folder)"
+                stream: .stdout, text: "[travel-runner] Waiting for the \(command) that runs in \(folder)"
             ))
+            return await running.value
+        }
+        let shell = shell
+        let record = dependencyRecord
+        let task = Task<CommandResult, Never> {
+            await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: announce))
             // One reader appends the lines, so the log keeps their order.
             let (lines, sink) = AsyncStream<LogEntry>.makeStream()
             let writer = Task {
                 for await entry in lines { await logStore.append(serviceID: serviceID, entry: entry) }
             }
             let result = await shell.run(
-                command, cwd: folder, environment: [:], timeout: .seconds(600),
+                command, cwd: folder, environment: [:], timeout: EnvironmentChecker.installTimeout,
                 onLine: { line, stream in sink.yield(LogEntry(stream: stream, text: line)) }
             )
             sink.finish()
             await writer.value
-            guard result.succeeded else {
-                let why = result.timedOut ? "did not finish in 10 minutes" : "failed (exit \(result.exitCode))"
-                lastError = "\(command) for \(name) \(why) — see its log"
-                onActionFeedback?("\(command) \(why)", false)
-                return
+            if result.succeeded, let hash = DependencyWatcher.lockHash(folder: folder) {
+                record.record(hash, for: folder)
             }
+            return result
+        }
+        installTasks[folder] = task
+        let result = await task.value
+        installTasks[folder] = nil
+        if result.succeeded {
+            // The row drops its install button now, not at the next watcher check.
+            npmStaleServices = npmStaleServices.filter { id in
+                serviceCwd(id).map { DependencyWatcher.installTarget(for: $0).folder } != folder
+            }
+        }
+        return result
+    }
+
+    /// Why an install failed, after its command: "failed (exit 1) — see its log".
+    nonisolated static func installFailure(_ result: CommandResult) -> String {
+        if (result.stdout + result.stderr).contains(EnvironmentChecker.registryRejectedMarker) {
+            return "failed: \(EnvironmentChecker.registryRejectedText)"
+        }
+        let minutes = EnvironmentChecker.installTimeout.components.seconds / 60
+        return result.timedOut
+            ? "did not finish in \(minutes) minutes — see its log"
+            : "failed (exit \(result.exitCode)) — see its log"
+    }
+
+    /// The services that check their own packages and are skipped without them.
+    /// No install runs for them before a start.
+    private static let ownPackageCheck: Set<String> = [
+        ServiceCatalog.agentID, ServiceCatalog.platformCoreID, ServiceCatalog.eventDirectoryID,
+    ]
+
+    /// The state of the packages of the service, or nil for a service that gets no
+    /// install from the runner: a oneshot, one with its own check, or one with no folder.
+    private func dependencyState(_ serviceID: String) async -> DependencyState? {
+        guard let definition = graph?.nodes[serviceID], definition.resolvedType == .daemon,
+              !Self.ownPackageCheck.contains(serviceID),
+              let cwd = definition.resolvedCwd, !cwd.isEmpty else { return nil }
+        let record = dependencyRecord
+        return await Task.detached { DependencyWatcher.state(of: cwd, record: record) }.value
+    }
+
+    /// A branch change restarts the running services of the repo. When their packages
+    /// are not fresh (the new branch changed the lockfile), the install runs first: the
+    /// old packages would make the portal crash in a loop. After a failed install the
+    /// services of that folder keep their process, and the banner says why.
+    func restartAfterBranchChange(_ serviceIDs: [String]) async {
+        var installed: [String: Bool] = [:]
+        for serviceID in serviceIDs {
+            guard let cwd = serviceCwd(serviceID) else { continue }
+            let (folder, command) = DependencyWatcher.installTarget(for: cwd)
+            guard installed[folder] == nil else { continue }
+            guard let state = await dependencyState(serviceID), state != .fresh else {
+                installed[folder] = true
+                continue
+            }
+            beginAction(serviceID)
+            let result = await installPackages(
+                serviceID, cwd: cwd,
+                announce: "[travel-runner] The lockfile changed — running \(command) before the restart"
+            )
+            endAction(serviceID)
+            installed[folder] = result.succeeded
+            if !result.succeeded {
+                let why = Self.installFailure(result)
+                lastError = "\(command) for \(displayName(serviceID)) \(why)"
+                onActionFeedback?("\(command) \(why)", false)
+            }
+        }
+        for serviceID in serviceIDs {
+            let folder = serviceCwd(serviceID).map { DependencyWatcher.installTarget(for: $0).folder }
+            if let folder, installed[folder] == false { continue }
             restartService(serviceID)
         }
     }
@@ -1337,6 +1441,8 @@ final class EnvironmentSupervisor {
             return .exited(code: state.exitCode)
         case .commandNotRunnable(_, let finding):
             return .cannotRun(finding)
+        case .installFailed:
+            return .installFailed(serviceError.description)
         default:
             return .message(serviceError.description)
         }
@@ -1575,9 +1681,7 @@ final class EnvironmentSupervisor {
             }
 
             let runningChanged = changed.filter { serviceStates[$0]?.phase == .running }
-            for serviceID in runningChanged {
-                restartService(serviceID)
-            }
+            await restartAfterBranchChange(sortedServiceIDs.filter { runningChanged.contains($0) })
         }
     }
 
@@ -2231,6 +2335,22 @@ final class EnvironmentSupervisor {
                     if let _ = await secretStore.get("STRIPE_WEBHOOK_SECRET") { break }
                     try? await clock.sleep(for: .milliseconds(500))
                 }
+            }
+        }
+
+        // A Node service without its packages cannot run: install them first, in its
+        // log. A stale install only gets the button of its row (decision 11).
+        if await dependencyState(serviceID) == .missing, let cwd = definition.resolvedCwd {
+            let command = DependencyWatcher.installTarget(for: cwd).command
+            state.phase = .starting
+            state.lastStarted = clock.date()
+            let result = await installPackages(
+                serviceID, cwd: cwd, announce: "[travel-runner] packages are not installed — running \(command)"
+            )
+            guard result.succeeded else {
+                throw ServiceError.installFailed(
+                    name: definition.displayName, command: command, why: Self.installFailure(result)
+                )
             }
         }
 

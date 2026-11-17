@@ -39,6 +39,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.onServiceCrash = { [weak self] name, code in
             self?.crashes.append((name, code))
         }
+        // deps.json of a test is in its own folder, never in ~/.config.
+        supervisor.dependencyRecord = DependencyRecord(path: workDir.appendingPathComponent("config/deps.json").path)
     }
 
     /// Gives the supervisor a shell that holds each "where is the tool" question
@@ -97,7 +99,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         return text.split(separator: "\n").contains { $0.hasPrefix("n") && $0.hasSuffix("/" + directory) }
     }
 
-    private static func listeners(on port: Int) -> [pid_t] {
+    private nonisolated static func listeners(on port: Int) -> [pid_t] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
         process.arguments = ["-ti", "TCP:\(port)", "-sTCP:LISTEN"]
@@ -1595,6 +1597,203 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains("ERR! network"), lines.joined(separator: "\n"))
     }
 
+    // MARK: - Dependencies before start (O6)
+
+    private nonisolated static let pnpmInstall = "pnpm install --frozen-lockfile"
+
+    /// Makes the folder of the test a pnpm workspace with no packages installed.
+    private func makeWorkspace(lock: String = "lock A") throws {
+        let old = Date(timeIntervalSince1970: 1_700_000_000)
+        for (name, text) in [("pnpm-workspace.yaml", "packages: []\n"), ("package.json", "{}\n"), ("pnpm-lock.yaml", lock)] {
+            let url = workDir.appendingPathComponent(name)
+            try Data(text.utf8).write(to: url)
+            try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: url.path)
+        }
+    }
+
+    private nonisolated static func markInstalled(_ folder: URL) {
+        let modules = folder.appendingPathComponent("node_modules")
+        try? FileManager.default.createDirectory(at: modules, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modules.appendingPathComponent(".modules.yaml").path, contents: Data())
+    }
+
+    /// A fake pnpm install that writes the install marker, as the real one does.
+    private func fakeInstaller(gate: Gate? = nil, during: (@Sendable () -> Void)? = nil) -> FakeCommandRunner {
+        let folder = workDir!
+        return FakeCommandRunner { call in
+            guard call.command == Self.pnpmInstall else { return FakeCommandRunner.ok() }
+            await gate?.wait()
+            during?()
+            Self.markInstalled(folder)
+            return FakeCommandRunner.ok("Packages: +1\nDone")
+        }
+    }
+
+    /// Finding "lifecycle-deps-stale-badge-only": a service whose packages are not
+    /// installed is started only after an install, which runs in its log.
+    func testMissingPackagesAreInstalledBeforeTheStart() async throws {
+        try makeWorkspace()
+        let shell = fakeInstaller()
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let installs = shell.calls.filter { $0.command == Self.pnpmInstall }
+        XCTAssertEqual(installs.map(\.cwd), [workDir.path])
+        XCTAssertEqual(installs.first?.timeout, EnvironmentChecker.installTimeout)
+        let lines = await logLines("web")
+        let announce = try XCTUnwrap(lines.firstIndex(of: "[travel-runner] packages are not installed — running pnpm install --frozen-lockfile"))
+        let done = try XCTUnwrap(lines.firstIndex(of: "Done"))
+        XCTAssertLessThan(announce, done)
+        XCTAssertEqual(supervisor.dependencyRecord.hash(for: workDir.path), DependencyWatcher.lockHash(folder: workDir.path))
+        XCTAssertNotNil(Self.listeners(on: port).first)
+    }
+
+    /// Two services of one workspace that start together share one install.
+    func testOneInstallPerWorkspaceRoot() async throws {
+        try makeWorkspace()
+        let gate = Gate()
+        let shell = fakeInstaller(gate: gate)
+        supervisor.shell = shell
+        let worker = ServiceDefinition(
+            id: "worker", name: nil, cmd: ["sleep", "30"], cwd: workDir.path, probe: nil, type: .daemon,
+            restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        let anchor = ServiceDefinition(
+            id: "anchor", name: nil, cmd: ["sleep", "1"], cwd: nil, probe: nil, type: .daemon, restart: .never,
+            dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([daemon("web", webServer), worker, anchor])
+        supervisor.serviceStates["anchor"]?.phase = .running
+        supervisor.health = .healthy
+
+        supervisor.restartService("web")
+        supervisor.restartService("worker")
+
+        let joined = await waitUntil(10) { shell.calls.contains { $0.command == Self.pnpmInstall } }
+        XCTAssertTrue(joined)
+        var waiting = false
+        for _ in 0..<100 where !waiting {
+            let all = await logLines("web") + logLines("worker")
+            waiting = all.contains { $0.hasPrefix("[travel-runner] Waiting for the pnpm install --frozen-lockfile that runs in") }
+            if !waiting { try await Task.sleep(for: .milliseconds(50)) }
+        }
+        XCTAssertTrue(waiting, "the second service waits for the install that runs")
+        await gate.open()
+
+        let ready = await waitUntil(30) { self.settled("web") && self.settled("worker") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue), worker is \(state("worker").phase.rawValue)")
+        XCTAssertEqual(shell.commands.filter { $0 == Self.pnpmInstall }.count, 1)
+    }
+
+    /// A failed install leaves the service failed, with a reason and the install
+    /// button. GitHub Packages' 401 names the row that fixes it.
+    func testAFailedInstallBeforeTheStartSaysWhy() async throws {
+        try makeWorkspace()
+        let shell = FakeCommandRunner { call in
+            call.command == Self.pnpmInstall
+                ? FakeCommandRunner.failed(1, stderr: " ERR_PNPM_FETCH_401  GET https://npm.pkg.github.com/x: Unauthorized - 401")
+                : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+
+        let failed = await waitUntil(10) {
+            self.state("web").phase == .failed && self.state("web").condition != nil && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(failed, "web is \(state("web").phase.rawValue)")
+        let text = "web cannot start: its packages are not installed and pnpm install --frozen-lockfile failed: GitHub Packages rejected your token — fix the 'GitHub Packages auth' row, then retry."
+        XCTAssertEqual(supervisor.lastError, text)
+        XCTAssertEqual(state("web").condition?.headline, text)
+        XCTAssertEqual(state("web").condition?.actions, [.installDependencies, .openLog])
+        XCTAssertEqual(Self.listeners(on: port), [], "nothing started")
+        XCTAssertNil(supervisor.dependencyRecord.hash(for: workDir.path), "a failed install records no hash")
+    }
+
+    /// Decision 11: stale packages (the lockfile changed after the install) are not
+    /// installed at a start. The row offers the install instead.
+    func testStalePackagesDoNotInstallAtTheStart() async throws {
+        try makeWorkspace(lock: "lock B")
+        Self.markInstalled(workDir)
+        let marker = workDir.appendingPathComponent("node_modules/.modules.yaml").path
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_600_000_000)], ofItemAtPath: marker)
+        supervisor.dependencyRecord.record("hash of lock A", for: workDir.path)
+        XCTAssertEqual(DependencyWatcher.state(of: workDir.path, record: supervisor.dependencyRecord), .stale)
+        let shell = fakeInstaller()
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        XCTAssertFalse(shell.commands.contains(Self.pnpmInstall))
+        XCTAssertTrue(supervisor.canPerform(.installDependencies, for: "web"))
+    }
+
+    /// Critic item 26: a branch change that changes the lockfile installs before the
+    /// restart, while the old process still runs. Without a lockfile change it only restarts.
+    func testBranchChangeWithANewLockfileInstallsBeforeTheRestart() async throws {
+        try makeWorkspace(lock: "lock A")
+        Self.markInstalled(workDir)
+        let port = port
+        let duringInstall = LockedPids()
+        let shell = fakeInstaller(during: { duringInstall.set(Self.listeners(on: port)) })
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let first = try XCTUnwrap(state("web").pid)
+
+        // Negative control: the same lockfile, so no install.
+        await supervisor.restartAfterBranchChange(["web"])
+        let restarted = await waitUntil(30) { self.settled("web") && self.state("web").pid != first }
+        XCTAssertTrue(restarted)
+        XCTAssertFalse(shell.commands.contains(Self.pnpmInstall))
+        let second = try XCTUnwrap(state("web").pid)
+
+        try Data("lock B".utf8).write(to: workDir.appendingPathComponent("pnpm-lock.yaml"))
+        await supervisor.restartAfterBranchChange(["web"])
+
+        XCTAssertEqual(shell.commands.filter { $0 == Self.pnpmInstall }.count, 1)
+        XCTAssertEqual(duringInstall.pids, [second], "the old process ran during the install")
+        let again = await waitUntil(30) { self.settled("web") && self.state("web").pid != second }
+        XCTAssertTrue(again)
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("[travel-runner] The lockfile changed — running pnpm install --frozen-lockfile before the restart"))
+        XCTAssertEqual(DependencyWatcher.state(of: workDir.path, record: supervisor.dependencyRecord), .fresh)
+    }
+
+    /// After a failed install on a branch change the old process keeps running: a
+    /// restart on the old packages would crash in a loop.
+    func testBranchChangeWithAFailedInstallKeepsTheProcess() async throws {
+        try makeWorkspace(lock: "lock A")
+        Self.markInstalled(workDir)
+        let shell = FakeCommandRunner { call in
+            call.command == Self.pnpmInstall ? FakeCommandRunner.failed(1, stderr: "ERR! network") : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let pid = try XCTUnwrap(state("web").pid)
+
+        try Data("lock B".utf8).write(to: workDir.appendingPathComponent("pnpm-lock.yaml"))
+        await supervisor.restartAfterBranchChange(["web"])
+
+        XCTAssertEqual(supervisor.lastError, "pnpm install --frozen-lockfile for web failed (exit 1) — see its log")
+        try await Task.sleep(for: .seconds(1.5))
+        XCTAssertEqual(state("web").pid, pid)
+        XCTAssertEqual(state("web").phase, .running)
+    }
+
     /// "Free port and restart" frees the port of the EADDRINUSE line, also when it is
     /// not the port of the probe, and keeps a container's port helper alive.
     func testFreePortAndRestartFreesThePortItNames() async throws {
@@ -2422,4 +2621,20 @@ private struct HeldPathQuestion {
 
     /// How often the shell was asked where a tool is.
     var calls: Int { shell.commands.filter { $0.contains("command -v") }.count }
+}
+
+/// The pids that a fake install saw on the port of the test.
+private final class LockedPids: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [pid_t] = []
+    var pids: [pid_t] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+    func set(_ pids: [pid_t]) {
+        lock.lock()
+        stored = pids
+        lock.unlock()
+    }
 }

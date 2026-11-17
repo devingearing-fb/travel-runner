@@ -25,6 +25,8 @@ enum FailureAdvisor {
         case cannotRun(CommandDiagnosis.Finding)
         /// A failure that already has its own sentence (a `ServiceError`).
         case message(String)
+        /// The missing packages could not be installed before the start.
+        case installFailed(String)
     }
 
     struct Context: Sendable {
@@ -83,6 +85,8 @@ enum FailureAdvisor {
             return condition(CommandDiagnosis.message(finding, name: name), nil, CommandDiagnosis.actions(finding))
         case .message(let text):
             return condition(text, nil, [.openLog, .restart])
+        case .installFailed(let text):
+            return condition(text, nil, [.installDependencies, .openLog])
         case .cleanExit:
             return condition("\(name) exited (code 0) — not restarted.", nil, [.restart, .openLog])
         // A kill or a failed wake check has its own cause. A line of the log from

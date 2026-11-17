@@ -81,13 +81,20 @@ struct ServiceRow: View {
                         .contentTransition(.numericText())
                 }
 
-                if depsStale {
-                    Text("deps")
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 4)
-                        .padding(.vertical, 1)
-                        .background(Color.orange, in: Capsule())
+                if depsStale, supervisor.canPerform(.installDependencies, for: state.id) {
+                    Button {
+                        supervisor.perform(.installDependencies, for: state.id)
+                    } label: {
+                        Text(RecoveryAction.installDependencies.title())
+                            .font(.system(size: 9, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.orange, in: Capsule())
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(isActionInFlight)
+                    .help("The packages do not match the lockfile. Install them, then restart \(state.definition.displayName).")
                 }
 
                 if let started = state.lastStarted, state.phase == .running {
