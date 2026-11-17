@@ -24,9 +24,8 @@ struct TimelineStrip: View {
 
     private func pillState(for phaseID: String) -> PhasePill.PillState {
         if currentPhase == .running { return .completed }
-        // Check "current" before "completed": multi-level phases (stream,
-        // verification) enter completedPhases after their first DAG level
-        // finishes, but the phase is still active until the graph moves on.
+        // Check "current" before "completed": a phase enters completedPhases
+        // when all its services settle, but the graph can still be on its level.
         if currentPhase.rawValue == phaseID { return .active }
         if completedPhases.contains(phaseID) { return .completed }
         return .pending

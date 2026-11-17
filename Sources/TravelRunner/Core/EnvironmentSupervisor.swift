@@ -165,7 +165,10 @@ final class EnvironmentSupervisor {
     private let userDefaults: UserDefaults
     private var stdoutProbes: [String: StdoutProbe] = [:]
     private var didBootstrap = false
-    private var phaseStartedAt: Date? = nil
+    /// Start All: the services of each startup phase that have not settled, and
+    /// when the phase began. A phase is done when all its services are.
+    private var startPhaseRemaining: [String: Int] = [:]
+    private var startPhaseBegan: [String: Date] = [:]
     private var dbSetupRunner: DbSetupRunner?
     /// Nil while issue capture is off. Tests set a tracker with a temporary folder.
     var debugTracker: DebugTracker?
@@ -616,10 +619,18 @@ final class EnvironmentSupervisor {
             let levels = graph.startOrder()
             var didMigrationCheck = false
 
+            // A phase is done, and timed, when all its services are, also the
+            // ones that start after the next level began.
+            self.startPhaseRemaining = [:]
+            self.startPhaseBegan = [:]
+            for level in levels {
+                self.startPhaseRemaining[self.resolvePhase(for: level).rawValue, default: 0] += level.count
+            }
+
             // The next level waits only for the services that a later service
-            // needs, and for the database, which the check after GROUND needs. A
-            // service that nothing needs (Stripe) starts with its level, and Start
-            // All waits for it at the end.
+            // needs. A service that nothing needs (Stripe) starts with its level,
+            // and Start All waits for it at the end. The GROUND level waits for
+            // all its services: the database check after it can reset the database.
             await withTaskGroup(of: Void.self) { trailing in
                 for level in levels {
                     if Task.isCancelled { break }
@@ -627,26 +638,19 @@ final class EnvironmentSupervisor {
                     let phase = self.resolvePhase(for: level)
                     await MainActor.run {
                         self.currentPhase = phase
-                        self.phaseStartedAt = self.clock.date()
+                        if self.startPhaseBegan[phase.rawValue] == nil {
+                            self.startPhaseBegan[phase.rawValue] = self.clock.date()
+                        }
                     }
 
-                    let needed = level.filter {
-                        !graph.dependents(of: $0).isEmpty || self.phaseForService($0) == "ground"
-                    }
+                    let needed = phase == .ground ? level : level.filter { !graph.dependents(of: $0).isEmpty }
                     for serviceID in level where !needed.contains(serviceID) {
-                        trailing.addTask { await self.startForStartAll(serviceID) }
+                        trailing.addTask { await self.startForStartAll(serviceID, phase: phase) }
                     }
                     await withTaskGroup(of: Void.self) { group in
                         for serviceID in needed {
-                            group.addTask { await self.startForStartAll(serviceID) }
+                            group.addTask { await self.startForStartAll(serviceID, phase: phase) }
                         }
-                    }
-
-                    _ = await MainActor.run {
-                        if let started = self.phaseStartedAt {
-                            self.phaseTimings[phase.rawValue] = self.clock.date().timeIntervalSince(started)
-                        }
-                        self.completedPhases.insert(phase.rawValue)
                     }
 
                     // After GROUND phase completes (Supabase is up), check migrations
@@ -677,14 +681,39 @@ final class EnvironmentSupervisor {
     }
 
     /// One service of Start All. A failure marks the service; the start goes on.
-    private func startForStartAll(_ serviceID: String) async {
+    private func startForStartAll(_ serviceID: String, phase: StartupPhase) async {
         do {
             try await startService(serviceID)
+            await awaitReplacingLaunch(serviceID)
         } catch {
             serviceStates[serviceID]?.phase = .failed
             lastError = "\(error)"
             recalculateHealth()
         }
+        finishStartAllService(inPhase: phase.rawValue)
+    }
+
+    /// A restart can replace the launch of Start All while it starts (a new
+    /// webhook secret restarts the portal). The services that need this one wait
+    /// until the new process is up or has failed.
+    private func awaitReplacingLaunch(_ serviceID: String) async {
+        while let state = serviceStates[serviceID], !isShuttingDown, !Task.isCancelled,
+              state.phase == .stopping || state.phase == .pending || state.phase == .starting {
+            try? await clock.sleep(for: .milliseconds(250))
+        }
+    }
+
+    private func finishStartAllService(inPhase phase: String) {
+        guard !isShuttingDown, let remaining = startPhaseRemaining[phase] else { return }
+        guard remaining <= 1 else {
+            startPhaseRemaining[phase] = remaining - 1
+            return
+        }
+        startPhaseRemaining[phase] = nil
+        if let began = startPhaseBegan[phase] {
+            phaseTimings[phase] = clock.date().timeIntervalSince(began)
+        }
+        completedPhases.insert(phase)
     }
 
     func stopAll() {
@@ -1000,9 +1029,10 @@ final class EnvironmentSupervisor {
         "No Stripe webhook secret — payments will not confirm until Stripe runs."
 
     /// Says once per portal start that payments will not confirm: the portal is
-    /// up or on its way, it has no webhook secret, and Stripe does not run.
+    /// up or on its way and Stripe does not run. A secret in `.env.local` from an
+    /// earlier run does not count: without Stripe no webhook arrives.
     private func warnIfNoWebhookSecret() async {
-        guard !warnedNoWebhookSecret, stripeWebhookSecret == nil,
+        guard !warnedNoWebhookSecret,
               let portal = serviceStates["travel-portal"],
               portal.phase == .starting || portal.phase == .running else { return }
         let stripeOff: Bool

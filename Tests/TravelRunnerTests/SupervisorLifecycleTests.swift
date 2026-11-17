@@ -1,4 +1,5 @@
 import Foundation
+import os
 import XCTest
 @testable import TravelRunner
 
@@ -1532,6 +1533,9 @@ final class SupervisorLifecycleTests: XCTestCase {
         let portalUp = await waitUntil(30) { self.state("travel-portal").phase == .running }
         XCTAssertTrue(portalUp, "travel-portal is \(state("travel-portal").phase.rawValue), error: \(supervisor.lastError ?? "none")")
         XCTAssertEqual(state("stripe").phase, .starting, "Stripe still waits for its secret")
+        XCTAssertFalse(supervisor.completedPhases.contains("GATEWAY"), "Stripe, a gateway service, still starts")
+        XCTAssertNotNil(supervisor.phaseTimings["PORTAL"])
+        XCTAssertNil(supervisor.phaseTimings["GATEWAY"])
         let lines = await logLines("travel-portal")
         XCTAssertFalse(
             lines.contains("[travel-runner] " + EnvironmentSupervisor.noWebhookSecretLine),
@@ -1606,6 +1610,102 @@ final class SupervisorLifecycleTests: XCTestCase {
         _ = await waitUntil(15) { self.supervisor.actionsInFlight.isEmpty }
         lines = await logLines("travel-portal")
         XCTAssertEqual(lines.filter { $0 == warning }.count, 1, "once for each start of the portal")
+    }
+
+    /// Review of S2: a secret from an earlier Stripe run forwards nothing. With
+    /// Stripe off the portal still says that payments will not confirm.
+    func testThePortalWarnsWhenStripeIsOffAlthoughAnOldSecretIsKnown() async throws {
+        // Remote mode: the portal starts without the keys of a local stack.
+        supervisor.dbMode = .remote
+        let stripeOn = OSAllocatedUnfairLock(initialState: true)
+        supervisor.stripeAvailability = { stripeOn.withLock { $0 } }
+        try supervisor.loadServices([
+            stripeWithSecretProbe("echo whsec_madeUpOldSecret1; sleep 30"),
+            daemon("travel-portal", webServer),
+        ])
+        supervisor.health = .healthy
+
+        supervisor.restartService("stripe")
+        let stripeUp = await waitUntil(20) { self.settled("stripe") }
+        XCTAssertTrue(stripeUp, "stripe is \(state("stripe").phase.rawValue)")
+        supervisor.restartService("travel-portal")
+        let portalUp = await waitUntil(20) { self.settled("travel-portal") }
+        XCTAssertTrue(portalUp, "travel-portal is \(state("travel-portal").phase.rawValue)")
+        let warning = "[travel-runner] " + EnvironmentSupervisor.noWebhookSecretLine
+        var lines = await logLines("travel-portal")
+        XCTAssertFalse(lines.contains(warning), "Stripe runs")
+
+        stripeOn.withLock { $0 = false }
+        supervisor.restartService("stripe")
+        let skipped = await waitUntil(15) { self.state("stripe").phase == .skipped && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        lines = await logLines("travel-portal")
+        XCTAssertEqual(lines.filter { $0 == warning }.count, 1, lines.joined(separator: "\n"))
+    }
+
+    /// Review of S2: a webhook secret that restarts the portal during Start All
+    /// does not let the portal's dependents start before the new portal is up.
+    func testAServiceThatNeedsThePortalWaitsForItsRestartOnANewSecret() async throws {
+        // Remote mode: the portal starts without the keys of a local stack.
+        supervisor.dbMode = .remote
+        _ = fakeTheOutsideOfStartAll()
+        supervisor.stripeAvailability = { true }
+        // The portal takes 3 s to listen; the secret comes after 2 s.
+        let web = daemon("travel-portal", ["sh", "-c", "sleep 3; exec \(webServer.joined(separator: " "))"])
+        let portal = ServiceDefinition(
+            id: web.id, name: web.name, cmd: web.cmd, cwd: web.cwd, probe: web.probe, type: .daemon,
+            restart: .onFailure, dependsOn: ["login"], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([
+            oneshot("base"),
+            oneshot("login", dependsOn: ["base"]),
+            stripeWithSecretProbe("sleep 2; echo whsec_madeUpForTheRestart1; sleep 60", dependsOn: ["base"]),
+            portal,
+            oneshot("verify", dependsOn: ["travel-portal"]),
+        ])
+
+        supervisor.startAll(skipPreflight: true)
+
+        var portalWhenVerifyStarted: ServicePhase?
+        let verifyStarted = await waitUntil(40) {
+            if self.state("verify").phase != .pending {
+                portalWhenVerifyStarted = self.state("travel-portal").phase
+                return true
+            }
+            return false
+        }
+        XCTAssertTrue(verifyStarted, "error: \(supervisor.lastError ?? "none")")
+        XCTAssertEqual(portalWhenVerifyStarted, .running)
+        let lines = await logLines("travel-portal")
+        XCTAssertEqual(
+            lines.filter { $0 == EnvironmentSupervisor.webhookSecretChangedLine }.count, 1,
+            "the secret came while the portal started: \(lines.joined(separator: "\n"))"
+        )
+    }
+
+    /// Review of S2: the database check after GROUND can reset the database, so
+    /// it waits for every service of that level, also one that nothing needs.
+    func testTheGroundLevelWaitsForAServiceThatNothingNeeds() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        let slow = daemon("fork-app", ["sh", "-c", "sleep 2; exec \(webServer.joined(separator: " "))"])
+        try supervisor.loadServices([
+            oneshot("supabase"),
+            slow,
+            oneshot("next", dependsOn: ["supabase"]),
+        ])
+
+        supervisor.startAll(skipPreflight: true)
+
+        var forkAppWhenNextStarted: ServicePhase?
+        let nextStarted = await waitUntil(40) {
+            if self.state("next").phase != .pending {
+                forkAppWhenNextStarted = self.state("fork-app").phase
+                return true
+            }
+            return false
+        }
+        XCTAssertTrue(nextStarted, "error: \(supervisor.lastError ?? "none")")
+        XCTAssertEqual(forkAppWhenNextStarted, .running)
     }
 
     /// A Stripe service and a booking portal whose `.env` has a made-up test key.
