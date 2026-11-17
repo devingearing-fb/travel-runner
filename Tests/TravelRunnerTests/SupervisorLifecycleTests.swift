@@ -457,11 +457,55 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(failed)
         try await Task.sleep(for: .seconds(6))
 
-        let attempts = await logLines("ghost").filter { $0.contains("no-such-script.sh") }.count
+        // The runner's own line names the file too; it is not an attempt.
+        let attempts = await logLines("ghost")
+            .filter { $0.contains("no-such-script.sh") && !$0.hasPrefix("[travel-runner]") }.count
         XCTAssertEqual(attempts, 1)
         XCTAssertEqual(state("ghost").restartCount, 0)
         XCTAssertEqual(state("ghost").phase, .failed)
-        XCTAssertTrue(supervisor.lastError?.contains("cannot start") == true, supervisor.lastError ?? "nil")
+        let expected = "ghost cannot start: this branch has no file `./no-such-script.sh` in \(workDir.path). "
+            + "Switch branch or pull, then restart ghost."
+        let said = await waitUntil(10) { self.supervisor.lastError == expected }
+        XCTAssertTrue(said, supervisor.lastError ?? "nil")
+    }
+
+    /// Exit 127 for a tool of the packages (`./node_modules/.bin/next`): the row
+    /// says that the packages are not installed and offers the install.
+    func testExit127ForAToolOfThePackagesOffersTheInstall() async throws {
+        try #"{"name":"web","scripts":{"dev":"next dev"}}"#.write(
+            to: workDir.appendingPathComponent("package.json"), atomically: true, encoding: .utf8
+        )
+        try load(daemon("web", ["./node_modules/.bin/next", "dev"]))
+
+        supervisor.restartService("web")
+
+        let expected = "web cannot start: its packages are not installed in \(workDir.path)."
+        let said = await waitUntil(20) {
+            self.state("web").phase == .failed && self.state("web").condition?.headline == expected
+        }
+        XCTAssertTrue(said, state("web").condition?.headline ?? "no condition")
+        XCTAssertEqual(state("web").condition?.actions, [.installDependencies, .openLog])
+        XCTAssertEqual(state("web").restartCount, 0)
+        XCTAssertTrue(supervisor.canPerform(.installDependencies, for: "web"))
+    }
+
+    /// Exit 126: the file exists but has no execute bit. The row names the file.
+    func testExit126NamesTheFileThatIsNotExecutable() async throws {
+        let script = workDir.appendingPathComponent("run.sh")
+        try "#!/bin/sh\necho hi\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: script.path)
+        try load(daemon("plain", ["./run.sh"]))
+
+        supervisor.restartService("plain")
+
+        let said = await waitUntil(20) {
+            self.state("plain").phase == .failed
+                && self.state("plain").condition?.headline.hasSuffix("is not executable (exit 126).") == true
+        }
+        XCTAssertTrue(said, state("plain").condition?.headline ?? "no condition")
+        XCTAssertEqual(state("plain").exitCode, 126)
+        XCTAssertTrue(state("plain").condition?.headline.contains("run.sh") == true)
+        XCTAssertEqual(state("plain").restartCount, 0)
     }
 
     /// Exit 127 for a tool, not a script: the error names the tool and the PATH
@@ -472,17 +516,19 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         supervisor.restartService("toolless")
 
-        let expected = "toolless cannot start: \(tool) was not found. \(Flavor.current.displayName) looked in: "
+        let expected = "toolless cannot start: `\(tool)` is not on \(Flavor.current.displayName)'s PATH. It looked in: "
         let named = await waitUntil(30) {
             self.state("toolless").phase == .failed && self.supervisor.lastError?.hasPrefix(expected) == true
         }
         XCTAssertTrue(named, supervisor.lastError ?? "nil")
         XCTAssertTrue(supervisor.lastError?.contains("/usr/bin") == true, supervisor.lastError ?? "nil")
         XCTAssertTrue(
-            supervisor.lastError?.hasSuffix("Install \(tool) or add its folder to ~/.zprofile, then restart the service.") == true,
+            supervisor.lastError?.hasSuffix("Open Health to see where each tool was found.") == true,
             supervisor.lastError ?? "nil"
         )
         XCTAssertEqual(state("toolless").restartCount, 0)
+        let offered = await waitUntil(10) { self.state("toolless").condition?.actions == [.openHealth, .openLog] }
+        XCTAssertTrue(offered, "\(state("toolless").condition?.actions ?? [])")
     }
 
     /// The PATH question takes time. A stop that arrives while it runs keeps the
@@ -532,7 +578,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("toolless").phase, .failed)
         XCTAssertEqual(
             supervisor.lastError,
-            "toolless cannot start: \(ToolEnvironment.notFoundText(tool: tool, searchedPath: "/fake/bin"))"
+            CommandDiagnosis.message(.toolMissing(tool: tool, searchedPath: "/fake/bin"), name: "toolless")
         )
         XCTAssertEqual(question.calls, 2, "one question: the PATH of the launch, then the PATH of the new read")
     }
@@ -1445,7 +1491,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(fields["reason"])
     }
 
-    /// "Run pnpm install": the install runs in the folder of the service, its output
+    /// "Install dependencies": the install runs in the folder of the service, its output
     /// goes to the service's log in order, and then the service starts again.
     func testTheInstallButtonInstallsThenRestarts() async throws {
         let output = (1...200).map { "install line \($0)" }

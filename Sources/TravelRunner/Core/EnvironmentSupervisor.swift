@@ -47,6 +47,8 @@ final class EnvironmentSupervisor {
     var debugOpenIssueCount = 0
     var actionsInFlight: Set<String> = []
     var onActionFeedback: ((String, Bool) -> Void)?
+    /// Opens the page that shows where each tool was found (the "Open Health" button).
+    var onOpenHealth: (() -> Void)?
     var gitBranches: [String: String] = [:]
     var gitBehindCounts: [String: Int] = [:]
     var behindBannerDismissed = false
@@ -275,9 +277,8 @@ final class EnvironmentSupervisor {
         case exitedDuringStartup(name: String)
         /// The supervisor stopped the automatic restarts; the text says why.
         case autoRestartStopped(String)
-        /// `tool` says what exit 127 means when the command is a tool that the
-        /// PATH of the launch did not have.
-        case commandNotRunnable(name: String, command: String, code: Int32, tool: ToolEnvironment.MissingTool? = nil)
+        /// Exit 126 or 127. `finding` says what is missing.
+        case commandNotRunnable(name: String, finding: CommandDiagnosis.Finding)
         case localKeysMissing(name: String, envFile: String)
         case portHeldByOtherStack(port: Int, container: String)
         /// `owner` is the process name of the container runtime that listens on the port.
@@ -292,12 +293,8 @@ final class EnvironmentSupervisor {
                 "\(name) did not pass its health probe in \(s)s" + (last.map { " (last check: \($0.summary))" } ?? "")
             case .exitedDuringStartup(let name): "\(name) exited before it was ready — see its log"
             case .autoRestartStopped(let reason): reason
-            case .commandNotRunnable(let name, let command, _, .notFound(let searchedPath)):
-                "\(name) cannot start: \(ToolEnvironment.notFoundText(tool: command, searchedPath: searchedPath))"
-            case .commandNotRunnable(let name, let command, _, .foundNow(let path)):
-                ToolEnvironment.foundNowText(name: name, tool: command, path: path)
-            case .commandNotRunnable(let name, let command, let code, nil):
-                "\(name) cannot start: the shell could not run \(command) (exit \(code)). Does the current branch have it? Restart \(name) after the fix."
+            case .commandNotRunnable(let name, let finding):
+                CommandDiagnosis.message(finding, name: name)
             case .localKeysMissing(let name, let envFile):
                 "\(name) was not started: the keys of the local Supabase stack could not be read (scripts/local-db.sh status -o env). Without them it would use the hosted dev values in \(envFile). Restart Supabase, then restart \(name)."
             case .portHeldByOtherStack(let port, let container):
@@ -1201,6 +1198,7 @@ final class EnvironmentSupervisor {
         case .clearCacheAndRestart: Self.cacheClearingServices.contains(serviceID)
         case .installDependencies: serviceCwd(serviceID) != nil
         case .openLog: logStore.revealTarget(for: serviceID) != nil
+        case .openHealth: onOpenHealth != nil
         default: false
         }
     }
@@ -1228,6 +1226,8 @@ final class EnvironmentSupervisor {
             Task { await ContainerRuntime.open(shell: shell) }
         case .installDependencies:
             installDependenciesAndRestart(serviceID)
+        case .openHealth:
+            onOpenHealth?()
         case .openLog:
             switch logStore.revealTarget(for: serviceID) {
             case .file(let file): NSWorkspace.shared.activateFileViewerSelecting([file])
@@ -1244,11 +1244,7 @@ final class EnvironmentSupervisor {
     private func installDependenciesAndRestart(_ serviceID: String) {
         guard let cwd = serviceCwd(serviceID) else { return }
         let name = displayName(serviceID)
-        let (folder, command) = if let root = DependencyWatcher.pnpmWorkspaceRoot(containing: cwd) {
-            (root, "pnpm install")
-        } else {
-            (cwd, "npm install")
-        }
+        let (folder, command) = DependencyWatcher.installTarget(for: cwd)
         Task {
             beginAction(serviceID)
             defer { endAction(serviceID) }
@@ -1335,6 +1331,8 @@ final class EnvironmentSupervisor {
             return .probeTimeout(seconds: seconds, processAlive: alive, lastProbe: lastProbe)
         case .oneshotFailed, .exitedDuringStartup:
             return .exited(code: state.exitCode)
+        case .commandNotRunnable(_, let finding):
+            return .cannotRun(finding)
         default:
             return .message(serviceError.description)
         }
@@ -1361,7 +1359,7 @@ final class EnvironmentSupervisor {
             let context = FailureAdvisor.Context(
                 name: definition.displayName, port: probe?.port, probePath: probePath, logTail: Array(tail),
                 likelyCause: likely, canClearCache: Self.cacheClearingServices.contains(serviceID),
-                runtime: ContainerRuntime.detect().displayName
+                runtime: ContainerRuntime.detect().displayName, command: definition.cmd, cwd: definition.resolvedCwd
             )
             state.likelyCause = likely
             state.condition = FailureAdvisor.advise(kind, context, now: clock.date())
@@ -2424,14 +2422,11 @@ final class EnvironmentSupervisor {
             if state.id == "stripe" { return false }
             throw ServiceError.exitedDuringStartup(name: state.definition.displayName)
         case .commandNotRunnable(let code):
-            let tool = await missingTool(forExit: code, pid: exit.pid, of: state.definition)
+            let finding = await commandFinding(forExit: code, pid: exit.pid, of: state)
             // The question takes time. A stop, or a newer launch, owns the state now.
             if isShuttingDown || state.phase == .stopping || state.phase == .stopped { return false }
             if let current = state.pid, current != exit.pid { return false }
-            throw ServiceError.commandNotRunnable(
-                name: state.definition.displayName, command: state.definition.cmd.first ?? "its command", code: code,
-                tool: tool
-            )
+            throw ServiceError.commandNotRunnable(name: state.definition.displayName, finding: finding)
         case .killedExternally, .crashed:
             // Stripe degrades to skipped when its CLI fails.
             if state.phase == .skipped { return false }
@@ -2461,6 +2456,23 @@ final class EnvironmentSupervisor {
         let task = Task { await tools.diagnoseMissing(tool: tool, cwd: cwd, runner: shell) }
         missingToolDiagnoses[definition.id] = (pid, task)
         return await task.value
+    }
+
+    /// What exit 126 or 127 of this launch means: the tool, the packages, the
+    /// script or the file that is missing.
+    private func commandFinding(
+        forExit code: Int32, pid: Int32, of state: ServiceState
+    ) async -> CommandDiagnosis.Finding {
+        let definition = state.definition
+        let tool = await missingTool(forExit: code, pid: pid, of: definition)
+        // The log keeps the lines of earlier launches; they are not the cause of this one.
+        let launched = state.lastStarted ?? .distantPast
+        let tail = await logStore.entries(for: definition.id)
+            .filter { $0.timestamp >= launched }
+            .suffix(FailureAdvisor.logWindow).map(\.text)
+        return CommandDiagnosis.diagnose(
+            code: code, command: definition.cmd, cwd: definition.resolvedCwd, logTail: Array(tail), tool: tool
+        )
     }
 
     private func handleTermination(serviceID: String, termination: ProcessRunner.Termination) {
@@ -2582,24 +2594,20 @@ final class EnvironmentSupervisor {
             // fails again, so there is no automatic restart.
             state.phase = .failed
             state.lastStopped = clock.date()
-            let command = state.definition.cmd.first ?? "its command"
-            let plain = ServiceError.commandNotRunnable(name: name, command: command, code: code).description
+            let unknown = CommandDiagnosis.Finding.unknown(command: state.definition.cmd.first ?? "its command", code: code)
+            let plain = CommandDiagnosis.message(unknown, name: name)
             lastError = plain
-            recordFailure(serviceID, kind: .message(plain))
-            let definition = state.definition
+            recordFailure(serviceID, kind: .cannotRun(unknown))
             let record = state.failureRecordCount
             Task {
-                guard let tool = await missingTool(forExit: code, pid: termination.pid, of: definition) else { return }
-                let line = switch tool {
-                case .notFound(let path): ToolEnvironment.notFoundText(tool: command, searchedPath: path)
-                case .foundNow(let path): ToolEnvironment.foundNowText(name: name, tool: command, path: path)
-                }
-                await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(line)"))
-                let full = ServiceError.commandNotRunnable(name: name, command: command, code: code, tool: tool).description
+                let finding = await commandFinding(forExit: code, pid: termination.pid, of: state)
+                guard finding != unknown else { return }
+                let full = CommandDiagnosis.message(finding, name: name)
+                await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(full)"))
                 // A newer error stays.
                 if lastError == plain { lastError = full }
                 if state.failureRecordCount == record, state.phase == .failed {
-                    recordFailure(serviceID, kind: .message(full))
+                    recordFailure(serviceID, kind: .cannotRun(finding))
                 }
             }
             onServiceCrash?(name, code)

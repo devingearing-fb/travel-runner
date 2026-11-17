@@ -67,6 +67,8 @@ final class WorkshopPanel {
         supervisor.onActionFeedback = { [weak toastCenter] message, success in
             toastCenter?.show(message, style: success ? .success : .error)
         }
+        // The Tools block of Diagnostics says where each tool was found.
+        supervisor.onOpenHealth = { [weak self] in self?.open(section: .diagnostics) }
     }
 
     func open(section: WorkshopSection = .status) {

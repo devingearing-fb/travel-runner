@@ -41,6 +41,14 @@ actor DependencyWatcher {
         return packageMtime > lockMtime
     }
 
+    /// Where the packages of `directory` are installed, and the command that installs
+    /// them: `pnpm install` at the root of its pnpm workspace, or `npm install` in
+    /// the directory itself.
+    static func installTarget(for directory: String) -> (folder: String, command: String) {
+        if let root = pnpmWorkspaceRoot(containing: directory) { return (root, "pnpm install") }
+        return (NSString(string: directory).expandingTildeInPath, "npm install")
+    }
+
     /// The nearest directory at or above `directory` with a `pnpm-workspace.yaml`.
     static func pnpmWorkspaceRoot(containing directory: String) -> String? {
         var current = NSString(string: directory).expandingTildeInPath

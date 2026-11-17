@@ -64,7 +64,7 @@ enum RecoveryAction: Equatable, Hashable, Sendable {
         case .startService: "Start"
         case .stopForeignAndRetry: "Free port and restart"
         case .openContainerRuntime: "Open \(runtime)"
-        case .installDependencies: "Run pnpm install"
+        case .installDependencies: "Install dependencies"
         case .clearCacheAndRestart: "Clear cache and restart"
         case .openLog: "Open log"
         case .stripeLogin: "Log in…"

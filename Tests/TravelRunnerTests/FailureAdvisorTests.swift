@@ -91,7 +91,7 @@ final class FailureAdvisorTests: XCTestCase {
             XCTAssertEqual(condition.headline, "A package is missing — dependencies are out of date.", line)
             XCTAssertEqual(condition.actions, [.installDependencies], line)
         }
-        XCTAssertEqual(RecoveryAction.installDependencies.title(), "Run pnpm install")
+        XCTAssertEqual(RecoveryAction.installDependencies.title(), "Install dependencies")
     }
 
     func testTheBreakerSaysItStoppedAndWhy() {

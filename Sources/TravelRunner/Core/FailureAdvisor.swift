@@ -21,6 +21,8 @@ enum FailureAdvisor {
         case runtimeDown
         /// The probe after a wake failed.
         case wakeCheck(lastProbe: ProbeOutcome?)
+        /// The shell could not run the command (exit 126 or 127); `CommandDiagnosis` says what is missing.
+        case cannotRun(CommandDiagnosis.Finding)
         /// A failure that already has its own sentence (a `ServiceError`).
         case message(String)
     }
@@ -38,6 +40,10 @@ enum FailureAdvisor {
         var canClearCache = false
         /// The display name of the container runtime of this Mac.
         var runtime = "Docker Desktop"
+        /// The command of the service and its folder: a run of pnpm can say that a
+        /// script or the packages are missing.
+        var command: [String] = []
+        var cwd: String? = nil
     }
 
     /// How many log lines the advisor reads, and the "No clear cause" text names.
@@ -73,6 +79,8 @@ enum FailureAdvisor {
             return condition(
                 "\(context.runtime) is not running.", nil, [.openContainerRuntime], kind: .halted(reason: "runtime down")
             )
+        case .cannotRun(let finding):
+            return condition(CommandDiagnosis.message(finding, name: name), nil, CommandDiagnosis.actions(finding))
         case .message(let text):
             return condition(text, nil, [.openLog, .restart])
         case .cleanExit:
@@ -155,6 +163,12 @@ enum FailureAdvisor {
             let headline = port.map { "Port \($0) is already in use by another process." }
                 ?? "The port is already in use by another process."
             return Cause(headline: headline, actions: [.stopForeignAndRetry(port: port)])
+        }
+        // pnpm ends with 1, not 127, when the packages or the script are missing.
+        if let finding = CommandDiagnosis.diagnoseFailedRun(command: context.command, cwd: context.cwd, logTail: Array(tail)) {
+            return Cause(
+                headline: CommandDiagnosis.message(finding, name: context.name), actions: CommandDiagnosis.actions(finding)
+            )
         }
         let missingModule = ["Cannot find module", "Module not found", "ERR_MODULE_NOT_FOUND", "Cannot find package"]
         if tail.contains(where: { line in missingModule.contains { line.contains($0) } }) {
