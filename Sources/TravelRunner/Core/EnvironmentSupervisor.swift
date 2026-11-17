@@ -141,9 +141,9 @@ final class EnvironmentSupervisor {
     /// The time of every wait, deadline and time stamp of the supervisor. Tests
     /// set a fake.
     @ObservationIgnored var clock = RunnerClock.live
-    /// The services that the other runner app runs now. Tests set it; nil asks
-    /// that app.
-    @ObservationIgnored var siblingActiveServices: (@Sendable () async -> [String])?
+    /// The services that the other runner app runs now. The config load and Start
+    /// All ask it. Tests set a fake, so no test asks the other app.
+    @ObservationIgnored var siblingActiveServices: @Sendable () async -> [String] = { await SiblingRunner.activeServices() }
     /// The ports that the secret registry tries. Tests give port 0, so the
     /// system picks a free one.
     @ObservationIgnored var secretRegistryPorts: ClosedRange<UInt16> = LiveSecretRegistry.defaultPorts
@@ -313,14 +313,13 @@ final class EnvironmentSupervisor {
     // MARK: - Lifecycle
 
     /// What the config load takes from the app and from this Mac. Tests give fakes,
-    /// so no test reads services.json, binds the control port or asks the other app.
+    /// so no test reads services.json or binds the control port.
     struct ConfigHost {
         var load: () throws -> ServiceConfig = { try ConfigLoader.load() }
         var controlServer: () -> ControlServer = { ControlServer() }
-        /// The services that the other runner app runs now. The load does not wait
-        /// for the answer: the other app can take a second, and the launch runs on
-        /// the main thread.
-        var siblingServices: @Sendable () async -> [String] = { await SiblingRunner.activeServices() }
+        /// False: the load starts no git and no npm watcher on the service folders.
+        /// Tests set it, so no test runs the git of this Mac.
+        var startsWatchers = true
     }
 
     /// The answer of `reconfigure()`.
@@ -482,7 +481,7 @@ final class EnvironmentSupervisor {
                 repoMap[service.id] = cwd
             }
         }
-        if !repoMap.isEmpty {
+        if configHost.startsWatchers, !repoMap.isEmpty {
             let watcher = GitBranchWatcher(repos: repoMap)
             gitBranchWatcher = watcher
             gitRepoRoots = watcher.repoRoots
@@ -496,7 +495,7 @@ final class EnvironmentSupervisor {
                 depsMap[service.id] = cwd
             }
         }
-        if !depsMap.isEmpty {
+        if configHost.startsWatchers, !depsMap.isEmpty {
             let depsWatcher = DependencyWatcher(repoPaths: depsMap)
             dependencyWatcher = depsWatcher
             depsWatcherTask = Task { await startDepsWatching(watcher: depsWatcher) }
@@ -505,16 +504,23 @@ final class EnvironmentSupervisor {
 
     /// Asks the other runner app what it runs, then resets the env files when it
     /// runs nothing. The ask runs in a task, so the launch does not wait for an
-    /// app that answers late. A start waits for the task; a newer load replaces it.
+    /// app that answers late. Each action that starts a process waits for the task
+    /// (`waitForEnvResetOfLoad`); a newer load replaces it.
     private func resetEnvAfterLoad() {
         envResetAfterLoad?.cancel()
-        let siblingServices = configHost.siblingServices
+        let siblingServices = siblingActiveServices
         envResetAfterLoad = Task { [weak self] in
             let services = await siblingServices()
             // A newer load, or a database mode that the person chose, replaced this reset.
             guard !Task.isCancelled, services.isEmpty else { return }
             self?.resetEnvToLocalhost()
         }
+    }
+
+    /// The env files of the last load must be written before a service or a
+    /// database step reads them.
+    private func waitForEnvResetOfLoad() async {
+        await envResetAfterLoad?.value
     }
 
     /// Loads a service graph without the app's side effects: no config file, control
@@ -551,17 +557,11 @@ final class EnvironmentSupervisor {
                 }
             }
 
-            // The env files of the load must be written before a service reads them.
-            await self.envResetAfterLoad?.value
+            await self.waitForEnvResetOfLoad()
 
             // The other runner app uses the same ports, and this start stops what it
             // finds on them.
-            let siblingServices: [String]
-            if let siblingActiveServices = self.siblingActiveServices {
-                siblingServices = await siblingActiveServices()
-            } else {
-                siblingServices = await SiblingRunner.activeServices()
-            }
+            let siblingServices = await self.siblingActiveServices()
             if !siblingServices.isEmpty {
                 await MainActor.run {
                     self.health = .degraded
@@ -1182,6 +1182,7 @@ final class EnvironmentSupervisor {
         Task {
             beginAction(serviceID)
             defer { endAction(serviceID) }
+            await waitForEnvResetOfLoad()
             do {
                 try await replaceProcess(serviceID, stoppedPhase: .pending, prepare: {
                     self.queuedRestarts.remove(serviceID)
@@ -1499,6 +1500,7 @@ final class EnvironmentSupervisor {
         dbSetupRunner = runner
 
         Task {
+            await waitForEnvResetOfLoad()
             await runner.run(pipeline: pipeline, from: stepId)
             dbResetRunning = false
             await refreshPendingMigrations(cwd: cwd)
@@ -1534,6 +1536,7 @@ final class EnvironmentSupervisor {
         lastError = nil
 
         Task {
+            await waitForEnvResetOfLoad()
             let success = await runner.executeStepPublic(step)
             dbResetRunning = false
             if !success {

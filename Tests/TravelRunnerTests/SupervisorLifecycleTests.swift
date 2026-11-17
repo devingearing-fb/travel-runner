@@ -1845,8 +1845,8 @@ final class SupervisorLifecycleTests: XCTestCase {
     // MARK: - Reconfigure
 
     /// A config for the supervisor, with nothing of this Mac behind it: no
-    /// services.json, no control port 19900, no tickets folder and no other app.
-    /// The services have no folder, so no watcher starts.
+    /// services.json, no control port 19900, no tickets folder, no other app and
+    /// no git or npm watcher.
     private func fakeConfigHost(services ids: [String]) -> ConfigLoads {
         let loads = ConfigLoads()
         loads.serviceIDs = ids
@@ -1871,8 +1871,9 @@ final class SupervisorLifecycleTests: XCTestCase {
                 loads.controlServers.append(server)
                 return server
             },
-            siblingServices: { [] }
+            startsWatchers: false
         )
+        supervisor.siblingActiveServices = { [] }
         supervisor.makeIssueTracker = { DebugTracker(baseDir: issues) }
         return loads
     }
@@ -2045,7 +2046,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     func testAConfigLoadDoesNotWaitForTheOtherApp() async throws {
         let loads = fakeConfigHost(services: ["first"])
         let gate = Gate()
-        supervisor.configHost.siblingServices = {
+        supervisor.siblingActiveServices = {
             await gate.wait()
             return []
         }
@@ -2068,7 +2069,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// app runs a stack, a load here leaves it alone.
     func testAConfigLoadKeepsTheEnvWhileTheOtherAppRunsAStack() async throws {
         let loads = fakeConfigHost(services: ["first"])
-        supervisor.configHost.siblingServices = { ["supabase", "travel-portal"] }
+        supervisor.siblingActiveServices = { ["supabase", "travel-portal"] }
         supervisor.dbMode = .remote
 
         supervisor.loadConfig()
@@ -2084,8 +2085,12 @@ final class SupervisorLifecycleTests: XCTestCase {
         _ = fakeTheOutsideOfStartAll()
         let loads = fakeConfigHost(services: ["first"])
         let gate = Gate()
-        supervisor.configHost.siblingServices = {
-            await gate.wait()
+        let asks = SiblingAsks()
+        // The first ask is the one of the load and waits for the gate. The ask of
+        // the start comes after the env wait, so it notes the database mode then.
+        supervisor.siblingActiveServices = { [supervisor] in
+            let first = await MainActor.run { asks.note(supervisor!.dbMode) }
+            if first { await gate.wait() }
             return []
         }
         supervisor.dbMode = .remote
@@ -2093,14 +2098,44 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.loadConfig()
         supervisor.startAll()
 
-        try await Task.sleep(for: .milliseconds(500))
-        XCTAssertNil(state("first").lastStarted, "no service starts before the answer of the other app")
-        XCTAssertEqual(supervisor.dbMode, .remote)
+        // Without the env wait the start asks at once, with the env not reset.
+        let askedEarly = await waitUntil(2) { asks.modes.count > 1 || self.supervisor.currentPhase == .preflight }
+        XCTAssertFalse(askedEarly, "the start went on before the answer of the other app")
+        XCTAssertNil(state("first").lastStarted)
 
         await gate.open()
         let started = await waitUntil(20) { self.state("first").lastStarted != nil }
         XCTAssertTrue(started, "error: \(supervisor.lastError ?? "none")")
-        XCTAssertEqual(supervisor.dbMode, .local, "the reset ran before the start")
+        XCTAssertEqual(asks.modes, [.remote, .local], "the reset ran before the start went on")
+        await loads.stopControlServers()
+    }
+
+    /// A restart, like a start, waits for the env reset of the load.
+    func testARestartWaitsForTheEnvResetOfTheLoad() async throws {
+        let shell = FakeCommandRunner { _ in FakeCommandRunner.ok() }
+        supervisor.shell = shell
+        let loads = fakeConfigHost(services: ["first"])
+        let gate = Gate()
+        supervisor.siblingActiveServices = {
+            await gate.wait()
+            return []
+        }
+        supervisor.dbMode = .remote
+        supervisor.loadConfig()
+        let reset = try XCTUnwrap(supervisor.envResetAfterLoad)
+        // A stopped stack starts nothing on a restart: the stack counts as up.
+        supervisor.health = .healthy
+
+        supervisor.restartService("first")
+
+        let startedEarly = await waitUntil(2) { self.state("first").lastStarted != nil }
+        XCTAssertFalse(startedEarly, "the restart went on before the answer of the other app")
+
+        await gate.open()
+        await reset.value
+        XCTAssertEqual(supervisor.dbMode, .local)
+        let started = await waitUntil(20) { self.state("first").lastStarted != nil }
+        XCTAssertTrue(started, "error: \(supervisor.lastError ?? "none")")
         await loads.stopControlServers()
     }
 
@@ -2109,7 +2144,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     func testANewerLoadReplacesTheEnvResetOfTheLoadBefore() async throws {
         let loads = fakeConfigHost(services: ["first"])
         let gate = Gate()
-        supervisor.configHost.siblingServices = {
+        supervisor.siblingActiveServices = {
             await gate.wait()
             return []
         }
@@ -2118,7 +2153,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.dbMode = .remote
 
         // Now the other app runs a stack.
-        supervisor.configHost.siblingServices = { ["supabase"] }
+        supervisor.siblingActiveServices = { ["supabase"] }
         let result = await supervisor.reconfigure()
         XCTAssertEqual(result, .applied)
         await supervisor.envResetAfterLoad?.value
@@ -2139,7 +2174,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         let loads = fakeConfigHost(services: ["travel-portal"])
         loads.cwd = app.path
         let gate = Gate()
-        supervisor.configHost.siblingServices = {
+        supervisor.siblingActiveServices = {
             await gate.wait()
             return []
         }
@@ -2153,6 +2188,18 @@ final class SupervisorLifecycleTests: XCTestCase {
         await reset.value
         XCTAssertEqual(supervisor.dbMode, .remote)
         await loads.stopControlServers()
+    }
+}
+
+/// The database mode at each ask of the other app.
+@MainActor
+private final class SiblingAsks {
+    var modes: [EnvironmentSupervisor.DatabaseMode] = []
+
+    /// True for the first ask.
+    func note(_ mode: EnvironmentSupervisor.DatabaseMode) -> Bool {
+        modes.append(mode)
+        return modes.count == 1
     }
 }
 
