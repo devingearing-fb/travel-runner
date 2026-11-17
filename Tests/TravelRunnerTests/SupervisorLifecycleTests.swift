@@ -1928,6 +1928,117 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(supervisor.lastError)
     }
 
+    /// A setup that cannot even begin (here: no pipeline) also halts the start, and
+    /// the header says that the portals were not started.
+    func testASetupThatCannotBeginStopsTheStartAndSaysSo() async throws {
+        _ = try startWithAnEmptyDatabase(setup: "echo '##db:status:done'")
+        supervisor.dbPipelineFactory = { _, _ in nil }
+
+        supervisor.startAll()
+
+        let halted = await waitUntil(40) {
+            self.supervisor.health == .degraded && self.supervisor.currentPhase == .idle
+        }
+        XCTAssertTrue(halted, "health is \(supervisor.health), phase \(supervisor.currentPhase)")
+        XCTAssertEqual(
+            supervisor.lastError,
+            "Database setup failed at setup: No DB setup pipeline for the profile reset. Portals were not started."
+        )
+        XCTAssertNil(state("portal").lastStarted)
+    }
+
+    /// After a halted start, a setup from DB Tools that passes keeps the start halted
+    /// and says to click Retry. A failed one says why.
+    func testASetupThatPassesAfterAHaltedStartSaysToRetry() async throws {
+        _ = try startWithAnEmptyDatabase(setup: "echo '##db:status:failed:HTTP 401'; exit 1")
+        supervisor.startAll()
+        let halted = await waitUntil(40) {
+            self.supervisor.health == .degraded && self.supervisor.currentPhase == .idle
+        }
+        XCTAssertTrue(halted)
+
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([self.step("load-hotels", "echo '##db:status:done'")], profile: profile)
+        }
+        supervisor.resetDatabase()
+        let done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+
+        XCTAssertEqual(supervisor.lastError, DbResetPolicy.setUpAfterHaltText)
+        XCTAssertTrue(supervisor.dbSetupFailedAtStart)
+        XCTAssertEqual(supervisor.health, .degraded)
+        XCTAssertNil(state("portal").lastStarted)
+    }
+
+    /// Positive control of the guard against the loader's fallback to `reset`: a
+    /// manifest with a `migrate` profile runs only the migrate steps, with no seed
+    /// scenario selected.
+    func testApplyMigrationsRunsTheMigrateProfileOfTheManifest() async throws {
+        let tracker = captureIssues()
+        try loadSupabase()
+        _ = try checkoutLackingAMigration()
+        let folder = workDir.appendingPathComponent("scripts/db")
+        let manifest = #"""
+        {"version":4,"steps":[
+          {"id":"reset-database","command":"echo '##db:status:done'"},
+          {"id":"apply-migrations","command":"echo '##db:status:done'"},
+          {"id":"verify-data","command":"echo '##db:status:done'"}
+        ],"profiles":{"reset":["reset-database","verify-data"],"migrate":["apply-migrations"]}}
+        """#
+        try Data(manifest.utf8).write(to: folder.appendingPathComponent("manifest.json"))
+        supervisor.dbResetAction = nil
+        supervisor.dbPipelineFactory = nil
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        XCTAssertNil(supervisor.selectedDbSeedScenario)
+
+        supervisor.applyMigrations()
+        let done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+
+        let pipeline = try XCTUnwrap(supervisor.dbSetupPipeline, supervisor.lastError ?? "no pipeline")
+        XCTAssertEqual(pipeline.profile, "migrate")
+        XCTAssertEqual(pipeline.steps.map(\.id), ["apply-migrations"])
+        XCTAssertEqual(pipeline.seedScenario, DbResetPolicy.noScenario)
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertEqual(supervisor.migrationsAppliedNotice, DbResetPolicy.appliedText)
+        let resets = await events("db_reset", in: tracker)
+        XCTAssertEqual(resets.map(\.message), ["origin: apply-migrations, profile: migrate"])
+    }
+
+    /// One step from DB Tools goes through the same entry point: a db_reset event,
+    /// the error, and an issue for a failed step.
+    func testOneStepFromDbToolsIsRecordedLikeEverySetup() async throws {
+        let tracker = captureIssues()
+        try loadSupabase()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        var ran: [String] = []
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([
+                self.step("first", "echo first"),
+                self.step("reset-database", "echo '##db:status:failed:boom'; exit 1"),
+                self.step("verify-data", "echo verify"),
+            ], profile: profile)
+        }
+
+        supervisor.runDbSetupStep("reset-database")
+        let done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+
+        let pipeline = try XCTUnwrap(supervisor.dbSetupPipeline)
+        ran = pipeline.steps.filter { $0.status != .pending }.map(\.id)
+        XCTAssertEqual(ran, ["reset-database"], "only the one step runs")
+        XCTAssertEqual(supervisor.lastError, "DB setup failed at reset-database: boom")
+        let resets = await events("db_reset", in: tracker)
+        XCTAssertEqual(resets.map(\.message), ["origin: single-step, profile: full, step: reset-database"])
+        let issues = await tracker.listOpenIssues()
+        XCTAssertEqual(issues.count, 1)
+
+        // A step that the pipeline does not have runs nothing.
+        supervisor.runDbSetupStep("no-such-step")
+        XCTAssertFalse(supervisor.dbResetRunning)
+    }
+
     // MARK: - DB setup with a pipeline from the test
 
     private func pipeline(_ steps: [DbSetupStep], profile: String = "reset") -> DbSetupPipeline {

@@ -164,6 +164,14 @@ enum DbResetPolicy {
         "Database setup failed at \(step): \(message). Portals were not started."
     }
 
+    /// A setup passed after Start All stopped before the portals.
+    static let setUpAfterHaltText = "Database is set up. Click Retry to start the portals."
+
+    /// The scenario of an apply when none is selected. The `migrate` steps seed nothing.
+    static let noScenario = DbSeedScenario(
+        id: "", name: "None (migrations only)", description: "", fileSummary: "", variables: []
+    )
+
     static let noMigrateProfileText =
         "This branch has no Apply migrations step (no \"migrate\" profile in scripts/db/manifest.json). Nothing was changed."
 

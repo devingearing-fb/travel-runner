@@ -1530,6 +1530,8 @@ final class EnvironmentSupervisor {
     enum DbSetupOrigin: String, Sendable {
         case manual
         case retry
+        /// One step from DB Tools, on its own.
+        case singleStep = "single-step"
         case applyMigrations = "apply-migrations"
         /// An empty database during Start All. A failure stops the start.
         case emptyDatabaseAtStart = "empty-database-at-start"
@@ -1540,7 +1542,7 @@ final class EnvironmentSupervisor {
 
         var isAutomatic: Bool {
             switch self {
-            case .manual, .retry, .applyMigrations: false
+            case .manual, .retry, .singleStep, .applyMigrations: false
             case .emptyDatabaseAtStart, .emptyDatabase, .autoResetSetting: true
             }
         }
@@ -1553,6 +1555,8 @@ final class EnvironmentSupervisor {
         let reason: String?
         let origin: DbSetupOrigin
         let stepId: String?
+        /// Runs only the step `stepId`, not the steps after it.
+        let singleStep: Bool
         /// Nil when a test replaces the run with `dbResetAction`.
         let pipeline: DbSetupPipeline?
         let runner: DbSetupRunner?
@@ -1566,6 +1570,12 @@ final class EnvironmentSupervisor {
         cwd: String? = nil, profile: String, reason: String?, origin: DbSetupOrigin, from stepId: String? = nil
     ) async -> Bool {
         guard let run = beginDbSetup(cwd: cwd ?? supabaseCwd, profile: profile, reason: reason, origin: origin, from: stepId) else {
+            // Start All stops before the portals: the header says so.
+            if origin == .emptyDatabaseAtStart {
+                let message = (lastError ?? "the setup did not start")
+                    .trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+                lastError = DbResetPolicy.emptySetupFailedText(step: "setup", message: message)
+            }
             return false
         }
         return await completeDbSetup(run)
@@ -1574,7 +1584,8 @@ final class EnvironmentSupervisor {
     /// The checks and the guard. Nil when nothing may start; the reason is then in
     /// `lastError`, or another setup runs.
     private func beginDbSetup(
-        cwd: String?, profile: String, reason: String?, origin: DbSetupOrigin, from stepId: String?
+        cwd: String?, profile: String, reason: String?, origin: DbSetupOrigin, from stepId: String?,
+        singleStep: Bool = false
     ) -> DbSetupRun? {
         guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return nil }
         guard let cwd else {
@@ -1593,6 +1604,7 @@ final class EnvironmentSupervisor {
                 dbSetupPipeline = newPipeline
                 pipeline = newPipeline
             }
+            if singleStep, pipeline?.steps.contains(where: { $0.id == stepId }) != true { return nil }
             if let pipeline {
                 runner = makeDbSetupRunner(cwd: cwd, pipeline: pipeline)
                 dbSetupRunner = runner
@@ -1605,19 +1617,28 @@ final class EnvironmentSupervisor {
         migrationsAppliedNotice = nil
         return DbSetupRun(
             cwd: cwd, profile: pipeline?.profile ?? profile, reason: reason, origin: origin,
-            stepId: stepId, pipeline: pipeline, runner: runner
+            stepId: stepId, singleStep: singleStep, pipeline: pipeline, runner: runner
         )
     }
 
     private func completeDbSetup(_ run: DbSetupRun) async -> Bool {
         await waitForEnvResetOfLoad()
+        let stepNote = run.singleStep ? ", step: \(run.stepId ?? "")" : ""
         await recordDebugEvent(
-            kind: "db_reset", serviceID: nil, message: "origin: \(run.origin.rawValue), profile: \(run.profile)"
+            kind: "db_reset", serviceID: nil,
+            message: "origin: \(run.origin.rawValue), profile: \(run.profile)\(stepNote)"
         )
         let ok: Bool
+        var failed: DbSetupStep?
         if let pipeline = run.pipeline, let runner = run.runner {
-            await runner.run(pipeline: pipeline, from: run.stepId)
-            ok = pipeline.allRequiredPassed
+            if run.singleStep, let step = pipeline.steps.first(where: { $0.id == run.stepId }) {
+                ok = await runner.executeStepPublic(step)
+                if !ok, step.status != .cancelled { failed = step }
+            } else {
+                await runner.run(pipeline: pipeline, from: run.stepId)
+                ok = pipeline.allRequiredPassed
+                failed = pipeline.firstFailed
+            }
         } else if let dbResetAction {
             ok = await dbResetAction(run.cwd)
         } else {
@@ -1626,15 +1647,18 @@ final class EnvironmentSupervisor {
         // A cancel unlocks the controls itself, and a new setup may run by now.
         if run.runner == nil || dbSetupRunner === run.runner { dbResetRunning = false }
 
-        let isApply = run.profile == DbResetPolicy.migrateProfile
+        let isApply = !run.singleStep && run.profile == DbResetPolicy.migrateProfile
         if ok {
             lastError = nil
             if run.pipeline != nil { await refreshLocalSupabaseKeys() }
             if isApply {
                 migrationsAppliedNotice = DbResetPolicy.appliedText
                 onActionFeedback?("Migrations applied", true)
+            } else if dbSetupFailedAtStart, !run.singleStep {
+                // The start stays halted until Retry, so the header says what to do.
+                lastError = DbResetPolicy.setUpAfterHaltText
             }
-        } else if let failed = run.pipeline?.firstFailed {
+        } else if let failed {
             let message = failed.errorMessage ?? "unknown error"
             lastError = run.origin == .emptyDatabaseAtStart
                 ? DbResetPolicy.emptySetupFailedText(step: failed.name, message: message)
@@ -1650,36 +1674,13 @@ final class EnvironmentSupervisor {
         return ok
     }
 
+    /// One step from DB Tools, on its own. It goes through the same guard, event and
+    /// failure issue as every other setup.
     func runDbSetupStep(_ stepId: String) {
-        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return }
-        guard let cwd = supabaseCwd else {
-            lastError = "Cannot find supabase service cwd in config"
-            return
-        }
-        guard !refreshCompatibility(cwd: cwd) else { return }
-
-        if dbSetupPipeline == nil {
-            guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "full") else { return }
-            dbSetupPipeline = pipeline
-        }
-
-        guard let pipeline = dbSetupPipeline,
-              let step = pipeline.steps.first(where: { $0.id == stepId }) else { return }
-
-        let runner = makeDbSetupRunner(cwd: cwd, pipeline: pipeline)
-        dbSetupRunner = runner
-        dbResetRunning = true
-        lastError = nil
-
-        Task {
-            await waitForEnvResetOfLoad()
-            let success = await runner.executeStepPublic(step)
-            dbResetRunning = false
-            if !success, step.status != .cancelled {
-                lastError = "DB setup failed at \(step.name): \(step.errorMessage ?? "unknown error")"
-                await captureDbSetupFailure(step, runner: runner)
-            }
-        }
+        guard let run = beginDbSetup(
+            cwd: supabaseCwd, profile: "full", reason: nil, origin: .singleStep, from: stepId, singleStep: true
+        ) else { return }
+        Task { await completeDbSetup(run) }
     }
 
     /// The issue of a failed DB step. It names the step and holds the step's log.
@@ -3339,7 +3340,10 @@ final class EnvironmentSupervisor {
             return nil
         }
         reloadDbSeedScenarios()
-        guard let seedScenario = selectedDbSeedScenario else {
+        // Apply migrations seeds nothing, so it needs no scenario.
+        let scenario = selectedDbSeedScenario
+            ?? (profile == DbResetPolicy.migrateProfile ? DbResetPolicy.noScenario : nil)
+        guard let seedScenario = scenario else {
             lastError = dbSeedScenarioLoadError
                 ?? "Choose a valid seed scenario before resetting the database."
             return nil
