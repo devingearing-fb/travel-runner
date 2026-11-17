@@ -3,6 +3,7 @@ import SwiftUI
 struct WorkshopHeaderBar: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
     @Environment(UpdateController.self) var updates: UpdateController?
+    @State private var confirmingReset = false
 
     private var healthLabel: String {
         switch supervisor.health {
@@ -185,16 +186,38 @@ struct WorkshopHeaderBar: View {
                     })
                 )
             }
-            if supervisor.migrationsBannerVisible {
+            if supervisor.migrationsBannerVisible, let notice = supervisor.migrationNotice {
+                let isDbSetupRunning = supervisor.dbResetRunning || supervisor.dbSetupPipeline?.isRunning == true
+                // A runner that is too old for the checkout cannot change the database.
+                let canChange = supervisor.compatibilityNotice == nil && !isDbSetupRunning
                 alertBanner(
                     icon: "arrow.triangle.2.circlepath",
                     color: .orange,
-                    text: "Local database is missing \(supervisor.pendingMigrations.count) migration\(supervisor.pendingMigrations.count == 1 ? "" : "s")",
-                    subtitle: supervisor.pendingMigrations.prefix(3).joined(separator: ", ")
-                        + (supervisor.pendingMigrations.count > 3 ? " …" : ""),
-                    // A runner that is too old for the checkout cannot reset it.
-                    action: supervisor.compatibilityNotice == nil ? ("Reset DB", { supervisor.resetDatabase() }) : nil,
+                    text: notice.headline,
+                    subtitle: supervisor.migrationApplyError ?? notice.detail,
+                    action: canChange && notice.offersApply ? ("Apply migrations", { supervisor.applyMigrations() }) : nil,
+                    secondaryAction: canChange ? ("Reset and reseed…", { confirmingReset = true }) : nil,
                     onDismiss: { supervisor.dismissMigrationsBanner() }
+                )
+                .confirmationDialog(
+                    DbResetPolicy.resetConfirmationTitle,
+                    isPresented: $confirmingReset,
+                    titleVisibility: .visible
+                ) {
+                    Button("Reset and reseed", role: .destructive) { supervisor.resetDatabase() }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text(notice.resetConfirmation)
+                }
+            }
+            if let note = supervisor.migrationsAppliedNotice {
+                alertBanner(
+                    icon: "checkmark.circle.fill",
+                    color: .green,
+                    text: note,
+                    subtitle: nil,
+                    action: nil,
+                    onDismiss: { supervisor.dismissMigrationsAppliedNotice() }
                 )
             }
             if supervisor.totalBehindCount > 0 && !supervisor.behindBannerDismissed {
@@ -274,6 +297,7 @@ struct WorkshopHeaderBar: View {
         subtitle: String?,
         link: (label: String, url: URL)? = nil,
         action: (label: String, handler: () -> Void)?,
+        secondaryAction: (label: String, handler: () -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
     ) -> some View {
         HStack(spacing: 8) {
@@ -299,6 +323,11 @@ struct WorkshopHeaderBar: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .tint(color)
+            }
+            if let secondaryAction {
+                Button(secondaryAction.label) { secondaryAction.handler() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
             }
             if let onDismiss {
                 Button {

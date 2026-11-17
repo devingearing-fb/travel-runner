@@ -25,8 +25,22 @@ final class EnvironmentSupervisor {
     var startupBeganAt: Date? = nil
     /// Migrations the local database has not applied (from the last check).
     var pendingMigrations: [String] = []
+    /// The banner while the database differs from the checkout (from the last check).
+    var migrationNotice: DbResetPolicy.Notice? = nil
     var migrationsBannerDismissed = false
-    var migrationsBannerVisible: Bool { !pendingMigrations.isEmpty && !migrationsBannerDismissed }
+    var migrationsBannerVisible: Bool { migrationNotice != nil && !migrationsBannerDismissed }
+    /// The error of the last "Apply migrations" that failed, until the next run.
+    var migrationApplyError: String? = nil
+    /// Set after "Apply migrations" passed, until the person closes it.
+    var migrationsAppliedNotice: String? = nil
+    /// Off: the runner asks before a reset for changed migrations. On: it resets a
+    /// database that this checkout built by itself. Saved in UserDefaults.
+    var autoResetOnMigrations = false {
+        didSet { userDefaults.set(autoResetOnMigrations, forKey: DbResetPolicy.autoResetSettingKey) }
+    }
+    /// The setup of an empty database failed during Start All. The start stopped
+    /// before the portals, and the health stays degraded until the next start.
+    private(set) var dbSetupFailedAtStart = false
     var dbResetRunning = false
     var dbSetupPipeline: DbSetupPipeline? = nil
     var dbSeedScenarios: [DbSeedScenario] = []
@@ -228,6 +242,7 @@ final class EnvironmentSupervisor {
         self.holdsViewer.logStore = logStore
         self.userDefaults = userDefaults
         self.selectedDbSeedScenarioID = userDefaults.string(forKey: "dbSeedScenarioID")
+        self.autoResetOnMigrations = userDefaults.bool(forKey: DbResetPolicy.autoResetSettingKey)
         if holdsViewer == nil {
             self.holdsViewer.monorepo = { [weak self] in self?.monorepoPath }
         }
@@ -547,6 +562,7 @@ final class EnvironmentSupervisor {
         for serviceID in serviceStates.keys { clearFailureHistory(serviceID) }
         health = .starting
         lastError = nil
+        dbSetupFailedAtStart = false
         startupBeganAt = clock.date()
         phaseTimings = [:]
 
@@ -658,17 +674,21 @@ final class EnvironmentSupervisor {
                     self.completedPhases.insert(phase.rawValue)
                 }
 
-                // After GROUND phase completes (Supabase is up), check migrations
-                // AND verify the database actually has application tables.
-                // Triggers db:reset when: first run, migrations changed, or DB is empty
-                // (e.g. fresh Docker volume with no tables applied).
+                // After the GROUND phase (Supabase is up), the reset policy looks at the
+                // database. An empty database is set up; changed migrations only show
+                // the banner, unless the opt-in setting is on.
                 if phase == .ground && !didMigrationCheck {
                     didMigrationCheck = true
                     // Supabase is up: write its keys before any portal starts.
                     await self.refreshLocalSupabaseKeys()
                     if let cwd = self.supabaseCwd {
-                        await self.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true)
+                        let outcome = await self.applyDbResetPolicy(cwd: cwd, checkMigrations: true, atStart: true)
                         await self.refreshPendingMigrations(cwd: cwd)
+                        // The portals need the tables. A failed setup ends the start here.
+                        if outcome == .failed {
+                            self.dbSetupFailedAtStart = true
+                            break
+                        }
                     }
                 }
 
@@ -676,7 +696,9 @@ final class EnvironmentSupervisor {
 
             await MainActor.run {
                 self.recalculateHealth()
-                if self.health == .healthy {
+                if self.dbSetupFailedAtStart {
+                    self.currentPhase = .idle
+                } else if self.health == .healthy {
                     self.currentPhase = .running
                 }
                 self.startupBeganAt = nil
@@ -718,6 +740,7 @@ final class EnvironmentSupervisor {
             }
 
             await registry?.stop()
+            dbSetupFailedAtStart = false
             health = .stopped
             currentPhase = .idle
             completedPhases = []
@@ -1323,11 +1346,11 @@ final class EnvironmentSupervisor {
                 }
                 clearCleanExitError(id)
 
-                // After Supabase comes back, check if DB is empty and auto-reset
+                // After Supabase comes back, the reset policy sets up an empty
+                // database. Changed migrations only refresh the banner.
                 if id == "supabase", let cwd = supabaseCwd {
-                    if await resetDatabaseIfNeeded(cwd: cwd, checkMigrations: false) {
-                        await refreshPendingMigrations(cwd: cwd)
-                    }
+                    await resetDatabaseIfNeeded(cwd: cwd, checkMigrations: false)
+                    await refreshPendingMigrations(cwd: cwd)
                 }
             }
             recalculateHealth()
@@ -1411,9 +1434,9 @@ final class EnvironmentSupervisor {
                 if let cwd = serviceCwd("supabase") ?? serviceCwd("travel-portal") {
                     // The new branch can name another minimum runner version.
                     refreshCompatibility(cwd: cwd)
-                    if let missing = await missingMigrations(cwd: cwd), !missing.isEmpty {
-                        _ = await runDbReset(cwd: cwd, reason: "Branch switch: new migrations detected — running db:reset...")
-                    }
+                    // The same policy as Start All: new migrations show the banner,
+                    // and reset only with the opt-in setting.
+                    await resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true)
                     await refreshPendingMigrations(cwd: cwd)
                 }
             }
@@ -1483,42 +1506,148 @@ final class EnvironmentSupervisor {
         runDbSetup(profile: profile)
     }
 
+    /// A DB setup that a person asked for: a button, a retry, or the control API.
     func runDbSetup(from stepId: String? = nil, profile: String = "reset") {
-        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return }
-        guard let cwd = supabaseCwd else {
-            lastError = "Cannot find supabase service cwd in config"
+        let origin: DbSetupOrigin = profile == DbResetPolicy.migrateProfile
+            ? .applyMigrations : (stepId == nil ? .manual : .retry)
+        guard let run = beginDbSetup(cwd: supabaseCwd, profile: profile, reason: nil, origin: origin, from: stepId) else {
             return
         }
-        guard !refreshCompatibility(cwd: cwd) else { return }
+        Task { await completeDbSetup(run) }
+    }
 
-        let pipeline: DbSetupPipeline
-        if stepId != nil, let existingPipeline = dbSetupPipeline {
-            pipeline = existingPipeline
-        } else {
-            guard let newPipeline = makeDbSetupPipeline(cwd: cwd, profile: profile) else { return }
-            dbSetupPipeline = newPipeline
-            pipeline = newPipeline
+    /// "Apply migrations": the manifest's `migrate` profile. It never resets. A failed
+    /// apply leaves the banner with "Reset and reseed…"; nothing resets by itself.
+    func applyMigrations() {
+        runDbSetup(profile: DbResetPolicy.migrateProfile)
+    }
+
+    func dismissMigrationsAppliedNotice() {
+        migrationsAppliedNotice = nil
+    }
+
+    /// Why a DB setup ran. Each one is a `db_reset` event in `events.jsonl`.
+    enum DbSetupOrigin: String, Sendable {
+        case manual
+        case retry
+        case applyMigrations = "apply-migrations"
+        /// An empty database during Start All. A failure stops the start.
+        case emptyDatabaseAtStart = "empty-database-at-start"
+        /// An empty database after a restart of Supabase or a branch switch.
+        case emptyDatabase = "empty-database"
+        /// Changed migrations, with the opt-in setting on.
+        case autoResetSetting = "auto-reset-setting"
+
+        var isAutomatic: Bool {
+            switch self {
+            case .manual, .retry, .applyMigrations: false
+            case .emptyDatabaseAtStart, .emptyDatabase, .autoResetSetting: true
+            }
+        }
+    }
+
+    /// One DB setup between its start and its end.
+    private struct DbSetupRun {
+        let cwd: String
+        let profile: String
+        let reason: String?
+        let origin: DbSetupOrigin
+        let stepId: String?
+        /// Nil when a test replaces the run with `dbResetAction`.
+        let pipeline: DbSetupPipeline?
+        let runner: DbSetupRunner?
+    }
+
+    /// The single entry point of every DB setup and reset. It holds the guard, files
+    /// an issue for a failed step whatever the origin, and sets the error itself.
+    /// `reason` is the text shown while it runs. True when every required step passed.
+    @discardableResult
+    func performDbSetup(
+        cwd: String? = nil, profile: String, reason: String?, origin: DbSetupOrigin, from stepId: String? = nil
+    ) async -> Bool {
+        guard let run = beginDbSetup(cwd: cwd ?? supabaseCwd, profile: profile, reason: reason, origin: origin, from: stepId) else {
+            return false
+        }
+        return await completeDbSetup(run)
+    }
+
+    /// The checks and the guard. Nil when nothing may start; the reason is then in
+    /// `lastError`, or another setup runs.
+    private func beginDbSetup(
+        cwd: String?, profile: String, reason: String?, origin: DbSetupOrigin, from stepId: String?
+    ) -> DbSetupRun? {
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return nil }
+        guard let cwd else {
+            lastError = "Cannot find supabase service cwd in config"
+            return nil
+        }
+        guard !refreshCompatibility(cwd: cwd) else { return nil }
+
+        var pipeline: DbSetupPipeline?
+        var runner: DbSetupRunner?
+        if dbResetAction == nil {
+            if stepId != nil, let existingPipeline = dbSetupPipeline {
+                pipeline = existingPipeline
+            } else {
+                guard let newPipeline = makeDbSetupPipeline(cwd: cwd, profile: profile) else { return nil }
+                dbSetupPipeline = newPipeline
+                pipeline = newPipeline
+            }
+            if let pipeline {
+                runner = makeDbSetupRunner(cwd: cwd, pipeline: pipeline)
+                dbSetupRunner = runner
+            }
         }
 
         dbResetRunning = true
-        lastError = nil
+        lastError = reason
+        migrationApplyError = nil
+        migrationsAppliedNotice = nil
+        return DbSetupRun(
+            cwd: cwd, profile: pipeline?.profile ?? profile, reason: reason, origin: origin,
+            stepId: stepId, pipeline: pipeline, runner: runner
+        )
+    }
 
-        let runner = makeDbSetupRunner(cwd: cwd, pipeline: pipeline)
-        dbSetupRunner = runner
-
-        Task {
-            await waitForEnvResetOfLoad()
-            await runner.run(pipeline: pipeline, from: stepId)
-            dbResetRunning = false
-            await refreshPendingMigrations(cwd: cwd)
-            if pipeline.allRequiredPassed {
-                lastError = nil
-                await refreshLocalSupabaseKeys()
-            } else if let failed = pipeline.firstFailed {
-                lastError = "DB setup failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
-                await captureDbSetupFailure(failed, runner: runner)
-            }
+    private func completeDbSetup(_ run: DbSetupRun) async -> Bool {
+        await waitForEnvResetOfLoad()
+        await recordDebugEvent(
+            kind: "db_reset", serviceID: nil, message: "origin: \(run.origin.rawValue), profile: \(run.profile)"
+        )
+        let ok: Bool
+        if let pipeline = run.pipeline, let runner = run.runner {
+            await runner.run(pipeline: pipeline, from: run.stepId)
+            ok = pipeline.allRequiredPassed
+        } else if let dbResetAction {
+            ok = await dbResetAction(run.cwd)
+        } else {
+            ok = false
         }
+        // A cancel unlocks the controls itself, and a new setup may run by now.
+        if run.runner == nil || dbSetupRunner === run.runner { dbResetRunning = false }
+
+        let isApply = run.profile == DbResetPolicy.migrateProfile
+        if ok {
+            lastError = nil
+            if run.pipeline != nil { await refreshLocalSupabaseKeys() }
+            if isApply {
+                migrationsAppliedNotice = DbResetPolicy.appliedText
+                onActionFeedback?("Migrations applied", true)
+            }
+        } else if let failed = run.pipeline?.firstFailed {
+            let message = failed.errorMessage ?? "unknown error"
+            lastError = run.origin == .emptyDatabaseAtStart
+                ? DbResetPolicy.emptySetupFailedText(step: failed.name, message: message)
+                : "DB setup failed at \(failed.name): \(message)"
+            if isApply { migrationApplyError = message }
+            await captureDbSetupFailure(failed, runner: run.runner)
+        } else if let reason = run.reason, lastError == reason {
+            // The run ended with no failed step: it was cancelled between two steps.
+            lastError = Self.dbResetCancelledMessage
+        }
+        // The automatic callers read the database again themselves.
+        if !run.origin.isAutomatic { await refreshPendingMigrations(cwd: run.cwd) }
+        return ok
     }
 
     func runDbSetupStep(_ stepId: String) {
@@ -1660,14 +1789,49 @@ final class EnvironmentSupervisor {
         return String(decoding: data, as: UTF8.self)
     }
 
-    /// Reads which migrations the database lacks, for the banner. A new set shows the
-    /// banner again after a dismiss.
+    /// Reads how the database differs from the checkout, for the banner. A new
+    /// banner shows again after a dismiss.
     func refreshPendingMigrations(cwd: String) async {
-        let missing = await missingMigrations(cwd: cwd) ?? []
-        await MainActor.run {
-            if missing != self.pendingMigrations { self.migrationsBannerDismissed = false }
-            self.pendingMigrations = missing
+        let status = await migrationStatus(cwd: cwd)
+        var notice: DbResetPolicy.Notice?
+        if let status, !status.isCurrent {
+            let builtFrom = await readBuiltFrom(cwd: cwd)
+            let manifest = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
+            notice = DbResetPolicy.notice(
+                status: status,
+                baseline: await baselineLabel(cwd: cwd),
+                builtFrom: builtFrom,
+                current: DbResetPolicy.Checkout(path: cwd, branch: gitBranches["supabase"]),
+                project: SupabaseProject.projectName(root: cwd),
+                hasMigrateProfile: DbManifestLoader.profileNames(from: manifest)?.contains(DbResetPolicy.migrateProfile) == true
+            )
         }
+        if notice != migrationNotice { migrationsBannerDismissed = false }
+        pendingMigrations = status?.missing ?? []
+        migrationNotice = notice
+        // An error of an apply belongs to the banner it came from.
+        if notice == nil { migrationApplyError = nil }
+    }
+
+    /// "<backend checkout> @ <short sha>": what the expected migrations come from.
+    private func baselineLabel(cwd: String) async -> String? {
+        guard let dir = MigrationTracker.backendBaselineDir(root: cwd) else { return nil }
+        let path = (dir as NSString).abbreviatingWithTildeInPath
+        let result = await shell.run(
+            ShellQuote.join(["git", "-C", dir, "rev-parse", "--short", "HEAD"]), cwd: cwd, timeout: .seconds(10)
+        )
+        let sha = result.exitCode == 0 ? DbQueryResult.lastLine(of: result.stdout) : nil
+        return sha.map { "\(path) @ \($0)" } ?? path
+    }
+
+    /// Who built the database, from `travel_runner.seed_state`. Nil when no reset
+    /// recorded it or the table cannot be read.
+    private func readBuiltFrom(cwd: String) async -> DbResetPolicy.BuiltFrom? {
+        let result = await queryDatabase(
+            cwd: cwd, sql: "SELECT row_to_json(s) FROM travel_runner.seed_state s WHERE singleton"
+        )
+        guard result.exitCode == 0 else { return nil }
+        return DbResetPolicy.BuiltFrom.parse(result.stdout)
     }
 
     // MARK: - Private: LAN-Aware Definition
@@ -2614,7 +2778,7 @@ final class EnvironmentSupervisor {
 
         if daemonStates.allSatisfy({ $0 == .stopped || $0 == .pending }) {
             health = .stopped
-        } else if daemonStates.contains(.failed) {
+        } else if daemonStates.contains(.failed) || dbSetupFailedAtStart {
             health = .degraded
         } else if daemonStates.allSatisfy({ $0 == .running || $0 == .completed || $0 == .skipped }) {
             health = .healthy
@@ -3040,15 +3204,28 @@ final class EnvironmentSupervisor {
         !Task.isCancelled && !isShuttingDown && serviceStates["supabase"]?.phase == .running
     }
 
-    /// After Supabase starts: resets an empty database and, with `checkMigrations`,
-    /// one that lacks migrations. It changes nothing when Supabase does not run,
-    /// after a stop, or when the database cannot be read. True when a reset ran;
-    /// false when another reset or setup already runs.
+    /// What `applyDbResetPolicy` did.
+    enum AutoSetupOutcome: Equatable, Sendable {
+        /// No setup ran: nothing to do, the person is asked, or nothing may change.
+        case notRun
+        case passed
+        case failed
+    }
+
+    /// After Supabase starts: applies `DbResetPolicy`. It changes nothing when
+    /// Supabase does not run, after a stop, or when the database cannot be read.
+    /// True when a setup ran; false when none ran or another setup already runs.
     @discardableResult
     func resetDatabaseIfNeeded(cwd: String, checkMigrations: Bool) async -> Bool {
-        guard canAutoReset else { return false }
+        await applyDbResetPolicy(cwd: cwd, checkMigrations: checkMigrations, atStart: false) != .notRun
+    }
+
+    /// An empty database is set up. With `checkMigrations`, changed migrations reset
+    /// the database only when the opt-in setting is on; otherwise the banner asks.
+    func applyDbResetPolicy(cwd: String, checkMigrations: Bool, atStart: Bool) async -> AutoSetupOutcome {
+        guard canAutoReset else { return .notRun }
         // A runner that is too old for this checkout does not even ask the database.
-        guard !refreshCompatibility(cwd: cwd) else { return false }
+        guard !refreshCompatibility(cwd: cwd) else { return .notRun }
         var probe = await probeDatabase(cwd: cwd)
         // Supabase counts as running when its port opens, and Postgres takes queries
         // a little later (much later on a new volume). Ask again before giving up.
@@ -3063,37 +3240,59 @@ final class EnvironmentSupervisor {
                 ))
             }
             try? await clock.sleep(for: databaseProbeRetry.interval)
-            guard canAutoReset else { return false }
+            guard canAutoReset else { return .notRun }
             probe = await probeDatabase(cwd: cwd)
         }
         // The probe takes time: a stop can arrive while it runs.
-        guard canAutoReset else { return false }
-        let reason: String
-        switch probe {
-        case .unknown(let detail):
-            lastError = DbProbe.unreadableMessage(detail)
-            return false
-        case .empty:
-            reason = "Empty database detected — running db:reset..."
-        case .hasTables:
-            guard checkMigrations else { return false }
-            let missing = await missingMigrations(cwd: cwd) ?? []
-            guard !missing.isEmpty, canAutoReset else { return false }
-            reason = "\(missing.count) new migration\(missing.count == 1 ? "" : "s") — running db:reset..."
+        guard canAutoReset else { return .notRun }
+
+        // Migrations matter only to the opt-in setting; the banner reads them itself.
+        var migrations: DbResetPolicy.MigrationStatus?
+        var builtFrom: DbResetPolicy.BuiltFrom?
+        if probe == .hasTables, checkMigrations, autoResetOnMigrations {
+            migrations = await migrationStatus(cwd: cwd)
+            if migrations?.isCurrent == false { builtFrom = await readBuiltFrom(cwd: cwd) }
+            guard canAutoReset else { return .notRun }
         }
-        // `runDbReset` does nothing while another reset or setup runs.
-        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return false }
-        _ = await runDbReset(cwd: cwd, reason: reason)
-        return true
+        let decision = DbResetPolicy.decide(
+            probe: probe,
+            migrations: migrations,
+            builtFrom: builtFrom,
+            current: DbResetPolicy.Checkout(path: cwd, branch: gitBranches["supabase"]),
+            autoResetOnMigrations: autoResetOnMigrations
+        )
+
+        let reason: String
+        let origin: DbSetupOrigin
+        switch decision {
+        case .blocked(let message):
+            lastError = message
+            return .notRun
+        case .none, .offerMigrate, .offerReset:
+            return .notRun
+        case .autoSetup:
+            reason = "Empty database detected — running db:reset..."
+            origin = atStart ? .emptyDatabaseAtStart : .emptyDatabase
+        case .autoReset:
+            let count = migrations.map { $0.missing.count + $0.extra.count } ?? 0
+            reason = "\(count) migration change\(count == 1 ? "" : "s") — resetting, because Settings resets the database when migrations change..."
+            origin = .autoResetSetting
+        }
+        // Another reset or setup runs: this one does not start.
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return .notRun }
+        let ok = await performDbSetup(cwd: cwd, profile: "reset", reason: reason, origin: origin)
+        return ok ? .passed : .failed
     }
 
-    /// Migrations the local database has not applied, oldest first; nil when that
-    /// cannot be read (database down, no backend baseline checkout).
-    private func missingMigrations(cwd: String) async -> [String]? {
+    /// How the database differs from the migration files; nil when that cannot be
+    /// read (database down, no backend baseline checkout).
+    private func migrationStatus(cwd: String) async -> DbResetPolicy.MigrationStatus? {
         guard let expected = MigrationTracker.expectedVersions(root: cwd) else { return nil }
         let result = await queryDatabase(cwd: cwd, sql: "SELECT version FROM supabase_migrations.schema_migrations")
         guard result.exitCode == 0 else { return nil }
-        return MigrationTracker.missing(expected: expected, applied: MigrationTracker.parseVersions(result.stdout))
+        return DbResetPolicy.MigrationStatus.compare(
+            expected: expected, applied: MigrationTracker.parseVersions(result.stdout)
+        )
     }
 
     /// One query against the local database (`psql -tA`), with its exit status and
@@ -3119,47 +3318,8 @@ final class EnvironmentSupervisor {
     /// A query that hangs counts as a failed query, never as an empty database.
     nonisolated static let databaseQueryTimeout: Duration = .seconds(20)
 
-    /// Automatic reset (empty database, migrations the database lacks, branch switch):
-    /// the manifest's `reset` profile with the selected seed scenario, shown in the
-    /// DB setup panel like a manual reset. It does nothing while another reset or
-    /// setup runs. On failure `lastError` names the step that failed.
-    private func runDbReset(cwd: String, reason: String) async -> Bool {
-        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return false }
-        guard !refreshCompatibility(cwd: cwd) else { return false }
-        dbResetRunning = true
-        defer { dbResetRunning = false }
-        lastError = reason
-        let ok: Bool
-        if let dbResetAction {
-            ok = await dbResetAction(cwd)
-        } else {
-            ok = await runDbResetPipeline(cwd: cwd)
-        }
-        if ok {
-            lastError = nil
-        } else if lastError == reason {
-            // The run ended with no failed step: it was cancelled between two steps.
-            lastError = Self.dbResetCancelledMessage
-        }
-        return ok
-    }
-
     nonisolated static let dbResetCancelledMessage =
         "The database reset stopped before it finished. Open DB Tools and click Reset Database to run it again."
-
-    private func runDbResetPipeline(cwd: String) async -> Bool {
-        guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "reset") else { return false }
-        dbSetupPipeline = pipeline
-        let runner = makeDbSetupRunner(cwd: cwd, pipeline: pipeline)
-        dbSetupRunner = runner
-        await runner.run(pipeline: pipeline, from: nil)
-        if pipeline.allRequiredPassed { await refreshLocalSupabaseKeys() }
-        if let failed = pipeline.firstFailed {
-            lastError = "DB reset failed at \(failed.name): \(failed.errorMessage ?? "unknown error")"
-            await captureDbSetupFailure(failed, runner: runner)
-        }
-        return pipeline.allRequiredPassed
-    }
 
     /// A pipeline for the manifest profile with the selected seed scenario, or nil (and
     /// `lastError` set) when no valid scenario is selected.
@@ -3171,13 +3331,19 @@ final class EnvironmentSupervisor {
             }
             return pipeline
         }
+        let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
+        // The loader runs `reset` for a profile it does not find. Apply must never reset.
+        if profile == DbResetPolicy.migrateProfile,
+           DbManifestLoader.profileNames(from: manifestPath)?.contains(profile) != true {
+            lastError = DbResetPolicy.noMigrateProfileText
+            return nil
+        }
         reloadDbSeedScenarios()
         guard let seedScenario = selectedDbSeedScenario else {
             lastError = dbSeedScenarioLoadError
                 ?? "Choose a valid seed scenario before resetting the database."
             return nil
         }
-        let manifestPath = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
         let steps = FileManager.default.fileExists(atPath: manifestPath)
             ? DbManifestLoader.load(from: manifestPath, profile: profile)
             : DbSetupPipeline.buildDefault()

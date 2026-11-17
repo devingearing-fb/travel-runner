@@ -1200,10 +1200,12 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(resets, 1)
     }
 
-    /// The database has tables and lacks a migration. A stop that arrives while the
-    /// runner reads the applied migrations must not start the reset.
+    /// The database has tables and lacks a migration, and the opt-in setting resets
+    /// it. A stop that arrives while the runner reads the applied migrations must not
+    /// start the reset.
     func testAStopWhileTheMigrationsAreReadDoesNotStartAReset() async throws {
         try loadSupabase()
+        supervisor.autoResetOnMigrations = true
         let migrations = workDir.appendingPathComponent(".backend-baseline/supabase/migrations")
         try FileManager.default.createDirectory(at: migrations, withIntermediateDirectories: true)
         try Data().write(to: migrations.appendingPathComponent("20260101000000_base.sql"))
@@ -1241,6 +1243,150 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         XCTAssertFalse(didReset)
         XCTAssertEqual(resets, 1)
+    }
+
+    // MARK: - Reset policy and Apply migrations (D1)
+
+    /// A checkout whose backend baseline has one migration, with the manifest
+    /// profiles `profiles`. The database answers with tables and `applied`.
+    private func checkoutLackingAMigration(
+        profiles: [String] = ["reset", "migrate"], builtFrom: String? = nil
+    ) throws -> (queries: () -> [String], resets: () -> Int) {
+        let migrations = workDir.appendingPathComponent(".backend-baseline/supabase/migrations")
+        try FileManager.default.createDirectory(at: migrations, withIntermediateDirectories: true)
+        try Data().write(to: migrations.appendingPathComponent("20260101000000_base.sql"))
+        let folder = workDir.appendingPathComponent("scripts/db")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let profileJSON = profiles.map { "\"\($0)\":[\"verify-data\"]" }.joined(separator: ",")
+        try Data(#"{"version":4,"steps":[{"id":"verify-data","command":"true"}],"profiles":{\#(profileJSON)}}"#.utf8)
+            .write(to: folder.appendingPathComponent("manifest.json"))
+        supervisor.shell = FakeCommandRunner { call in
+            call.command.contains("rev-parse") ? FakeCommandRunner.ok("abc1234\n") : FakeCommandRunner.ok()
+        }
+        supervisor.databaseProbeRetry = (.milliseconds(10), .zero)
+        var queries: [String] = []
+        var resets = 0
+        supervisor.databaseQuery = { _, sql in
+            queries.append(sql)
+            if sql.contains("pg_tables") { return DbQueryResult(exitCode: 0, stdout: "42", stderr: "") }
+            if sql.contains("seed_state") {
+                guard let builtFrom else { return DbQueryResult(exitCode: 1, stdout: "", stderr: "relation does not exist") }
+                return DbQueryResult(exitCode: 0, stdout: builtFrom, stderr: "")
+            }
+            // Applied: only versions the checkout does not know about are absent.
+            return DbQueryResult(exitCode: 0, stdout: "", stderr: "")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+        return ({ queries }, { resets })
+    }
+
+    /// Findings "automatic reset destroys data silently" and "Start and branch switch
+    /// reset the DB unprompted": a database with data that lacks a migration is not
+    /// reset. The banner asks, with Apply migrations.
+    func testMissingMigrationsShowTheBannerAndNeverResetByThemselves() async throws {
+        try loadSupabase()
+        let fake = try checkoutLackingAMigration()
+
+        let didReset = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+        await supervisor.refreshPendingMigrations(cwd: workDir.path)
+
+        XCTAssertFalse(didReset)
+        XCTAssertEqual(fake.resets(), 0)
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertEqual(supervisor.pendingMigrations, ["20260101000000"])
+        let notice = try XCTUnwrap(supervisor.migrationNotice)
+        let baseline = (workDir.appendingPathComponent(".backend-baseline").path as NSString).abbreviatingWithTildeInPath
+        XCTAssertEqual(notice.headline, "Local database is missing 1 migration (from \(baseline) @ abc1234)")
+        XCTAssertTrue(notice.offersApply)
+        XCTAssertTrue(supervisor.migrationsBannerVisible)
+
+        // The same database with the opt-in setting on is reset.
+        supervisor.autoResetOnMigrations = true
+        let optIn = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+        XCTAssertTrue(optIn)
+        XCTAssertEqual(fake.resets(), 1)
+    }
+
+    /// The opt-in setting never replaces the data of another checkout. The banner
+    /// says who built the database.
+    func testTheSettingDoesNotResetADatabaseThatAnotherCheckoutBuilt() async throws {
+        try loadSupabase()
+        let fake = try checkoutLackingAMigration(
+            builtFrom: #"{"scenario_id":"standard","checkout_path":"/elsewhere/fb-travel-monolith-hackathon","branch":"main"}"#
+        )
+        supervisor.autoResetOnMigrations = true
+
+        let didReset = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+        await supervisor.refreshPendingMigrations(cwd: workDir.path)
+
+        XCTAssertFalse(didReset)
+        XCTAssertEqual(fake.resets(), 0)
+        let notice = try XCTUnwrap(supervisor.migrationNotice)
+        let other = "This database was last built from /elsewhere/fb-travel-monolith-hackathon (main). "
+            + "Resetting replaces it for every checkout that shares project `\(workDir.lastPathComponent)`."
+        XCTAssertEqual(notice.detail, other)
+        XCTAssertTrue(notice.resetConfirmation.hasSuffix(other), notice.resetConfirmation)
+    }
+
+    /// The manifest of an older branch has no `migrate` profile. The loader would run
+    /// `reset` in its place, so Apply refuses and the banner hides its button.
+    func testApplyMigrationsWithoutAMigrateProfileChangesNothing() async throws {
+        try loadSupabase()
+        let fake = try checkoutLackingAMigration(profiles: ["reset"])
+        supervisor.dbResetAction = nil
+
+        supervisor.applyMigrations()
+
+        XCTAssertNil(supervisor.dbSetupPipeline)
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertEqual(supervisor.lastError, DbResetPolicy.noMigrateProfileText)
+        await supervisor.refreshPendingMigrations(cwd: workDir.path)
+        XCTAssertEqual(supervisor.migrationNotice?.offersApply, false)
+        XCTAssertFalse(fake.queries().isEmpty)
+    }
+
+    /// "Apply migrations" runs the `migrate` profile. A failed apply keeps the
+    /// script's message, files an issue, and resets nothing; the banner stays.
+    func testAFailedApplyIsReportedAndNothingResets() async throws {
+        let tracker = captureIssues()
+        try loadSupabase()
+        _ = try checkoutLackingAMigration()
+        supervisor.dbResetAction = nil
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let failure = "Migration 20260101000000_base.sql could not be applied on top of your data. Reset and reseed to continue."
+        var profiles: [String] = []
+        var command = "echo '##db:status:failed:\(failure)'; exit 1"
+        supervisor.dbPipelineFactory = { _, profile in
+            profiles.append(profile)
+            return self.pipeline([self.step("apply-migrations", command)], profile: profile)
+        }
+
+        supervisor.applyMigrations()
+        let done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+
+        XCTAssertEqual(profiles, ["migrate"])
+        XCTAssertEqual(supervisor.lastError, "DB setup failed at apply-migrations: \(failure)")
+        XCTAssertEqual(supervisor.migrationApplyError, failure)
+        XCTAssertNil(supervisor.migrationsAppliedNotice)
+        XCTAssertNotNil(supervisor.migrationNotice, "the banner with Reset and reseed stays")
+        let issues = await tracker.listOpenIssues()
+        XCTAssertEqual(issues.count, 1)
+        let resets = await events("db_reset", in: tracker)
+        XCTAssertEqual(resets.map(\.message), ["origin: apply-migrations, profile: migrate"])
+
+        // Control: an apply that passes shows the note and clears the error.
+        command = "echo '##db:status:done'"
+        supervisor.applyMigrations()
+        let passed = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(passed)
+        XCTAssertEqual(profiles, ["migrate", "migrate"])
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertNil(supervisor.migrationApplyError)
+        XCTAssertEqual(supervisor.migrationsAppliedNotice, DbResetPolicy.appliedText)
     }
 
     func testOnlyAnAnswerOfZeroIsAnEmptyDatabase() {
@@ -1734,11 +1880,59 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(resets, 0)
     }
 
+    /// Supabase and a portal that needs it. The database is empty, so Start All runs
+    /// the setup pipeline of the test (`command` is its one step).
+    private func startWithAnEmptyDatabase(setup command: String) throws -> ServiceDefinition {
+        _ = fakeTheOutsideOfStartAll()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "0", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        supervisor.dbPipelineFactory = { _, _ in self.pipeline([self.step("load-hotels", command)]) }
+        let portal = ServiceDefinition(
+            id: "portal", name: "portal", cmd: ["sleep", "60"], cwd: workDir.path, probe: nil,
+            type: .daemon, restart: .never, dependsOn: ["supabase"], env: nil, phase: "portal", reuseIfRunning: nil
+        )
+        try supervisor.loadServices([daemon("supabase", webServer), portal])
+        return portal
+    }
+
+    /// Finding "the start goes on after a failed setup": the setup of an empty
+    /// database failed, and the portals started on a database without tables.
+    func testAFailedSetupOfAnEmptyDatabaseStopsTheStartBeforeThePortals() async throws {
+        _ = try startWithAnEmptyDatabase(setup: "echo '##db:status:failed:HTTP 401'; exit 1")
+
+        supervisor.startAll()
+
+        let halted = await waitUntil(40) {
+            self.supervisor.health == .degraded && self.supervisor.currentPhase == .idle
+        }
+        XCTAssertTrue(halted, "health is \(supervisor.health), phase \(supervisor.currentPhase)")
+        XCTAssertEqual(
+            supervisor.lastError, "Database setup failed at load-hotels: HTTP 401. Portals were not started."
+        )
+        XCTAssertNil(state("portal").lastStarted)
+        XCTAssertFalse(supervisor.completedPhases.contains("PORTAL"), "\(supervisor.completedPhases)")
+        // A later health pass keeps the start failed.
+        supervisor.recalculateHealth()
+        XCTAssertEqual(supervisor.health, .degraded)
+    }
+
+    /// Control: the same start with a setup that passes starts the portal.
+    func testAPassedSetupOfAnEmptyDatabaseStartsThePortals() async throws {
+        _ = try startWithAnEmptyDatabase(setup: "echo '##db:status:done'")
+
+        supervisor.startAll()
+
+        let healthy = await waitUntil(40) { self.supervisor.health == .healthy }
+        XCTAssertTrue(healthy, "health is \(supervisor.health), error: \(supervisor.lastError ?? "none")")
+        XCTAssertNotNil(state("portal").lastStarted)
+        XCTAssertNil(supervisor.lastError)
+    }
+
     // MARK: - DB setup with a pipeline from the test
 
-    private func pipeline(_ steps: [DbSetupStep]) -> DbSetupPipeline {
+    private func pipeline(_ steps: [DbSetupStep], profile: String = "reset") -> DbSetupPipeline {
         let scenario = DbSeedScenario(id: "test", name: "Test", description: "", fileSummary: "", variables: [])
-        let pipeline = DbSetupPipeline(profile: "reset", seedScenario: scenario)
+        let pipeline = DbSetupPipeline(profile: profile, seedScenario: scenario)
         pipeline.steps = steps
         return pipeline
     }

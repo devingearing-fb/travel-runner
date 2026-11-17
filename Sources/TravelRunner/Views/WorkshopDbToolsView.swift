@@ -71,11 +71,20 @@ struct WorkshopDbToolsView: View {
                         .accessibilityValue(resetAccessibilityValue)
                         .accessibilityHint(resetAccessibilityHint)
 
-                        if supervisor.migrationsBannerVisible {
-                            Label("Migrations not applied", systemImage: "exclamationmark.triangle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
+                        if let notice = supervisor.migrationNotice, notice.offersApply {
+                            Button("Apply Migrations") { supervisor.applyMigrations() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.regular)
+                                .disabled(isDbSetupRunning || supervisor.compatibilityNotice != nil)
+                                .help("Apply only the migrations the database lacks. Nothing is deleted.")
                         }
+                    }
+
+                    if let notice = supervisor.migrationNotice {
+                        Label(supervisor.migrationApplyError ?? notice.headline, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
 
                     Text(resetStatusText)

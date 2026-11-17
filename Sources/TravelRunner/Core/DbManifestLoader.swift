@@ -43,6 +43,16 @@ enum DbManifestLoader {
         return result.isEmpty ? DbSetupPipeline.buildDefault() : result
     }
 
+    /// The profile names of the manifest, or nil when it is absent or unreadable.
+    /// `load` falls back to `reset` for a profile that is not there, so a caller that
+    /// must never reset (Apply migrations) asks this first.
+    static func profileNames(from manifestPath: String) -> Set<String>? {
+        guard let data = FileManager.default.contents(atPath: manifestPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let profiles = json["profiles"] as? [String: [String]] else { return nil }
+        return Set(profiles.keys)
+    }
+
     static func loadSeedScenarios(from manifestPath: String) throws -> DbSeedScenarioCatalog {
         let manifestURL = URL(fileURLWithPath: manifestPath).standardizedFileURL
         let data: Data

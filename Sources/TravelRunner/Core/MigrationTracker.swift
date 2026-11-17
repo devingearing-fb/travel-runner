@@ -99,12 +99,18 @@ enum SupabaseProject {
     /// Docker container of the local database: `supabase_db_<project_id>` from
     /// `supabase/config.toml`, falling back to the directory name like the Supabase CLI.
     static func dbContainerName(root: String) -> String {
+        "supabase_db_\(projectName(root: root))"
+    }
+
+    /// The `project_id` of `supabase/config.toml`, or the directory name. Every
+    /// checkout with the same name shares one local database.
+    static func projectName(root: String) -> String {
         let configPath = (root as NSString).appendingPathComponent("supabase/config.toml")
         if let config = try? String(contentsOfFile: configPath, encoding: .utf8),
            let projectID = projectID(inConfig: config) {
-            return "supabase_db_\(projectID)"
+            return projectID
         }
-        return "supabase_db_\((root as NSString).lastPathComponent)"
+        return (root as NSString).lastPathComponent
     }
 
     static func projectID(inConfig config: String) -> String? {

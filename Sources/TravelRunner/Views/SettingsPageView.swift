@@ -114,6 +114,26 @@ struct SettingsPageView: View {
                 Divider().padding(.leading, 32)
 
                 settingsRow {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle(isOn: Binding(
+                            get: { supervisor.autoResetOnMigrations },
+                            set: { supervisor.autoResetOnMigrations = $0 }
+                        )) {
+                            Label("Reset the database when migrations change", systemImage: "arrow.counterclockwise")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        Text("Off: a banner offers Apply migrations or a reset. On: the database is reset by itself, and every local booking, block and user is deleted. A database built from another checkout is never reset by itself.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Divider().padding(.leading, 32)
+
+                settingsRow {
                     HStack {
                         Toggle(isOn: Binding(
                             get: { supervisor.networkMode },
