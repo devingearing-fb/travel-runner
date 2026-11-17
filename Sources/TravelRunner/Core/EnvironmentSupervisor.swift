@@ -15,6 +15,10 @@ final class EnvironmentSupervisor {
     var lastError: String? = nil
     /// Set when the control API could not listen on a loopback address.
     var controlAPIError: String? = nil
+    /// One line for each service of services.json that the last load left out.
+    var configIssues: [String] = []
+    /// Set when a release copy runs outside an Applications folder, until the person closes it.
+    var misplacedCopyNotice: InstanceGuard.MisplacedNotice? = nil
     var startupBeganAt: Date? = nil
     /// Migrations the local database has not applied (from the last check).
     var pendingMigrations: [String] = []
@@ -51,6 +55,16 @@ final class EnvironmentSupervisor {
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
+    /// The row shows Start for a daemon with no process while the environment runs:
+    /// skipped (Stripe without its CLI or its session) or stopped. A service outside
+    /// the profile cannot start.
+    func canStartFromRow(_ state: ServiceState) -> Bool {
+        state.definition.resolvedType != .oneshot
+            && (state.phase == .skipped || state.phase == .stopped)
+            && health != .stopped
+            && isInProfile(state.id)
+    }
+
     /// The fb-travel-monolith checkout that the runner runs, or nil before setup.
     var monorepoPath: String? {
         guard let path = config?.paths?.monorepo, !path.isEmpty else { return nil }
@@ -83,6 +97,13 @@ final class EnvironmentSupervisor {
 
     func dismissBehindBanner() {
         behindBannerDismissed = true
+    }
+
+    /// The banner does not come back for this place.
+    func dismissMisplacedCopyNotice() {
+        guard let notice = misplacedCopyNotice else { return }
+        InstanceGuard.dismiss(notice, defaults: userDefaults)
+        misplacedCopyNotice = nil
     }
 
     var rootCauseDescription: String? {
@@ -242,6 +263,8 @@ final class EnvironmentSupervisor {
         case portHeldByOtherStack(port: Int, container: String)
         /// `owner` is the process name of the container runtime that listens on the port.
         case portHeldByContainer(name: String, port: Int, owner: String)
+        /// `reason` is `ProbeConfig.problem`.
+        case badProbe(name: String, reason: String)
 
         var description: String {
             switch self {
@@ -259,6 +282,8 @@ final class EnvironmentSupervisor {
                 "\(name) was not started: the keys of the local Supabase stack could not be read (scripts/local-db.sh status -o env). Without them it would use the hosted dev values in \(envFile). Restart Supabase, then restart \(name)."
             case .portHeldByOtherStack(let port, let container):
                 "Port \(port) is held by another Supabase stack (\(container)) — stop it, then start again"
+            case .badProbe(let name, let reason):
+                "\(name) cannot start: \(reason). Correct its probe in services.json, then quit Travel Runner and open it again."
             case .portHeldByContainer(let name, let port, let owner):
                 "\(name) cannot start: port \(port) is published by a container (\(owner)) — stop that container, then restart \(name)"
             }
@@ -269,8 +294,11 @@ final class EnvironmentSupervisor {
 
     func loadConfig() {
         do {
+            configIssues = []
             let config = try ConfigLoader.load()
             self.config = config
+            configIssues = config.skippedServices.map(\.message)
+            for issue in configIssues { print("[Config] \(issue)") }
             self.serviceStates = [:]
             let graph = try ServiceGraph(services: config.services)
             self.graph = graph
@@ -553,6 +581,27 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// The answer of `/api/status`.
+    func statusJSON(buildInfo: BuildInfo = .current) -> String {
+        let states = serviceStates.mapValues { s in
+            ["phase": s.phase.rawValue, "pid": s.pid.map(String.init) ?? "nil"]
+        }
+        var dict: [String: Any] = [
+            "app": Flavor.current.rawValue,
+            "health": health.rawValue, "services": states, "lan": networkMode, "ip": localIP ?? "none",
+            "profile": profile.rawValue,
+            "db_mode": dbMode.rawValue,
+            "branches": gitBranches,
+            "gitBehind": gitBehindCounts,
+            "npmStale": Array(npmStaleServices)
+        ]
+        // version, build, commit, build_kind
+        dict.merge(buildInfo.statusFields) { current, _ in current }
+        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+           let str = String(data: data, encoding: .utf8) { return str }
+        return "{}"
+    }
+
     private func startControlServer() {
         let logStore = self.logStore
         controlServer = ControlServer()
@@ -561,33 +610,7 @@ final class EnvironmentSupervisor {
                 actions: ControlServer.Actions(
                     getStatus: { [weak self] in
                         guard let self else { return "{}" }
-                        let states = await MainActor.run {
-                            self.serviceStates.mapValues { s in
-                                ["phase": s.phase.rawValue, "pid": s.pid.map(String.init) ?? "nil"]
-                            }
-                        }
-                        let health = await MainActor.run { self.health.rawValue }
-                        let lan = await MainActor.run { self.networkMode }
-                        let ip = await MainActor.run { self.localIP ?? "none" }
-                        let profile = await MainActor.run { self.profile.rawValue }
-                        let dbMode = await MainActor.run { self.dbMode.rawValue }
-                        let branches = await MainActor.run { self.gitBranches }
-                        let behind = await MainActor.run { self.gitBehindCounts }
-                        let npmStale = await MainActor.run { Array(self.npmStaleServices) }
-                        var dict: [String: Any] = [
-                            "app": Flavor.current.rawValue,
-                            "health": health, "services": states, "lan": lan, "ip": ip,
-                            "profile": profile,
-                            "db_mode": dbMode,
-                            "branches": branches,
-                            "gitBehind": behind,
-                            "npmStale": npmStale
-                        ]
-                        // version, build, commit, build_kind
-                        dict.merge(BuildInfo.current.statusFields) { current, _ in current }
-                        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
-                           let str = String(data: data, encoding: .utf8) { return str }
-                        return "{}"
+                        return await MainActor.run { self.statusJSON() }
                     },
                     getLogs: { [weak self] serviceId, lines in
                         guard let self else { return "[]" }
@@ -785,6 +808,7 @@ final class EnvironmentSupervisor {
                     await self.logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: "[travel-runner] Cleared .next cache"))
                     try? await self.clock.sleep(for: .seconds(1))
                 })
+                clearCleanExitError(serviceID)
             } catch {
                 serviceStates[serviceID]?.phase = .failed
                 lastError = "\(error)"
@@ -977,6 +1001,7 @@ final class EnvironmentSupervisor {
                     self.queuedRestarts.remove(serviceID)
                     try? await self.clock.sleep(for: .seconds(1))
                 })
+                clearCleanExitError(serviceID)
                 if serviceStates[serviceID]?.phase == .skipped {
                     onActionFeedback?("\(name) skipped — see its log", false)
                 } else {
@@ -1007,6 +1032,17 @@ final class EnvironmentSupervisor {
             lastError = "\(error)"
         }
         recalculateHealth()
+    }
+
+    /// The banner text for a daemon that ended with code 0.
+    nonisolated static func cleanExitMessage(_ name: String) -> String {
+        "\(name) exited (code 0) and was not restarted — restart it from its row"
+    }
+
+    /// The person restarted the service, as the banner asked. A newer error stays.
+    private func clearCleanExitError(_ serviceID: String) {
+        guard let name = serviceStates[serviceID]?.definition.displayName else { return }
+        if lastError == Self.cleanExitMessage(name) { lastError = nil }
     }
 
     private func clearFailureHistory(_ serviceID: String) {
@@ -1091,6 +1127,7 @@ final class EnvironmentSupervisor {
                     onActionFeedback?("Cascade restart failed at \(id)", false)
                     return
                 }
+                clearCleanExitError(id)
 
                 // After Supabase comes back, check if DB is empty and auto-reset
                 if id == "supabase", let cwd = supabaseCwd {
@@ -1628,6 +1665,11 @@ final class EnvironmentSupervisor {
             return nil
         }
 
+        // A probe with a missing or wrong field: say so, and start nothing.
+        if let problem = definition.probe?.problem {
+            throw ServiceError.badProbe(name: definition.displayName, reason: problem)
+        }
+
         // Reuse-if-running: Docker-managed services (Supabase) persist between sessions.
         // If the port is already bound, skip starting and mark as running.
         if definition.shouldReuseIfRunning, let port = definition.probe?.port {
@@ -1772,10 +1814,13 @@ final class EnvironmentSupervisor {
 
             // Kill any stale occupant on the port
             if let port = definition.probe?.port, definition.resolvedType == .daemon, isPortBound(port) {
-                await killPortOccupants(port)
-                for _ in 0..<10 {
-                    try? await clock.sleep(for: .milliseconds(500))
-                    if !isPortBound(port) { break }
+                // The port frees only when a listener was killed. With none killed
+                // (a container holds it) there is nothing to wait for.
+                if await killPortOccupants(port) {
+                    for _ in 0..<10 {
+                        try? await clock.sleep(for: .milliseconds(500))
+                        if !isPortBound(port) { break }
+                    }
                 }
                 // A container still has the port: the service would fail with
                 // EADDRINUSE while its TCP probe passes against the container.
@@ -1823,8 +1868,12 @@ final class EnvironmentSupervisor {
         state.pid = nil
 
         var stdoutProbe: StdoutProbe?
-        if case .stdoutRegex = definition.probe?.type {
-            stdoutProbe = StdoutProbe(pattern: definition.probe!.pattern!)
+        if let probeConfig = definition.probe, probeConfig.type == .stdoutRegex {
+            do {
+                stdoutProbe = try StdoutProbe(pattern: probeConfig.pattern ?? "")
+            } catch {
+                throw ServiceError.badProbe(name: definition.displayName, reason: "\(error)")
+            }
             stdoutProbes[serviceID] = stdoutProbe
         }
 
@@ -1918,7 +1967,7 @@ final class EnvironmentSupervisor {
 
         // Daemons: wait for the probe (the launch's definition has the LAN-aware host)
         if let probeConfig = launch.definition.probe {
-            let probe: Probe = if let sp = launch.stdoutProbe { sp } else { ProbeFactory.makeProbe(for: probeConfig) }
+            let probe: Probe = if let sp = launch.stdoutProbe { sp } else { try ProbeFactory.makeProbe(for: probeConfig) }
             let deadline = clock.uptime() + probeConfig.resolvedTimeout
             var ready = false
             while clock.uptime() < deadline {
@@ -2001,9 +2050,13 @@ final class EnvironmentSupervisor {
             if state.id == "stripe" { return false }
             throw ServiceError.exitedDuringStartup(state.id)
         case .commandNotRunnable(let code):
+            let tool = await missingTool(forExit: code, pid: exit.pid, of: state.definition)
+            // The question takes time. A stop, or a newer launch, owns the state now.
+            if isShuttingDown || state.phase == .stopping || state.phase == .stopped { return false }
+            if let current = state.pid, current != exit.pid { return false }
             throw ServiceError.commandNotRunnable(
                 name: state.definition.displayName, command: state.definition.cmd.first ?? "its command", code: code,
-                tool: await missingTool(forExit: code, pid: exit.pid, of: state.definition)
+                tool: tool
             )
         case .killedExternally, .crashed:
             // Stripe degrades to skipped when its CLI fails.
@@ -2077,7 +2130,7 @@ final class EnvironmentSupervisor {
                 let cause = if let known = CrashCause.knownCause(in: output, serviceID: serviceID) {
                     "\(exit) — \(known)"
                 } else {
-                    "\(exit) — see the lines above (401: run stripe login), then start it from its row"
+                    "\(exit) — see the lines above. If they show 401, run: stripe login. Then start it from its row."
                 }
                 await logStore.append(serviceID: serviceID, entry: LogEntry(
                     stream: .stderr, text: Self.stripeStoppedLine(cause)
@@ -2117,6 +2170,8 @@ final class EnvironmentSupervisor {
             // It is not a crash: no notification and no debug issue.
             state.phase = .failed
             state.lastStopped = clock.date()
+            // The header shows the banner only with a text: say which service ended.
+            lastError = Self.cleanExitMessage(name)
             Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
                 stream: .stderr, text: "[travel-runner] \(name) exited (code 0) — not restarted"
             ))}
@@ -2409,7 +2464,7 @@ final class EnvironmentSupervisor {
             // actually bound to, and allow a grace window — a single 2s
             // check right after wake produces false failures.
             let effectiveProbe = lanAwareDefinition(for: state.definition, serviceID: serviceID).probe ?? probeConfig
-            let probe = ProbeFactory.makeProbe(for: effectiveProbe)
+            guard let probe = try? ProbeFactory.makeProbe(for: effectiveProbe) else { continue }
             let ok = (try? await waitForProbe(probe, timeout: .seconds(15), interval: .seconds(3))) ?? false
             // A restart or a stop can start while the probe runs; it owns the state then.
             guard state.phase == .running else { continue }
@@ -2727,7 +2782,8 @@ final class EnvironmentSupervisor {
 
     /// After Supabase starts: resets an empty database and, with `checkMigrations`,
     /// one that lacks migrations. It changes nothing when Supabase does not run,
-    /// after a stop, or when the database cannot be read. True when a reset ran.
+    /// after a stop, or when the database cannot be read. True when a reset ran;
+    /// false when another reset or setup already runs.
     @discardableResult
     func resetDatabaseIfNeeded(cwd: String, checkMigrations: Bool) async -> Bool {
         guard canAutoReset else { return false }
@@ -2763,6 +2819,8 @@ final class EnvironmentSupervisor {
             guard !missing.isEmpty, canAutoReset else { return false }
             reason = "\(missing.count) new migration\(missing.count == 1 ? "" : "s") — running db:reset..."
         }
+        // `runDbReset` does nothing while another reset or setup runs.
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return false }
         _ = await runDbReset(cwd: cwd, reason: reason)
         return true
     }
@@ -2814,9 +2872,17 @@ final class EnvironmentSupervisor {
         } else {
             ok = await runDbResetPipeline(cwd: cwd)
         }
-        if ok { lastError = nil }
+        if ok {
+            lastError = nil
+        } else if lastError == reason {
+            // The run ended with no failed step: it was cancelled between two steps.
+            lastError = Self.dbResetCancelledMessage
+        }
         return ok
     }
+
+    nonisolated static let dbResetCancelledMessage =
+        "The database reset stopped before it finished. Click Reset DB to run it again."
 
     private func runDbResetPipeline(cwd: String) async -> Bool {
         guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "reset") else { return false }
@@ -2891,9 +2957,11 @@ final class EnvironmentSupervisor {
         guard sock >= 0 else { return false }
         defer { Darwin.close(sock) }
 
+        // A number that is not a port has no listener.
+        guard let portNumber = UInt16(exactly: port) else { return false }
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = UInt16(port).bigEndian
+        addr.sin_port = portNumber.bigEndian
         addr.sin_addr.s_addr = address
 
         let result = withUnsafePointer(to: &addr) {
@@ -2908,7 +2976,10 @@ final class EnvironmentSupervisor {
     /// the clients of the port (a browser tab, the Stripe CLI that forwards to the
     /// portal, another dev server), and those must stay alive.
     /// A container runtime is never killed: its port helper serves every container.
-    private func killPortOccupants(_ port: Int) async {
+    /// True when it killed a listener.
+    @discardableResult
+    private func killPortOccupants(_ port: Int) async -> Bool {
+        var killed = false
         for listener in await portTools.listeners(port) {
             if PortOwner.isContainerRuntime(listener.command) {
                 if let serviceID = sortedServiceIDs.first(where: { serviceStates[$0]?.definition.probe?.port == port }) {
@@ -2920,7 +2991,9 @@ final class EnvironmentSupervisor {
                 continue
             }
             portTools.kill(listener.pid)
+            killed = true
         }
+        return killed
     }
 
     /// Services whose port the cleanup may clear: in the profile, and not a
@@ -2971,7 +3044,7 @@ final class EnvironmentSupervisor {
     /// Kill anything holding the web service ports — including orphaned dev
     /// servers whose npm parent died during sleep. Without this, the replacement
     /// server silently binds port+1 while the zombie serves 404s on the real port.
-    private func killWebServicePorts() async {
+    func killWebServicePorts() async {
         for serviceID in Self.wakeHealthPaths.keys.sorted() where isInProfile(serviceID) {
             guard let port = serviceStates[serviceID]?.definition.probe?.port else { continue }
             await lifecycle.withLock(serviceID) {

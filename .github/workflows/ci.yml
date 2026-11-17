@@ -25,14 +25,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The cache holds compiled code, so its key names the compiler that made it.
       - name: Show the toolchain
-        run: swift --version
+        id: toolchain
+        run: |
+          swift --version
+          echo "hash=$(swift --version 2>&1 | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - name: Cache the Swift packages
         uses: actions/cache@v4
         with:
           path: .build
-          key: spm-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Package.resolved') }}
+          key: spm-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-${{ hashFiles('Package.resolved') }}
 
       - name: Check the syntax of the build scripts
         run: bash -n build.sh && bash -n release.sh

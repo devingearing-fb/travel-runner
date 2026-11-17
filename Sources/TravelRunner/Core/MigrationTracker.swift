@@ -1,13 +1,5 @@
 import Foundation
 
-/// Finds the migrations the local database has not applied. The monorepo replays the
-/// fb-amateur-backend baseline plus its own pending `supabase/migrations/*.sql`, so the
-/// expected versions are the files of both; the applied versions come from the database
-/// (`supabase_migrations.schema_migrations`).
-///
-/// The database is the record, not a hash file: a reset outside the runner
-/// (`pnpm db:reset`) or another runner build cannot make it stale, so a database that
-/// is up to date is never reset again.
 /// The migrations the database should have.
 struct ExpectedMigrations: Equatable {
     /// Versions as the migration files name them (the timestamp before the first `_`).
@@ -16,6 +8,14 @@ struct ExpectedMigrations: Equatable {
     var aliases: [String: String] = [:]
 }
 
+/// Finds the migrations the local database has not applied. The monorepo replays the
+/// fb-amateur-backend baseline plus its own pending `supabase/migrations/*.sql`, so the
+/// expected versions are the files of both; the applied versions come from the database
+/// (`supabase_migrations.schema_migrations`).
+///
+/// The database is the record, not a hash file: a reset outside the runner
+/// (`pnpm db:reset`) or another runner build cannot make it stale, so a database that
+/// is up to date is never reset again.
 enum MigrationTracker {
     /// `scripts/local-db.sh` renames the two backend bootstraps (`*_init-roles.sql`,
     /// `*_init-schema.sql`) to these local versions before it applies them, so the

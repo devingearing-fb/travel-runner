@@ -193,6 +193,7 @@ struct WorkshopDiagnosticsView: View {
 
         if let error = supervisor.lastError { bundle["lastError"] = redactor.redact(error) }
         if let error = supervisor.controlAPIError { bundle["controlAPIError"] = error }
+        if !supervisor.configIssues.isEmpty { bundle["configIssues"] = supervisor.configIssues }
         if let rootCause = supervisor.rootCauseDescription { bundle["rootCause"] = redactor.redact(rootCause) }
 
         var services: [String: [String: Any]] = [:]

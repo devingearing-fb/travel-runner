@@ -6,9 +6,14 @@ final class StdoutProbe: Probe, @unchecked Sendable {
     private var matched = false
     private let lock = NSLock()
 
-    init(pattern: String) {
+    /// Throws `ProbeConfigError` when the pattern is empty or not a regular expression.
+    init(pattern: String) throws {
+        guard !pattern.isEmpty else { throw ProbeConfigError(reason: "probe type stdout_regex needs a pattern") }
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            throw ProbeConfigError(reason: "probe type stdout_regex needs a pattern that is a valid regular expression")
+        }
         self.pattern = pattern
-        self.regex = try! NSRegularExpression(pattern: pattern)
+        self.regex = regex
     }
 
     func feed(line: String) -> String? {

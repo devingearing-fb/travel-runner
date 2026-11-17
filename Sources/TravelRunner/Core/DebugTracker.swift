@@ -126,6 +126,10 @@ actor DebugTracker {
         var appCommit: String?
         var appBuildKind: String?
         var appFlavor: String?
+        /// The build of the app at the last recurrence. Nil until the issue recurs.
+        var lastAppVersion: String?
+        var lastAppBuild: String?
+        var lastAppCommit: String?
         var createdAt: String
         var updatedAt: String
         var resolvedAt: String?
@@ -144,6 +148,9 @@ actor DebugTracker {
             case appCommit = "app_commit"
             case appBuildKind = "app_build_kind"
             case appFlavor = "app_flavor"
+            case lastAppVersion = "last_app_version"
+            case lastAppBuild = "last_app_build"
+            case lastAppCommit = "last_app_commit"
             case createdAt = "created_at"
             case updatedAt = "updated_at"
             case resolvedAt = "resolved_at"
@@ -613,6 +620,10 @@ actor DebugTracker {
         issue.recurrenceCount += 1
         issue.recurrenceTimestamps = Array((issue.recurrenceTimestamps + [stamp]).suffix(Self.maxRecurrenceTimestamps))
         issue.updatedAt = stamp
+        // The `app_*` fields keep the build of the first capture.
+        issue.lastAppVersion = buildInfo.version
+        issue.lastAppBuild = buildInfo.build
+        issue.lastAppCommit = buildInfo.commit
         writeJSON(issue, to: issuePath)
     }
 

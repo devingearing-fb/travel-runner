@@ -13,15 +13,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastIconHealth: HealthStatus?
     private var pulseState: Bool = false
     private var updateController: UpdateController!
+    /// Another copy of the app ran first. This copy only says so and quits: it has no
+    /// supervisor, and it must not touch the env, the processes or the ports of the other.
+    private var yieldsToRunningCopy = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
+
+        // Before the supervisor: it would take the control port and write the config.
+        if let running = InstanceGuard.runningCopyNow() {
+            yieldsToRunningCopy = true
+            if InstanceGuard.skipsAlert() {
+                FileHandle.standardError.write(Data((InstanceGuard.message(for: running.copy) + "\n").utf8))
+                exit(InstanceGuard.smokeExitCode)
+            }
+            InstanceGuard.refuse(running) { NSApplication.shared.terminate(nil) }
+            return
+        }
 
         // Read the PATH of the user's shell first. A command that starts while
         // this runs waits for it.
         ToolEnvironment.shared.beginResolve(runner: LoginShell())
 
         supervisor = EnvironmentSupervisor(logSink: .live())
+        supervisor.misplacedCopyNotice = InstanceGuard.misplacedNotice(
+            bundlePath: Bundle.main.bundlePath,
+            build: .current,
+            defaults: .standard
+        )
         supervisor.loadConfig()
 
         supervisor.onServiceCrash = { [weak self] serviceName, exitCode in
@@ -44,6 +63,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// A second launch from Finder or Spotlight shows the window. The app has no Dock icon.
     /// A window that is already open keeps its section.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        guard !yieldsToRunningCopy else { return false }
         let panel = WorkshopPanel.shared
         if panel.isVisible {
             panel.open(section: panel.navigation.selectedSection ?? .status)
@@ -55,6 +75,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        guard !yieldsToRunningCopy else { return }
         if let monitor = rightClickMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = globalHotkeyMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = localHotkeyMonitor { NSEvent.removeMonitor(monitor) }
@@ -303,7 +324,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Notifications
 
+    /// The notification centre aborts the process when the binary has no app bundle
+    /// (`swift run`, or the bare executable). Such a run has no notifications.
+    private var canNotify: Bool { Bundle.main.bundleIdentifier != nil }
+
     private func setupNotifications() {
+        guard canNotify else { return }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         let openAction = UNNotificationAction(identifier: "OPEN_LOGS", title: "Open Logs", options: [.foreground])
         let category = UNNotificationCategory(identifier: "CRASH", actions: [openAction], intentIdentifiers: [])
@@ -311,6 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func postCrashNotification(serviceName: String, exitCode: Int32) {
+        guard canNotify else { return }
         let content = UNMutableNotificationContent()
         content.title = "\(serviceName) crashed"
         content.body = "Exited with code \(exitCode)"

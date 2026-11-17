@@ -144,6 +144,32 @@ struct WorkshopHeaderBar: View {
                     action: nil
                 )
             }
+            // Keyed by place: two skipped services can give the same text.
+            ForEach(Array(supervisor.configIssues.enumerated()), id: \.offset) { _, issue in
+                alertBanner(
+                    icon: "exclamationmark.triangle.fill",
+                    color: .orange,
+                    text: issue,
+                    subtitle: "Correct the file, then quit Travel Runner and open it again.",
+                    action: ("Open services.json", {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: ConfigLoader.configPath))
+                    })
+                )
+            }
+            if let notice = supervisor.misplacedCopyNotice {
+                alertBanner(
+                    icon: "folder.badge.questionmark",
+                    color: .orange,
+                    text: notice.text,
+                    subtitle: notice.advice,
+                    action: notice.revealPath.map { path in
+                        ("Show in Finder", {
+                            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                        })
+                    },
+                    onDismiss: { supervisor.dismissMisplacedCopyNotice() }
+                )
+            }
             if supervisor.migrationsBannerVisible {
                 alertBanner(
                     icon: "arrow.triangle.2.circlepath",

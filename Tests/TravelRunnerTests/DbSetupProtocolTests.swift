@@ -57,6 +57,29 @@ final class DbSetupProtocolTests: XCTestCase {
         XCTAssertEqual(step.progressLabel, "Quarter")
     }
 
+    /// The finding: the bar showed 0% for the whole run, because the view read the
+    /// 0-1 fraction as a 0-100 percent. The view shows these two values.
+    func testTheBarAndTheLabelReadTheFraction() {
+        let step = makeStep()
+        DbSetupRunner.parseProtocolLine("progress:0.42:Applying migrations", step: step)
+        let progress = step.progress ?? -1
+
+        XCTAssertEqual(DbSetupStep.percentLabel(progress), "42%")
+        XCTAssertEqual(DbSetupStep.barValue(progress), 0.42, accuracy: 0.0001)
+        XCTAssertEqual(DbSetupStep.percentLabel(0), "0%")
+        XCTAssertEqual(DbSetupStep.percentLabel(1), "100%")
+        XCTAssertEqual(DbSetupStep.barValue(1.7), 1)
+        XCTAssertEqual(DbSetupStep.barValue(.nan), 0)
+    }
+
+    /// 0.29 * 100 is 28.999…, so a label that cuts the fraction said 28%.
+    func testTheLabelRoundsEachTwoDecimalFraction() {
+        for percent in 0...100 {
+            let fraction = Double(String(format: "%.2f", Double(percent) / 100)) ?? -1
+            XCTAssertEqual(DbSetupStep.percentLabel(fraction), "\(percent)%")
+        }
+    }
+
     func testOtherLineTypesLeaveProgressAlone() {
         let step = makeStep()
         DbSetupRunner.parseProtocolLine("status:failed:Migration error", step: step)

@@ -26,14 +26,7 @@ struct ServiceRow: View {
             && (state.phase == .completed || state.phase == .skipped)
     }
 
-    /// A daemon with no process while the environment runs: skipped (Stripe without
-    /// its CLI or its session) or stopped. A service outside the profile cannot start.
-    private var canStart: Bool {
-        state.definition.resolvedType != .oneshot
-            && (state.phase == .skipped || state.phase == .stopped)
-            && supervisor.health != .stopped
-            && supervisor.isInProfile(state.id)
-    }
+    private var canStart: Bool { supervisor.canStartFromRow(state) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {

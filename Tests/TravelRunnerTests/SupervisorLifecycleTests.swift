@@ -41,6 +41,19 @@ final class SupervisorLifecycleTests: XCTestCase {
         }
     }
 
+    /// Gives the supervisor a shell that holds each "where is the tool" question
+    /// until the test opens the gate. The answer: not on the PATH `/fake/bin`.
+    private func heldPathQuestion() -> HeldPathQuestion {
+        let gate = Gate()
+        let shell = FakeCommandRunner { call in
+            guard call.command.contains("command -v") else { return FakeCommandRunner.ok() }
+            await gate.wait()
+            return CommandResult(exitCode: 3, stdout: "/fake/bin\n", stderr: "")
+        }
+        supervisor.shell = shell
+        return HeldPathQuestion(shell: shell, gate: gate)
+    }
+
     override func tearDown() async throws {
         supervisor.stopAll()
         _ = await waitUntil(10) { self.supervisor.health == .stopped }
@@ -468,6 +481,58 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("toolless").restartCount, 0)
     }
 
+    /// The PATH question takes time. A stop that arrives while it runs keeps the
+    /// service stopped, and the answer does not bring the error back.
+    func testAStopDuringThePathQuestionLeavesTheServiceStopped() async throws {
+        let tool = "tr-no-such-tool-\(UUID().uuidString)"
+        let question = heldPathQuestion()
+        try load(daemon("toolless", [tool, "dev"]))
+
+        supervisor.restartService("toolless")
+        let asked = await waitUntil(30) { self.state("toolless").phase == .failed && question.calls == 1 }
+        XCTAssertTrue(asked, "\(question.calls) questions")
+        // Longer than one round of the probe, so the wait for the probe asks too.
+        try await Task.sleep(for: .seconds(3))
+
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        await question.gate.open()
+        let done = await waitUntil(10) { self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(done)
+        // Time for the answer to reach the end of the process.
+        try await Task.sleep(for: .milliseconds(500))
+
+        XCTAssertEqual(state("toolless").phase, .stopped)
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertEqual(question.calls, 2, "one question: the PATH of the launch, then the PATH of the new read")
+    }
+
+    /// The control of the test above: with no stop, the answer gives the error. The
+    /// wait for the probe and the end of the process ask one question for the process.
+    func testThePathQuestionIsAskedOncePerProcess() async throws {
+        let tool = "tr-no-such-tool-\(UUID().uuidString)"
+        let question = heldPathQuestion()
+        try load(daemon("toolless", [tool, "dev"]))
+
+        supervisor.restartService("toolless")
+        let asked = await waitUntil(30) { self.state("toolless").phase == .failed && question.calls == 1 }
+        XCTAssertTrue(asked, "\(question.calls) questions")
+        try await Task.sleep(for: .seconds(3))
+        XCTAssertFalse(supervisor.actionsInFlight.isEmpty, "the wait for the probe has not ended")
+
+        await question.gate.open()
+        let done = await waitUntil(10) { self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(done)
+
+        XCTAssertEqual(state("toolless").phase, .failed)
+        XCTAssertEqual(
+            supervisor.lastError,
+            "toolless cannot start: \(ToolEnvironment.notFoundText(tool: tool, searchedPath: "/fake/bin"))"
+        )
+        XCTAssertEqual(question.calls, 2, "one question: the PATH of the launch, then the PATH of the new read")
+    }
+
     /// A stop-all while a service starts: the start's wait for the probe must not
     /// mark the service as failed after the stop.
     func testStopAllDuringAStartLeavesTheServiceStopped() async throws {
@@ -577,6 +642,39 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(Self.listeners(on: port).isEmpty)
     }
 
+    /// A probe with no port crashed the app at Start. It must fail the one service
+    /// with a message, and start no process.
+    func testAServiceWithABadProbeFailsWithAMessageAndStartsNothing() async throws {
+        let probes = [
+            ProbeConfig(type: .tcp, port: nil, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5),
+            ProbeConfig(type: .tcp, port: 70000, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5),
+            ProbeConfig(type: .stdoutRegex, port: nil, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5),
+            ProbeConfig(type: .stdoutRegex, port: nil, host: nil, url: nil, pattern: "ready (", artifact: nil, timeout: 5),
+            ProbeConfig(type: .http, port: nil, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5),
+        ]
+        for probe in probes {
+            try load(ServiceDefinition(
+                id: "custom", name: "Custom", cmd: ["sh", "-c", "echo custom-start; sleep 30"], cwd: workDir.path,
+                probe: probe, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+            ))
+
+            supervisor.restartService("custom")
+
+            let failed = await waitUntil(20) {
+                self.state("custom").phase == .failed && self.supervisor.actionsInFlight.isEmpty
+            }
+            XCTAssertTrue(failed, "custom is \(state("custom").phase.rawValue) for \(probe)")
+            let reason = try XCTUnwrap(probe.problem)
+            XCTAssertEqual(
+                supervisor.lastError,
+                "Custom cannot start: \(reason). Correct its probe in services.json, then quit Travel Runner and open it again."
+            )
+            let lines = await logLines("custom")
+            XCTAssertFalse(lines.contains("custom-start"), "the process must not start")
+            XCTAssertNil(state("custom").pid)
+        }
+    }
+
     /// Ticket "failed wake probe" with a recurrence five seconds later: two wake
     /// notifications ran two passes, and both restarted the service.
     func testTwoWakeNotificationsRestartAFailedServiceOnce() async throws {
@@ -681,7 +779,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.databaseProbeRetry = (.milliseconds(10), .zero)
         var queries = 0
         var resets = 0
-        var answer = DbQueryResult(exitCode: 1, stdout: "", stderr: "\nCannot connect to the Docker daemon\nIs it running?")
+        // A login profile prints its own warning first; the error of Docker is the last line.
+        var answer = DbQueryResult(exitCode: 1, stdout: "", stderr: "\ncompinit: insecure directories\nCannot connect to the Docker daemon\n")
         supervisor.databaseQuery = { _, _ in
             queries += 1
             return answer
@@ -848,16 +947,19 @@ final class SupervisorLifecycleTests: XCTestCase {
         try loadSupabase()
         var resets = 0
         supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "0", stderr: "") }
+        var second: Bool?
         supervisor.dbResetAction = { [supervisor] cwd in
             resets += 1
             // The same request while this one runs.
-            await supervisor?.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: false)
+            second = await supervisor?.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: false)
             supervisor?.lastError = "DB reset failed at Load hotels: HTTP 401"
             return false
         }
 
-        await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
+        let first = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
 
+        XCTAssertTrue(first, "a reset ran, and failed")
+        XCTAssertEqual(second, false, "no reset started for the second request")
         XCTAssertEqual(resets, 1)
         XCTAssertEqual(supervisor.lastError, "DB reset failed at Load hotels: HTTP 401")
         XCTAssertFalse(supervisor.dbResetRunning)
@@ -896,6 +998,135 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(supervisor.lastError)
     }
 
+    /// A reset that was cancelled between two steps has no failed step. The banner
+    /// stayed at "running db:reset..." although nothing ran.
+    func testAResetThatEndsWithNoFailedStepDoesNotLeaveTheProgressText() async throws {
+        try loadSupabase()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "0", stderr: "") }
+        supervisor.dbResetAction = { _ in false }
+
+        await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
+
+        XCTAssertEqual(
+            supervisor.lastError,
+            "The database reset stopped before it finished. Click Reset DB to run it again."
+        )
+        XCTAssertFalse(supervisor.dbResetRunning)
+    }
+
+    /// The answer "no tables" arrives after Stop was clicked and before the stop
+    /// changed the state of Supabase: only the stop flag says that the start is over.
+    func testAnAnswerThatArrivesAsTheStopBeginsDoesNotStartAReset() async throws {
+        try loadSupabase()
+        var resets = 0
+        var asked = false
+        var release: CheckedContinuation<Void, Never>?
+        supervisor.databaseQuery = { _, _ in
+            asked = true
+            await withCheckedContinuation { release = $0 }
+            return DbQueryResult(exitCode: 0, stdout: "0", stderr: "")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+        let cwd = workDir.path
+        let check = Task { await self.supervisor.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true) }
+        let waiting = await waitUntil(10) { asked && release != nil }
+        XCTAssertTrue(waiting)
+
+        // The answer is on its way when the stop begins. Nothing waits between the
+        // two lines, so the answer is read before the stop marks Supabase as stopping.
+        release?.resume()
+        supervisor.stopAll()
+        let didReset = await check.value
+
+        XCTAssertFalse(didReset)
+        XCTAssertEqual(resets, 0)
+        _ = await waitUntil(10) { self.supervisor.health == .stopped }
+    }
+
+    /// A stop cancels the task of the start. Supabase can still count as running
+    /// then, so the cancel alone must end the check.
+    func testACancelledStartDoesNotStartAReset() async throws {
+        try loadSupabase()
+        var resets = 0
+        var release: CheckedContinuation<Void, Never>?
+        supervisor.databaseQuery = { _, _ in
+            await withCheckedContinuation { release = $0 }
+            return DbQueryResult(exitCode: 0, stdout: "0", stderr: "")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+        let cwd = workDir.path
+        let check = Task { await self.supervisor.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true) }
+        let waiting = await waitUntil(10) { release != nil }
+        XCTAssertTrue(waiting)
+
+        check.cancel()
+        release?.resume()
+        let didReset = await check.value
+
+        XCTAssertFalse(didReset)
+        XCTAssertEqual(resets, 0)
+        XCTAssertEqual(state("supabase").phase, .running)
+        XCTAssertNil(supervisor.lastError)
+
+        // Control: the same answer without the cancel starts the reset.
+        release = nil
+        let again = Task { await self.supervisor.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true) }
+        _ = await waitUntil(10) { release != nil }
+        release?.resume()
+        let didResetAgain = await again.value
+        XCTAssertTrue(didResetAgain)
+        XCTAssertEqual(resets, 1)
+    }
+
+    /// The database has tables and lacks a migration. A stop that arrives while the
+    /// runner reads the applied migrations must not start the reset.
+    func testAStopWhileTheMigrationsAreReadDoesNotStartAReset() async throws {
+        try loadSupabase()
+        let migrations = workDir.appendingPathComponent(".backend-baseline/supabase/migrations")
+        try FileManager.default.createDirectory(at: migrations, withIntermediateDirectories: true)
+        try Data().write(to: migrations.appendingPathComponent("20260101000000_base.sql"))
+        var resets = 0
+        var release: CheckedContinuation<Void, Never>?
+        supervisor.databaseQuery = { _, sql in
+            // The first question counts the tables; the second reads the applied versions.
+            guard sql.contains("schema_migrations") else { return DbQueryResult(exitCode: 0, stdout: "42", stderr: "") }
+            await withCheckedContinuation { release = $0 }
+            return DbQueryResult(exitCode: 0, stdout: "", stderr: "")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+        let cwd = workDir.path
+
+        // Control: without a stop, the missing migration starts the reset.
+        let control = Task { await self.supervisor.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true) }
+        let controlWaiting = await waitUntil(10) { release != nil }
+        XCTAssertTrue(controlWaiting)
+        release?.resume()
+        let controlReset = await control.value
+        XCTAssertTrue(controlReset)
+        XCTAssertEqual(resets, 1)
+
+        release = nil
+        let check = Task { await self.supervisor.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true) }
+        let waiting = await waitUntil(10) { release != nil }
+        XCTAssertTrue(waiting)
+        // Supabase went down while the runner asked.
+        state("supabase").phase = .failed
+        release?.resume()
+        let didReset = await check.value
+
+        XCTAssertFalse(didReset)
+        XCTAssertEqual(resets, 1)
+    }
+
     func testOnlyAnAnswerOfZeroIsAnEmptyDatabase() {
         XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "0", stderr: "")), .empty)
         XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "17\n", stderr: "warning")), .hasTables)
@@ -905,6 +1136,44 @@ final class SupervisorLifecycleTests: XCTestCase {
         )
         XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 127, stdout: "", stderr: "")), .unknown("exit code 127"))
         XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "", stderr: "")), .unknown("the query gave no answer"))
+
+        // The query runs in a login shell. A profile that prints does not hide the count.
+        XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "Welcome back\n0\n", stderr: "")), .empty)
+        XCTAssertEqual(DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "nvm: using v22\n\n17", stderr: "")), .hasTables)
+        // The error of Docker or psql is the last line, after the warnings of the profile.
+        XCTAssertEqual(
+            DbProbe.classify(DbQueryResult(
+                exitCode: 1, stdout: "", stderr: "compinit: insecure directories\nError response from daemon: No such container: x\n"
+            )),
+            .unknown("Error response from daemon: No such container: x")
+        )
+        // psql prints `LINE 1:` and a caret after an SQL error. The detail is the error.
+        XCTAssertEqual(
+            DbProbe.classify(DbQueryResult(
+                exitCode: 1, stdout: "",
+                stderr: "ERROR:  relation \"public.events\" does not exist\nLINE 1: SELECT count(*) FROM public.events\n                             ^\n"
+            )),
+            .unknown("ERROR:  relation \"public.events\" does not exist")
+        )
+        // A socket that does not answer: the cause is the first line, a hint is the last.
+        XCTAssertEqual(
+            DbProbe.classify(DbQueryResult(
+                exitCode: 2, stdout: "",
+                stderr: "psql: error: connection to server on socket \"/tmp/.s.PGSQL.5432\" failed: No such file or directory\n"
+                    + "\tIs the server running locally and accepting connections on that socket?\n"
+            )),
+            .unknown("psql: error: connection to server on socket \"/tmp/.s.PGSQL.5432\" failed: No such file or directory")
+        )
+        // An error with no known mark: the last line.
+        XCTAssertEqual(
+            DbProbe.classify(DbQueryResult(exitCode: 1, stdout: "", stderr: "first\nsomething broke\n")),
+            .unknown("something broke")
+        )
+        // An answer that is not a number stays on one line of the banner.
+        XCTAssertEqual(
+            DbProbe.classify(DbQueryResult(exitCode: 0, stdout: "first line\nnot a number", stderr: "")),
+            .unknown("unexpected answer: not a number")
+        )
     }
 
     /// A daemon that ends with code 0 has no process, and nothing starts it again.
@@ -932,6 +1201,68 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains("[travel-runner] quitter exited (code 0) — not restarted"), lines.joined(separator: "\n"))
         XCTAssertEqual(lines.filter { $0 == "quitter-start" }.count, 1, "it is not restarted")
         XCTAssertTrue(crashes.isEmpty, "a clean exit is not a crash: \(crashes)")
+        // The header shows its banner only with a text.
+        XCTAssertEqual(supervisor.lastError, "quitter exited (code 0) and was not restarted — restart it from its row")
+    }
+
+    /// The banner of a clean exit asks for a restart from the row. The restart
+    /// clears it, and it does not clear another error.
+    func testARestartFromTheRowClearsTheCleanExitBanner() async throws {
+        let marker = workDir.appendingPathComponent("second-run").path
+        let script = "if [ -f '\(marker)' ]; then exec sleep 60; else touch '\(marker)'; sleep 2; exit 0; fi"
+        let quitter = ServiceDefinition(
+            id: "quitter", name: "quitter", cmd: ["sh", "-c", script], cwd: workDir.path,
+            probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try load(quitter)
+        supervisor.restartService("quitter")
+        let banner = EnvironmentSupervisor.cleanExitMessage("quitter")
+        let ended = await waitUntil(20) { self.state("quitter").phase == .failed && self.supervisor.lastError == banner }
+        XCTAssertTrue(ended, supervisor.lastError ?? "nil")
+
+        supervisor.restartService("quitter")
+        let cleared = await waitUntil(15) { self.settled("quitter") && self.supervisor.lastError == nil }
+        XCTAssertTrue(cleared, supervisor.lastError ?? "nil")
+
+        // An error that is not the banner of this service stays.
+        supervisor.lastError = "Could not save profile: disk full"
+        supervisor.restartService("quitter")
+        let started = await waitUntil(5) { !self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(started)
+        let restarted = await waitUntil(15) { self.settled("quitter") }
+        XCTAssertTrue(restarted)
+        XCTAssertEqual(supervisor.lastError, "Could not save profile: disk full")
+    }
+
+    /// The Start control of a row: only for a daemon of the profile that has no
+    /// process while the environment runs.
+    func testTheRowOffersStartOnlyForAStoppedDaemonOfTheProfile() throws {
+        func service(_ id: String, type: ServiceType = .daemon) -> ServiceDefinition {
+            ServiceDefinition(
+                id: id, name: id, cmd: ["sleep", "1"], cwd: workDir.path, probe: nil, type: type, restart: .never,
+                dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+            )
+        }
+        try supervisor.loadServices(
+            [service("stripe"), service("partner-portal"), service("seed", type: .oneshot)], profile: .booking
+        )
+        supervisor.health = .degraded
+        for id in ["stripe", "partner-portal", "seed"] { state(id).phase = .skipped }
+
+        XCTAssertTrue(supervisor.canStartFromRow(state("stripe")))
+        state("stripe").phase = .stopped
+        XCTAssertTrue(supervisor.canStartFromRow(state("stripe")))
+
+        // Negative controls.
+        XCTAssertFalse(supervisor.canStartFromRow(state("partner-portal")), "outside the profile")
+        XCTAssertFalse(supervisor.canStartFromRow(state("seed")), "a oneshot")
+        for phase in [ServicePhase.running, .starting, .failed, .pending] {
+            state("stripe").phase = phase
+            XCTAssertFalse(supervisor.canStartFromRow(state("stripe")), phase.rawValue)
+        }
+        state("stripe").phase = .skipped
+        supervisor.health = .stopped
+        XCTAssertFalse(supervisor.canStartFromRow(state("stripe")), "the environment is stopped: Start All is the control")
     }
 
     private func stripe(_ script: String) -> ServiceDefinition {
@@ -985,7 +1316,10 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         let lines = await logLines("stripe")
         XCTAssertTrue(
-            lines.contains { $0.hasPrefix("[travel-runner] Stripe stopped: the Stripe CLI exited with code 1") },
+            lines.contains(
+                "[travel-runner] Stripe stopped: the Stripe CLI exited with code 1 — see the lines above. "
+                    + "If they show 401, run: stripe login. Then start it from its row."
+            ),
             lines.joined(separator: "\n")
         )
         XCTAssertEqual(lines.filter { $0 == "stripe-start" }.count, 1, "it is not restarted")
@@ -1117,12 +1451,22 @@ final class SupervisorLifecycleTests: XCTestCase {
         await supervisor.cleanupStaleProcesses()
         XCTAssertEqual(calls.kills, [pid_t(inProfile.port)])
 
+        // The port sweep of a wake (the LAN address changed) has the same rules: not
+        // the partner portal outside the profile, and not the container.
+        calls.reset()
+        await supervisor.killWebServicePorts()
+        XCTAssertEqual(calls.kills, [pid_t(inProfile.port)])
+
         // The partner profile: now the partner portal is in, and Stripe is out.
         calls.reset()
         try supervisor.loadServices(services, profile: .partner)
         await supervisor.cleanupStaleProcesses()
         XCTAssertEqual(calls.kills, [pid_t(outside.port)])
         XCTAssertEqual(calls.patterns, [], "Stripe is outside the profile")
+        // Control for the wake sweep: in the profile, the partner portal is swept.
+        calls.reset()
+        await supervisor.killWebServicePorts()
+        XCTAssertEqual(calls.kills, [pid_t(outside.port)])
     }
 
     /// A container publishes the port of a service. The runner does not kill the
@@ -1141,11 +1485,14 @@ final class SupervisorLifecycleTests: XCTestCase {
             killCommands: { calls.addPattern($0) }
         )
         try load(daemon("held", ["sh", "-c", "echo held-start; sleep 30"]))
+        let started = Date()
 
         supervisor.restartService("held")
 
         let failed = await waitUntil(30) { self.state("held").phase == .failed && self.supervisor.actionsInFlight.isEmpty }
         XCTAssertTrue(failed, "held is \(state("held").phase.rawValue)")
+        // Nothing was killed, so the port cannot become free: the start does not wait 5 s for it.
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
         XCTAssertEqual(
             supervisor.lastError,
             "held cannot start: port \(port) is published by a container (OrbStack Helper) — stop that container, then restart held"
@@ -1391,4 +1738,13 @@ private final class PortToolCalls: @unchecked Sendable {
     func addKill(_ pid: pid_t) { lock.withLock { killed.append(pid) } }
     func addPattern(_ pattern: String) { lock.withLock { killedPatterns.append(pattern) } }
     func reset() { lock.withLock { killed = []; killedPatterns = [] } }
+}
+
+/// The PATH question of the supervisor's shell, which a test holds open.
+private struct HeldPathQuestion {
+    let shell: FakeCommandRunner
+    let gate: Gate
+
+    /// How often the shell was asked where a tool is.
+    var calls: Int { shell.commands.filter { $0.contains("command -v") }.count }
 }

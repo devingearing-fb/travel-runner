@@ -321,9 +321,9 @@ struct DbSetupStepRow: View {
         if step.status == .running, let progress = step.progress {
             HStack(spacing: 6) {
                 Spacer().frame(width: 24)
-                ProgressView(value: min(max(progress, 0), 1), total: 1)
+                ProgressView(value: DbSetupStep.barValue(progress), total: 1)
                     .tint(.blue)
-                Text("\(Int(progress * 100))%")
+                Text(DbSetupStep.percentLabel(progress))
                     .font(.system(.caption2, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .frame(width: 32, alignment: .trailing)
