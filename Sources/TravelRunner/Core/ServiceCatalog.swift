@@ -145,10 +145,11 @@ enum ServiceCatalog {
                     StripeLauncher.command,
                     probe: ProbeConfig(type: .stdoutRegex, port: nil, host: nil, url: nil,
                                        pattern: "whsec_[A-Za-z0-9]+", artifact: "STRIPE_WEBHOOK_SECRET", timeout: nil),
-                    restart: .onFailure, phase: "gateway", dependsOn: ["universal-login"]),
+                    restart: .onFailure, phase: "gateway", dependsOn: ["supabase"]),
+            // The portal does not wait for Stripe. A new webhook secret restarts it.
             service("travel-portal", "Travel Portal", ["pnpm", "dev"], cwd: booking,
                     probe: http("http://127.0.0.1:3002/api/health", port: 3002, timeout: 240),
-                    restart: .onFailure, phase: "portal", dependsOn: ["universal-login", "stripe"],
+                    restart: .onFailure, phase: "portal", dependsOn: ["universal-login"],
                     env: [
                         "PINO_PRETTY": "false",
                         "CACHE_APPLY_MODE": "full",

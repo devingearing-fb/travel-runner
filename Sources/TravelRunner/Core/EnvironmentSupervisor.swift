@@ -191,6 +191,8 @@ final class EnvironmentSupervisor {
     private var stripeReconnectingSince: Date? = nil
     private var localSupabaseKeys: LocalSupabaseKeys?
     private var stripeWebhookSecret: String?
+    /// The portal's log has said that it has no webhook secret, for this start.
+    private var warnedNoWebhookSecret = false
     /// How the last start of the Stripe CLI signed in. An exit reads it for its cause.
     private var stripeMode: StripeMode?
     /// The stop and start of one service run one at a time (see `KeyedLock`).
@@ -614,52 +616,54 @@ final class EnvironmentSupervisor {
             let levels = graph.startOrder()
             var didMigrationCheck = false
 
-            for level in levels {
-                if Task.isCancelled { break }
+            // The next level waits only for the services that a later service
+            // needs, and for the database, which the check after GROUND needs. A
+            // service that nothing needs (Stripe) starts with its level, and Start
+            // All waits for it at the end.
+            await withTaskGroup(of: Void.self) { trailing in
+                for level in levels {
+                    if Task.isCancelled { break }
 
-                let phase = self.resolvePhase(for: level)
-                await MainActor.run {
-                    self.currentPhase = phase
-                    self.phaseStartedAt = self.clock.date()
-                }
+                    let phase = self.resolvePhase(for: level)
+                    await MainActor.run {
+                        self.currentPhase = phase
+                        self.phaseStartedAt = self.clock.date()
+                    }
 
-                await withTaskGroup(of: Void.self) { group in
-                    for serviceID in level {
-                        group.addTask { [self] in
-                            do {
-                                try await self.startService(serviceID)
-                            } catch {
-                                await MainActor.run {
-                                    self.serviceStates[serviceID]?.phase = .failed
-                                    self.lastError = "\(error)"
-                                    self.recalculateHealth()
-                                }
-                            }
+                    let needed = level.filter {
+                        !graph.dependents(of: $0).isEmpty || self.phaseForService($0) == "ground"
+                    }
+                    for serviceID in level where !needed.contains(serviceID) {
+                        trailing.addTask { await self.startForStartAll(serviceID) }
+                    }
+                    await withTaskGroup(of: Void.self) { group in
+                        for serviceID in needed {
+                            group.addTask { await self.startForStartAll(serviceID) }
                         }
                     }
-                }
 
-                _ = await MainActor.run {
-                    if let started = self.phaseStartedAt {
-                        self.phaseTimings[phase.rawValue] = self.clock.date().timeIntervalSince(started)
+                    _ = await MainActor.run {
+                        if let started = self.phaseStartedAt {
+                            self.phaseTimings[phase.rawValue] = self.clock.date().timeIntervalSince(started)
+                        }
+                        self.completedPhases.insert(phase.rawValue)
                     }
-                    self.completedPhases.insert(phase.rawValue)
-                }
 
-                // After GROUND phase completes (Supabase is up), check migrations
-                // AND verify the database actually has application tables.
-                // Triggers db:reset when: first run, migrations changed, or DB is empty
-                // (e.g. fresh Docker volume with no tables applied).
-                if phase == .ground && !didMigrationCheck {
-                    didMigrationCheck = true
-                    // Supabase is up: write its keys before any portal starts.
-                    await self.refreshLocalSupabaseKeys()
-                    if let cwd = self.supabaseCwd {
-                        await self.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true)
-                        await self.refreshPendingMigrations(cwd: cwd)
+                    // After GROUND phase completes (Supabase is up), check migrations
+                    // AND verify the database actually has application tables.
+                    // Triggers db:reset when: first run, migrations changed, or DB is empty
+                    // (e.g. fresh Docker volume with no tables applied).
+                    if phase == .ground && !didMigrationCheck {
+                        didMigrationCheck = true
+                        // Supabase is up: write its keys before any portal starts.
+                        await self.refreshLocalSupabaseKeys()
+                        if let cwd = self.supabaseCwd {
+                            await self.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true)
+                            await self.refreshPendingMigrations(cwd: cwd)
+                        }
                     }
-                }
 
+                }
             }
 
             await MainActor.run {
@@ -669,6 +673,17 @@ final class EnvironmentSupervisor {
                 }
                 self.startupBeganAt = nil
             }
+        }
+    }
+
+    /// One service of Start All. A failure marks the service; the start goes on.
+    private func startForStartAll(_ serviceID: String) async {
+        do {
+            try await startService(serviceID)
+        } catch {
+            serviceStates[serviceID]?.phase = .failed
+            lastError = "\(error)"
+            recalculateHealth()
         }
     }
 
@@ -960,9 +975,47 @@ final class EnvironmentSupervisor {
             guard stripeWebhookSecret != value else { return }
             stripeWebhookSecret = value
             writeAppEnv()
+            restartPortalForNewWebhookSecret()
         } else if let cwd = graph?.nodes["travel-portal"]?.resolvedCwd {
             EnvCompatLayer(envFilePaths: [cwd + "/.env.local"]).write(key: name, value: value)
         }
+    }
+
+    /// The portal does not wait for Stripe, so it can run on an old secret or on
+    /// none. Node reads `.env.local` when it boots: a running portal restarts.
+    private func restartPortalForNewWebhookSecret() {
+        guard let portal = serviceStates["travel-portal"], !isShuttingDown,
+              portal.phase == .running || (portal.phase == .starting && portal.pid != nil) else { return }
+        Task {
+            await logStore.append(serviceID: "travel-portal", entry: LogEntry(
+                stream: .stdout, text: Self.webhookSecretChangedLine
+            ))
+        }
+        restartService("travel-portal")
+    }
+
+    nonisolated static let webhookSecretChangedLine =
+        "[travel-runner] Stripe webhook secret changed — restarting Travel Portal to load it"
+    nonisolated static let noWebhookSecretLine =
+        "No Stripe webhook secret — payments will not confirm until Stripe runs."
+
+    /// Says once per portal start that payments will not confirm: the portal is
+    /// up or on its way, it has no webhook secret, and Stripe does not run.
+    private func warnIfNoWebhookSecret() async {
+        guard !warnedNoWebhookSecret, stripeWebhookSecret == nil,
+              let portal = serviceStates["travel-portal"],
+              portal.phase == .starting || portal.phase == .running else { return }
+        let stripeOff: Bool
+        if let stripe = serviceStates["stripe"], isInProfile("stripe") {
+            stripeOff = stripe.phase == .skipped || stripe.phase == .failed
+        } else {
+            stripeOff = true
+        }
+        guard stripeOff else { return }
+        warnedNoWebhookSecret = true
+        await logStore.append(serviceID: "travel-portal", entry: LogEntry(
+            stream: .stderr, text: "[travel-runner] " + Self.noWebhookSecretLine
+        ))
     }
 
     func clearCacheAndRestart(_ serviceID: String) {
@@ -1920,6 +1973,7 @@ final class EnvironmentSupervisor {
                     entry: LogEntry(stream: .stderr, text: Self.stripeStoppedLine(cause))
                 )
                 await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
+                await warnIfNoWebhookSecret()
                 return nil
             }
         }
@@ -2047,24 +2101,6 @@ final class EnvironmentSupervisor {
             }
         }
 
-        // If this is the portal and Stripe is configured + available, wait for the
-        // Stripe secret before starting. This ensures .env.local has the correct
-        // STRIPE_WEBHOOK_SECRET when Node boots. Skip if Stripe isn't set up.
-        if serviceID == "travel-portal",
-           let stripeService = graph?.nodes["stripe"],
-           stripeService.probe?.artifact != nil {
-            let stripeAvailable = await isStripeAvailable()
-            if stripeAvailable {
-                state.phase = .starting
-                state.lastStarted = clock.date()
-                // Wait up to 30s for Stripe to capture its secret
-                for _ in 0..<60 {
-                    if let _ = await secretStore.get("STRIPE_WEBHOOK_SECRET") { break }
-                    try? await clock.sleep(for: .milliseconds(500))
-                }
-            }
-        }
-
         // A start during a read of the shell waits for the new PATH. The wait is
         // here, before the last check for a stop: the process runner must not
         // wait, or a stop-all in that time sees no process and the start runs one.
@@ -2082,6 +2118,13 @@ final class EnvironmentSupervisor {
         state.exitCode = nil
         // No pid until the new process has one: handleTermination compares it.
         state.pid = nil
+
+        // The portal does not wait for Stripe. Without a secret it says why
+        // payments will not confirm; a secret that comes later restarts it.
+        if serviceID == "travel-portal" {
+            warnedNoWebhookSecret = false
+            await warnIfNoWebhookSecret()
+        }
 
         var stdoutProbe: StdoutProbe?
         if let probeConfig = definition.probe, probeConfig.type == .stdoutRegex {
@@ -2357,6 +2400,7 @@ final class EnvironmentSupervisor {
                     stream: .stderr, text: Self.stripeStoppedLine(cause)
                 ))
                 await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
+                await warnIfNoWebhookSecret()
             }
             recalculateHealth()
             return
@@ -2507,6 +2551,7 @@ final class EnvironmentSupervisor {
                         stream: .stderr, text: Self.stripeStoppedLine(cause)
                     ))
                     await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
+                    await warnIfNoWebhookSecret()
                 }
                 recalculateHealth()
                 return
