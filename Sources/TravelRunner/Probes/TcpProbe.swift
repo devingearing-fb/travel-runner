@@ -17,7 +17,9 @@ struct TcpProbe: Probe {
             return .other("\(port) is not a port")
         }
         return await withCheckedContinuation { continuation in
-            let guard_ = ContinuationGuard()
+            // The first result wins. Each path claims it before it cancels the
+            // connection, so the cancel cannot change the outcome.
+            let once = ResumeOnce(continuation)
             let connection = NWConnection(
                 host: NWEndpoint.Host(host),
                 port: endpointPort,
@@ -28,13 +30,11 @@ struct TcpProbe: Probe {
             connection.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
+                    once.resume(with: .ok)
                     connection.cancel()
-                    Task { await guard_.resume(continuation, with: .ok) }
                 case .failed(let error), .waiting(let error):
+                    once.resume(with: Self.outcome(of: error))
                     connection.cancel()
-                    Task { await guard_.resume(continuation, with: Self.outcome(of: error)) }
-                case .cancelled:
-                    Task { await guard_.resume(continuation, with: .refused) }
                 default:
                     break
                 }
@@ -43,15 +43,16 @@ struct TcpProbe: Probe {
             connection.start(queue: queue)
 
             queue.asyncAfter(deadline: .now() + 2) {
+                once.resume(with: .timedOut)
                 connection.cancel()
-                Task { await guard_.resume(continuation, with: .timedOut) }
             }
         }
     }
 
     static func outcome(of error: NWError) -> ProbeOutcome {
         switch error {
-        case .posix(.ECONNREFUSED): .refused
+        // A reset before the connection is ready is a refused connect too.
+        case .posix(.ECONNREFUSED), .posix(.ECONNRESET): .refused
         case .posix(.ETIMEDOUT): .timedOut
         case .dns: .dnsError
         default: .other(error.localizedDescription)
@@ -59,12 +60,20 @@ struct TcpProbe: Probe {
     }
 }
 
-private actor ContinuationGuard {
-    private var resumed = false
+/// Resumes the continuation with the first value only.
+private final class ResumeOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<ProbeOutcome, Never>?
 
-    func resume(_ continuation: CheckedContinuation<ProbeOutcome, Never>, with value: ProbeOutcome) {
-        guard !resumed else { return }
-        resumed = true
-        continuation.resume(returning: value)
+    init(_ continuation: CheckedContinuation<ProbeOutcome, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(with value: ProbeOutcome) {
+        let pending: CheckedContinuation<ProbeOutcome, Never>? = lock.withLock {
+            defer { continuation = nil }
+            return continuation
+        }
+        pending?.resume(returning: value)
     }
 }

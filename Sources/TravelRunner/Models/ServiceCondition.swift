@@ -39,8 +39,9 @@ struct ServiceCondition: Equatable, Sendable {
 enum RecoveryAction: Equatable, Hashable, Sendable {
     case restart
     case startService
-    /// Stop the process that holds the port, then start again.
-    case stopForeignAndRetry(pid: Int32?)
+    /// Stop the processes that listen on `port` (the port of the EADDRINUSE line),
+    /// then start again. With no port, the start frees the port of the probe.
+    case stopForeignAndRetry(port: Int?)
     case openContainerRuntime
     case installDependencies
     case clearCacheAndRestart

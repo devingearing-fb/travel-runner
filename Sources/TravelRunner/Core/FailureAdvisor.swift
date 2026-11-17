@@ -45,6 +45,8 @@ enum FailureAdvisor {
 
     static func advise(_ kind: Kind, _ context: Context, now: Date) -> ServiceCondition {
         let name = context.name
+        // The log of the launch explains an exit, a probe that timed out, and the
+        // stop of the restarts. The other kinds return before they read it.
         let cause = logCause(context)
 
         func condition(
@@ -75,6 +77,16 @@ enum FailureAdvisor {
             return condition(text, nil, [.openLog, .restart])
         case .cleanExit:
             return condition("\(name) exited (code 0) — not restarted.", nil, [.restart, .openLog])
+        // A kill or a failed wake check has its own cause. A line of the log from
+        // earlier in the launch (a page that did not compile) does not explain it.
+        case .killed(let signal):
+            return condition(
+                "\(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))).", nil,
+                [.restart, .openLog]
+            )
+        case .wakeCheck(let lastProbe):
+            let detail = lastProbe.map { "Last check: \($0.summary)." }
+            return condition("\(name) did not answer after the Mac woke up.", detail, [.restart, .openLog])
         default:
             break
         }
@@ -89,6 +101,12 @@ enum FailureAdvisor {
                     "\(name) answers with HTTP 404 at \(path).", "Does this branch have that route?", [.openLog]
                 )
             }
+            if case .notFoundThenRoot(let root) = lastProbe, let path = context.probePath {
+                return condition(
+                    "\(name) answers with HTTP 404 at \(path) and \(root.summary) at /.", "See its log for the error.",
+                    context.canClearCache ? [.openLog, .clearCacheAndRestart] : [.openLog, .restart]
+                )
+            }
             let place = context.port.map { "on port \($0)" } ?? "its ready check"
             var detail = "The process is still running — it may still be compiling."
             if let lastProbe, !lastProbe.isReady { detail += " Last check: \(lastProbe.summary)." }
@@ -101,14 +119,6 @@ enum FailureAdvisor {
         case .exited(let code):
             let what = code.map { "\(name) exited with code \($0)." } ?? "\(name) exited."
             return exitedCondition(what, context, now: now)
-        case .killed(let signal):
-            return condition(
-                "\(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))).", nil,
-                [.restart, .openLog]
-            )
-        case .wakeCheck(let lastProbe):
-            let detail = lastProbe.map { "Last check: \($0.summary)." }
-            return condition("\(name) did not answer after the Mac woke up.", detail, [.restart, .openLog])
         default:
             return condition("\(name) failed.", nil, [.openLog])
         }
@@ -144,7 +154,7 @@ enum FailureAdvisor {
             let port = addressInUsePort(tail) ?? context.port
             let headline = port.map { "Port \($0) is already in use by another process." }
                 ?? "The port is already in use by another process."
-            return Cause(headline: headline, actions: [.stopForeignAndRetry(pid: nil)])
+            return Cause(headline: headline, actions: [.stopForeignAndRetry(port: port)])
         }
         let missingModule = ["Cannot find module", "Module not found", "ERR_MODULE_NOT_FOUND", "Cannot find package"]
         if tail.contains(where: { line in missingModule.contains { line.contains($0) } }) {

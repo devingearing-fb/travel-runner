@@ -27,6 +27,7 @@ final class ProbeOutcomeTests: XCTestCase {
 
     func testTcpErrorsMapToOutcomes() {
         XCTAssertEqual(TcpProbe.outcome(of: .posix(.ECONNREFUSED)), .refused)
+        XCTAssertEqual(TcpProbe.outcome(of: .posix(.ECONNRESET)), .refused)
         XCTAssertEqual(TcpProbe.outcome(of: .posix(.ETIMEDOUT)), .timedOut)
         guard case .other = TcpProbe.outcome(of: .posix(.EHOSTUNREACH)) else {
             return XCTFail("an unreachable host is another failure")
@@ -38,7 +39,10 @@ final class ProbeOutcomeTests: XCTestCase {
     func testOnlyOkAndARedirectAreReady() {
         XCTAssertTrue(ProbeOutcome.ok.isReady)
         XCTAssertTrue(ProbeOutcome.redirect(to: "/login").isReady)
-        let notReady: [ProbeOutcome] = [.refused, .timedOut, .http(status: 404), .http(status: 503), .dnsError, .noMatchYet, .other("x")]
+        let notReady: [ProbeOutcome] = [
+            .refused, .timedOut, .http(status: 404), .http(status: 503), .notFoundThenRoot(.http(status: 500)), .dnsError,
+            .noMatchYet, .other("x"),
+        ]
         for outcome in notReady {
             XCTAssertFalse(outcome.isReady, outcome.summary)
         }
@@ -89,11 +93,16 @@ final class ProbeOutcomeTests: XCTestCase {
         let rootRedirects = await probe(FakeServer(["/api/health": 404, "/": 307])).outcome()
         XCTAssertEqual(rootRedirects, .ok)
 
-        // Negative controls: a 404 or a 5xx on the root keeps the 404.
+        // Negative controls: a 404 on the root keeps the 404; a 5xx or no answer
+        // on the root is kept with it, so the reason can name it.
         let zombie = await probe(FakeServer(["/api/health": 404, "/": 404])).outcome()
         XCTAssertEqual(zombie, .http(status: 404))
         let broken = await probe(FakeServer(["/api/health": 404, "/": 500])).outcome()
-        XCTAssertEqual(broken, .http(status: 404))
+        XCTAssertEqual(broken, .notFoundThenRoot(.http(status: 500)))
+        XCTAssertEqual(broken.summary, "HTTP 404, and HTTP 500 at /")
+        XCTAssertFalse(broken.isReady)
+        let gone = await probe(FakeServer(["/api/health": 404])).outcome()
+        XCTAssertEqual(gone, .notFoundThenRoot(.refused))
     }
 
     func testOnlyA404FallsBack() async {
@@ -146,11 +155,40 @@ final class ProbeOutcomeTests: XCTestCase {
     }
 
     func testProbesOfAClosedPortSayRefused() async throws {
-        let port = try await LoopbackHTTPServer.closedPort()
+        let port = try Self.closedPort()
         let tcp = await TcpProbe(port: port).outcome()
         XCTAssertEqual(tcp, .refused)
-        let http = await HttpProbe(url: "http://127.0.0.1:\(port)/", requestTimeout: 5).outcome()
+        // Now and then, after other loopback requests of the run, URLSession reports
+        // a refused connect as "The network connection was lost." (a reset). The
+        // supervisor checks again; so does the test, up to three times.
+        var http = ProbeOutcome.noMatchYet
+        for _ in 0..<3 {
+            http = await HttpProbe(url: "http://127.0.0.1:\(port)/", requestTimeout: 5).outcome()
+            if http == .refused { break }
+        }
         XCTAssertEqual(http, .refused)
+    }
+
+    /// A loopback port whose listener is closed. `close` frees the port at once, so a
+    /// connect is refused. (An NWListener cancels later, and a socket that is only
+    /// bound drops the connect on macOS, so the probe times out.)
+    private static func closedPort() throws -> Int {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        guard sock >= 0 else { throw POSIXError(.EMFILE) }
+        defer { close(sock) }
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = UInt32(INADDR_LOOPBACK).bigEndian
+        addr.sin_port = 0
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        guard bound == 0, listen(sock, 1) == 0 else { throw POSIXError(.EADDRNOTAVAIL) }
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(sock, $0, &length) }
+        }
+        return Int(UInt16(bigEndian: addr.sin_port))
     }
 
     func testTcpProbeOfAListenerIsOk() async throws {
@@ -196,16 +234,6 @@ private final class LoopbackHTTPServer: @unchecked Sendable {
         let server = try LoopbackHTTPServer(response: response)
         try await server.listen()
         return server
-    }
-
-    /// A port that nothing listens on: a listener takes it, then lets it go.
-    static func closedPort() async throws -> Int {
-        let server = try LoopbackHTTPServer(response: "")
-        try await server.listen()
-        let port = server.port
-        server.stop()
-        try await Task.sleep(for: .milliseconds(100))
-        return port
     }
 
     private func listen() async throws {

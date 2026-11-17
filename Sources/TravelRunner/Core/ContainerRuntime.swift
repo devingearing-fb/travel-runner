@@ -36,11 +36,16 @@ enum ContainerRuntime: Sendable {
         checks: Int = 10, shell: any CommandRunning = LoginShell(), clock: RunnerClock = .live
     ) async -> Bool {
         if await isResponding(shell: shell) { return true }
-        _ = await shell.run("open -a '\(detect().appName)'", timeout: .seconds(10))
+        await open(shell: shell)
         for _ in 0..<checks {
             try? await clock.sleep(for: .seconds(2))
             if await isResponding(shell: shell) { return true }
         }
         return false
+    }
+
+    /// Opens the runtime's app of this Mac.
+    static func open(shell: any CommandRunning = LoginShell()) async {
+        _ = await shell.run("open -a \(ShellQuote.quote(detect().appName))", timeout: .seconds(10))
     }
 }

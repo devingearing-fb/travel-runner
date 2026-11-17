@@ -1211,14 +1211,21 @@ final class EnvironmentSupervisor {
         switch action {
         case .restart, .startService:
             restartService(serviceID)
-        case .stopForeignAndRetry:
-            // The start stops the stale process that holds the port of the service.
+        case .stopForeignAndRetry(nil):
+            // The start stops the stale process that holds the port of the probe.
             restartService(serviceID)
+        case .stopForeignAndRetry(let port?):
+            // The port can be another port of the app (the HMR port); the start
+            // frees only the port of the probe.
+            Task {
+                await freePort(port)
+                restartService(serviceID)
+            }
         case .clearCacheAndRestart:
             clearCacheAndRestart(serviceID)
         case .openContainerRuntime:
             let shell = shell
-            Task { _ = await shell.run("open -a \(ShellQuote.quote(ContainerRuntime.detect().appName))", timeout: .seconds(10)) }
+            Task { await ContainerRuntime.open(shell: shell) }
         case .installDependencies:
             installDependenciesAndRestart(serviceID)
         case .openLog:
@@ -1249,12 +1256,17 @@ final class EnvironmentSupervisor {
             await logStore.append(serviceID: serviceID, entry: LogEntry(
                 stream: .stdout, text: "[travel-runner] Running \(command) in \(folder)"
             ))
+            // One reader appends the lines, so the log keeps their order.
+            let (lines, sink) = AsyncStream<LogEntry>.makeStream()
+            let writer = Task {
+                for await entry in lines { await logStore.append(serviceID: serviceID, entry: entry) }
+            }
             let result = await shell.run(
                 command, cwd: folder, environment: [:], timeout: .seconds(600),
-                onLine: { line, stream in
-                    Task { await logStore.append(serviceID: serviceID, entry: LogEntry(stream: stream, text: line)) }
-                }
+                onLine: { line, stream in sink.yield(LogEntry(stream: stream, text: line)) }
             )
+            sink.finish()
+            await writer.value
             guard result.succeeded else {
                 let why = result.timedOut ? "did not finish in 10 minutes" : "failed (exit \(result.exitCode))"
                 lastError = "\(command) for \(name) \(why) — see its log"
@@ -2175,14 +2187,7 @@ final class EnvironmentSupervisor {
 
             // Kill any stale occupant on the port
             if let port = definition.probe?.port, definition.resolvedType == .daemon, isPortBound(port) {
-                // The port frees only when a listener was killed. With none killed
-                // (a container holds it) there is nothing to wait for.
-                if await killPortOccupants(port) {
-                    for _ in 0..<10 {
-                        try? await clock.sleep(for: .milliseconds(500))
-                        if !isPortBound(port) { break }
-                    }
-                }
+                await freePort(port)
                 // A container still has the port: the service would fail with
                 // EADDRINUSE while its TCP probe passes against the container.
                 if isPortBound(port),
@@ -3389,6 +3394,17 @@ final class EnvironmentSupervisor {
             }
         }
         return result == 0
+    }
+
+    /// Kills the listeners of the port and waits up to five seconds for it to free.
+    /// The port frees only when a listener was killed. With none killed (a container
+    /// holds it) there is nothing to wait for.
+    private func freePort(_ port: Int) async {
+        guard await killPortOccupants(port) else { return }
+        for _ in 0..<10 {
+            try? await clock.sleep(for: .milliseconds(500))
+            if !isPortBound(port) { break }
+        }
     }
 
     /// Kills the process that listens on the port. `lsof -i :port` alone also matches

@@ -43,6 +43,13 @@ final class FailureAdvisorTests: XCTestCase {
         XCTAssertEqual(condition.text, "Booking Portal answers with HTTP 404 at /api/health. Does this branch have that route?")
         XCTAssertEqual(condition.actions, [.openLog])
 
+        // A 404 on the route and a 500 on / names both; the 500 is the error to read.
+        let broken = advise(
+            .probeTimeout(seconds: 240, processAlive: true, lastProbe: .notFoundThenRoot(.http(status: 500))), portal()
+        )
+        XCTAssertEqual(broken.text, "Booking Portal answers with HTTP 404 at /api/health and HTTP 500 at /. See its log for the error.")
+        XCTAssertEqual(broken.actions, [.openLog, .clearCacheAndRestart])
+
         // Negative controls: another status, or a process that has ended.
         let error500 = advise(.probeTimeout(seconds: 240, processAlive: true, lastProbe: .http(status: 500)), portal())
         XCTAssertEqual(error500.headline, "Booking Portal did not answer on port 3002 within 240s.")
@@ -54,14 +61,16 @@ final class FailureAdvisorTests: XCTestCase {
         let log = ["Error: listen EADDRINUSE: address already in use :::3002", "    at Server.setupListenHandle"]
         let condition = advise(.exited(code: 1), portal(log: log, likelyCause: log[0]))
         XCTAssertEqual(condition.headline, "Port 3002 is already in use by another process.")
-        XCTAssertEqual(condition.actions, [.stopForeignAndRetry(pid: nil)])
-        XCTAssertEqual(RecoveryAction.stopForeignAndRetry(pid: nil).title(), "Free port and restart")
+        XCTAssertEqual(condition.actions, [.stopForeignAndRetry(port: 3002)])
+        XCTAssertEqual(RecoveryAction.stopForeignAndRetry(port: 3002).title(), "Free port and restart")
 
         // The line names the port that is taken, also when it is not the probe port.
         let hmr = advise(
             .exited(code: 1), portal(log: ["12:00:01 Error: listen EADDRINUSE: address already in use 127.0.0.1:24678"])
         )
         XCTAssertEqual(hmr.headline, "Port 24678 is already in use by another process.")
+        // The button frees the port that the line names, not the probe port.
+        XCTAssertEqual(hmr.actions, [.stopForeignAndRetry(port: 24678)])
     }
 
     func testADownContainerRuntimeNamesTheApp() {
@@ -129,6 +138,27 @@ final class FailureAdvisorTests: XCTestCase {
 
         let wake = advise(.wakeCheck(lastProbe: .timedOut), portal())
         XCTAssertEqual(wake.text, "Booking Portal did not answer after the Mac woke up. Last check: no answer in time.")
+    }
+
+    /// A line of the log from earlier in the launch (a page that did not compile, a
+    /// port that was taken once) does not explain a kill or a failed wake check.
+    func testAKillOrAWakeFailureKeepsItsOwnHeadlineWhateverTheLogSays() {
+        let logs = [
+            ["Module not found: Can't resolve './x'"],
+            ["Error: listen EADDRINUSE: address already in use :::24678"],
+            ["Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"],
+        ]
+        for log in logs {
+            let context = portal(log: log, likelyCause: log[0])
+            let killed = advise(.killed(signal: SIGTERM), context)
+            XCTAssertEqual(killed.headline, "Booking Portal was stopped from outside Travel Runner (SIGTERM).", log[0])
+            XCTAssertEqual(killed.actions, [.restart, .openLog], log[0])
+            let wake = advise(.wakeCheck(lastProbe: .timedOut), context)
+            XCTAssertEqual(wake.headline, "Booking Portal did not answer after the Mac woke up.", log[0])
+            XCTAssertEqual(wake.actions, [.restart, .openLog], log[0])
+            // Negative control: the same log explains an exit.
+            XCTAssertNotEqual(advise(.exited(code: 1), context).actions, [.openLog], log[0])
+        }
     }
 
     func testOnlyTheLogOfTheWindowCounts() {

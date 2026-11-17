@@ -1366,6 +1366,164 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(condition.action, .restart)
     }
 
+    /// A kill from outside says so, also when the log of the launch has a line with
+    /// a fix of its own (a page that did not compile while the server ran).
+    func testAnOutsideKillSaysSoWhateverTheLogSays() async throws {
+        let line = "Module not found: Can't resolve './x'"
+        try load(ServiceDefinition(
+            id: "web", name: "Web App", cmd: ["sh", "-c", "echo \"\(line)\"; exec \(webServer.joined(separator: " "))"],
+            cwd: workDir.path,
+            probe: ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30),
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        ))
+        supervisor.restartService("web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains(line), lines.joined(separator: "\n"))
+        let pid = try XCTUnwrap(Self.listeners(on: port).first)
+
+        kill(pid, SIGTERM)
+
+        let said = await waitUntil(10) { self.state("web").phase == .failed && self.state("web").condition != nil }
+        XCTAssertTrue(said, "web is \(state("web").phase.rawValue)")
+        let condition = try XCTUnwrap(state("web").condition)
+        XCTAssertEqual(condition.headline, "Web App was stopped from outside Travel Runner (SIGTERM).")
+        XCTAssertEqual(condition.actions, [.restart, .openLog])
+    }
+
+    /// Kills from outside until the breaker trips: the reason is the crash loop. The
+    /// kill records its reason first, and the breaker's reason replaces it.
+    func testOutsideKillsThatTripTheBreakerSayItStoppedRetrying() async throws {
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        var last: pid_t = 0
+        for kill in 1...AutoRestart.failuresToTrip {
+            let up = await waitUntil(40) {
+                self.settled("web") && Self.listeners(on: self.port).first.map { $0 != last } == true
+            }
+            XCTAssertTrue(up, "kill \(kill): web is \(state("web").phase.rawValue)")
+            last = try XCTUnwrap(Self.listeners(on: port).first)
+            Darwin.kill(last, SIGTERM)
+        }
+
+        let tripped = await waitUntil(20) {
+            self.state("web").isCircuitBroken && self.state("web").condition?.kind == .halted(reason: "crash loop")
+        }
+        XCTAssertTrue(tripped, "web: \(state("web").condition?.text ?? "no condition")")
+        // A late record of the last kill does not replace it.
+        try await Task.sleep(for: .seconds(1))
+        let condition = try XCTUnwrap(state("web").condition)
+        XCTAssertEqual(condition.text, "Stopped retrying after 3 crashes in a minute. Cause: not clear from the log.")
+        XCTAssertEqual(condition.action, .restart)
+        XCTAssertEqual(state("web").phase, .failed)
+    }
+
+    /// A service outside the profile is skipped, and `/api/status` says why.
+    func testAServiceOutsideTheProfileHasASkipReason() async throws {
+        let partner = ServiceDefinition(
+            id: "partner-portal", name: "Partner Portal", cmd: ["sleep", "30"], cwd: workDir.path, probe: nil,
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        let anchor = ServiceDefinition(
+            id: "anchor", name: nil, cmd: ["sleep", "1"], cwd: nil, probe: nil, type: .daemon, restart: .never,
+            dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([partner, anchor], profile: .booking)
+        supervisor.serviceStates["anchor"]?.phase = .running
+        supervisor.health = .healthy
+
+        supervisor.restartService("partner-portal")
+
+        let skipped = await waitUntil(10) {
+            self.state("partner-portal").phase == .skipped && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(skipped, "partner-portal is \(state("partner-portal").phase.rawValue)")
+        XCTAssertEqual(state("partner-portal").condition?.kind, .notInProfile)
+        let fields = EnvironmentSupervisor.statusFields(state("partner-portal"))
+        XCTAssertEqual(fields["skip_reason"], "Not in the Booking profile.")
+        XCTAssertNil(fields["reason"])
+    }
+
+    /// "Run pnpm install": the install runs in the folder of the service, its output
+    /// goes to the service's log in order, and then the service starts again.
+    func testTheInstallButtonInstallsThenRestarts() async throws {
+        let output = (1...200).map { "install line \($0)" }
+        let shell = FakeCommandRunner { call in
+            call.command == "npm install" ? FakeCommandRunner.ok(output.joined(separator: "\n")) : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+        XCTAssertTrue(supervisor.canPerform(.installDependencies, for: "web"))
+        // Negative control: a service that is not a Next app has no cache to clear.
+        XCTAssertFalse(supervisor.canPerform(.clearCacheAndRestart, for: "web"))
+
+        supervisor.perform(.installDependencies, for: "web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let install = try XCTUnwrap(shell.calls.first { $0.command == "npm install" })
+        XCTAssertEqual(install.cwd, workDir.path, "a folder without a pnpm workspace runs npm in the service folder")
+        let lines = await logLines("web")
+        XCTAssertEqual(lines.filter { $0.hasPrefix("install line ") }, output, "the install output keeps its order")
+        let started = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("[travel-runner] Running npm install") })
+        let lastInstall = try XCTUnwrap(lines.lastIndex(of: "install line 200"))
+        XCTAssertLessThan(started, lastInstall)
+        XCTAssertNotNil(Self.listeners(on: port).first, "the restart started the service")
+    }
+
+    /// A failed install does not restart the service; the banner says why.
+    func testAFailedInstallDoesNotRestart() async throws {
+        let shell = FakeCommandRunner { call in
+            call.command == "npm install" ? FakeCommandRunner.failed(1, stderr: "ERR! network") : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+
+        supervisor.perform(.installDependencies, for: "web")
+
+        let done = await waitUntil(10) { self.supervisor.lastError != nil && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(done)
+        XCTAssertEqual(supervisor.lastError, "npm install for web failed (exit 1) — see its log")
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertNotEqual(state("web").phase, .running)
+        XCTAssertEqual(Self.listeners(on: port), [], "no restart after a failed install")
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("ERR! network"), lines.joined(separator: "\n"))
+    }
+
+    /// "Free port and restart" frees the port of the EADDRINUSE line, also when it is
+    /// not the port of the probe, and keeps a container's port helper alive.
+    func testFreePortAndRestartFreesThePortItNames() async throws {
+        let hmr = try Self.listeningSocket()
+        let published = try Self.listeningSocket()
+        defer { close(hmr.fd); close(published.fd) }
+        let calls = PortToolCalls()
+        let commands = [hmr.port: "node", published.port: "OrbStack Helper"]
+        supervisor.portTools = PortTools(
+            listeners: { port in commands[port].map { [PortOwner.Listener(pid: pid_t(port), command: $0)] } ?? [] },
+            kill: { calls.addKill($0) },
+            killCommands: { calls.addPattern($0) }
+        )
+        try load(daemon("web", webServer))
+
+        supervisor.perform(.stopForeignAndRetry(port: hmr.port), for: "web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(calls.kills, [pid_t(hmr.port)])
+
+        // Negative control: a container's port helper is not killed.
+        calls.reset()
+        let before = try XCTUnwrap(Self.listeners(on: port).first)
+        supervisor.perform(.stopForeignAndRetry(port: published.port), for: "web")
+        let again = await waitUntil(30) {
+            self.settled("web") && Self.listeners(on: self.port).first.map { $0 != before } == true
+        }
+        XCTAssertTrue(again, "the service did not restart")
+        XCTAssertEqual(calls.kills, [])
+    }
+
     /// A daemon that ends with code 0 has no process, and nothing starts it again.
     /// The environment showed "starting" with no end.
     func testACleanExitOfADaemonGivesDegradedNotStarting() async throws {

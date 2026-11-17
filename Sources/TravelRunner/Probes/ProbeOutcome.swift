@@ -2,7 +2,7 @@ import Foundation
 
 /// What one probe check found. A failed check says why, so the row and the
 /// triage card can name the cause instead of "not ready".
-enum ProbeOutcome: Equatable, Sendable {
+indirect enum ProbeOutcome: Equatable, Sendable {
     case ok
     /// Nothing listens on the port.
     case refused
@@ -10,6 +10,9 @@ enum ProbeOutcome: Equatable, Sendable {
     case timedOut
     /// The server answered with a status that is not a ready answer.
     case http(status: Int)
+    /// The health route answered 404, and the request to / then gave this (a 5xx,
+    /// or no answer).
+    case notFoundThenRoot(ProbeOutcome)
     /// The server answered with a redirect. The probe does not follow it.
     case redirect(to: String)
     /// The host name did not resolve.
@@ -34,6 +37,7 @@ enum ProbeOutcome: Equatable, Sendable {
         case .refused: "connection refused"
         case .timedOut: "no answer in time"
         case .http(let status): "HTTP \(status)"
+        case .notFoundThenRoot(let root): "HTTP 404, and \(root.summary) at /"
         case .redirect(let to): "redirects to \(to)"
         case .dnsError: "host name not found"
         case .noMatchYet: "ready line not seen yet"

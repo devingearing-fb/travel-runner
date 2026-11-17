@@ -18,12 +18,19 @@ struct HttpProbe: Probe {
         let first = ProbeOutcome.from(status: response.statusCode, location: response.value(forHTTPHeaderField: "Location"))
         // A 404 on a health route: the branch may not have that route. Then any
         // answer below 500 on / counts. A 404 there too is the zombie server that
-        // answers 404 for every route, so it does not count.
+        // answers 404 for every route, so it does not count. A 5xx or no answer
+        // on / is kept, so the reason can name it.
         guard response.statusCode == 404, !["", "/"].contains(target.path),
-              let root = URL(string: "/", relativeTo: target)?.absoluteURL,
-              let rootResponse = try? await send(request(root)) else { return first }
+              let root = URL(string: "/", relativeTo: target)?.absoluteURL else { return first }
+        let rootResponse: HTTPURLResponse
+        do {
+            rootResponse = try await send(request(root))
+        } catch {
+            return .notFoundThenRoot(.from(urlError: error))
+        }
         let status = rootResponse.statusCode
-        return status < 500 && status != 404 ? .ok : first
+        if status == 404 { return first }
+        return status < 500 ? .ok : .notFoundThenRoot(.http(status: status))
     }
 
     private func request(_ target: URL) -> URLRequest {
