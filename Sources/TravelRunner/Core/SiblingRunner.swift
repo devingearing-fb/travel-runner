@@ -43,7 +43,7 @@ enum SiblingRunner {
         return activeServices(statusJSON: data)
     }
 
-    /// The same for code that cannot wait in a task (app launch and app quit).
+    /// The same for code that cannot wait in a task (app quit).
     static func activeServicesNow(of flavor: Flavor = Flavor.current.sibling, timeout: TimeInterval = 1.0) -> [String] {
         activeServicesNow(at: statusURL(of: flavor), timeout: timeout)
     }

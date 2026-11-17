@@ -1857,7 +1857,7 @@ final class SupervisorLifecycleTests: XCTestCase {
                 if let error = loads.error { throw error }
                 let services = loads.serviceIDs.map { id in
                     ServiceDefinition(
-                        id: id, name: nil, cmd: ["sleep", "30"], cwd: nil, probe: nil, type: .daemon,
+                        id: id, name: nil, cmd: ["sleep", "30"], cwd: loads.cwd, probe: nil, type: .daemon,
                         restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
                     )
                 }
@@ -2036,6 +2036,124 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(feedback.map(\.1), [false])
         await loads.stopControlServers()
     }
+
+    // MARK: - The other app at a config load
+
+    /// Finding "Blocking calls on main": the launch asked the other runner app
+    /// and held the main thread until the answer came. Now the load ends first,
+    /// and the env reset follows the answer.
+    func testAConfigLoadDoesNotWaitForTheOtherApp() async throws {
+        let loads = fakeConfigHost(services: ["first"])
+        let gate = Gate()
+        supervisor.configHost.siblingServices = {
+            await gate.wait()
+            return []
+        }
+        // The reset sets the database mode to local: that is how the test sees it.
+        supervisor.dbMode = .remote
+
+        supervisor.loadConfig()
+
+        XCTAssertEqual(supervisor.sortedServiceIDs, ["first"], "the config is loaded before the other app answers")
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertEqual(supervisor.dbMode, .remote, "no reset before the answer")
+
+        await gate.open()
+        await supervisor.envResetAfterLoad?.value
+        XCTAssertEqual(supervisor.dbMode, .local, "the other app runs nothing: the env is reset")
+        await loads.stopControlServers()
+    }
+
+    /// The env file of the login is one file for the two apps. While the other
+    /// app runs a stack, a load here leaves it alone.
+    func testAConfigLoadKeepsTheEnvWhileTheOtherAppRunsAStack() async throws {
+        let loads = fakeConfigHost(services: ["first"])
+        supervisor.configHost.siblingServices = { ["supabase", "travel-portal"] }
+        supervisor.dbMode = .remote
+
+        supervisor.loadConfig()
+        await supervisor.envResetAfterLoad?.value
+
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        await loads.stopControlServers()
+    }
+
+    /// A start right after the load ("Save & Start") must not start a service
+    /// before the env files of the load are written.
+    func testAStartWaitsForTheEnvResetOfTheLoad() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        let loads = fakeConfigHost(services: ["first"])
+        let gate = Gate()
+        supervisor.configHost.siblingServices = {
+            await gate.wait()
+            return []
+        }
+        supervisor.dbMode = .remote
+
+        supervisor.loadConfig()
+        supervisor.startAll()
+
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertNil(state("first").lastStarted, "no service starts before the answer of the other app")
+        XCTAssertEqual(supervisor.dbMode, .remote)
+
+        await gate.open()
+        let started = await waitUntil(20) { self.state("first").lastStarted != nil }
+        XCTAssertTrue(started, "error: \(supervisor.lastError ?? "none")")
+        XCTAssertEqual(supervisor.dbMode, .local, "the reset ran before the start")
+        await loads.stopControlServers()
+    }
+
+    /// A newer load replaces the reset of the load before it: an old answer must
+    /// not write the env after the new config decided to keep it.
+    func testANewerLoadReplacesTheEnvResetOfTheLoadBefore() async throws {
+        let loads = fakeConfigHost(services: ["first"])
+        let gate = Gate()
+        supervisor.configHost.siblingServices = {
+            await gate.wait()
+            return []
+        }
+        supervisor.loadConfig()
+        let first = try XCTUnwrap(supervisor.envResetAfterLoad)
+        supervisor.dbMode = .remote
+
+        // Now the other app runs a stack.
+        supervisor.configHost.siblingServices = { ["supabase"] }
+        let result = await supervisor.reconfigure()
+        XCTAssertEqual(result, .applied)
+        await supervisor.envResetAfterLoad?.value
+
+        await gate.open()
+        await first.value
+        XCTAssertEqual(supervisor.dbMode, .remote, "the late answer for the old load resets nothing")
+        await loads.stopControlServers()
+    }
+
+    /// The person switches to the hosted database while the other app has not
+    /// answered yet. The late reset must not switch back to local.
+    func testADatabaseModeChoiceWinsOverTheEnvResetOfTheLoad() async throws {
+        let app = workDir.appendingPathComponent("booking")
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        try "AMATEUR_SUPABASE_URL=https://hosted.example.test\n"
+            .write(to: app.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+        let loads = fakeConfigHost(services: ["travel-portal"])
+        loads.cwd = app.path
+        let gate = Gate()
+        supervisor.configHost.siblingServices = {
+            await gate.wait()
+            return []
+        }
+        supervisor.loadConfig()
+        let reset = try XCTUnwrap(supervisor.envResetAfterLoad)
+
+        supervisor.toggleDatabaseMode()
+        XCTAssertEqual(supervisor.dbMode, .remote, "error: \(supervisor.lastError ?? "none")")
+
+        await gate.open()
+        await reset.value
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        await loads.stopControlServers()
+    }
 }
 
 /// What the supervisor asked of the fake config host.
@@ -2045,6 +2163,8 @@ private final class ConfigLoads {
     /// The services of the config that the next load gives.
     var serviceIDs: [String] = []
     var error: (any Error)?
+    /// The folder of each service. Nil: no folder, so no env file and no watcher.
+    var cwd: String?
     var controlServers: [ControlServer] = []
 
     /// The listen runs in a task of the supervisor; it ends before the stop.

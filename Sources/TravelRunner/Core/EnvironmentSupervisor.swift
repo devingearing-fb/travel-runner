@@ -161,6 +161,9 @@ final class EnvironmentSupervisor {
     private let userDefaults: UserDefaults
     private var stdoutProbes: [String: StdoutProbe] = [:]
     private var didBootstrap = false
+    /// The env reset of the last config load, which first asks the other runner
+    /// app. Nil before the first load.
+    private(set) var envResetAfterLoad: Task<Void, Never>?
     private var phaseStartedAt: Date? = nil
     private var dbSetupRunner: DbSetupRunner?
     /// Nil while issue capture is off. Tests set a tracker with a temporary folder.
@@ -314,8 +317,10 @@ final class EnvironmentSupervisor {
     struct ConfigHost {
         var load: () throws -> ServiceConfig = { try ConfigLoader.load() }
         var controlServer: () -> ControlServer = { ControlServer() }
-        /// The services that the other runner app runs now.
-        var siblingServices: () -> [String] = { SiblingRunner.activeServicesNow() }
+        /// The services that the other runner app runs now. The load does not wait
+        /// for the answer: the other app can take a second, and the launch runs on
+        /// the main thread.
+        var siblingServices: @Sendable () async -> [String] = { await SiblingRunner.activeServices() }
     }
 
     /// The answer of `reconfigure()`.
@@ -456,9 +461,7 @@ final class EnvironmentSupervisor {
         localSupabaseKeys = nil
         stripeWebhookSecret = nil
         cacheLocalSupabaseKeys()
-        if configHost.siblingServices().isEmpty {
-            resetEnvToLocalhost()
-        }
+        resetEnvAfterLoad()
 
         // The watchers of the last config stop; their answers are for other folders.
         gitWatcherTask?.cancel()
@@ -500,6 +503,20 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// Asks the other runner app what it runs, then resets the env files when it
+    /// runs nothing. The ask runs in a task, so the launch does not wait for an
+    /// app that answers late. A start waits for the task; a newer load replaces it.
+    private func resetEnvAfterLoad() {
+        envResetAfterLoad?.cancel()
+        let siblingServices = configHost.siblingServices
+        envResetAfterLoad = Task { [weak self] in
+            let services = await siblingServices()
+            // A newer load, or a database mode that the person chose, replaced this reset.
+            guard !Task.isCancelled, services.isEmpty else { return }
+            self?.resetEnvToLocalhost()
+        }
+    }
+
     /// Loads a service graph without the app's side effects: no config file, control
     /// server, env files, or watchers. The lifecycle tests use it with small services.
     func loadServices(_ services: [ServiceDefinition], profile: RunProfile = .full) throws {
@@ -533,6 +550,9 @@ final class EnvironmentSupervisor {
                     self.startTask = nil
                 }
             }
+
+            // The env files of the load must be written before a service reads them.
+            await self.envResetAfterLoad?.value
 
             // The other runner app uses the same ports, and this start stops what it
             // finds on them.
@@ -1035,6 +1055,8 @@ final class EnvironmentSupervisor {
                 lastError = "Hosted dev values are missing from \(files.joined(separator: " and ")) — import the shared file (Settings → Reconfigure Repos… → Environment Check), then switch again"
                 return
             }
+            // The reset of a config load that still waits must not undo this choice.
+            envResetAfterLoad?.cancel()
             dbMode = .remote
             writeAppEnv()
         } else {
