@@ -466,7 +466,7 @@ final class EnvironmentCheckerTests: XCTestCase {
     }
 
     /// `stripe login` asks questions, so it runs in Terminal. The runner checks again until it passes.
-    func testStripeLoginRunsInTerminalAndTheRowWaitsForTheCheck() async {
+    func testStripeLoginRunsInTerminalAndTheRowWaitsForTheCheck() async throws {
         let balanceCalls = Counter()
         let runner = FakeCommandRunner { call in
             guard call.command.hasPrefix("stripe balance retrieve") else { return FakeCommandRunner.ok() }
@@ -478,7 +478,12 @@ final class EnvironmentCheckerTests: XCTestCase {
 
         await checker.fix("stripe-auth")
 
-        XCTAssertEqual(runner.commands.first, #"osascript -e 'tell application "Terminal" to do script "stripe login"'"#)
+        // A .command file that Terminal opens: no Apple event, so no Automation permission.
+        let opened = try XCTUnwrap(runner.commands.first)
+        XCTAssertEqual(opened, EnvironmentChecker.terminalCommand("stripe login"))
+        XCTAssertFalse(opened.contains("osascript"), opened)
+        XCTAssertTrue(opened.hasSuffix(#"open -a Terminal "$f""#), opened)
+        XCTAssertTrue(opened.contains("'#!/bin/sh\nstripe login\n'"), opened)
         XCTAssertEqual(checker.activeFix?.state, .succeeded)
         XCTAssertEqual(checker.activeFix?.action.copyCommand, "stripe login")
         XCTAssertEqual(status("stripe-auth", in: checker), .passing("Authenticated"))
@@ -617,6 +622,59 @@ final class EnvironmentCheckerTests: XCTestCase {
             EnvironmentChecker.fixFailedText(for: "pnpm", result: CommandResult(exitCode: 1, stdout: "", stderr: ""), timeout: .seconds(60)),
             "Fix failed (exit 1)"
         )
+    }
+
+    /// pnpm writes its error to the output. A warning in the error output must not hide it.
+    func testTheErrorLineOfPnpmInTheOutputWinsOverAWarning() {
+        let result = CommandResult(
+            exitCode: 1,
+            stdout: " ERR_PNPM_NO_LOCKFILE  Cannot install with \"frozen-lockfile\" because pnpm-lock.yaml is absent\n\n"
+                + "Note that in CI environments this setting is true by default. If you still need to run install in such cases, use \"pnpm install --no-frozen-lockfile\"\n",
+            stderr: "(node:4242) [DEP0040] DeprecationWarning: The `punycode` module is deprecated.\n"
+        )
+
+        XCTAssertEqual(
+            EnvironmentChecker.fixFailedText(for: "workspace-modules", result: result, timeout: .seconds(60)),
+            #"Fix failed (exit 1): ERR_PNPM_NO_LOCKFILE  Cannot install with "frozen-lockfile" because pnpm-lock.yaml is absent"#
+        )
+        // Control: without an error line, the last line of the error output stays the answer.
+        XCTAssertEqual(
+            EnvironmentChecker.lastErrorLine(CommandResult(exitCode: 1, stdout: "done\n", stderr: "warning one\nlast words\n")),
+            "last words"
+        )
+    }
+
+    // MARK: - The login check
+
+    /// The check reads the file as the fix does: quotes and comments count the same.
+    func testTheLoginCheckReadsTheFileAsTheFixDoes() {
+        XCTAssertEqual(EnvironmentChecker.loginEnvStatus("ALLOW_LOCALHOST_REDIRECTS=true\n"), .passing("Configured"))
+        XCTAssertEqual(EnvironmentChecker.loginEnvStatus("ALLOW_LOCALHOST_REDIRECTS=\"true\"\n"), .passing("Configured"))
+        XCTAssertEqual(
+            EnvironmentChecker.loginEnvStatus("# ALLOW_LOCALHOST_REDIRECTS=true\n"),
+            .warning("ALLOW_LOCALHOST_REDIRECTS is not set — Add missing keys adds it")
+        )
+        XCTAssertEqual(
+            EnvironmentChecker.loginEnvStatus("ALLOW_LOCALHOST_REDIRECTS=false\n"),
+            .warning(#"ALLOW_LOCALHOST_REDIRECTS is "false" — set it to true by hand; the fix keeps your value"#)
+        )
+    }
+
+    /// A quoted value passes the row, and the fix then has nothing to add: the two agree.
+    func testAQuotedValuePassesTheRowAndTheFixAgrees() async throws {
+        let directory = try temporaryFolder()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let content = EnvironmentChecker.loginEnvTemplate
+            .map { "\($0.key)=\"\($0.value)\"" }.joined(separator: "\n") + "\n"
+        try content.write(to: directory.appendingPathComponent(".env.local"), atomically: true, encoding: .utf8)
+        let checker = makeChecker(FakeCommandRunner(), loginPath: directory.path)
+
+        await checker.runAllChecks()
+        XCTAssertEqual(status("login-env", in: checker), .passing("Configured"))
+
+        await checker.fix("login-env")
+        XCTAssertEqual(checker.activeFix?.lines, ["Every key is there. Nothing was changed."])
+        XCTAssertEqual(status("login-env", in: checker), .passing("Configured"))
     }
 
     func testTheElapsedTimeHasMinutesAndSeconds() {

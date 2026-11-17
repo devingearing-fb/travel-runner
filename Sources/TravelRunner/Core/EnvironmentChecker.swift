@@ -321,7 +321,7 @@ final class EnvironmentChecker {
             HealthCheck(id: "login-env", name: "Login .env.local", section: .supabase,
                         fixLabel: "Add missing keys",
                         checkCommand: "grep ALLOW_LOCALHOST_REDIRECTS .env.local",
-                        checkDescription: "Must contain ALLOW_LOCALHOST_REDIRECTS=true for the local auth flow. The runner adds the local Supabase keys when it starts the login. The fix adds only the keys that are missing, keeps your values, and saves a copy of the file first.",
+                        checkDescription: "Must set ALLOW_LOCALHOST_REDIRECTS to true for the local auth flow. The runner adds the local Supabase keys when it starts the login. The fix adds only the keys that are missing, keeps your values, and saves a copy of the file first.",
                         checkPath: (loginPath as NSString).appendingPathComponent(".env.local")),
             HealthCheck(id: "hotel-data", name: "Hotel data cached", section: .supabase,
                         isRequired: false, fixLabel: "Download hotels",
@@ -406,14 +406,21 @@ final class EnvironmentChecker {
         return text
     }
 
-    /// The last line of the error output that has text, or of the output when the error output has none.
+    /// Text that starts the error line of pnpm, npm, a shell or Node.
+    nonisolated static let errorLineMarkers = ["ERR_PNPM_", "npm ERR!", "npm error", "error:", "Error:"]
+
+    /// The last line with an error marker, in the error output or else the output:
+    /// pnpm writes its errors to the output. Without such a line, the last line of the
+    /// error output that has text, or of the output when the error output has none.
     nonisolated static func lastErrorLine(_ result: CommandResult) -> String? {
-        func last(_ text: String) -> String? {
+        func last(_ text: String, where match: (String) -> Bool = { _ in true }) -> String? {
             text.components(separatedBy: .newlines).reversed()
                 .map { TerminalLineBuffer.stripAnsiEscapes($0).trimmingCharacters(in: .whitespaces) }
-                .first { !$0.isEmpty }
+                .first { !$0.isEmpty && match($0) }
         }
-        guard let line = last(result.stderr) ?? last(result.stdout) else { return nil }
+        let isError: (String) -> Bool = { line in errorLineMarkers.contains { line.contains($0) } }
+        guard let line = last(result.stderr, where: isError) ?? last(result.stdout, where: isError)
+            ?? last(result.stderr) ?? last(result.stdout) else { return nil }
         return line.count > 200 ? String(line.prefix(200)) + "…" : line
     }
 
@@ -599,11 +606,10 @@ final class EnvironmentChecker {
             guard exists(path) else {
                 return .failing("Missing")
             }
-            if let content = try? String(contentsOfFile: path, encoding: .utf8),
-               content.contains("ALLOW_LOCALHOST_REDIRECTS=true") {
-                return .passing("Configured")
+            guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+                return .warning("Exists but could not be read")
             }
-            return .warning("Exists but may be incomplete")
+            return Self.loginEnvStatus(content)
 
         case "hotel-data":
             // The dump of the app, or one still in the checkout: the next fetch moves it.
@@ -706,10 +712,14 @@ final class EnvironmentChecker {
     /// `pnpm db:hotels` stops when one of these is absent.
     nonisolated static let hotelDataFixNeeds = "The fix needs the local Supabase running and the shared apps/booking-portal/.env."
 
-    /// The command that opens Terminal with `command` in a new window.
+    /// The command that opens Terminal with `command` in a new window. It writes a
+    /// `.command` file and opens it: Terminal runs that without the Automation
+    /// permission, which an Apple event to Terminal needs and the app does not have.
     nonisolated static func terminalCommand(_ command: String) -> String {
-        let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-        return "osascript -e \(ShellQuote.quote("tell application \"Terminal\" to do script \"\(escaped)\""))"
+        let script = "#!/bin/sh\n\(command)\n"
+        return #"f="$(mktemp -d)/travel-runner-fix.command" && printf '%s' "#
+            + ShellQuote.quote(script)
+            + #" > "$f" && chmod 700 "$f" && open -a Terminal "$f""#
     }
 
     nonisolated static let nodeGuidance = "Install Node 22: `brew install node@22` or `nvm install 22`"
@@ -1003,6 +1013,17 @@ final class EnvironmentChecker {
         ("ALLOW_LOCALHOST_REDIRECTS", "true"),
         ("EMAIL_CONFIRMATION_REQUIRED", "false"),
     ]
+
+    /// The row of the login check. It reads the file as the fix does, so the two agree.
+    nonisolated static func loginEnvStatus(_ content: String) -> CheckStatus {
+        let key = "ALLOW_LOCALHOST_REDIRECTS"
+        guard let value = AgentEnv.parse(content, dialect: .node)[key] else {
+            return .warning("\(key) is not set — Add missing keys adds it")
+        }
+        return value == "true"
+            ? .passing("Configured")
+            : .warning("\(key) is \"\(value)\" — set it to true by hand; the fix keeps your value")
+    }
 
     struct LoginEnvReport: Equatable, Sendable {
         /// The name of the copy of the file, or nil when nothing was copied.
