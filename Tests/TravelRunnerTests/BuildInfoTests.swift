@@ -135,7 +135,10 @@ final class BuildInfoTests: XCTestCase {
         newer["CFBundleShortVersionString"] = "0.13.6"
         newer["CFBundleVersion"] = "20261120120000"
         newer[BuildInfo.commitKey] = "e4f5a6b"
-        let second = DebugTracker(baseDir: root.path, buildInfo: BuildInfo.resolve(info: newer, flavor: .standard))
+        // The newer build sees the error again later, not inside the rate limit of one minute.
+        let second = DebugTracker(
+            baseDir: root.path, buildInfo: BuildInfo.resolve(info: newer, flavor: .standard), rateLimitSeconds: 0
+        )
         let again = await second.captureIssue(trigger: "manual", serviceId: nil, errorMessage: "Something is wrong")
         XCTAssertNil(again, "the same error bumps the open issue")
 
