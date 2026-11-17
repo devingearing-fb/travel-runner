@@ -75,6 +75,9 @@ actor LogStore {
         self.sink = sink
     }
 
+    /// The folder of the log files. Nil when the store writes no files.
+    nonisolated var fileDirectory: URL? { sink?.directory }
+
     /// The log file of one id. Nil when the store writes no files.
     nonisolated func fileURL(for serviceID: String) -> URL? {
         sink?.fileURL(for: serviceID)

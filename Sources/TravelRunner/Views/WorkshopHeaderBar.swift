@@ -133,7 +133,8 @@ struct WorkshopHeaderBar: View {
                     color: .red,
                     text: error,
                     subtitle: supervisor.rootCauseDescription,
-                    action: headerOffersRetry ? nil : ("Retry", { supervisor.retryStartAll() })
+                    action: headerOffersRetry ? nil : ("Retry", { supervisor.retryStartAll() }),
+                    report: { ReportProblem.run(supervisor: supervisor) }
                 )
             }
             if let error = supervisor.controlAPIError {
@@ -274,6 +275,7 @@ struct WorkshopHeaderBar: View {
         subtitle: String?,
         link: (label: String, url: URL)? = nil,
         action: (label: String, handler: () -> Void)?,
+        report: (() -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
     ) -> some View {
         HStack(spacing: 8) {
@@ -299,6 +301,13 @@ struct WorkshopHeaderBar: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .tint(color)
+            }
+            if let report {
+                Button("Report") { report() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(supervisor.reportExportRunning)
+                    .help("Save a report zip to Downloads and copy a summary for Slack")
             }
             if let onDismiss {
                 Button {

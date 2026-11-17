@@ -25,6 +25,21 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 - **Sleep/wake**: Re-probes services after macOS wake, one pass per wake
 - **Rooms tab**: For one event and hotel, shows how many rooms of each room type are booked, held and free on each night, and who holds them. A switch selects the local stack or dev. The tab is read-only. It shows the page of the monolith's holds viewer (`scripts/holds-viewer`): the copy in your checkout, or the copy of `origin/dev` when your branch does not have it. Dev needs only the shared `apps/<app>/.env`, not Doppler. The viewer runs while the tab is open and stops 10 minutes after it closes. `defaults write ai.fastbreak.travel-runner holdsViewerPath <folder>` makes the tab use a copy from another folder; `defaults delete ai.fastbreak.travel-runner holdsViewerPath` removes that
 
+## Something broke
+
+1. Read the red card on Status, or the banner at the top. A failed service shows its last log lines; a failed DB step shows its error and its log (the terminal button).
+2. Try the button on it: **Restart**, **Clear Cache**, or **Retry** on a DB step.
+3. Still broken? Press **Report**. It is on the red card, on a failed DB step, on the error banner, in an issue on the Issues tab, under Diagnostics, and in the menu bar menu (**Report a Problem…**).
+4. The runner saves `TravelRunner-report-<yyyyMMdd-HHmm>-v<version>.zip` to Downloads, shows it in Finder, and copies a three-line summary.
+5. Paste the summary in Slack, attach the zip, and send it to Devin.
+
+The report holds `diagnostics.json` (the app version, macOS, the tools and their PATH, the profile, the database mode, the start checks, the DB setup steps, the pending migrations, the repo paths and each service), the last 2000 lines of each log, the newest open issues, and `events.jsonl`. Secret values are masked (`‹redacted:kind›`). Open the zip and read it before you share it. Nothing is sent anywhere by the app.
+
+Where the files are on your Mac:
+
+- **Logs**: `~/Library/Logs/Travel Runner/<service id>.log`, with a time on each line. They are kept for 14 days.
+- **Issues**: `~/Library/Application Support/Travel Runner/issues`, one folder for each failure, with `issue.json`, `diagnostics.json` and the logs. Turn issue capture on or off in Settings. It saves failure details on this Mac only.
+
 ## Travel Runner Hackathon
 
 The same source makes a second app, Travel Runner Hackathon, for the hackathon fork (`SnapBuild-2026/fb-travel-monolith-hackathon`). `FLAVOR=hackathon ./build.sh` builds it; `FLAVOR=hackathon ./release.sh <version>` releases it (tag `hackathon-v<version>`, never the latest release; its update feed is the fixed release `hackathon-appcast`).

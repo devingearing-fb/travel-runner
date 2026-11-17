@@ -252,6 +252,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalsItem.target = self
         menu.addItem(terminalsItem)
 
+        let reportItem = NSMenuItem(title: "Report a Problem…", action: #selector(reportProblem), keyEquivalent: "")
+        reportItem.target = self
+        reportItem.isEnabled = !supervisor.reportExportRunning
+        menu.addItem(reportItem)
+
         let buildItem = NSMenuItem(title: BuildInfo.current.menuTitle, action: nil, keyEquivalent: "")
         buildItem.isEnabled = false
         menu.addItem(buildItem)
@@ -297,6 +302,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         WorkshopPanel.shared.open(section: .logs)
         NSApp.activate(ignoringOtherApps: true)
         supervisor.panelVisible = true
+    }
+
+    /// Opens the panel first, so the sheet and the toast have a window.
+    @objc private func reportProblem() {
+        openPanel()
+        ReportProblem.run(supervisor: supervisor)
     }
 
     @objc private func openIssues() {

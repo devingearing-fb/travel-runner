@@ -288,6 +288,7 @@ actor DebugTracker {
 
     var folderPath: String { baseDir }
     var configFilePath: String { configPath }
+    var eventsFilePath: String { eventsPath }
 
     // MARK: - Config
 

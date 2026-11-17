@@ -23,6 +23,18 @@ struct WorkshopDiagnosticsView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
 
+                Button {
+                    ReportProblem.run(supervisor: supervisor)
+                } label: {
+                    Label("Report a Problem…", systemImage: "square.and.arrow.up")
+                }
+                .controlSize(.regular)
+                .disabled(supervisor.reportExportRunning)
+
+                Text("Saves a zip to Downloads with the diagnostics, the logs and the open issues, and copies a summary for Slack.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
                 Divider()
 
                 sectionHeader("Preflight Checks")

@@ -45,6 +45,10 @@ final class EnvironmentSupervisor {
     var onServiceCrash: (@MainActor (String, Int32) -> Void)? = nil
     var debugTrackingEnabled = false
     var debugOpenIssueCount = 0
+    /// True while "Report a problem" saves its zip.
+    private(set) var reportExportRunning = false
+    /// Makes the exporter of a report. Tests give one with a temporary folder and a fake zip.
+    @ObservationIgnored var makeReportExporter: () -> ReportExporter = { .live() }
     var actionsInFlight: Set<String> = []
     var onActionFeedback: ((String, Bool) -> Void)?
     var gitBranches: [String: String] = [:]
@@ -3039,6 +3043,62 @@ final class EnvironmentSupervisor {
     func debugIssueFolder(id: String, status: String = "open") async -> String? {
         guard let tracker = debugTracker else { return nil }
         return await tracker.issueFolderPath(id: id, status: status)
+    }
+
+    // MARK: - Problem report
+
+    /// Saves the problem report to Downloads (`ReportExporter`): the snapshot of
+    /// this Mac, the log files, the newest open issues and the events. Capture
+    /// can be off; the issues that exist still go in.
+    func exportReport(focus: ReportExporter.Focus = .general) async throws -> ReportExporter.Report {
+        guard !reportExportRunning else { throw ReportExporter.ExportError.alreadyRunning }
+        reportExportRunning = true
+        defer { reportExportRunning = false }
+
+        let tracker = currentIssueTracker()
+        var issueFolders: [(status: String, folder: URL)] = []
+        for issue in await tracker.listIssues(status: "open").prefix(ReportExporter.maxIssues) {
+            issueFolders.append(("open", URL(fileURLWithPath: await tracker.issueFolderPath(id: issue.id))))
+        }
+        if case .issue(let id, let status) = focus,
+           !issueFolders.contains(where: { $0.folder.lastPathComponent == id }) {
+            issueFolders.append((status, URL(fileURLWithPath: await tracker.issueFolderPath(id: id, status: status))))
+        }
+        var memoryLogs: [String: [LogEntry]] = [:]
+        for id in await logStore.serviceIDs() {
+            memoryLogs[id] = await logStore.entries(for: id)
+        }
+        let redactor = makeRedactor()
+        let input = ReportExporter.Input(
+            snapshot: await diagnosticsSnapshot(),
+            redactor: redactor,
+            focus: focus,
+            focusText: await reportFocusText(focus, redactor: redactor),
+            logDirectory: logStore.fileDirectory,
+            memoryLogs: memoryLogs,
+            issueFolders: issueFolders,
+            eventsFile: URL(fileURLWithPath: await tracker.eventsFilePath)
+        )
+        return try await makeReportExporter().export(input)
+    }
+
+    /// One line about what the report was made from.
+    private func reportFocusText(_ focus: ReportExporter.Focus, redactor: Redactor) async -> String? {
+        switch focus {
+        case .general:
+            return lastError ?? rootCauseDescription
+        case .service(let id):
+            guard let state = serviceStates[id] else { return nil }
+            let lines = await logStore.entries(for: id).map(\.text)
+            let cause = CrashCause.likelyCause(in: lines, serviceID: id, redactor: redactor)
+            let exit = state.exitCode.map { " (exit code \($0))" } ?? ""
+            return "\(state.definition.displayName) \(state.phase.rawValue)\(exit)" + (cause.map { " — \($0)" } ?? "")
+        case .dbStep(let id):
+            guard let step = dbSetupPipeline?.steps.first(where: { $0.id == id }) else { return nil }
+            return "\(step.name): \(step.errorMessage ?? step.status.rawValue)"
+        case .issue(let id, let status):
+            return await currentIssueTracker().listIssues(status: status).first { $0.id == id }?.summary
+        }
     }
 
     func closeDebugIssue(id: String, resolution: String) async -> Bool {

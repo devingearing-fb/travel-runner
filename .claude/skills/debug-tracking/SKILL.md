@@ -206,3 +206,19 @@ cat ~/Desktop/debug-tracking/open/20260510T143200_service-crash-travel-portal/is
 # Read captured logs
 cat ~/Desktop/debug-tracking/open/20260510T143200_service-crash-travel-portal/logs-travel-portal.txt
 ```
+
+## A teammate's report
+
+A teammate sends a problem report in Slack: three summary lines and a zip, `TravelRunner-report-<yyyyMMdd-HHmm>-v<version>.zip`. The app made it with **Report** (on a failed service, a failed DB step, the error banner, an issue, Diagnostics, or the menu bar). Unzip it and read:
+
+```
+TravelRunner-report-20261116-0914-v0.13.5/
+  summary.txt        # The three Slack lines: runner and Mac, the stack, what failed
+  diagnostics.json   # Same shape as an issue's diagnostics.json, taken at export
+  logs/<id>.log      # Last 2000 lines of each log file, `2026-11-16T09:14:03.412-0700 [out|err] text`
+  issues/open/<id>/  # The newest 10 open issues of that Mac
+  issues/closed/<id>/  # Only when the report was made from a closed issue
+  events.jsonl
+```
+
+All text in it went through the redactor. Read `diagnostics.json` first (version, tools, PATH, profile, DB steps), then the log of the failed service or `db-setup-<step>`.

@@ -94,6 +94,18 @@ struct TriageCard: View {
                 if isActionInFlight {
                     ProgressView().controlSize(.mini)
                 }
+
+                Spacer()
+
+                Button {
+                    ReportProblem.run(.service(id: state.id), supervisor: supervisor)
+                } label: {
+                    Label("Report", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .disabled(supervisor.reportExportRunning)
+                .help("Save a report zip to Downloads and copy a summary for Slack")
             }
             .disabled(isActionInFlight)
         }

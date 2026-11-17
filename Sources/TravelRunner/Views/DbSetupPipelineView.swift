@@ -6,6 +6,8 @@ struct DbSetupPipelineView: View {
     let onRetryFrom: (String) -> Void
     let onCancel: () -> Void
     let onDismiss: () -> Void
+    /// "Report" on a failed step, with the step id.
+    var onReport: ((String) -> Void)? = nil
 
     private var isActivelyRunning: Bool {
         isRunning || pipeline.isRunning
@@ -137,7 +139,8 @@ struct DbSetupPipelineView: View {
                         onToggleExpand: {
                             expandedStepID = expandedStepID == step.id ? nil : step.id
                         },
-                        onRetry: { onRetryFrom(step.id) }
+                        onRetry: { onRetryFrom(step.id) },
+                        onReport: onReport.map { report in { report(step.id) } }
                     )
                 }
             }
@@ -163,6 +166,7 @@ struct DbSetupStepRow: View {
     let isExpanded: Bool
     let onToggleExpand: () -> Void
     let onRetry: () -> Void
+    var onReport: (() -> Void)? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -233,6 +237,12 @@ struct DbSetupStepRow: View {
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
                     .tint(.orange)
+                if let onReport {
+                    Button("Report") { onReport() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help("Save a report zip to Downloads and copy a summary for Slack")
+                }
             }
 
             Button {
