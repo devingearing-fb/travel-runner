@@ -72,6 +72,8 @@ final class PreflightRunnerTests: XCTestCase {
             ("no Node on the PATH of the shell", FakeCommandRunner.failed(127, stderr: "zsh:1: command not found: node"),
              "failed: Node.js not found | fix: \(install)"),
             ("a Node that prints no version", FakeCommandRunner.ok("nvm: N/A version is not installed\n"),
+             "failed: node --version printed no version: nvm: N/A version is not installed | fix: Run node --version in the portal folder"),
+            ("a Node that prints nothing", FakeCommandRunner.ok(""),
              "failed: Node.js not found | fix: \(install)"),
             ("a Node that hangs", FakeCommandRunner.timedOut,
              "failed: node --version did not answer in 15 s | fix: Run node --version in a terminal to see what it waits for"),

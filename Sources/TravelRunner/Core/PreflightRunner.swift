@@ -119,7 +119,16 @@ struct PreflightRunner: Sendable {
             // A login profile can print lines first ("Now using node v22.3.0"): the
             // version is the last line that is only a version.
             guard let number = ToolVersion.parse(result.stdout) else {
-                return .failed(message: "Node.js not found", fix: "Install Node 22 via nvm or brew")
+                let printed = result.trimmedOutput
+                if printed.isEmpty || result.exitCode == 127 {
+                    return .failed(message: "Node.js not found", fix: "Install Node 22 via nvm or brew")
+                }
+                // Something answered (nvm: "N/A version is not installed"): show what it said.
+                let lastLine = printed.components(separatedBy: .newlines).last ?? printed
+                return .failed(
+                    message: "node --version printed no version: \(lastLine)",
+                    fix: "Run node --version in the portal folder"
+                )
             }
             let version = "v\(number)"
             let major = EnvironmentChecker.major(of: number) ?? 0
