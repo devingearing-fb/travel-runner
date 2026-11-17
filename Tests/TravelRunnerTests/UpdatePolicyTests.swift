@@ -23,6 +23,23 @@ final class UpdatePolicyTests: XCTestCase {
         )
     }
 
+    /// A new release goes to the canary feed first (`release.sh`). Only a copy that
+    /// was put on the canary channel reads it.
+    func testOnlyACopyOnTheCanaryChannelReadsTheCanaryFeed() {
+        XCTAssertNil(UpdatePolicy.feedURL(defaults: defaults, flavor: .standard), "no value: the feed of Info.plist")
+
+        defaults.set("canary", forKey: UpdatePolicy.channelKey)
+        XCTAssertEqual(
+            UpdatePolicy.feedURL(defaults: defaults, flavor: .standard),
+            "https://github.com/devingearing-fb/travel-runner/releases/download/canary-appcast/appcast.xml"
+        )
+        // The hackathon app has one feed.
+        XCTAssertNil(UpdatePolicy.feedURL(defaults: defaults, flavor: .hackathon))
+
+        defaults.set("stable", forKey: UpdatePolicy.channelKey)
+        XCTAssertNil(UpdatePolicy.feedURL(defaults: defaults, flavor: .standard))
+    }
+
     func testAReleaseBuildTurnsAutomaticDownloadsOnOnce() {
         var enabled = 0
 

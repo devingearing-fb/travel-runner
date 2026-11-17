@@ -7,10 +7,18 @@ enum SetupStep {
     case environment
 }
 
+/// How the setup view ended.
+enum SetupOutcome: Equatable {
+    /// "Back": nothing was saved.
+    case cancelled
+    /// The paths are in services.json. `start` is true when the stack must
+    /// start: "Save & Start" of the first run.
+    case saved(start: Bool)
+}
+
 struct SetupView: View {
     let isFirstRun: Bool
-    /// The argument is true when the stack must start: "Save & Start" of the first run.
-    let onComplete: (_ start: Bool) -> Void
+    let onComplete: (SetupOutcome) -> Void
 
     @State private var currentStep: SetupStep = .paths
     @State private var checker: EnvironmentChecker?
@@ -36,7 +44,7 @@ struct SetupView: View {
                     onBack: { currentStep = .paths },
                     onComplete: {
                         if savePaths() {
-                            onComplete(isFirstRun)
+                            onComplete(.saved(start: isFirstRun))
                         } else {
                             // Step 1 shows the error.
                             currentStep = .paths
@@ -64,7 +72,7 @@ struct SetupView: View {
                 }
                 Spacer()
                 if !isFirstRun {
-                    Button("Back") { onComplete(false) }
+                    Button("Back") { onComplete(.cancelled) }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                 }
@@ -113,7 +121,7 @@ struct SetupView: View {
                         .controlSize(.regular)
                         .disabled(!canProceed)
 
-                    Button(action: { if savePaths() { onComplete(false) } }) {
+                    Button(action: { if savePaths() { onComplete(.saved(start: false)) } }) {
                         Label("Save", systemImage: "checkmark.circle")
                     }
                     .buttonStyle(.borderedProminent)

@@ -364,6 +364,7 @@ final class DbSeedScenarioTests: XCTestCase {
         )
         XCTAssertEqual(environment["PATH"], "/test/bin")
         XCTAssertEqual(environment["TRAVEL_SEED_SCENARIO"], "sold-out")
+        XCTAssertNil(environment["TRAVEL_DB_PROFILE"])
     }
 
     @MainActor

@@ -49,7 +49,8 @@ When running, travel-runner exposes an HTTP API on `http://localhost:19900` (it 
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/status` | All service statuses, health, LAN mode, profile, DB mode, git branches, and `app` (`standard` or `hackathon`) |
+| `GET` | `/api/status` | All service statuses, health, LAN mode, profile, DB mode, git branches, `app` (`standard` or `hackathon`), and `configured` (false until a `services.json` loads) |
+| `GET` | `/api/preflight` | Runs the start checks that change nothing (Node, ports, folders) and gives each result |
 | `GET` | `/api/logs/{serviceId}?lines=N` | Last N log lines (default 50) |
 | `POST` | `/api/restart/{serviceId}` | Restart a service |
 | `POST` | `/api/restart-cascade/{serviceId}` | Restart a service and its dependents |
@@ -69,6 +70,10 @@ When running, travel-runner exposes an HTTP API on `http://localhost:19900` (it 
 | `GET` | `/api/debug/issues` | List open debug-tracking issues |
 | `POST` | `/api/debug/issues` | Capture an issue; body `{"description": "..."}` |
 | `POST` | `/api/debug/issues/close/{id}` | Close an issue; optional body `{"resolution": "..."}` |
+
+The API listens from launch, also before the setup wizard has saved a config.
+
+The checkout names the oldest runner that may reset it: `"runner": { "minVersion": "x.y.z" }` in `scripts/db/manifest.json`. A dev build (`./build.sh`) is never blocked. An older release still starts the services, but `db-reset`, `db-setup`, `retry` and `step` answer `409` with `{"ok": false, "error": "runner_too_old", "message": "...", "download_url": "..."}`, and `/api/status` has a `reset_blocked` text.
 
 **Service IDs:** `supabase`, `universal-login`, `stripe`, `travel-portal`,
 `partner-portal`, `cache-apply-transport`, `capacity-contention`,
@@ -114,6 +119,10 @@ Runner-owned Sequin containers and volumes; the next run creates a fresh rehears
 
 Config lives at `~/.config/travel-runner/services.json` (version 3). The setup wizard creates it on first launch. It holds `paths` (`monorepo`, `universal_login`, `stream_services`, `load_test`) and the `profile`. The service graph is generated in code from the paths on every load, so only custom services you add to `services` are kept as written. Edit manually or use the Settings gear icon in the app.
 
+Settings → Reconfigure Repos applies new paths at once when the stack is stopped. While the stack runs, the app asks: "Stop and apply" stops the stack and loads the new paths; "Apply at next launch" keeps the stack and loads them at the next launch.
+
+Every DB setup step gets `TRAVEL_SEED_SCENARIO`, `TRAVEL_DB_PROFILE` (the profile of the pipeline), `TRAVEL_RUNNER_FLAVOR` and `TRAVEL_HOTEL_DUMP`. The hotel dump (about 285 MB) is kept in `~/Library/Application Support/Travel Runner/hotels/`, not in the checkout, so a second checkout or a worktree does not download it again. The fetch script moves a valid dump from `data/` there once.
+
 ## Building
 
 Requires Swift 6+ (Xcode or Command Line Tools).
@@ -132,6 +141,8 @@ No test starts two real copies. Check these by hand in a built app before a rele
 - "Show the running copy" opens the window of the first copy, and the second copy quits.
 - "Quit" in the alert leaves the services and the ports of the first copy up.
 - With `TRAVEL_RUNNER_SMOKE=1`, the second copy shows no alert: it prints the message and exits with code 75.
+
+Releases: see [RELEASING.md](RELEASING.md). A release goes to the canary channel first (`./release.sh <version>`), then to everyone (`./release.sh --promote <version>`). `scripts/smoke.sh <App.app>` starts a built app with an empty home folder and checks that it answers.
 
 ## Tech Stack
 

@@ -19,6 +19,9 @@ final class EnvironmentSupervisor {
     var configIssues: [String] = []
     /// Set when a release copy runs outside an Applications folder, until the person closes it.
     var misplacedCopyNotice: InstanceGuard.MisplacedNotice? = nil
+    /// Set while the checkout needs a newer runner. No reset and no DB step runs
+    /// while it is set; the services still start.
+    var compatibilityNotice: Compatibility.Notice? = nil
     var startupBeganAt: Date? = nil
     /// Migrations the local database has not applied (from the last check).
     var pendingMigrations: [String] = []
@@ -52,6 +55,9 @@ final class EnvironmentSupervisor {
     /// Which part of the graph start-all brings up (stored in services.json).
     var profile: RunProfile = .both
     private(set) var profileMembers: Set<String> = []
+    /// True when Settings saved new paths while the stack ran. They load at the
+    /// next launch, or at the next reconfigure with the stack stopped.
+    private(set) var reconfigurePending = false
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
@@ -141,6 +147,8 @@ final class EnvironmentSupervisor {
     /// The ports that the secret registry tries. Tests give port 0, so the
     /// system picks a free one.
     @ObservationIgnored var secretRegistryPorts: ClosedRange<UInt16> = LiveSecretRegistry.defaultPorts
+    /// Where the config and the control server come from.
+    @ObservationIgnored var configHost = ConfigHost()
     /// The preflight checks run their commands in the shell of the supervisor and
     /// wait on its clock.
     private var preflightRunner: PreflightRunner { PreflightRunner(shell: shell, clock: clock) }
@@ -152,7 +160,7 @@ final class EnvironmentSupervisor {
     private var isShuttingDown = false
     private let userDefaults: UserDefaults
     private var stdoutProbes: [String: StdoutProbe] = [:]
-    private var observerRegistered = false
+    private var didBootstrap = false
     private var phaseStartedAt: Date? = nil
     private var dbSetupRunner: DbSetupRunner?
     /// Nil while issue capture is off. Tests set a tracker with a temporary folder.
@@ -160,6 +168,12 @@ final class EnvironmentSupervisor {
     /// The tracker of this app, also while capture is off. One instance for the
     /// whole run: it holds the rate limit.
     private var issueTracker: DebugTracker?
+    /// Makes the tracker of this app. Tests give one with a temporary folder.
+    var makeIssueTracker: () -> DebugTracker = { DebugTracker() }
+    /// How often the switch and the open count are read from the issue folder.
+    var issueCapturePollInterval: Duration = .seconds(30)
+    private var issueCapturePollStarted = false
+    private var issueLaunchPruneDone = false
     private var gitBranchWatcher: GitBranchWatcher?
     private var gitRepoRoots: [String: String] = [:]
     private var dependencyWatcher: DependencyWatcher?
@@ -193,6 +207,9 @@ final class EnvironmentSupervisor {
     /// is read. Nil from the closure starts nothing and sets `lastError`, like a
     /// missing scenario.
     var dbPipelineFactory: ((_ cwd: String, _ profile: String) -> DbSetupPipeline?)?
+    /// The version that the checkout's `runner.minVersion` is compared with. Nil is
+    /// never blocked. Tests set it.
+    @ObservationIgnored var runnerVersion: String? = Compatibility.comparableVersion(of: .current)
 
     init(
         userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil,
@@ -283,7 +300,7 @@ final class EnvironmentSupervisor {
             case .portHeldByOtherStack(let port, let container):
                 "Port \(port) is held by another Supabase stack (\(container)) — stop it, then start again"
             case .badProbe(let name, let reason):
-                "\(name) cannot start: \(reason). Correct its probe in services.json, then quit Travel Runner and open it again."
+                "\(name) cannot start: \(reason). Correct its probe in services.json, then quit \(Flavor.current.displayName) and open it again."
             case .portHeldByContainer(let name, let port, let owner):
                 "\(name) cannot start: port \(port) is published by a container (\(owner)) — stop that container, then restart \(name)"
             }
@@ -292,87 +309,32 @@ final class EnvironmentSupervisor {
 
     // MARK: - Lifecycle
 
+    /// What the config load takes from the app and from this Mac. Tests give fakes,
+    /// so no test reads services.json, binds the control port or asks the other app.
+    struct ConfigHost {
+        var load: () throws -> ServiceConfig = { try ConfigLoader.load() }
+        var controlServer: () -> ControlServer = { ControlServer() }
+        /// The services that the other runner app runs now.
+        var siblingServices: () -> [String] = { SiblingRunner.activeServicesNow() }
+    }
+
+    /// The answer of `reconfigure()`.
+    enum ReconfigureResult: Equatable, Sendable {
+        /// The new config is loaded.
+        case applied
+        /// The stack runs. Nothing changed; the new config waits in services.json.
+        case needsStop
+        /// The new config could not be loaded. The old one stays.
+        case failed(String)
+    }
+
+    /// The launch of the app: starts what lives as long as the app does, then
+    /// loads the config. The control API and issue capture do not wait for a
+    /// config: a first run has none.
     func loadConfig() {
+        bootstrapOnce()
         do {
-            configIssues = []
-            let config = try ConfigLoader.load()
-            self.config = config
-            configIssues = config.skippedServices.map(\.message)
-            for issue in configIssues { print("[Config] \(issue)") }
-            self.serviceStates = [:]
-            let graph = try ServiceGraph(services: config.services)
-            self.graph = graph
-            let redactor = makeRedactor()
-            Task { [logStore] in await logStore.setRunnerRedactor(redactor) }
-            self.sortedServiceIDs = graph.sortedIDs
-            self.profile = config.resolvedProfile
-            self.profileMembers = config.resolvedProfile.members(of: config.services)
-
-            for service in config.services {
-                serviceStates[service.id] = ServiceState(definition: service)
-            }
-
-            reloadDbSeedScenarios()
-
-            // Register secret observer once. It resolves paths at write time, so a
-            // config reload (new monorepo path) needs no new observer.
-            if !observerRegistered {
-                observerRegistered = true
-                Task {
-                    await secretStore.onChange { [weak self] key, value in
-                        Task { @MainActor in self?.recordArtifact(key, value: value) }
-                    }
-                }
-            }
-
-            sleepWakeObserver = SleepWakeObserver { [weak self] in
-                self?.handleWake()
-            }
-            sleepWakeObserver?.startObserving()
-
-            // Always reset .env.local files to localhost on startup. Keys from the
-            // last block first; the running stack's keys replace them after GROUND.
-            // Not while the other runner app runs a stack: the login's env file is
-            // the same file for the two apps.
-            cacheLocalSupabaseKeys()
-            if SiblingRunner.activeServicesNow().isEmpty {
-                resetEnvToLocalhost()
-            }
-
-            // Start control API server
-            startControlServer()
-
-            // Issue capture is on unless the config in the issue folder says no.
-            Task { await initDebugTracking() }
-
-            // Initialize git branch watcher for all repos with cwds
-            var repoMap: [String: String] = [:]
-            for service in config.services {
-                if let cwd = service.resolvedCwd {
-                    repoMap[service.id] = cwd
-                }
-            }
-            if !repoMap.isEmpty {
-                let watcher = GitBranchWatcher(repos: repoMap)
-                gitBranchWatcher = watcher
-                gitRepoRoots = watcher.repoRoots
-                gitWatcherTask?.cancel()
-                gitWatcherTask = Task { await startGitBranchWatching(watcher: watcher) }
-            }
-
-            // Initialize dependency (npm install) freshness watcher
-            var depsMap: [String: String] = [:]
-            for service in config.services {
-                if let cwd = service.resolvedCwd, service.resolvedType == .daemon {
-                    depsMap[service.id] = cwd
-                }
-            }
-            if !depsMap.isEmpty {
-                let depsWatcher = DependencyWatcher(repoPaths: depsMap)
-                dependencyWatcher = depsWatcher
-                depsWatcherTask?.cancel()
-                depsWatcherTask = Task { await startDepsWatching(watcher: depsWatcher) }
-            }
+            try applyConfig()
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this
         } catch ConfigLoader.ConfigError.monorepoNotFound {
@@ -380,6 +342,161 @@ final class EnvironmentSupervisor {
         } catch {
             lastError = "Config load failed: \(error)"
             print("[Supervisor] \(lastError!)")
+        }
+    }
+
+    /// Loads the config that Settings saved. While the stack runs it changes
+    /// nothing and answers `.needsStop`: a new service state knows no process, so
+    /// a load now would lose the processes that run.
+    func reconfigure() async -> ReconfigureResult {
+        guard await !holdsLiveStack() else {
+            reconfigurePending = true
+            return .needsStop
+        }
+        do {
+            try applyConfig()
+            lastError = nil
+            onActionFeedback?("Paths updated", true)
+            return .applied
+        } catch {
+            let message = "Paths not applied: \(error)"
+            lastError = message
+            onActionFeedback?(message, false)
+            return .failed(message)
+        }
+    }
+
+    /// "Stop and apply": stops the stack, then loads the config that Settings saved.
+    @discardableResult
+    func stopAndReconfigure() -> Task<ReconfigureResult, Never> {
+        let stop = beginStopAll()
+        return Task {
+            await stop.value
+            let result = await reconfigure()
+            if result == .needsStop {
+                onActionFeedback?("Paths not applied: the stack did not stop. Stop it, then save the paths again.", false)
+            }
+            return result
+        }
+    }
+
+    /// True while the runner starts, stops or holds a process of the stack, or
+    /// runs a database step.
+    private func holdsLiveStack() async -> Bool {
+        // A failed service can still have a process, and `pid` of a state stays
+        // after its process ends. The process runner knows what runs. It answers
+        // first: the other checks then see the state of this moment.
+        if await processRunner.hasRunningProcess() { return true }
+        if startTask != nil || isShuttingDown || !actionsInFlight.isEmpty { return true }
+        if dbResetRunning || dbSetupPipeline?.isRunning == true { return true }
+        let livePhases: Set<ServicePhase> = [.starting, .running, .stopping]
+        return serviceStates.values.contains { livePhases.contains($0.phase) }
+    }
+
+    /// Runs once for the app: the secret observer, the wake observer, the control
+    /// API and issue capture. A second control server would fail on the port, and
+    /// a second wake observer would run each recovery twice.
+    private func bootstrapOnce() {
+        guard !didBootstrap else { return }
+        didBootstrap = true
+
+        // Issue capture is on unless the config in the issue folder says no.
+        Task { await initDebugTracking() }
+
+        // The observer resolves paths at write time, so a new monorepo path needs
+        // no new observer.
+        Task {
+            await secretStore.onChange { [weak self] key, value in
+                Task { @MainActor in self?.recordArtifact(key, value: value) }
+            }
+        }
+
+        sleepWakeObserver = SleepWakeObserver { [weak self] in
+            self?.handleWake()
+        }
+        sleepWakeObserver?.startObserving()
+
+        // Start control API server
+        startControlServer()
+    }
+
+    /// Reads services.json and replaces the graph, the service states, the env
+    /// blocks and the watchers. It runs at launch and at each reconfigure. The
+    /// caller makes sure that no service runs. When the read fails, nothing changes.
+    private func applyConfig() throws {
+        let config = try configHost.load()
+        let graph = try ServiceGraph(services: config.services)
+        self.config = config
+        configIssues = config.skippedServices.map(\.message)
+        for issue in configIssues { print("[Config] \(issue)") }
+        self.graph = graph
+        let redactor = makeRedactor()
+        Task { [logStore] in await logStore.setRunnerRedactor(redactor) }
+        self.sortedServiceIDs = graph.sortedIDs
+        self.profile = config.resolvedProfile
+        self.profileMembers = config.resolvedProfile.members(of: config.services)
+        self.serviceStates = [:]
+        for service in config.services {
+            serviceStates[service.id] = ServiceState(definition: service)
+        }
+        reconfigurePending = false
+
+        reloadDbSeedScenarios()
+        // Another checkout can name another minimum runner version.
+        if let cwd = serviceCwd("supabase") {
+            refreshCompatibility(cwd: cwd)
+        } else if compatibilityNotice != nil {
+            compatibilityNotice = nil
+        }
+
+        // Always reset .env.local files to localhost on startup. Keys from the
+        // last block first; the running stack's keys replace them after GROUND.
+        // Not while the other runner app runs a stack: the login's env file is
+        // the same file for the two apps.
+        localSupabaseKeys = nil
+        stripeWebhookSecret = nil
+        cacheLocalSupabaseKeys()
+        if configHost.siblingServices().isEmpty {
+            resetEnvToLocalhost()
+        }
+
+        // The watchers of the last config stop; their answers are for other folders.
+        gitWatcherTask?.cancel()
+        gitWatcherTask = nil
+        gitBranchWatcher = nil
+        gitRepoRoots = [:]
+        gitBranches = [:]
+        gitBehindCounts = [:]
+        depsWatcherTask?.cancel()
+        depsWatcherTask = nil
+        dependencyWatcher = nil
+        npmStaleServices = []
+
+        // Initialize git branch watcher for all repos with cwds
+        var repoMap: [String: String] = [:]
+        for service in config.services {
+            if let cwd = service.resolvedCwd {
+                repoMap[service.id] = cwd
+            }
+        }
+        if !repoMap.isEmpty {
+            let watcher = GitBranchWatcher(repos: repoMap)
+            gitBranchWatcher = watcher
+            gitRepoRoots = watcher.repoRoots
+            gitWatcherTask = Task { await startGitBranchWatching(watcher: watcher) }
+        }
+
+        // Initialize dependency (npm install) freshness watcher
+        var depsMap: [String: String] = [:]
+        for service in config.services {
+            if let cwd = service.resolvedCwd, service.resolvedType == .daemon {
+                depsMap[service.id] = cwd
+            }
+        }
+        if !depsMap.isEmpty {
+            let depsWatcher = DependencyWatcher(repoPaths: depsMap)
+            dependencyWatcher = depsWatcher
+            depsWatcherTask = Task { await startDepsWatching(watcher: depsWatcher) }
         }
     }
 
@@ -546,10 +663,16 @@ final class EnvironmentSupervisor {
     }
 
     func stopAll() {
+        beginStopAll()
+    }
+
+    /// Starts the stop of the stack. The task ends when the stack is stopped.
+    @discardableResult
+    private func beginStopAll() -> Task<Void, Never> {
         isShuttingDown = true
         startTask?.cancel()
         startTask = nil
-        Task {
+        return Task {
             for serviceID in sortedServiceIDs {
                 serviceStates[serviceID]?.phase = .stopping
             }
@@ -588,6 +711,8 @@ final class EnvironmentSupervisor {
         }
         var dict: [String: Any] = [
             "app": Flavor.current.rawValue,
+            // False until a services.json loads: a first run, or a config that needs setup.
+            "configured": config != nil,
             "health": health.rawValue, "services": states, "lan": networkMode, "ip": localIP ?? "none",
             "profile": profile.rawValue,
             "db_mode": dbMode.rawValue,
@@ -595,6 +720,8 @@ final class EnvironmentSupervisor {
             "gitBehind": gitBehindCounts,
             "npmStale": Array(npmStaleServices)
         ]
+        // Present only while this runner is too old to reset the checkout.
+        if let compatibilityNotice { dict["reset_blocked"] = compatibilityNotice.text }
         // version, build, commit, build_kind
         dict.merge(buildInfo.statusFields) { current, _ in current }
         if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
@@ -602,15 +729,49 @@ final class EnvironmentSupervisor {
         return "{}"
     }
 
+    /// The answer of `/api/preflight`: the checks of a start that change nothing
+    /// (Node, the ports, the folders), run now. Each check has a time limit, so
+    /// the answer always comes. Without a config only the Node check runs.
+    func preflightJSON() async -> String {
+        let runner = preflightRunner
+        var rows: [[String: String]] = []
+        for check in runner.readOnlyChecks(for: loadedServices) {
+            var row = ["id": check.id, "name": check.name]
+            switch await runner.run(check: check) {
+            case .pending: row["status"] = "pending"
+            case .passed(let detail):
+                row["status"] = "passed"
+                row["detail"] = detail
+            case .warning(let message):
+                row["status"] = "warning"
+                row["detail"] = message
+            case .failed(let message, let fix):
+                row["status"] = "failed"
+                row["detail"] = message
+                if let fix { row["fix"] = fix }
+            }
+            rows.append(row)
+        }
+        let body: [String: Any] = ["configured": config != nil, "checks": rows]
+        if let data = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) {
+            return String(decoding: data, as: UTF8.self)
+        }
+        return "{}"
+    }
+
     private func startControlServer() {
         let logStore = self.logStore
-        controlServer = ControlServer()
+        controlServer = configHost.controlServer()
         Task {
             let failures = await controlServer?.start(
                 actions: ControlServer.Actions(
                     getStatus: { [weak self] in
                         guard let self else { return "{}" }
                         return await MainActor.run { self.statusJSON() }
+                    },
+                    getPreflight: { [weak self] in
+                        guard let self else { return "{}" }
+                        return await self.preflightJSON()
                     },
                     getLogs: { [weak self] serviceId, lines in
                         guard let self else { return "[]" }
@@ -641,6 +802,9 @@ final class EnvironmentSupervisor {
                     },
                     restartCascade: { [weak self] serviceId in
                         await MainActor.run { self?.restartCascade(serviceId) }
+                    },
+                    dbResetBlock: { [weak self] in
+                        await MainActor.run { self?.resetBlockJSON() }
                     },
                     dbReset: { [weak self] in
                         await MainActor.run { self?.resetDatabase() }
@@ -1165,6 +1329,8 @@ final class EnvironmentSupervisor {
     private func startDepsWatching(watcher: DependencyWatcher) async {
         while !Task.isCancelled {
             let stale = await watcher.check()
+            // A reconfigure replaced this watcher during the check.
+            if Task.isCancelled { break }
             await MainActor.run { self.npmStaleServices = stale }
             try? await clock.sleep(for: .seconds(30))
         }
@@ -1175,6 +1341,8 @@ final class EnvironmentSupervisor {
         await watcher.fetchAndCount(fetchInterval: 0)
         let initial = await watcher.branches
         let initialBehind = await watcher.behindCounts
+        // A reconfigure replaced this watcher: its answers are for other folders.
+        if Task.isCancelled { return }
         await MainActor.run {
             self.gitBranches = initial
             self.gitBehindCounts = initialBehind
@@ -1182,10 +1350,12 @@ final class EnvironmentSupervisor {
 
         while !Task.isCancelled {
             try? await clock.sleep(for: .seconds(5))
+            if Task.isCancelled { break }
             let changed = await watcher.check()
             await watcher.fetchAndCount()
             let allBranches = await watcher.branches
             let allBehind = await watcher.behindCounts
+            if Task.isCancelled { break }
             let prevBehind = await MainActor.run { self.gitBehindCounts }
             await MainActor.run {
                 self.gitBranches = allBranches
@@ -1209,6 +1379,8 @@ final class EnvironmentSupervisor {
 
             if changed.contains("supabase") || changed.contains("travel-portal") {
                 if let cwd = serviceCwd("supabase") ?? serviceCwd("travel-portal") {
+                    // The new branch can name another minimum runner version.
+                    refreshCompatibility(cwd: cwd)
                     if let missing = await missingMigrations(cwd: cwd), !missing.isEmpty {
                         _ = await runDbReset(cwd: cwd, reason: "Branch switch: new migrations detected — running db:reset...")
                     }
@@ -1287,6 +1459,7 @@ final class EnvironmentSupervisor {
             lastError = "Cannot find supabase service cwd in config"
             return
         }
+        guard !refreshCompatibility(cwd: cwd) else { return }
 
         let pipeline: DbSetupPipeline
         if stepId != nil, let existingPipeline = dbSetupPipeline {
@@ -1323,6 +1496,7 @@ final class EnvironmentSupervisor {
             lastError = "Cannot find supabase service cwd in config"
             return
         }
+        guard !refreshCompatibility(cwd: cwd) else { return }
 
         if dbSetupPipeline == nil {
             guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "full") else { return }
@@ -1416,6 +1590,31 @@ final class EnvironmentSupervisor {
 
     func dismissMigrationsBanner() {
         migrationsBannerDismissed = true
+    }
+
+    /// Reads the checkout's `runner.minVersion` again, and sets or clears the banner.
+    /// True when this runner is too old for the checkout: the caller must not reset
+    /// the database or run a DB step.
+    @discardableResult
+    func refreshCompatibility(cwd: String) -> Bool {
+        let notice = Compatibility.notice(for: Compatibility.check(root: cwd, runnerVersion: runnerVersion))
+        if notice != compatibilityNotice { compatibilityNotice = notice }
+        return notice != nil
+    }
+
+    /// The answer of the control API to a reset or a DB step while the runner is too
+    /// old, or nil when the request may run.
+    func resetBlockJSON() -> String? {
+        guard let cwd = serviceCwd("supabase"), refreshCompatibility(cwd: cwd),
+              let notice = compatibilityNotice else { return nil }
+        let body: [String: Any] = [
+            "ok": false,
+            "error": "runner_too_old",
+            "message": notice.text,
+            "download_url": notice.downloadURL.absoluteString,
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: body, options: [.sortedKeys]) else { return nil }
+        return String(decoding: data, as: UTF8.self)
     }
 
     /// Reads which migrations the database lacks, for the banner. A new set shows the
@@ -2542,20 +2741,36 @@ final class EnvironmentSupervisor {
 
     // MARK: - Debug Tracking
 
-    private func initDebugTracking() async {
-        // A config reload comes here again. The tracker and its poll stay.
-        guard issueTracker == nil else { return }
-        let tracker = DebugTracker()
-        issueTracker = tracker
+    /// Starts issue capture. A config reload comes here again: the tracker, its
+    /// poll and the launch prune stay single.
+    func initDebugTracking() async {
+        let tracker = currentIssueTracker()
+        let prune = !issueLaunchPruneDone
+        issueLaunchPruneDone = true
+        startIssueCapturePoll()
         await refreshIssueCapture()
-        if debugTracker != nil {
+        if prune, debugTracker != nil {
             await tracker.pruneClosedIssues()
         }
+    }
 
-        // The config can change on disk, and issues can be closed there.
-        Task {
+    /// The one tracker of this run. It holds the rate limit.
+    private func currentIssueTracker() -> DebugTracker {
+        if let issueTracker { return issueTracker }
+        let tracker = debugTracker ?? makeIssueTracker()
+        issueTracker = tracker
+        return tracker
+    }
+
+    /// The config can change on disk, and issues can be closed there.
+    private func startIssueCapturePoll() {
+        guard !issueCapturePollStarted else { return }
+        issueCapturePollStarted = true
+        let (interval, clock) = (issueCapturePollInterval, clock)
+        Task { [weak self] in
             while !Task.isCancelled {
-                try? await clock.sleep(for: .seconds(30))
+                try? await clock.sleep(for: interval)
+                guard let self else { return }
                 await self.refreshIssueCapture()
             }
         }
@@ -2573,10 +2788,12 @@ final class EnvironmentSupervisor {
 
     /// The switch in Settings. It is saved in the config of the issue folder.
     func setIssueCaptureEnabled(_ enabled: Bool) async {
-        let tracker = issueTracker ?? debugTracker ?? DebugTracker()
-        issueTracker = tracker
+        let tracker = currentIssueTracker()
         guard await tracker.setEnabled(enabled) else {
-            onActionFeedback?("Issue capture: the setting could not be saved", false)
+            let path = await tracker.configFilePath
+            onActionFeedback?(
+                "Issue capture: could not write \(path). Check that the folder is writable, then try again.", false
+            )
             return
         }
         await refreshIssueCapture()
@@ -2584,7 +2801,7 @@ final class EnvironmentSupervisor {
 
     /// The issue folder of this app, for "Show in Finder".
     func issueCaptureFolder() async -> String {
-        await (issueTracker ?? debugTracker ?? DebugTracker()).folderPath
+        await currentIssueTracker().folderPath
     }
 
     /// One line in `events.jsonl` for something that files no issue.
@@ -2787,6 +3004,8 @@ final class EnvironmentSupervisor {
     @discardableResult
     func resetDatabaseIfNeeded(cwd: String, checkMigrations: Bool) async -> Bool {
         guard canAutoReset else { return false }
+        // A runner that is too old for this checkout does not even ask the database.
+        guard !refreshCompatibility(cwd: cwd) else { return false }
         var probe = await probeDatabase(cwd: cwd)
         // Supabase counts as running when its port opens, and Postgres takes queries
         // a little later (much later on a new volume). Ask again before giving up.
@@ -2863,6 +3082,7 @@ final class EnvironmentSupervisor {
     /// setup runs. On failure `lastError` names the step that failed.
     private func runDbReset(cwd: String, reason: String) async -> Bool {
         guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return false }
+        guard !refreshCompatibility(cwd: cwd) else { return false }
         dbResetRunning = true
         defer { dbResetRunning = false }
         lastError = reason
@@ -2882,7 +3102,7 @@ final class EnvironmentSupervisor {
     }
 
     nonisolated static let dbResetCancelledMessage =
-        "The database reset stopped before it finished. Click Reset DB to run it again."
+        "The database reset stopped before it finished. Open DB Tools and click Reset Database to run it again."
 
     private func runDbResetPipeline(cwd: String) async -> Bool {
         guard let pipeline = makeDbSetupPipeline(cwd: cwd, profile: "reset") else { return false }
@@ -2928,7 +3148,7 @@ final class EnvironmentSupervisor {
     private func makeDbSetupRunner(cwd: String, pipeline: DbSetupPipeline) -> DbSetupRunner {
         DbSetupRunner(
             portalCwd: cwd, logStore: logStore, seedScenarioID: pipeline.seedScenario.id,
-            tools: tools, shell: shell
+            profile: pipeline.profile, tools: tools, shell: shell
         )
     }
 

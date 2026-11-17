@@ -212,7 +212,7 @@ enum ServiceCatalog {
                         "CACHE_CDC_STREAM_URL": "http://127.0.0.1:3003",
                         "CACHE_CDC_QSTASH_URL": "http://127.0.0.1:8080",
                         "CACHE_CDC_PORTAL_URL": "http://127.0.0.1:3002",
-                        "TRAVEL_RUNNER_CONTROL_URL": Flavor.current.controlURL,
+                        "TRAVEL_RUNNER_CONTROL_URL": LaunchEnvironment.controlURL(),
                     ]),
             service("cache-cutover-audit", "Cache Cutover Audit", ["npm", "run", "audit:p6"], cwd: loadTest,
                     type: .oneshot, restart: .never, phase: "verification",

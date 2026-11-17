@@ -2,6 +2,7 @@ import SwiftUI
 
 struct WorkshopHeaderBar: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
+    @Environment(UpdateController.self) var updates: UpdateController?
 
     private var healthLabel: String {
         switch supervisor.health {
@@ -150,7 +151,7 @@ struct WorkshopHeaderBar: View {
                     icon: "exclamationmark.triangle.fill",
                     color: .orange,
                     text: issue,
-                    subtitle: "Correct the file, then quit Travel Runner and open it again.",
+                    subtitle: "Correct the file, then quit \(Flavor.current.displayName) and open it again.",
                     action: ("Open services.json", {
                         NSWorkspace.shared.open(URL(fileURLWithPath: ConfigLoader.configPath))
                     })
@@ -170,6 +171,20 @@ struct WorkshopHeaderBar: View {
                     onDismiss: { supervisor.dismissMisplacedCopyNotice() }
                 )
             }
+            if let notice = supervisor.compatibilityNotice {
+                // No dismiss: it stays while the resets are blocked.
+                alertBanner(
+                    icon: "arrow.up.circle.fill",
+                    color: .red,
+                    text: notice.text,
+                    subtitle: nil,
+                    link: (Compatibility.downloadLinkTitle, notice.downloadURL),
+                    action: (Compatibility.updateButtonTitle, {
+                        // Without the updater (a source run), the link is the only way.
+                        if let updates { updates.checkForUpdates() } else { NSWorkspace.shared.open(notice.downloadURL) }
+                    })
+                )
+            }
             if supervisor.migrationsBannerVisible {
                 alertBanner(
                     icon: "arrow.triangle.2.circlepath",
@@ -177,7 +192,8 @@ struct WorkshopHeaderBar: View {
                     text: "Local database is missing \(supervisor.pendingMigrations.count) migration\(supervisor.pendingMigrations.count == 1 ? "" : "s")",
                     subtitle: supervisor.pendingMigrations.prefix(3).joined(separator: ", ")
                         + (supervisor.pendingMigrations.count > 3 ? " …" : ""),
-                    action: ("Reset DB", { supervisor.resetDatabase() }),
+                    // A runner that is too old for the checkout cannot reset it.
+                    action: supervisor.compatibilityNotice == nil ? ("Reset DB", { supervisor.resetDatabase() }) : nil,
                     onDismiss: { supervisor.dismissMigrationsBanner() }
                 )
             }
@@ -256,6 +272,7 @@ struct WorkshopHeaderBar: View {
         color: Color,
         text: String,
         subtitle: String?,
+        link: (label: String, url: URL)? = nil,
         action: (label: String, handler: () -> Void)?,
         onDismiss: (() -> Void)? = nil
     ) -> some View {
@@ -265,11 +282,15 @@ struct WorkshopHeaderBar: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(text)
                     .font(.caption)
-                    .lineLimit(2)
+                    .lineLimit(link == nil ? 2 : 3)
                 if let subtitle {
                     Text(subtitle)
                         .font(.caption2)
                         .foregroundStyle(.orange)
+                }
+                if let link {
+                    Link(link.label, destination: link.url)
+                        .font(.caption2)
                 }
             }
             Spacer()

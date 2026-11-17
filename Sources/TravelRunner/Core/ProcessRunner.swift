@@ -168,6 +168,11 @@ actor ProcessRunner {
         }
     }
 
+    /// True while a process that this runner started still runs.
+    func hasRunningProcess() -> Bool {
+        launches.values.contains { $0.process.isRunning }
+    }
+
     func isRunning(serviceID: String) -> Bool {
         launches[serviceID]?.process.isRunning ?? false
     }

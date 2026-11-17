@@ -302,9 +302,9 @@ final class EnvironmentChecker {
                         checkPath: (loginPath as NSString).appendingPathComponent(".env.local")),
             HealthCheck(id: "hotel-data", name: "Hotel data cached", section: .supabase,
                         isRequired: false, fixLabel: "Download hotels",
-                        checkCommand: "ls data/travel_organizations.sql",
+                        checkCommand: "ls \(ShellQuote.quote(DbSetupRunner.hotelDumpPath()))",
                         checkDescription: "~200K hotel records cached locally. First db:setup pulls from remote (~3-5 min). Reused on subsequent runs. The fix downloads the file only; it does not reset the database. \(Self.hotelDataFixNeeds)",
-                        checkPath: (monorepoPath as NSString).appendingPathComponent("data/travel_organizations.sql")),
+                        checkPath: DbSetupRunner.hotelDumpPath()),
 
             // Optional
             HealthCheck(id: "sb-linked", name: "Supabase project linked", section: .optional,
@@ -521,8 +521,10 @@ final class EnvironmentChecker {
             return .warning("Exists but may be incomplete")
 
         case "hotel-data":
-            let path = (monorepoPath as NSString).appendingPathComponent("data/travel_organizations.sql")
-            return exists(path) ? .passing("Cached") : .warning("Not cached — will be slow on first db:setup")
+            // The dump of the app, or one still in the checkout: the next fetch moves it.
+            let cached = exists(DbSetupRunner.hotelDumpPath())
+                || exists(DbSetupRunner.checkoutHotelDumpPath(root: monorepoPath))
+            return cached ? .passing("Cached") : .warning("Not cached — will be slow on first db:setup")
 
         case "sb-linked":
             let path = (monorepoPath as NSString).appendingPathComponent("supabase/.temp/project-ref")
@@ -612,7 +614,10 @@ final class EnvironmentChecker {
     // MARK: - Fix implementations
 
     /// Downloads the hotel dump when it is missing. It never resets the database.
-    nonisolated static let hotelDataFixCommand = "pnpm db:hotels"
+    /// The dump goes where the DB setup of the app looks for it.
+    nonisolated static var hotelDataFixCommand: String {
+        "TRAVEL_HOTEL_DUMP=\(ShellQuote.quote(DbSetupRunner.hotelDumpPath())) pnpm db:hotels"
+    }
     /// `pnpm db:hotels` stops when one of these is absent.
     nonisolated static let hotelDataFixNeeds = "The fix needs the local Supabase running and the shared apps/booking-portal/.env."
 

@@ -201,6 +201,18 @@ struct SettingsPageView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+
+            if supervisor.reconfigurePending {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Text("New paths are saved. The stack still runs from the old paths; the new paths apply at the next launch.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Stop and apply") { supervisor.stopAndReconfigure() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
         }
     }
 

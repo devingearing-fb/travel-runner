@@ -80,6 +80,14 @@ struct PreflightRunner: Sendable {
         return checks
     }
 
+    /// The checks that only read: Node, the ports and the folders. The others can
+    /// start a container runtime or ask Stripe.
+    func readOnlyChecks(for services: [ServiceDefinition]) -> [PreflightCheck] {
+        allChecks(for: services).filter {
+            $0.id == "node-version" || $0.id.hasPrefix("port-") || $0.id.hasPrefix("dir-")
+        }
+    }
+
     private func nodeCwd(for services: [ServiceDefinition]) -> String? {
         services.first(where: { $0.id == "travel-portal" })?.resolvedCwd ?? services.compactMap(\.resolvedCwd).first
     }

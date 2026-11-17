@@ -179,8 +179,13 @@ actor DebugTracker {
     private let rateLimitSeconds: TimeInterval
     private let defaultRetentionDays: Int?
     private let now: @Sendable () -> Date
+    /// True for every folder but the Desktop one: only the user reads the files.
+    private let privateFiles: Bool
     /// The last capture of each signature, for the rate limit.
     private var lastCaptureAt: [String: Date] = [:]
+    /// The repeats that the rate limit dropped, for each signature. The next
+    /// write of the issue adds them to its count.
+    private var droppedRepeats: [String: Int] = [:]
 
     private let fm = FileManager.default
     private let jsonEncoder: JSONEncoder = {
@@ -209,7 +214,9 @@ actor DebugTracker {
 
     /// - Parameters:
     ///   - baseDir: The issue folder. Without it, the folder of this app (`defaultLocation`).
-    ///   - rateLimitSeconds: One capture for each signature in this time. The rest are dropped.
+    ///   - rateLimitSeconds: One automatic capture for each signature in this time.
+    ///     The rest write nothing; the next write adds them to the count. A manual
+    ///     capture has no limit.
     ///   - prunesClosedIssues: Without it, every folder but the Desktop one prunes.
     ///     The Desktop folder is a hand-kept archive: it prunes only when its config
     ///     has `closed_retention_days`.
@@ -225,6 +232,7 @@ actor DebugTracker {
         self.now = now
         let location = baseDir.map { Location(path: $0, isDesktop: false) } ?? Self.defaultLocation
         self.defaultRetentionDays = (prunesClosedIssues ?? !location.isDesktop) ? Self.closedRetentionDays : nil
+        self.privateFiles = !location.isDesktop
         let root = location.path
         self.baseDir = root
         self.configPath = (root as NSString).appendingPathComponent("config.json")
@@ -234,6 +242,7 @@ actor DebugTracker {
     }
 
     var folderPath: String { baseDir }
+    var configFilePath: String { configPath }
 
     // MARK: - Config
 
@@ -317,19 +326,32 @@ actor DebugTracker {
         // recurrence_count on the open issue, not file a new ticket each day.
         let dedupWindow = config?.dedupWindowSeconds ?? 604_800
 
-        // Rate limit: a failure that repeats every few seconds is one capture a
-        // minute, not a write for each repeat.
+        // Rate limit: a failure that repeats every few seconds is one write a
+        // minute, not a write for each repeat. The repeats are still counted.
+        // A report that a person files is never dropped.
         let now = self.now()
-        lastCaptureAt = lastCaptureAt.filter { now.timeIntervalSince($0.value) < rateLimitSeconds }
-        if lastCaptureAt[signature] != nil { return nil }
+        let limited = trigger != "manual"
+        if limited {
+            lastCaptureAt = lastCaptureAt.filter { now.timeIntervalSince($0.value) < rateLimitSeconds }
+            if lastCaptureAt[signature] != nil {
+                droppedRepeats[signature, default: 0] += 1
+                return nil
+            }
+        }
         let existing = findMatchingOpenIssue(signature: signature, dedupWindow: dedupWindow, now: now)
-        // The app can start again inside the minute: the issue on disk has the time too.
-        if let existing, now.timeIntervalSince(existing.updatedAt) < rateLimitSeconds { return nil }
-        lastCaptureAt[signature] = now
+        if limited {
+            // The app can start again inside the minute: the issue on disk has the time too.
+            if let existing, now.timeIntervalSince(existing.updatedAt) < rateLimitSeconds {
+                droppedRepeats[signature, default: 0] += 1
+                return nil
+            }
+            lastCaptureAt[signature] = now
+        }
+        let dropped = droppedRepeats.removeValue(forKey: signature) ?? 0
 
         // Dedup check
         if let existing {
-            updateRecurrence(issueId: existing.id, now: now)
+            updateRecurrence(issueId: existing.id, now: now, dropped: dropped)
             return nil
         }
 
@@ -365,7 +387,8 @@ actor DebugTracker {
             updatedAt: iso,
             resolvedAt: nil,
             resolution: nil,
-            recurrenceCount: 0,
+            // Repeats that were dropped after the last issue of this failure closed.
+            recurrenceCount: dropped,
             recurrenceTimestamps: []
         )
 
@@ -437,6 +460,7 @@ actor DebugTracker {
         // Update issue.json before moving
         let issuePath = (srcFolder as NSString).appendingPathComponent("issue.json")
         if var issue = readIssue(at: issuePath) {
+            issue.recurrenceCount += droppedRepeats.removeValue(forKey: issue.errorSignature) ?? 0
             issue.status = "closed"
             issue.resolution = resolution
             issue.resolvedAt = isoString(now())
@@ -455,7 +479,9 @@ actor DebugTracker {
     }
 
     /// Deletes the closed issues that are older than the retention time, and gives
-    /// their number. A folder without a readable `issue.json` stays.
+    /// their number. A folder without a readable `issue.json` stays. So does an
+    /// issue without `resolved_at`: someone moved it here by hand, and its age
+    /// as a closed issue is not known.
     @discardableResult
     func pruneClosedIssues() -> Int {
         let days = loadConfig()?.closedRetentionDays ?? defaultRetentionDays
@@ -467,7 +493,8 @@ actor DebugTracker {
         for entry in entries {
             let folder = (closedDir as NSString).appendingPathComponent(entry)
             guard let issue = readIssue(at: (folder as NSString).appendingPathComponent("issue.json")),
-                  let closedAt = parseISO(issue.resolvedAt ?? issue.updatedAt),
+                  let resolvedAt = issue.resolvedAt,
+                  let closedAt = parseISO(resolvedAt),
                   closedAt < cutoff
             else { continue }
             if (try? fm.removeItem(atPath: folder)) != nil { removed += 1 }
@@ -611,13 +638,13 @@ actor DebugTracker {
         return nil
     }
 
-    private func updateRecurrence(issueId: String, now: Date) {
+    private func updateRecurrence(issueId: String, now: Date, dropped: Int = 0) {
         let issuePath = (openDir as NSString)
             .appendingPathComponent(issueId)
             .appending("/issue.json")
         guard var issue = readIssue(at: issuePath) else { return }
         let stamp = isoString(now)
-        issue.recurrenceCount += 1
+        issue.recurrenceCount += 1 + dropped
         issue.recurrenceTimestamps = Array((issue.recurrenceTimestamps + [stamp]).suffix(Self.maxRecurrenceTimestamps))
         issue.updatedAt = stamp
         // The `app_*` fields keep the build of the first capture.
@@ -634,7 +661,15 @@ actor DebugTracker {
 
     private func writeJSON<T: Encodable>(_ value: T, to path: String) {
         guard let data = try? jsonEncoder.encode(value) else { return }
-        try? data.write(to: URL(fileURLWithPath: path))
+        writeFile(data, to: path)
+    }
+
+    /// Writes a file of an issue. Outside the Desktop folder only the user can read it.
+    private func writeFile(_ data: Data, to path: String) {
+        try? data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        if privateFiles {
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        }
     }
 
     private func writeServiceLogs(
@@ -653,7 +688,7 @@ actor DebugTracker {
             let lines = serviceEntries.map { redactor.redact($0.line) }
             let content = lines.joined(separator: "\n")
             let path = (folderPath as NSString).appendingPathComponent("logs-\(sid).txt")
-            try? content.write(toFile: path, atomically: true, encoding: .utf8)
+            writeFile(Data(content.utf8), to: path)
         }
 
         // All-services combined log
@@ -669,7 +704,7 @@ actor DebugTracker {
         allLines.sort { $0.0 < $1.0 }
         let combined = allLines.map { $0.1 }.joined(separator: "\n")
         let allPath = (folderPath as NSString).appendingPathComponent("logs-all.txt")
-        try? combined.write(toFile: allPath, atomically: true, encoding: .utf8)
+        writeFile(Data(combined.utf8), to: allPath)
     }
 
     private func makeSlug(trigger: String, serviceId: String?) -> String {
@@ -708,7 +743,10 @@ actor DebugTracker {
 
     private func ensureDirectory(_ path: String) {
         if !fm.fileExists(atPath: path) {
-            try? fm.createDirectory(atPath: path, withIntermediateDirectories: true)
+            try? fm.createDirectory(
+                atPath: path, withIntermediateDirectories: true,
+                attributes: privateFiles ? [.posixPermissions: 0o700] : nil
+            )
         }
     }
 }

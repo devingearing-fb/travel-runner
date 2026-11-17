@@ -19,6 +19,9 @@ actor DbSetupRunner {
     private let portalCwd: String
     private let logStore: LogStore
     private let seedScenarioID: String
+    /// The profile of the pipeline. The prerequisites step reads it: a profile
+    /// with a hotel step checks the hotel source before anything is reset.
+    private let profile: String?
     private var currentProcess: Process?
     private var cancelled = false
     /// The PATH of the step commands.
@@ -30,23 +33,50 @@ actor DbSetupRunner {
     static let healthCheckTimeout: Duration = .seconds(60)
 
     init(
-        portalCwd: String, logStore: LogStore, seedScenarioID: String,
+        portalCwd: String, logStore: LogStore, seedScenarioID: String, profile: String? = nil,
         tools: ToolEnvironment = .shared, shell: (any CommandRunning)? = nil
     ) {
         self.portalCwd = portalCwd
         self.logStore = logStore
         self.seedScenarioID = seedScenarioID
+        self.profile = profile
         self.tools = tools
         self.shell = shell ?? LoginShell(tools: tools)
     }
 
+    /// What every step and every health check gets from the runner. The scripts
+    /// of the checkout read these names (`scripts/db`):
+    /// - `TRAVEL_SEED_SCENARIO`: the seed scenario of the reset.
+    /// - `TRAVEL_DB_PROFILE`: the profile of the pipeline.
+    /// - `TRAVEL_HOTEL_DUMP`: where the hotel dump is kept (`hotelDumpPath`).
+    /// - `TRAVEL_RUNNER_FLAVOR`: which app built the database. A packaged app has
+    ///   its flavor in Info.plist only, so the scripts cannot read it there.
     nonisolated static func environment(
         parent: [String: String],
-        seedScenarioID: String
+        seedScenarioID: String,
+        profile: String? = nil,
+        flavor: Flavor = .current,
+        home: String = NSHomeDirectory()
     ) -> [String: String] {
         var environment = parent
         environment["TRAVEL_SEED_SCENARIO"] = seedScenarioID
+        if let profile { environment["TRAVEL_DB_PROFILE"] = profile }
+        environment["TRAVEL_HOTEL_DUMP"] = hotelDumpPath(flavor: flavor, home: home)
+        environment[Flavor.environmentKey] = flavor.rawValue
         return environment
+    }
+
+    /// The hotel dump (about 285 MB) lives outside the checkout, so a worktree or a
+    /// second checkout does not download it again. It is not under `~/Library/Caches`,
+    /// which macOS may empty. The fetch script moves a valid dump from the checkout
+    /// (`data/travel_organizations.sql`) here once.
+    nonisolated static func hotelDumpPath(flavor: Flavor = .current, home: String = NSHomeDirectory()) -> String {
+        "\(home)/Library/Application Support/\(flavor.displayName)/hotels/travel_organizations.sql"
+    }
+
+    /// Where the dump was before `TRAVEL_HOTEL_DUMP`. A valid dump here still counts.
+    nonisolated static func checkoutHotelDumpPath(root: String) -> String {
+        (root as NSString).appendingPathComponent("data/travel_organizations.sql")
     }
 
     func run(pipeline: DbSetupPipeline, from startStepId: String? = nil) async {
@@ -155,7 +185,7 @@ actor DbSetupRunner {
             process.currentDirectoryURL = URL(fileURLWithPath: cwd)
             process.environment = Self.environment(
                 parent: ProcessInfo.processInfo.environment,
-                seedScenarioID: seedScenarioID
+                seedScenarioID: seedScenarioID, profile: profile
             )
 
             let pipe = Pipe()
@@ -395,11 +425,17 @@ actor DbSetupRunner {
 
     // MARK: - Health Check
 
+    /// `cancel()` is the only stop of a pipeline. Stop All cancels the task of the
+    /// start, and an automatic reset runs inside that task. The step command is
+    /// its own process and runs to its end; the shell of the health check ends a
+    /// command at once when its task is cancelled. Without this own task the step
+    /// in flight would pass, its check would fail as "Cancelled", and the pipeline
+    /// would break: a database that is reset and has no hotels.
     private func runHealthCheck(_ command: String) async -> CommandResult {
-        await shell.run(
-            command, cwd: portalCwd,
-            environment: Self.environment(parent: [:], seedScenarioID: seedScenarioID),
-            timeout: Self.healthCheckTimeout
-        )
+        let (shell, cwd) = (shell, portalCwd)
+        let environment = Self.environment(parent: [:], seedScenarioID: seedScenarioID, profile: profile)
+        return await Task {
+            await shell.run(command, cwd: cwd, environment: environment, timeout: Self.healthCheckTimeout)
+        }.value
     }
 }

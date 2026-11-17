@@ -132,6 +132,65 @@ final class InstanceGuardTests: XCTestCase {
         XCTAssertNotEqual(InstanceGuard.smokeExitCode, 0)
     }
 
+    // MARK: - A copy on its way out
+
+    /// Quit stops the stack before the process ends. A launch in that time found
+    /// the old process and said "already running".
+    func testTheMarkerNamesTheCopyThatQuits() {
+        let quitting = copy(700, launched: 1_000)
+        let marker = InstanceGuard.quittingMarker(pid: 700, start: Date(timeIntervalSince1970: 1_000))
+        XCTAssertEqual(marker, "700 1000.0")
+        XCTAssertTrue(InstanceGuard.isQuitting(quitting, marker: marker))
+        // A start time that one side does not know: the pid decides.
+        XCTAssertTrue(InstanceGuard.isQuitting(copy(700), marker: marker))
+        XCTAssertTrue(InstanceGuard.isQuitting(quitting, marker: InstanceGuard.quittingMarker(pid: 700, start: nil)))
+
+        // Controls: no marker, another pid, a later process with the same pid, and text that is no marker.
+        XCTAssertFalse(InstanceGuard.isQuitting(quitting, marker: nil))
+        XCTAssertFalse(InstanceGuard.isQuitting(copy(701, launched: 1_000), marker: marker))
+        XCTAssertFalse(InstanceGuard.isQuitting(copy(700, launched: 5_000), marker: marker))
+        for bad in ["", "700", "x 1000", "700 1000 extra"] {
+            XCTAssertFalse(InstanceGuard.isQuitting(quitting, marker: bad), bad)
+        }
+    }
+
+    func testTheMarkerIsWrittenReadAndCleared() throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("InstanceGuard-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let path = folder.appendingPathComponent("quitting").path
+        XCTAssertNil(InstanceGuard.readQuittingMarker(path: path))
+
+        InstanceGuard.markQuitting(pid: getpid(), path: path)
+
+        let own = InstanceGuard.Copy(
+            pid: getpid(), launchDate: InstanceGuard.processStart(of: getpid()), path: nil, version: nil
+        )
+        XCTAssertTrue(InstanceGuard.isQuitting(own, marker: InstanceGuard.readQuittingMarker(path: path)))
+        InstanceGuard.clearQuittingMarker(path: path)
+        XCTAssertNil(InstanceGuard.readQuittingMarker(path: path))
+    }
+
+    func testTheLaunchWaitsUntilTheCopyIsGoneButNotForEver() {
+        // The process ends after three looks.
+        var looks = 0
+        var slept: [TimeInterval] = []
+        let gone = InstanceGuard.waitForExit(
+            pid: 700, timeout: 5, isAlive: { _ in looks += 1; return looks <= 3 }, sleep: { slept.append($0) }
+        )
+        XCTAssertTrue(gone)
+        XCTAssertEqual(slept.count, 3)
+
+        // A copy that does not end: the wait stops at the limit, and the alert comes as before.
+        var waited: TimeInterval = 0
+        let stuck = InstanceGuard.waitForExit(pid: 700, timeout: 1, isAlive: { _ in true }, sleep: { waited += $0 })
+        XCTAssertFalse(stuck)
+        XCTAssertEqual(waited, 1, accuracy: 0.11)
+
+        // A process that is already gone needs no wait.
+        XCTAssertTrue(InstanceGuard.waitForExit(pid: 700, isAlive: { _ in false }, sleep: { _ in XCTFail("no wait") }))
+    }
+
     // MARK: - The message
 
     func testTheMessageNamesThePathAndTheVersion() {

@@ -54,6 +54,21 @@ enum UpdatePolicy {
         defaults.set(true, forKey: didDefaultAutoUpdateKey)
     }
 
+    /// `defaults write ai.fastbreak.travel-runner updateChannel canary` puts a copy
+    /// on the canary channel. Any other value, or none, is the normal channel.
+    static let channelKey = "updateChannel"
+    static let canaryChannel = "canary"
+    /// The fixed release that holds the appcast of the newest release, promoted or not (`release.sh`).
+    static let canaryFeedURL = "https://github.com/devingearing-fb/travel-runner/releases/download/canary-appcast/appcast.xml"
+
+    /// The feed of a copy on the canary channel, or nil for the feed in Info.plist.
+    /// A new release goes to the canary feed first; `release.sh --promote` gives it
+    /// to everyone. The hackathon app has one feed and no canary.
+    static func feedURL(defaults: UserDefaults, flavor: Flavor) -> String? {
+        guard flavor == .standard, defaults.string(forKey: channelKey) == canaryChannel else { return nil }
+        return canaryFeedURL
+    }
+
     /// The text of the pill in the header.
     static func pillText(_ update: PendingUpdate) -> String {
         switch update {

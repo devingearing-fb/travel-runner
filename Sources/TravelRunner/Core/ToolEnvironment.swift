@@ -233,8 +233,41 @@ final class ToolEnvironment: @unchecked Sendable {
         // The command of `resolve` reads the plain login shell.
         if Self.isResolving { return command }
         let capture = self.capture
-        let fallback = Self.fallbackDirectories(cwd: cwd, home: home).filter { !capture.shellPath.contains($0) }
-        return Self.wrap(command, before: capture.shellPath, after: fallback, variables: capture.variables)
+        var before = capture.shellPath
+        if let node = Self.nodeAhead(ofShellPath: capture.shellPath, cwd: cwd, home: home) {
+            before.insert(node, at: 0)
+        }
+        let fallback = Self.fallbackDirectories(cwd: cwd, home: home).filter { !before.contains($0) }
+        return Self.wrap(command, before: before, after: fallback, variables: capture.variables)
+    }
+
+    /// The Node folder that must go in front of the PATH of the user's shell, or nil.
+    ///
+    /// An rc file can put an older default Node first (`nvm alias default 20`).
+    /// The checkout needs the Node of its `.nvmrc`. When the first `node` of the
+    /// shell PATH is an install that is too old, and a version manager has one that
+    /// fits, that one goes first. A `node` that is no known install (a shim, a
+    /// Homebrew link without a version) stays where it is.
+    static func nodeAhead(
+        ofShellPath shellPath: [String],
+        cwd: String?,
+        home: String = NSHomeDirectory(),
+        fileManager: FileManager = .default
+    ) -> String? {
+        guard let first = shellPath.first(where: { fileManager.isExecutableFile(atPath: "\($0)/node") }) else {
+            return nil
+        }
+        let major = nodeMajor(forCwd: cwd, fileManager: fileManager) ?? defaultNodeMajor
+        let installs = NodeLocator.installs(home: home, fileManager: fileManager)
+        // fnm and Homebrew put a link on the PATH, not the folder of the version.
+        func real(_ directory: String) -> String {
+            URL(fileURLWithPath: "\(directory)/node").resolvingSymlinksInPath().deletingLastPathComponent().path
+        }
+        let firstReal = real(first)
+        guard let onPath = installs.first(where: { $0.binDirectory == first || real($0.binDirectory) == firstReal }),
+              onPath.major < major,
+              let fitting = NodeLocator.pick(installs, minimumMajor: major) else { return nil }
+        return fitting.binDirectory
     }
 
     /// `before` goes in front of the PATH of the login shell and `after` goes

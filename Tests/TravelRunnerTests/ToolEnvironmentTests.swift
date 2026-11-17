@@ -169,6 +169,45 @@ final class ToolEnvironmentTests: XCTestCase {
         XCTAssertTrue(wrapped.hasSuffix("; node server.js"))
     }
 
+    /// An rc file with an older default Node (`nvm alias default`) put that Node in
+    /// front of the one that fits the `.nvmrc`. Before the shell PATH was read, the
+    /// login shell had no Node and the fitting one was found.
+    func testANodeOfTheShellPathThatIsTooOldDoesNotHideTheOneThatFits() throws {
+        // Majors that no real install has, so the Node versions of this Mac do not count.
+        let old = try makeNode("v97.4.0")
+        let wanted = try makeNode("v98.2.0")
+        let checkout = home.appendingPathComponent("repo")
+        try makeDirectory("repo")
+        try "98\n".write(to: checkout.appendingPathComponent(".nvmrc"), atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(
+            ToolEnvironment.nodeAhead(ofShellPath: ["/usr/bin", old], cwd: checkout.path, home: home.path), wanted
+        )
+        let tools = ToolEnvironment(home: home.path, capture: .init(shellPath: ["/usr/bin", old]))
+        let wrapped = tools.wrap("node server.js", cwd: checkout.path)
+        XCTAssertTrue(wrapped.hasPrefix("export PATH=\(wanted):/usr/bin:\(old):\"$PATH\""), wrapped)
+
+        // A link to the old install on the PATH (fnm, Homebrew) is the same install.
+        try makeDirectory("links")
+        let link = home.appendingPathComponent("links/current").path
+        try FileManager.default.createSymbolicLink(atPath: link, withDestinationPath: old)
+        XCTAssertEqual(ToolEnvironment.nodeAhead(ofShellPath: [link], cwd: checkout.path, home: home.path), wanted)
+
+        // Controls: a Node that fits stays first; so does one that no version manager
+        // knows; and with no install that fits, nothing moves.
+        XCTAssertNil(ToolEnvironment.nodeAhead(ofShellPath: [wanted, old], cwd: checkout.path, home: home.path))
+        let unknown = home.appendingPathComponent("shims")
+        try makeDirectory("shims")
+        try "#!/bin/sh\n".write(to: unknown.appendingPathComponent("node"), atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: unknown.appendingPathComponent("node").path
+        )
+        XCTAssertNil(ToolEnvironment.nodeAhead(ofShellPath: [unknown.path, old], cwd: checkout.path, home: home.path))
+        try "99\n".write(to: checkout.appendingPathComponent(".nvmrc"), atomically: true, encoding: .utf8)
+        XCTAssertNil(ToolEnvironment.nodeAhead(ofShellPath: [old], cwd: checkout.path, home: home.path))
+        XCTAssertNil(ToolEnvironment.nodeAhead(ofShellPath: ["/nonexistent"], cwd: checkout.path, home: home.path))
+    }
+
     /// Negative control: before a resolve the command has no directory of the rc file.
     func testWithoutAResolveOnlyTheFallbackDirectoriesAreAdded() throws {
         try makeDirectory("Library/pnpm")
@@ -547,12 +586,18 @@ final class ToolEnvironmentTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
         let directory = home.appendingPathComponent("tools").path
 
-        let resolved = LoginShell(tools: ToolEnvironment(home: home.path, capture: .init(shellPath: [directory])))
+        // The startup files of the person who runs the tests are not read: a
+        // profile that prints a line would change the output.
+        try makeDirectory("zdotdir")
+        let zdotdir = home.appendingPathComponent("zdotdir").path
+        let resolved = ProfileFreeLoginShell(
+            tools: ToolEnvironment(home: home.path, capture: .init(shellPath: [directory])), zdotdir: zdotdir
+        )
         let found = await PreflightRunner(shell: resolved).shellOutput("\(tool) --version")
         XCTAssertEqual(found.trimmingCharacters(in: .whitespacesAndNewlines), "v98.1.0")
 
         // Negative control: without the directory the shell does not find it.
-        let bare = LoginShell(tools: ToolEnvironment(home: home.path))
+        let bare = ProfileFreeLoginShell(tools: ToolEnvironment(home: home.path), zdotdir: zdotdir)
         let missing = await PreflightRunner(shell: bare).shellOutput("\(tool) --version")
         XCTAssertEqual(missing.trimmingCharacters(in: .whitespacesAndNewlines), "")
     }

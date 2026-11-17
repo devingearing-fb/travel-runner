@@ -11,19 +11,26 @@ set -euo pipefail
 #   - Sparkle EdDSA private key in Keychain (from generate_keys)
 #   - gh CLI authenticated
 #
-# Usage:
-#   ./release.sh 0.2.0             Build + sign + notarize + release
-#   ./release.sh 0.2.0 --draft     Same but creates a draft release
-#   FLAVOR=hackathon ./release.sh 1.0.0   Release Travel Runner Hackathon
+# Usage (RELEASING.md has the whole procedure):
+#   ./release.sh 0.2.0                       Build + smoke test + sign + notarize + publish to the canary feed
+#   ./release.sh 0.2.0 --draft               Same but creates a draft release that nobody sees
+#   ./release.sh --promote 0.2.0             Give a canary release to every teammate
+#   ./release.sh --pull 0.2.0                Take a release back
+#   ./release.sh --rollback-to v0.1.9 0.2.1  Release the source of an older tag under a new number
+#   FLAVOR=hackathon ./release.sh 1.0.0      Release Travel Runner Hackathon
 #
 # The two apps release to the same repository. The standard app reads the appcast of
-# the release that GitHub marks as latest. A hackathon release is never marked as
-# latest (tag hackathon-v<version>), and its app reads the appcast of the fixed
-# release "hackathon-appcast", which each hackathon release replaces.
+# the release that GitHub marks as latest. A new standard release is a prerelease, so
+# it is not the latest: only a copy on the canary channel sees it, through the fixed
+# release "canary-appcast". --promote makes it the latest release. A hackathon release
+# is never marked as latest (tag hackathon-v<version>), and its app reads the appcast
+# of the fixed release "hackathon-appcast", which each hackathon release replaces.
 #
 # The script first makes sure that the release can finish (signing identity, notary
 # access, GitHub access, a clean tree that is on the remote), then runs the tests.
-# SKIP_TESTS=1 skips the tests.
+# After the build it runs scripts/smoke.sh on the app: a release that cannot start on
+# a clean Mac stops here, before it is notarized.
+# SKIP_TESTS=1 skips the tests, for a --draft only.
 # ────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -60,19 +67,151 @@ GITHUB_REPO="${GITHUB_REPO:-devingearing-fb/travel-runner}"
 EDDSA_PUBLIC_KEY="${EDDSA_PUBLIC_KEY:-Z7c9sySgE0b4RH8NOK405c3mv/7w4NKMrs3DJDCxHsU=}"
 # ────────────────────────────────────────────────────────────────────────────
 
-VERSION="${1:?Usage: ./release.sh <version> [--draft]}"
+USAGE="Usage: ./release.sh <version> [--draft] | --promote <version> | --pull <version> | --rollback-to <tag> <new-version>"
+
+fail() {
+    echo "  ✗ $1"
+    exit 1
+}
+
+# What to do: build (the default), promote or pull. A rollback is a build from an older tag.
+MODE="build"
 DRAFT=false
-[[ "${2:-}" == "--draft" ]] && DRAFT=true
+ROLLBACK_TAG=""
+case "${1:-}" in
+    --promote)
+        MODE="promote"
+        VERSION="${2:?$USAGE}"
+        [ $# -eq 2 ] || fail "$USAGE"
+        ;;
+    --pull)
+        MODE="pull"
+        VERSION="${2:?$USAGE}"
+        [ $# -eq 2 ] || fail "$USAGE"
+        ;;
+    --rollback-to)
+        ROLLBACK_TAG="${2:?$USAGE}"
+        VERSION="${3:?$USAGE}"
+        [ $# -eq 3 ] || fail "$USAGE"
+        ;;
+    ""|-*)
+        fail "$USAGE"
+        ;;
+    *)
+        VERSION="$1"
+        case "${2:-}" in
+            "") ;;
+            --draft) DRAFT=true ;;
+            *) fail "$USAGE" ;;
+        esac
+        [ $# -le 2 ] || fail "$USAGE"
+        ;;
+esac
+# Sparkle and the runner's own checks compare three plain numbers.
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "'$VERSION' is not a version (x.y.z)"
 
 BUILD_NUMBER="$(date +%Y%m%d%H%M%S)"
 ZIP_NAME="${PRODUCT_NAME}-${VERSION}.zip"
-FEED_TAG="hackathon-appcast"
+# One fixed release for each feed that is not "the latest release". It holds the newest appcast.
+CANARY_FEED_TAG="canary-appcast"
 if [ "$FLAVOR" = "hackathon" ]; then
     TAG="hackathon-v${VERSION}"
+    TAG_PATTERN='^hackathon-v[0-9]+\.[0-9]+\.[0-9]+$'
+    FEED_TAG="hackathon-appcast"
     FEED_URL="https://github.com/$GITHUB_REPO/releases/download/$FEED_TAG/appcast.xml"
 else
     TAG="v${VERSION}"
+    TAG_PATTERN='^v[0-9]+\.[0-9]+\.[0-9]+$'
+    FEED_TAG="$CANARY_FEED_TAG"
     FEED_URL="https://github.com/$GITHUB_REPO/releases/latest/download/appcast.xml"
+fi
+
+can_release() {
+    [ "$(gh api "repos/$GITHUB_REPO" --jq .permissions.push 2>/dev/null)" = "true" ] \
+        || fail "The active gh account cannot release to $GITHUB_REPO (gh auth switch --user <owner>)"
+}
+
+# The tag of the release that GitHub marks as latest: the feed of every standard app.
+latest_tag() {
+    gh api "repos/$GITHUB_REPO/releases/latest" --jq .tag_name 2>/dev/null || true
+}
+
+# release_field <tag> <jq expression>
+release_field() {
+    gh release view "$1" --repo "$GITHUB_REPO" --json isDraft,isPrerelease,assets --jq "$2"
+}
+
+# The newest full release of this app that is not <tag>. Empty when there is none.
+previous_release() {
+    gh release list --repo "$GITHUB_REPO" --exclude-drafts --exclude-pre-releases --limit 100 \
+        --json tagName --jq '.[].tagName' \
+        | grep -E "$TAG_PATTERN" | grep -vx "$1" | sort -t. -k1,1V -k2,2n -k3,3n | tail -1 || true
+}
+
+# Puts the appcast of release <tag> on the fixed feed release.
+point_feed_at() {
+    local dir
+    dir="$(mktemp -d)"
+    gh release download "$1" --repo "$GITHUB_REPO" --pattern appcast.xml --dir "$dir" \
+        || fail "$1 has no appcast.xml"
+    gh release upload "$FEED_TAG" "$dir/appcast.xml" --repo "$GITHUB_REPO" --clobber
+    rm -rf "$dir"
+}
+
+# ── Promote: the canary release becomes the release that every teammate gets ──
+if [ "$MODE" = "promote" ]; then
+    [ "$FLAVOR" = "standard" ] \
+        || fail "The hackathon app has one feed and no canary: its release is live when release.sh ends."
+    can_release
+    gh release view "$TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1 || fail "$TAG is not released."
+    [ "$(release_field "$TAG" .isDraft)" = "false" ] \
+        || fail "$TAG is a draft. Publish it on GitHub first (as a prerelease)."
+    # The installed apps read appcast.xml from the latest release. Without it they see no update at all.
+    for asset in appcast.xml "$ZIP_NAME"; do
+        release_field "$TAG" '.assets[].name' | grep -qx "$asset" || fail "$TAG has no $asset. Do not promote it."
+    done
+    gh release edit "$TAG" --repo "$GITHUB_REPO" --prerelease=false --latest
+    LATEST="$(latest_tag)"
+    [ "$LATEST" = "$TAG" ] || fail "GitHub marks '$LATEST' as the latest release, not $TAG. Fix it on GitHub now."
+    echo "  ✓ $TAG is the latest release. Every Travel Runner sees it at its next update check."
+    exit 0
+fi
+
+# ── Pull: take a release back ───────────────────────────────────────────────
+# A copy that already installed it keeps it: Sparkle never installs an older version.
+# Move those copies forward with --rollback-to.
+if [ "$MODE" = "pull" ]; then
+    can_release
+    gh release view "$TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1 || fail "$TAG is not released."
+    PREVIOUS="$(previous_release "$TAG")"
+    [ -n "$PREVIOUS" ] || fail "There is no older full release to go back to. Fix forward with a new version."
+    gh release edit "$TAG" --repo "$GITHUB_REPO" --prerelease --latest=false
+    if [ "$FLAVOR" = "standard" ]; then
+        gh release edit "$PREVIOUS" --repo "$GITHUB_REPO" --latest
+        LATEST="$(latest_tag)"
+        [ "$LATEST" = "$PREVIOUS" ] \
+            || fail "GitHub marks '$LATEST' as the latest release, not $PREVIOUS. Fix it on GitHub now."
+    fi
+    # The fixed feed must not offer the pulled version either.
+    if gh release view "$FEED_TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
+        point_feed_at "$PREVIOUS"
+    fi
+    echo "  ✓ $TAG is pulled. New update checks get $PREVIOUS."
+    echo "    Copies that already have ${VERSION} keep it. To move them, release the older source"
+    echo "    under a new number: ./release.sh --rollback-to $PREVIOUS <new-version>"
+    exit 0
+fi
+
+# ── Rollback: build the source of an older tag as a new version ─────────────
+# The build runs in a separate worktree of that tag. This checkout is not changed.
+SMOKE_SCRIPT="$SCRIPT_DIR/scripts/smoke.sh"
+if [ -n "$ROLLBACK_TAG" ]; then
+    git rev-parse --verify --quiet "refs/tags/$ROLLBACK_TAG" >/dev/null || fail "There is no tag $ROLLBACK_TAG."
+    ROLLBACK_DIR="$(mktemp -d)/travel-runner-$ROLLBACK_TAG"
+    git worktree add --detach "$ROLLBACK_DIR" "$ROLLBACK_TAG" >/dev/null
+    trap 'cd "$SCRIPT_DIR"; git worktree remove --force "$ROLLBACK_DIR" 2>/dev/null || true' EXIT
+    cd "$ROLLBACK_DIR"
+    echo "  Building the source of $ROLLBACK_TAG as $TAG"
 fi
 
 echo ""
@@ -86,10 +225,10 @@ echo ""
 # version that cannot be released again under the same number.
 echo "  [0/7] Checking that the release can finish..."
 
-fail() {
-    echo "  ✗ $1"
-    exit 1
-}
+# The tests are skipped only for a draft: nobody gets a draft.
+if [ "${SKIP_TESTS:-0}" = "1" ] && ! $DRAFT; then
+    fail "SKIP_TESTS=1 is for a --draft only. A release that teammates get runs the tests."
+fi
 
 security find-identity -v -p codesigning | grep -q "$DEVELOPER_ID" \
     || fail "Signing identity $DEVELOPER_ID is not in the keychain"
@@ -100,13 +239,19 @@ NOTARY_CHECK=$(xcrun notarytool history --keychain-profile "$NOTARIZE_PROFILE" 2
     For 'A required agreement is missing or has expired': the account holder must accept
     the agreement at https://developer.apple.com/account. It can take five minutes to apply."
 
-[ "$(gh api "repos/$GITHUB_REPO" --jq .permissions.push 2>/dev/null)" = "true" ] \
-    || fail "The active gh account cannot release to $GITHUB_REPO (gh auth switch --user <owner>)"
+can_release
 
 gh release view "$TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1 \
     && fail "$TAG is already released. Use the next version number."
 
 [ -f "$ICON_FILE" ] || fail "$ICON_FILE is missing (./generate-icon.swift $FLAVOR)"
+
+# The standard app reads its updates from the latest release. If that is a hackathon
+# release or a feed release now, the state is already wrong: stop before anything is published.
+LATEST_BEFORE="$(latest_tag)"
+case "$LATEST_BEFORE" in
+    hackathon-*|*-appcast) fail "GitHub marks $LATEST_BEFORE as the latest release. Fix it first: the standard app reads its updates from the latest release." ;;
+esac
 
 [ -z "$(git status --porcelain)" ] || fail "The working tree has changes. Commit them first."
 
@@ -122,7 +267,7 @@ if [ "${SKIP_TESTS:-0}" != "1" ]; then
     if ! swift test >"$TEST_LOG" 2>&1; then
         grep -E "error:|failed" "$TEST_LOG" | head -20 || true
         rm -f "$TEST_LOG"
-        fail "Tests failed. Fix them, or set SKIP_TESTS=1 to release without them."
+        fail "Tests failed. Fix them. (SKIP_TESTS=1 works for a --draft only.)"
     fi
     rm -f "$TEST_LOG"
 fi
@@ -234,6 +379,18 @@ codesign --force --options runtime --timestamp --sign "$DEVELOPER_ID" \
 codesign --verify --deep --strict "$APP_BUNDLE"
 echo "  ✓ Signed and verified"
 
+# ── 3b. Smoke test ──────────────────────────────────────────────────────────
+# The signed app starts with an empty home folder and a bare PATH, and must answer.
+# It runs before the notarization: a version number that Apple has seen cannot be used again.
+# A tag from before the smoke test (older than 0.14.0) cannot pass it; SKIP_SMOKE=1 is
+# for a rollback to such a tag only.
+if [ -n "$ROLLBACK_TAG" ] && [ "${SKIP_SMOKE:-0}" = "1" ]; then
+    echo "  ! Smoke test skipped (SKIP_SMOKE=1, rollback to $ROLLBACK_TAG)"
+else
+    [ "${SKIP_SMOKE:-0}" != "1" ] || fail "SKIP_SMOKE=1 is for --rollback-to only."
+    "$SMOKE_SCRIPT" "$APP_BUNDLE" "$VERSION"
+fi
+
 # ── 4. ZIP for notarization ─────────────────────────────────────────────────
 echo "  [4/7] Creating ZIP..."
 ditto -c -k --keepParent "$APP_BUNDLE" "$ZIP_NAME"
@@ -316,6 +473,21 @@ APPCAST
 DRAFT_FLAG=""
 $DRAFT && DRAFT_FLAG="--draft"
 
+# Replaces appcast.xml on the fixed feed release, or makes that release.
+publish_feed() {
+    if gh release view "$FEED_TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
+        gh release upload "$FEED_TAG" appcast.xml --repo "$GITHUB_REPO" --clobber
+    else
+        gh release create "$FEED_TAG" appcast.xml \
+            --repo "$GITHUB_REPO" \
+            --title "$1" \
+            --target "$RELEASE_COMMIT" \
+            --notes "$2" \
+            --prerelease \
+            --latest=false
+    fi
+}
+
 if [ "$FLAVOR" = "hackathon" ]; then
     # Never the latest release: the standard app reads its appcast from the latest one.
     gh release create "$TAG" \
@@ -330,24 +502,12 @@ if [ "$FLAVOR" = "hackathon" ]; then
 
     # The feed of the installed hackathon apps: one fixed release that holds the newest appcast.
     if ! $DRAFT; then
-        if gh release view "$FEED_TAG" --repo "$GITHUB_REPO" >/dev/null 2>&1; then
-            gh release upload "$FEED_TAG" appcast.xml --repo "$GITHUB_REPO" --clobber
-        else
-            gh release create "$FEED_TAG" appcast.xml \
-                --repo "$GITHUB_REPO" \
-                --title "$DISPLAY_NAME update feed" \
-                --target "$RELEASE_COMMIT" \
-                --notes "The update feed of Travel Runner Hackathon. Each hackathon release replaces appcast.xml here. Do not delete this release." \
-                --latest=false
-        fi
+        publish_feed "$DISPLAY_NAME update feed" \
+            "The update feed of Travel Runner Hackathon. Each hackathon release replaces appcast.xml here. Do not delete this release."
     fi
-
-    LATEST=$(gh api "repos/$GITHUB_REPO/releases/latest" --jq .tag_name)
-    case "$LATEST" in
-        hackathon-*) echo "  ✗ GitHub marks $LATEST as the latest release. Fix it now: the standard app reads its updates from the latest release."; exit 1 ;;
-    esac
-    echo "  ✓ Latest release is still $LATEST (the feed of the standard app)"
 else
+    # A prerelease is never the latest release, so no installed copy sees it yet.
+    # Only a copy on the canary channel does, through the canary feed.
     gh release create "$TAG" \
         "$ZIP_NAME" \
         appcast.xml \
@@ -355,8 +515,21 @@ else
         --title "Travel Runner v${VERSION}" \
         --target "$RELEASE_COMMIT" \
         --generate-notes \
+        --prerelease \
+        --latest=false \
         $DRAFT_FLAG
+
+    if ! $DRAFT; then
+        publish_feed "Travel Runner canary feed" \
+            "The update feed of the canary channel of Travel Runner. Each release replaces appcast.xml here; --promote gives the release to everyone. Do not delete this release."
+    fi
 fi
+
+# Neither app's release may change what the standard app reads.
+LATEST="$(latest_tag)"
+[ "$LATEST" = "$LATEST_BEFORE" ] \
+    || fail "GitHub now marks '$LATEST' as the latest release (before: '$LATEST_BEFORE'). Fix it now: the standard app reads its updates from the latest release."
+echo "  ✓ Latest release is still ${LATEST:-none} (the feed of the standard app)"
 
 # Cleanup
 rm -f appcast.xml
@@ -366,4 +539,7 @@ echo "  ╔═══════════════════════
 echo "  ║  Release ${TAG} complete!"
 echo "  ║  https://github.com/$GITHUB_REPO/releases  ║"
 echo "  ╚═══════════════════════════════════════════════════════╝"
+if [ "$FLAVOR" = "standard" ] && ! $DRAFT; then
+    echo "  Only the canary channel has it now. After the soak: ./release.sh --promote $VERSION"
+fi
 echo ""

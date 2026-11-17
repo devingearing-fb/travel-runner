@@ -57,7 +57,7 @@ curl -s http://localhost:19900/api/debug/issues | python3 -m json.tool
 ]
 ```
 
-The ID is `yyyyMMdd'T'HHmmss` (local time) + `_` + the trigger (underscores as dashes) + `-<service_id>` when there is one. `service_id` is `""` when the issue has no service (e.g. manual captures). A repeat of the same error within the dedup window (7 days by default) bumps `recurrence_count` on the open issue instead of creating a new one. A repeat within 60 seconds of the last capture of the same error is dropped: it is not counted and files nothing. `recurrence_timestamps` keeps the newest 20 times; the count keeps all.
+The ID is `yyyyMMdd'T'HHmmss` (local time) + `_` + the trigger (underscores as dashes) + `-<service_id>` when there is one. `service_id` is `""` when the issue has no service (e.g. manual captures). A repeat of the same error within the dedup window (7 days by default) bumps `recurrence_count` on the open issue instead of creating a new one. An automatic repeat within 60 seconds of the last capture of the same error writes nothing; the next write of the issue (a later repeat, or the close) adds it to `recurrence_count`. Manual captures have no such limit. `recurrence_timestamps` keeps the newest 20 times; the count keeps all.
 
 When the service's output shows why it failed, `summary` ends with ` — <likely cause>`, for example `service_crash [travel-portal]: Travel Portal exited with code 1 — Error: listen EADDRINUSE: address already in use :::3002`. The same text is in `likely_cause` in `issue.json`. The cause is not part of the dedup signature.
 
@@ -186,7 +186,7 @@ Issues live at `~/Desktop/debug-tracking/open/` and `~/Desktop/debug-tracking/cl
       state-snapshot.json
 ```
 
-Closed issues older than 30 days are deleted in the Application Support folder. The Desktop folder keeps them all, unless its `config.json` has `closed_retention_days` (`0` keeps all, in any folder).
+Closed issues older than 30 days are deleted in the Application Support folder. The age is from `resolved_at`; a closed issue without it is kept. Issue folders and files there are readable by the user only. The Desktop folder keeps them all, unless its `config.json` has `closed_retention_days` (`0` keeps all, in any folder).
 
 `events.jsonl` counts what files no issue: `stripe_skip` (Stripe ended as skipped), `outside_kill` (a service was stopped from outside the runner) and `breaker_trip` (auto-restart stopped). Each line has `at`, `kind`, `service_id`, `message` and `app_version`, with secrets redacted. At 1 MB the file moves to `events.1.jsonl`. Nothing is written while capture is off.
 

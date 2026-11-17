@@ -10,7 +10,7 @@ actor ControlServer {
     /// Why a server stopped before it listened, by host.
     private var runErrors: [String: String] = [:]
 
-    init(port: UInt16 = Flavor.current.controlPort) {
+    init(port: UInt16 = LaunchEnvironment.controlPort()) {
         self.port = port
     }
 
@@ -45,6 +45,8 @@ actor ControlServer {
 
     struct Actions: Sendable {
         let getStatus: @Sendable () async -> String
+        /// The checks of a start that change nothing, with their results.
+        let getPreflight: @Sendable () async -> String
         let getLogs: @Sendable (String, Int) async -> String
         let restartService: @Sendable (String) async -> Void
         let clearCacheRestart: @Sendable (String) async -> Void
@@ -52,6 +54,10 @@ actor ControlServer {
         let stopAll: @Sendable () async -> Void
         let toggleLan: @Sendable () async -> Void
         let restartCascade: @Sendable (String) async -> Void
+        /// The JSON body of the refusal while this runner is too old to reset the
+        /// checkout (`Compatibility`), or nil. The four routes that change the
+        /// database ask it first.
+        let dbResetBlock: @Sendable () async -> String?
         let dbReset: @Sendable () async -> Void
         let dbSetupRun: @Sendable (String) async -> Void
         let dbSetupRetry: @Sendable (String) async -> Void
@@ -140,6 +146,11 @@ actor ControlServer {
             return HTTPResponse(statusCode: .ok, headers: [.contentType: "application/json"], body: Data(json.utf8))
         }
 
+        await server.appendRoute("GET /api/preflight") { _ in
+            let json = await actions.getPreflight()
+            return HTTPResponse(statusCode: .ok, headers: [.contentType: "application/json"], body: Data(json.utf8))
+        }
+
         await server.appendRoute("GET /api/logs/*") { request in
             let path = request.path
             let parts = path.split(separator: "/")
@@ -188,6 +199,7 @@ actor ControlServer {
         }
 
         await server.appendRoute("POST /api/db-reset") { _ in
+            if let blocked = await actions.dbResetBlock() { return Self.resetBlocked(blocked) }
             await actions.dbReset()
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
@@ -201,6 +213,7 @@ actor ControlServer {
             } else {
                 profile = "reset"
             }
+            if let blocked = await actions.dbResetBlock() { return Self.resetBlocked(blocked) }
             await actions.dbSetupRun(profile)
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
@@ -211,6 +224,7 @@ actor ControlServer {
                 return HTTPResponse(statusCode: .badRequest, body: Data("Usage: /api/db-setup/retry/{stepId}".utf8))
             }
             let stepId = String(parts[3])
+            if let blocked = await actions.dbResetBlock() { return Self.resetBlocked(blocked) }
             await actions.dbSetupRetry(stepId)
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
@@ -231,6 +245,7 @@ actor ControlServer {
                 return HTTPResponse(statusCode: .badRequest, body: Data("Usage: /api/db-setup/step/{stepId}".utf8))
             }
             let stepId = String(parts[3])
+            if let blocked = await actions.dbResetBlock() { return Self.resetBlocked(blocked) }
             await actions.dbSetupRunStep(stepId)
             return HTTPResponse(statusCode: .ok, body: Data("{\"ok\":true}".utf8))
         }
@@ -304,5 +319,10 @@ actor ControlServer {
         }
         servers = []
         boundPort = nil
+    }
+
+    /// 409: the runner is too old for the checkout, and the database was not touched.
+    static func resetBlocked(_ body: String) -> HTTPResponse {
+        HTTPResponse(statusCode: .conflict, headers: [.contentType: "application/json"], body: Data(body.utf8))
     }
 }

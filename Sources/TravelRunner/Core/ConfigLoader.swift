@@ -1,7 +1,8 @@
 import Foundation
 
 enum ConfigLoader {
-    static let configDir = NSString(string: "~/.config/\(Flavor.current.storageName)").expandingTildeInPath
+    /// `~/.config/<storage name>`, or the folder that `TRAVEL_RUNNER_CONFIG_DIR` names.
+    static let configDir = LaunchEnvironment.configDir()
     static let configPath = (configDir as NSString).appendingPathComponent("services.json")
     static let currentVersion = 3
 

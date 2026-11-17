@@ -21,7 +21,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.setActivationPolicy(.accessory)
 
         // Before the supervisor: it would take the control port and write the config.
-        if let running = InstanceGuard.runningCopyNow() {
+        var running = InstanceGuard.runningCopyNow()
+        // A copy that quits still stops its stack. Wait for it to end; then this
+        // launch is the only copy. Before, it said "already running" about a copy
+        // that was gone a moment later.
+        for _ in 0..<3 {
+            guard let copy = running?.copy,
+                  InstanceGuard.isQuitting(copy, marker: InstanceGuard.readQuittingMarker()),
+                  InstanceGuard.waitForExit(pid: copy.pid) else { break }
+            running = InstanceGuard.runningCopyNow()
+        }
+        if let running {
             yieldsToRunningCopy = true
             if InstanceGuard.skipsAlert() {
                 FileHandle.standardError.write(Data((InstanceGuard.message(for: running.copy) + "\n").utf8))
@@ -30,6 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             InstanceGuard.refuse(running) { NSApplication.shared.terminate(nil) }
             return
         }
+
+        InstanceGuard.clearQuittingMarker()
 
         // Read the PATH of the user's shell first. A command that starts while
         // this runs waits for it.
@@ -51,13 +63,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         WorkshopPanel.shared.configure(supervisor: supervisor, updateController: updateController)
 
-        setupNotifications()
+        // A smoke launch has nobody to answer a permission prompt.
+        if !LaunchEnvironment.isSmoke() { setupNotifications() }
         setupStatusItem()
         setupGlobalHotkey()
 
         // `open -a … --args --open-panel` shows the window at once (scripts, screenshots).
         // Without a usable config, the setup wizard is the only way forward: show it.
-        if CommandLine.arguments.contains("--open-panel") || ConfigLoader.needsSetup { openPanel() }
+        // A smoke launch shows no window by itself.
+        if CommandLine.arguments.contains("--open-panel") || (ConfigLoader.needsSetup && !LaunchEnvironment.isSmoke()) {
+            openPanel()
+        }
     }
 
     /// A second launch from Finder or Spotlight shows the window. The app has no Dock icon.
@@ -76,6 +92,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         guard !yieldsToRunningCopy else { return }
+        // The stop below takes some seconds. A launch in that time waits for this copy.
+        InstanceGuard.markQuitting()
         if let monitor = rightClickMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = globalHotkeyMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = localHotkeyMonitor { NSEvent.removeMonitor(monitor) }

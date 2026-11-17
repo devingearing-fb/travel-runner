@@ -87,3 +87,25 @@ actor Gate {
         waiters = []
     }
 }
+
+/// A real login shell that reads no startup file of the person who runs the tests.
+/// `ZDOTDIR` names an empty folder, so zsh finds no `.zshenv`, `.zprofile` or
+/// `.zlogin` there. A profile that prints a line would change the output.
+struct ProfileFreeLoginShell: CommandRunning {
+    let tools: ToolEnvironment
+    /// An empty folder of the test.
+    let zdotdir: String
+
+    func run(
+        _ command: String,
+        cwd: String?,
+        environment: [String: String],
+        timeout: Duration,
+        onLine: (@Sendable (_ line: String, _ stream: LogEntry.Stream) -> Void)?
+    ) async -> CommandResult {
+        await LoginShell(tools: tools).run(
+            command, cwd: cwd, environment: environment.merging(["ZDOTDIR": zdotdir]) { _, new in new },
+            timeout: timeout, onLine: onLine
+        )
+    }
+}

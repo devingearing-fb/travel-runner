@@ -13,7 +13,7 @@ struct WorkshopDbToolsView: View {
     }
 
     private var canResetDatabase: Bool {
-        !isDbSetupRunning && validSelectedScenario != nil
+        !isDbSetupRunning && validSelectedScenario != nil && supervisor.compatibilityNotice == nil
     }
 
     var body: some View {
@@ -121,6 +121,7 @@ struct WorkshopDbToolsView: View {
             }
             return "Database setup is running. Wait for it to finish or cancel it from the pipeline."
         }
+        if let notice = supervisor.compatibilityNotice { return notice.text }
         if let scenario = validSelectedScenario {
             return "Destructive: recreates the database using \(scenario.name)."
         }
@@ -133,6 +134,9 @@ struct WorkshopDbToolsView: View {
                 return "Database setup is already running with the \(resetScenarioName) seed scenario"
             }
             return "Database setup is already running"
+        }
+        if supervisor.compatibilityNotice != nil {
+            return "Update \(Flavor.current.displayName) before resetting the database"
         }
         if let scenario = validSelectedScenario {
             return "Reset the database using the \(scenario.name) seed scenario"
@@ -148,6 +152,7 @@ struct WorkshopDbToolsView: View {
         if isDbSetupRunning {
             return "Unavailable while database setup is running"
         }
+        if let notice = supervisor.compatibilityNotice { return notice.text }
         if let scenario = validSelectedScenario {
             return "Destructive. Recreates the database using \(scenario.name), selected for the next reset"
         }

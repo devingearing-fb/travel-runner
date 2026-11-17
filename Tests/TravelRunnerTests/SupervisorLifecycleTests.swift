@@ -145,12 +145,16 @@ final class SupervisorLifecycleTests: XCTestCase {
         return tracker
     }
 
-    /// The events of one kind in `events.jsonl`. It waits for the first one.
+    /// The events of one kind in `events.jsonl`. It waits for the first one, then
+    /// a moment more, so a second one that should not be there is seen.
     private func events(_ kind: String, in tracker: DebugTracker) async -> [DebugTracker.Event] {
         let deadline = Date().addingTimeInterval(5)
         while Date() < deadline {
             let found = await tracker.listEvents().filter { $0.kind == kind }
-            if !found.isEmpty { return found }
+            if !found.isEmpty {
+                try? await Task.sleep(for: .milliseconds(500))
+                return await tracker.listEvents().filter { $0.kind == kind }
+            }
             try? await Task.sleep(for: .milliseconds(50))
         }
         return []
@@ -667,7 +671,8 @@ final class SupervisorLifecycleTests: XCTestCase {
             let reason = try XCTUnwrap(probe.problem)
             XCTAssertEqual(
                 supervisor.lastError,
-                "Custom cannot start: \(reason). Correct its probe in services.json, then quit Travel Runner and open it again."
+                "Custom cannot start: \(reason). Correct its probe in services.json, "
+                    + "then quit \(Flavor.current.displayName) and open it again."
             )
             let lines = await logLines("custom")
             XCTAssertFalse(lines.contains("custom-start"), "the process must not start")
@@ -887,6 +892,117 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(lines.filter { $0.contains("does not answer yet") }.count, 1, lines.joined(separator: "\n"))
     }
 
+    // MARK: - Runner too old for the checkout (T2)
+
+    private func writeManifest(minVersion: String) throws {
+        let folder = workDir.appendingPathComponent("scripts/db")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data(#"{"version":4,"runner":{"minVersion":"\#(minVersion)"},"steps":[],"profiles":{}}"#.utf8)
+            .write(to: folder.appendingPathComponent("manifest.json"))
+    }
+
+    private static let tooOldText =
+        "This fb-travel-monolith checkout needs Travel Runner 0.14.0 or newer (you have 0.13.4). "
+        + "The database was not touched."
+
+    /// Finding "no runner-to-monolith compatibility check": an old runner on a new
+    /// checkout wiped the database in a loop. Now it does not even ask the database.
+    func testARunnerOlderThanTheCheckoutNeverResetsByItself() async throws {
+        try loadSupabase()
+        try writeManifest(minVersion: "0.14.0")
+        supervisor.runnerVersion = "0.13.4"
+        supervisor.databaseProbeRetry = (.milliseconds(10), .zero)
+        var queries = 0
+        var resets = 0
+        // An empty database: the case that starts a reset.
+        supervisor.databaseQuery = { _, _ in
+            queries += 1
+            return DbQueryResult(exitCode: 0, stdout: "0", stderr: "")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+
+        let blocked = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+
+        XCTAssertFalse(blocked)
+        XCTAssertEqual(queries, 0)
+        XCTAssertEqual(resets, 0)
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertEqual(supervisor.compatibilityNotice?.text, Self.tooOldText)
+        // The service is left alone: only the reset is blocked.
+        XCTAssertEqual(state("supabase").phase, .running)
+        XCTAssertTrue(supervisor.statusJSON().contains("\"reset_blocked\""))
+
+        // Control: the same checkout with the runner it asks for is reset, and the banner goes.
+        supervisor.runnerVersion = "0.14.0"
+        let allowed = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
+        XCTAssertTrue(allowed)
+        XCTAssertEqual(resets, 1)
+        XCTAssertNil(supervisor.compatibilityNotice)
+        XCTAssertFalse(supervisor.statusJSON().contains("reset_blocked"))
+    }
+
+    /// The Reset button, a retry, one step, and the control API: all blocked.
+    func testARunnerOlderThanTheCheckoutRunsNoManualResetOrStep() async throws {
+        try loadSupabase()
+        try writeManifest(minVersion: "0.14.0")
+        supervisor.runnerVersion = "0.13.4"
+
+        supervisor.resetDatabase()
+        supervisor.runDbSetup(profile: "full")
+        supervisor.runDbSetup(from: "reset-database")
+        supervisor.runDbSetupStep("reset-database")
+
+        XCTAssertNil(supervisor.dbSetupPipeline)
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertEqual(supervisor.compatibilityNotice?.text, Self.tooOldText)
+        let body = try XCTUnwrap(supervisor.resetBlockJSON())
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(body.utf8)) as? [String: Any])
+        XCTAssertEqual(json["ok"] as? Bool, false)
+        XCTAssertEqual(json["error"] as? String, "runner_too_old")
+        XCTAssertEqual(json["message"] as? String, Self.tooOldText)
+        XCTAssertEqual(json["download_url"] as? String, "https://github.com/devingearing-fb/travel-runner/releases/latest")
+
+        // Control: a runner that is new enough passes the check. This test has no seed
+        // scenario, so the reset stops at the next guard, with that guard's message.
+        supervisor.runnerVersion = "0.14.0"
+        XCTAssertNil(supervisor.resetBlockJSON())
+        supervisor.resetDatabase()
+        XCTAssertNil(supervisor.compatibilityNotice)
+        XCTAssertNotNil(supervisor.lastError)
+        XCTAssertFalse(supervisor.dbResetRunning)
+    }
+
+    /// A checkout with no `runner` section, and a runner with no version (`swift run`),
+    /// reset as before.
+    func testNoMinimumOrNoVersionBlocksNothing() async throws {
+        try loadSupabase()
+        supervisor.databaseProbeRetry = (.milliseconds(10), .zero)
+        var resets = 0
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "0", stderr: "") }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+
+        // No manifest at all.
+        supervisor.runnerVersion = "0.13.4"
+        let noManifest = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
+        XCTAssertTrue(noManifest)
+
+        // A minimum, but a runner that has no version to compare.
+        try writeManifest(minVersion: "99.0.0")
+        supervisor.runnerVersion = nil
+        let noVersion = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
+        XCTAssertTrue(noVersion)
+
+        XCTAssertEqual(resets, 2)
+        XCTAssertNil(supervisor.compatibilityNotice)
+    }
+
     /// A database that never answers is never reset: the wait ends with the message.
     func testADatabaseThatNeverAnswersIsNotReset() async throws {
         try loadSupabase()
@@ -1009,7 +1125,7 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         XCTAssertEqual(
             supervisor.lastError,
-            "The database reset stopped before it finished. Click Reset DB to run it again."
+            "The database reset stopped before it finished. Open DB Tools and click Reset Database to run it again."
         )
         XCTAssertFalse(supervisor.dbResetRunning)
     }
@@ -1724,6 +1840,222 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
         XCTAssertEqual(state("web").lastStarted, time.now)
         XCTAssertEqual(state("web").readyAt, time.now)
+    }
+
+    // MARK: - Reconfigure
+
+    /// A config for the supervisor, with nothing of this Mac behind it: no
+    /// services.json, no control port 19900, no tickets folder and no other app.
+    /// The services have no folder, so no watcher starts.
+    private func fakeConfigHost(services ids: [String]) -> ConfigLoads {
+        let loads = ConfigLoads()
+        loads.serviceIDs = ids
+        let issues = workDir.appendingPathComponent("issues").path
+        supervisor.configHost = EnvironmentSupervisor.ConfigHost(
+            load: {
+                loads.count += 1
+                if let error = loads.error { throw error }
+                let services = loads.serviceIDs.map { id in
+                    ServiceDefinition(
+                        id: id, name: nil, cmd: ["sleep", "30"], cwd: nil, probe: nil, type: .daemon,
+                        restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+                    )
+                }
+                return ServiceConfig(
+                    version: ConfigLoader.currentVersion, registryPortRange: [0, 0], services: services,
+                    paths: nil, profile: .full
+                )
+            },
+            controlServer: {
+                let server = ControlServer(port: 0)
+                loads.controlServers.append(server)
+                return server
+            },
+            siblingServices: { [] }
+        )
+        supervisor.makeIssueTracker = { DebugTracker(baseDir: issues) }
+        return loads
+    }
+
+    /// Findings "Reconfigure while running loses state": a config load made new
+    /// service states, and the runner forgot the processes that ran.
+    func testReconfigureWhileAServiceRunsChangesNothingAndKeepsThePid() async throws {
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let ready = await waitUntil(40) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let before = state("web")
+        let pid = try XCTUnwrap(before.pid)
+        let loads = fakeConfigHost(services: ["other"])
+
+        let result = await supervisor.reconfigure()
+
+        XCTAssertEqual(result, .needsStop)
+        XCTAssertEqual(loads.count, 0, "the new config is not read while the stack runs")
+        XCTAssertTrue(state("web") === before)
+        XCTAssertEqual(state("web").pid, pid)
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertEqual(Self.listeners(on: port), [pid])
+        XCTAssertNil(supervisor.serviceStates["other"])
+        XCTAssertTrue(supervisor.reconfigurePending)
+        XCTAssertTrue(loads.controlServers.isEmpty)
+    }
+
+    /// "Stop and apply": the stop ends first, then the new config loads.
+    func testStopAndApplyStopsTheStackThenLoadsTheNewConfig() async throws {
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let ready = await waitUntil(40) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let loads = fakeConfigHost(services: ["other"])
+        var feedback: [String] = []
+        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        let needsStop = await supervisor.reconfigure()
+        XCTAssertEqual(needsStop, .needsStop)
+
+        let result = await supervisor.stopAndReconfigure().value
+
+        XCTAssertEqual(result, .applied)
+        XCTAssertEqual(loads.count, 1)
+        XCTAssertEqual(Self.listeners(on: port), [], "the old process is gone before the new config loads")
+        XCTAssertEqual(supervisor.sortedServiceIDs, ["other"])
+        XCTAssertEqual(Array(supervisor.serviceStates.keys), ["other"])
+        XCTAssertNil(state("other").pid)
+        XCTAssertEqual(supervisor.health, .stopped)
+        XCTAssertFalse(supervisor.reconfigurePending)
+        XCTAssertEqual(feedback, ["Paths updated"])
+        await loads.stopControlServers()
+    }
+
+    /// Findings "Reconfigure saves but does not reload": with the stack stopped the
+    /// new config loads at once. And the app keeps one control server: a second
+    /// one cannot bind the port.
+    func testReconfigureOfAStoppedStackLoadsTheConfigAndKeepsOneControlServer() async throws {
+        let loads = fakeConfigHost(services: ["first"])
+        var feedback: [String] = []
+        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+
+        supervisor.loadConfig()
+        XCTAssertEqual(supervisor.sortedServiceIDs, ["first"])
+        XCTAssertEqual(loads.controlServers.count, 1)
+        XCTAssertEqual(feedback, [])
+
+        loads.serviceIDs = ["second"]
+        let result = await supervisor.reconfigure()
+
+        XCTAssertEqual(result, .applied)
+        XCTAssertEqual(supervisor.sortedServiceIDs, ["second"])
+        XCTAssertEqual(Array(supervisor.serviceStates.keys), ["second"])
+        XCTAssertEqual(feedback, ["Paths updated"])
+        XCTAssertNil(supervisor.lastError)
+
+        supervisor.loadConfig()
+        XCTAssertEqual(loads.controlServers.count, 1, "one control server for the life of the app")
+
+        // The one server listens.
+        let server = try XCTUnwrap(loads.controlServers.first)
+        var bound: UInt16?
+        for _ in 0..<100 where bound == nil {
+            bound = await server.boundPort
+            if bound == nil { try await Task.sleep(for: .milliseconds(50)) }
+        }
+        XCTAssertNotNil(bound)
+        XCTAssertNil(supervisor.controlAPIError)
+        await loads.stopControlServers()
+    }
+
+    /// A first run has no services.json. The control API still listens, says so,
+    /// and its preflight answers: the release smoke test asks exactly this.
+    func testWithoutAConfigTheControlAPIAnswersAndSaysNotConfigured() async throws {
+        let loads = fakeConfigHost(services: ["first"])
+        loads.error = ConfigLoader.ConfigError.noConfig
+        // A Mac without Node: the shell finds no `node`.
+        let shell = FakeCommandRunner { call in
+            call.command == "node --version" ? FakeCommandRunner.failed(127, stderr: "command not found: node") : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+
+        supervisor.loadConfig()
+
+        XCTAssertNil(supervisor.lastError, "a first run is no error")
+        XCTAssertEqual(loads.controlServers.count, 1)
+        let server = try XCTUnwrap(loads.controlServers.first)
+        var bound: UInt16?
+        for _ in 0..<100 where bound == nil {
+            bound = await server.boundPort
+            if bound == nil { try await Task.sleep(for: .milliseconds(50)) }
+        }
+        let port = try XCTUnwrap(bound)
+        func get(_ path: String) async throws -> [String: Any] {
+            let config = URLSessionConfiguration.ephemeral
+            config.connectionProxyDictionary = [:]
+            config.timeoutIntervalForRequest = 10
+            let session = URLSession(configuration: config)
+            defer { session.invalidateAndCancel() }
+            let (data, _) = try await session.data(from: try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)\(path)")))
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        }
+
+        let status = try await get("/api/status")
+        XCTAssertEqual(status["configured"] as? Bool, false)
+        XCTAssertEqual(status["health"] as? String, HealthStatus.stopped.rawValue)
+        let preflight = try await get("/api/preflight")
+        XCTAssertEqual(preflight["configured"] as? Bool, false)
+        let checks = try XCTUnwrap(preflight["checks"] as? [[String: String]])
+        XCTAssertEqual(checks.map { $0["id"] }, ["node-version"], "only checks that change nothing, and no service has a port yet")
+        XCTAssertEqual(checks.first?["status"], "failed")
+        XCTAssertEqual(checks.first?["detail"], "Node.js not found")
+        XCTAssertEqual(shell.commands, ["node --version"], "no container runtime and no Stripe is asked")
+
+        // The setup saved a config: the same server now says so.
+        loads.error = nil
+        let result = await supervisor.reconfigure()
+        XCTAssertEqual(result, .applied)
+        let configured = try await get("/api/status")
+        XCTAssertEqual(configured["configured"] as? Bool, true)
+        XCTAssertEqual(loads.controlServers.count, 1)
+        await loads.stopControlServers()
+    }
+
+    func testAConfigThatDoesNotLoadKeepsTheOldOne() async throws {
+        let loads = fakeConfigHost(services: ["first"])
+        supervisor.loadConfig()
+        let before = state("first")
+        var feedback: [(String, Bool)] = []
+        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        loads.error = ConfigLoader.ConfigError.monorepoNotFound
+
+        let result = await supervisor.reconfigure()
+
+        let message = "Paths not applied: \(ConfigLoader.ConfigError.monorepoNotFound)"
+        XCTAssertEqual(result, .failed(message))
+        XCTAssertTrue(state("first") === before)
+        XCTAssertEqual(supervisor.sortedServiceIDs, ["first"])
+        XCTAssertEqual(supervisor.lastError, message)
+        XCTAssertEqual(feedback.map(\.0), [message])
+        XCTAssertEqual(feedback.map(\.1), [false])
+        await loads.stopControlServers()
+    }
+}
+
+/// What the supervisor asked of the fake config host.
+@MainActor
+private final class ConfigLoads {
+    var count = 0
+    /// The services of the config that the next load gives.
+    var serviceIDs: [String] = []
+    var error: (any Error)?
+    var controlServers: [ControlServer] = []
+
+    /// The listen runs in a task of the supervisor; it ends before the stop.
+    func stopControlServers() async {
+        for server in controlServers {
+            for _ in 0..<100 {
+                if await server.boundPort != nil { break }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            await server.stop()
+        }
     }
 }
 

@@ -21,8 +21,9 @@ struct WorkshopView: View {
         ZStack {
             VStack(spacing: 0) {
                 if showSetup || isFirstRun {
-                    SetupView(isFirstRun: isFirstRun) { start in
+                    SetupView(isFirstRun: isFirstRun) { outcome in
                         showSetup = false
+                        guard case .saved(let start) = outcome else { return }
                         supervisor.loadConfig()
                         if start { supervisor.startAll() }
                     }
@@ -69,18 +70,36 @@ struct WorkshopView: View {
 }
 
 struct WorkshopSettingsView: View {
+    @Environment(EnvironmentSupervisor.self) var supervisor
     @State private var showSetup = false
+    @State private var askStop = false
 
     var body: some View {
-        if showSetup {
-            SetupView(isFirstRun: false) { _ in
-                showSetup = false
+        Group {
+            if showSetup {
+                SetupView(isFirstRun: false) { outcome in
+                    showSetup = false
+                    if case .saved = outcome { applySavedPaths() }
+                }
+            } else {
+                SettingsPageView(
+                    onDismiss: {},
+                    onReconfigureRepos: { showSetup = true }
+                )
             }
-        } else {
-            SettingsPageView(
-                onDismiss: {},
-                onReconfigureRepos: { showSetup = true }
-            )
+        }
+        .alert("Stop the stack and apply the new paths?", isPresented: $askStop) {
+            Button("Stop and apply") { supervisor.stopAndReconfigure() }
+            Button("Apply at next launch", role: .cancel) {}
+        } message: {
+            Text("The stack runs from the old paths. The new paths are saved.")
+        }
+    }
+
+    /// The supervisor loads the saved paths now, or says that the stack must stop first.
+    private func applySavedPaths() {
+        Task {
+            if await supervisor.reconfigure() == .needsStop { askStop = true }
         }
     }
 }

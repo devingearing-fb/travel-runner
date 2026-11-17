@@ -15,9 +15,14 @@ final class ControlServerTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private static func actions(status: String) -> ControlServer.Actions {
+    private static func actions(
+        status: String,
+        resetBlock: String? = nil,
+        onDbChange: @escaping @Sendable (String) -> Void = { _ in }
+    ) -> ControlServer.Actions {
         ControlServer.Actions(
             getStatus: { status },
+            getPreflight: { "{\"checks\":[]}" },
             getLogs: { _, _ in "[]" },
             restartService: { _ in },
             clearCacheRestart: { _ in },
@@ -25,12 +30,13 @@ final class ControlServerTests: XCTestCase {
             stopAll: {},
             toggleLan: {},
             restartCascade: { _ in },
-            dbReset: {},
-            dbSetupRun: { _ in },
-            dbSetupRetry: { _ in },
+            dbResetBlock: { resetBlock },
+            dbReset: { onDbChange("reset") },
+            dbSetupRun: { _ in onDbChange("run") },
+            dbSetupRetry: { _ in onDbChange("retry") },
             dbSetupCancel: {},
             dbSetupStatus: { "{}" },
-            dbSetupRunStep: { _ in },
+            dbSetupRunStep: { _ in onDbChange("step") },
             debugListIssues: { "[]" },
             debugCapture: { _ in "{}" },
             debugCloseIssue: { _, _ in "{}" },
@@ -184,5 +190,79 @@ final class ControlServerTests: XCTestCase {
         let v6 = await status(host: "[::1]", port: port)
         XCTAssertNil(v4)
         XCTAssertNil(v6)
+    }
+
+    /// The four routes that change the database answer 409 while the runner is too
+    /// old for the checkout, and run nothing.
+    /// The release smoke test asks this route (`scripts/smoke.sh`).
+    func testThePreflightRouteGivesTheAnswerOfTheAction() async throws {
+        let server = makeServer(port: 0)
+        _ = await server.start(actions: Self.actions(status: "{}"), logStore: LogStore())
+        let boundPort = await server.boundPort
+        let port = try XCTUnwrap(boundPort)
+        let config = URLSessionConfiguration.ephemeral
+        config.connectionProxyDictionary = [:]
+        config.timeoutIntervalForRequest = 5
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)/api/preflight"))
+        let (data, response) = try await session.data(from: url)
+
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(String(decoding: data, as: UTF8.self), #"{"checks":[]}"#)
+    }
+
+    func testTheDatabaseRoutesRefuseWhileTheRunnerIsTooOld() async throws {
+        final class Calls: @unchecked Sendable {
+            private let lock = NSLock()
+            private var names: [String] = []
+            func add(_ name: String) { lock.lock(); names.append(name); lock.unlock() }
+            var all: [String] { lock.lock(); defer { lock.unlock() }; return names }
+        }
+        let routes = ["/api/db-reset", "/api/db-setup", "/api/db-setup/retry/reset-database", "/api/db-setup/step/reset-database"]
+        let refusal = #"{"error":"runner_too_old","ok":false}"#
+
+        func post(_ path: String, port: UInt16) async throws -> (Int, String) {
+            let config = URLSessionConfiguration.ephemeral
+            config.connectionProxyDictionary = [:]
+            config.timeoutIntervalForRequest = 5
+            let session = URLSession(configuration: config)
+            defer { session.invalidateAndCancel() }
+            var request = URLRequest(url: try XCTUnwrap(URL(string: "http://127.0.0.1:\(port)\(path)")))
+            request.httpMethod = "POST"
+            let (data, response) = try await session.data(for: request)
+            return ((response as? HTTPURLResponse)?.statusCode ?? 0, String(decoding: data, as: UTF8.self))
+        }
+
+        let blockedCalls = Calls()
+        let blocked = makeServer(port: 0)
+        _ = await blocked.start(
+            actions: Self.actions(status: "{}", resetBlock: refusal, onDbChange: { blockedCalls.add($0) }),
+            logStore: LogStore()
+        )
+        let blockedBound = await blocked.boundPort
+        let blockedPort = try XCTUnwrap(blockedBound)
+        for route in routes {
+            let (code, body) = try await post(route, port: blockedPort)
+            XCTAssertEqual(code, 409, route)
+            XCTAssertEqual(body, refusal, route)
+        }
+        XCTAssertEqual(blockedCalls.all, [])
+
+        // Control: with no refusal, every route runs its action.
+        let openCalls = Calls()
+        let open = makeServer(port: 0)
+        _ = await open.start(
+            actions: Self.actions(status: "{}", onDbChange: { openCalls.add($0) }),
+            logStore: LogStore()
+        )
+        let openBound = await open.boundPort
+        let openPort = try XCTUnwrap(openBound)
+        for route in routes {
+            let (code, _) = try await post(route, port: openPort)
+            XCTAssertEqual(code, 200, route)
+        }
+        XCTAssertEqual(openCalls.all, ["reset", "run", "retry", "step"])
     }
 }

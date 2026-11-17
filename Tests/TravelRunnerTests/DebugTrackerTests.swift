@@ -334,6 +334,89 @@ final class DebugTrackerTests: XCTestCase {
         XCTAssertEqual(supervisor.debugOpenIssueCount, 1)
     }
 
+    /// A first run has no service config. Capture starts all the same, and a
+    /// config reload makes no second tracker.
+    @MainActor
+    func testTheSupervisorStartsOneTrackerAndPrunesOnce() async throws {
+        let clock = TestClock()
+        try writeClosedIssue("old", resolvedAt: clock.now.addingTimeInterval(-31 * 86_400))
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DebugTrackerTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        let path = root.path
+        var made = 0
+        supervisor.makeIssueTracker = {
+            made += 1
+            return DebugTracker(baseDir: path, now: { clock.now })
+        }
+
+        await supervisor.initDebugTracking()
+        XCTAssertTrue(supervisor.debugTrackingEnabled, "no config means on")
+        XCTAssertNotNil(supervisor.debugTracker)
+        XCTAssertEqual(try closedIDs(), [], "the launch prune ran")
+
+        // A reload: the same tracker, and no second prune.
+        let first = supervisor.debugTracker
+        try writeClosedIssue("old", resolvedAt: clock.now.addingTimeInterval(-31 * 86_400))
+        await supervisor.initDebugTracking()
+        XCTAssertEqual(made, 1)
+        XCTAssertTrue(supervisor.debugTracker === first)
+        XCTAssertEqual(try closedIDs(), ["old"])
+    }
+
+    /// The config and the issues can change on disk. The poll reads them again.
+    @MainActor
+    func testThePollReadsTheSwitchAndTheCountFromDisk() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DebugTrackerTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        let path = root.path
+        supervisor.makeIssueTracker = { DebugTracker(baseDir: path) }
+        supervisor.issueCapturePollInterval = .milliseconds(50)
+        func waitUntil(_ condition: @MainActor () -> Bool) async -> Bool {
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                if condition() { return true }
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+            return condition()
+        }
+
+        // "Turn On" before the launch call: the poll must start all the same.
+        await supervisor.setIssueCaptureEnabled(true)
+        await supervisor.initDebugTracking()
+        await supervisor.captureDebugIssue(trigger: "manual", serviceID: nil, summary: "one")
+        let counted = await waitUntil { supervisor.debugOpenIssueCount == 1 }
+        XCTAssertTrue(counted)
+
+        try writeConfig(#"{"enabled": false}"#)
+        let off = await waitUntil { !supervisor.debugTrackingEnabled }
+        XCTAssertTrue(off)
+        XCTAssertNil(supervisor.debugTracker)
+        XCTAssertEqual(supervisor.debugOpenIssueCount, 0)
+
+        try writeConfig(#"{"enabled": true}"#)
+        let on = await waitUntil { supervisor.debugTrackingEnabled }
+        XCTAssertTrue(on)
+    }
+
+    @MainActor
+    func testASwitchThatCannotBeSavedNamesTheFile() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DebugTrackerTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        // A file where the folder should be: nothing can be written under it.
+        try "x".write(to: root.appendingPathComponent("blocked"), atomically: true, encoding: .utf8)
+        let folder = root.appendingPathComponent("blocked/issues").path
+        supervisor.makeIssueTracker = { DebugTracker(baseDir: folder) }
+        var feedback: [String] = []
+        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+
+        await supervisor.setIssueCaptureEnabled(false)
+
+        XCTAssertEqual(feedback, [
+            "Issue capture: could not write \(folder)/config.json. Check that the folder is writable, then try again."
+        ])
+        XCTAssertFalse(supervisor.debugTrackingEnabled)
+    }
+
     // MARK: - Guards
 
     /// Finding "unbounded recurrence list": the count keeps every repeat, the list
@@ -354,7 +437,7 @@ final class DebugTrackerTests: XCTestCase {
         XCTAssertEqual(times.last, issue["updated_at"] as? String, "the newest stay")
     }
 
-    func testARepeatInsideAMinuteIsDropped() async throws {
+    func testARepeatInsideAMinuteWritesNothingAndIsCountedLater() async throws {
         let clock = TestClock()
         let tracker = DebugTracker(baseDir: root.path, now: { clock.now })
         func capture(_ tracker: DebugTracker, _ service: String = "web") async -> String? {
@@ -365,7 +448,7 @@ final class DebugTrackerTests: XCTestCase {
         let id = try XCTUnwrap(first)
         clock.advance(30)
         _ = await capture(tracker)
-        XCTAssertEqual(try issueJSON(id)["recurrence_count"] as? Int, 0, "dropped, not counted")
+        XCTAssertEqual(try issueJSON(id)["recurrence_count"] as? Int, 0, "no write inside the minute")
 
         // Another signature has its own limit.
         let other = await capture(tracker, "api")
@@ -378,7 +461,9 @@ final class DebugTrackerTests: XCTestCase {
 
         clock.advance(15)
         _ = await capture(tracker)
-        XCTAssertEqual(try issueJSON(id)["recurrence_count"] as? Int, 1, "65 s after the first")
+        XCTAssertEqual(
+            try issueJSON(id)["recurrence_count"] as? Int, 2, "65 s after the first: this one and the dropped one"
+        )
 
         // A closed issue does not open the door: the same failure a moment later
         // files no second issue.
@@ -389,10 +474,78 @@ final class DebugTrackerTests: XCTestCase {
         XCTAssertNil(again)
         clock.advance(60)
         let later = await capture(tracker)
-        XCTAssertNotNil(later)
+        XCTAssertEqual(try issueJSON(try XCTUnwrap(later))["recurrence_count"] as? Int, 1, "the dropped one counts")
     }
 
-    private func writeClosedIssue(_ id: String, resolvedAt: Date) throws {
+    /// A close writes the issue: the repeats that were dropped go into its count.
+    func testACloseCountsTheDroppedRepeats() async throws {
+        let clock = TestClock()
+        let tracker = DebugTracker(baseDir: root.path, now: { clock.now })
+        let first = await tracker.captureIssue(trigger: "service_crash", serviceId: "web", errorMessage: "web exited")
+        let id = try XCTUnwrap(first)
+        for _ in 0..<3 {
+            clock.advance(5)
+            _ = await tracker.captureIssue(trigger: "service_crash", serviceId: "web", errorMessage: "web exited")
+        }
+
+        let closed = await tracker.closeIssue(id: id, resolution: "fixed")
+        XCTAssertTrue(closed)
+        XCTAssertEqual(try issueJSON(id, status: "closed")["recurrence_count"] as? Int, 3)
+    }
+
+    /// A report that a person files is never dropped. The same text again is a
+    /// recurrence of the open issue.
+    func testAManualCaptureHasNoRateLimit() async throws {
+        let clock = TestClock()
+        let tracker = DebugTracker(baseDir: root.path, now: { clock.now })
+        let first = await tracker.captureIssue(trigger: "manual", serviceId: nil, errorMessage: "the page is blank")
+        let id = try XCTUnwrap(first)
+        clock.advance(5)
+        _ = await tracker.captureIssue(trigger: "manual", serviceId: nil, errorMessage: "the page is blank")
+        clock.advance(5)
+        _ = await tracker.captureIssue(trigger: "manual", serviceId: nil, errorMessage: "the page is blank")
+
+        XCTAssertEqual(try issueJSON(id)["recurrence_count"] as? Int, 2)
+    }
+
+    /// Issue logs are redacted, but they are logs: only the user reads them.
+    func testIssueFilesAreForTheUserOnly() async throws {
+        let base = root.appendingPathComponent("support/issues")
+        let tracker = DebugTracker(baseDir: base.path)
+        let captured = await tracker.captureIssue(
+            trigger: "service_crash", serviceId: "web", errorMessage: "web exited",
+            logEntries: [.init(timestamp: Date(), serviceId: "web", line: "boom")],
+            stateSnapshots: [
+                ServiceStateSnapshot(
+                    id: "web", phase: "failed", pid: nil, exitCode: 1, restartCount: 0,
+                    isCircuitBroken: false, uptimeSeconds: nil
+                )
+            ]
+        )
+        let id = try XCTUnwrap(captured)
+        // A recurrence writes issue.json again.
+        _ = await tracker.captureIssue(trigger: "manual", serviceId: nil, errorMessage: "x")
+        await tracker.recordEvent(kind: "stripe_skip", serviceId: "stripe", message: "skipped")
+
+        func mode(_ path: String) throws -> Int {
+            let attributes = try FileManager.default.attributesOfItem(atPath: base.appendingPathComponent(path).path)
+            return try XCTUnwrap(attributes[.posixPermissions] as? Int)
+        }
+        XCTAssertEqual(try mode(""), 0o700)
+        XCTAssertEqual(try mode("open"), 0o700)
+        XCTAssertEqual(try mode("open/\(id)"), 0o700)
+        for file in ["issue.json", "logs-web.txt", "logs-all.txt", "state-snapshot.json"] {
+            XCTAssertEqual(try mode("open/\(id)/\(file)"), 0o600, file)
+        }
+        XCTAssertEqual(try mode("events.jsonl"), 0o600)
+
+        let closed = await tracker.closeIssue(id: id, resolution: "fixed")
+        XCTAssertTrue(closed)
+        XCTAssertEqual(try mode("closed"), 0o700)
+        XCTAssertEqual(try mode("closed/\(id)/issue.json"), 0o600)
+    }
+
+    private func writeClosedIssue(_ id: String, resolvedAt: Date, byHand: Bool = false) throws {
         let folder = root.appendingPathComponent("closed/\(id)")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let formatter = ISO8601DateFormatter()
@@ -402,7 +555,7 @@ final class DebugTrackerTests: XCTestCase {
         {
           "category": "runtime", "created_at": "\(stamp)", "error_message": "x", "error_signature": "\(id)",
           "id": "\(id)", "recurrence_count": 0, "recurrence_timestamps": [], "resolution": "fixed",
-          "resolved_at": "\(stamp)", "severity": "error", "status": "closed", "summary": "x",
+          \(byHand ? "" : "\"resolved_at\": \"\(stamp)\",") "severity": "error", "status": "closed", "summary": "x",
           "trigger": "service_crash", "updated_at": "\(stamp)"
         }
         """
@@ -428,6 +581,13 @@ final class DebugTrackerTests: XCTestCase {
 
         XCTAssertEqual(removed, 1)
         XCTAssertEqual(try closedIDs(), ["notes", "recent"])
+
+        // A folder that someone moved here by hand has no close time. It stays.
+        try writeClosedIssue("moved", resolvedAt: clock.now.addingTimeInterval(-90 * 86_400), byHand: true)
+        let none = await tracker.pruneClosedIssues()
+        XCTAssertEqual(none, 0)
+        XCTAssertEqual(try closedIDs(), ["moved", "notes", "recent"])
+        try FileManager.default.removeItem(at: root.appendingPathComponent("closed/moved"))
 
         // Open issues have no age limit, and a close prunes too.
         let captured = await tracker.captureIssue(trigger: "manual", serviceId: nil, errorMessage: "open one")

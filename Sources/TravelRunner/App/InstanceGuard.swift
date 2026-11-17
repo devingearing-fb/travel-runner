@@ -47,8 +47,8 @@ enum InstanceGuard {
 
     // MARK: - A launch that nobody watches
 
-    /// The release smoke test sets this (plan item T1). Nobody is there to answer an alert.
-    static let smokeKey = "TRAVEL_RUNNER_SMOKE"
+    /// The release smoke test sets this (`scripts/smoke.sh`). Nobody is there to answer an alert.
+    static let smokeKey = LaunchEnvironment.smokeKey
     /// The exit code of a smoke launch that found a running copy (EX_TEMPFAIL: try again later).
     static let smokeExitCode: Int32 = 75
 
@@ -60,6 +60,65 @@ enum InstanceGuard {
     /// The two lines as one text.
     static func message(for copy: Copy, flavor: Flavor = .current, home: String = NSHomeDirectory()) -> String {
         "\(title(for: copy, flavor: flavor, home: home)) \(detail)"
+    }
+
+    // MARK: - A copy on its way out
+
+    /// Quit stops the stack before the process ends, and that takes some seconds.
+    /// The copy that quits writes its pid and its start time here first. A launch
+    /// in that time waits for it to end and then starts like a first copy.
+    static var quittingMarkerPath: String {
+        (ConfigLoader.configDir as NSString).appendingPathComponent("quitting")
+    }
+
+    /// How long a launch waits for a copy that quits. A stop of the stack takes a few seconds.
+    static let quitWait: TimeInterval = 15
+
+    /// "<pid> <start time>": the start time tells this process from a later one with the same pid.
+    static func quittingMarker(pid: pid_t, start: Date?) -> String {
+        "\(pid) \(start.map { String($0.timeIntervalSince1970) } ?? "-")"
+    }
+
+    /// True when the marker names this copy.
+    static func isQuitting(_ copy: Copy, marker: String?) -> Bool {
+        guard let parts = marker?.split(separator: " "), parts.count == 2, pid_t(parts[0]) == copy.pid else {
+            return false
+        }
+        // Without a start time on one side, the pid decides.
+        guard let start = TimeInterval(parts[1]), let launched = copy.launchDate else { return true }
+        return abs(launched.timeIntervalSince1970 - start) < 1
+    }
+
+    /// The copy that quits says so. A failed write changes nothing: the next launch
+    /// then shows the alert, as before.
+    static func markQuitting(pid: pid_t = getpid(), path: String = quittingMarkerPath) {
+        try? quittingMarker(pid: pid, start: processStart(of: pid)).write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    static func readQuittingMarker(path: String = quittingMarkerPath) -> String? {
+        (try? String(contentsOfFile: path, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// A copy that starts removes the marker of the copy before it.
+    static func clearQuittingMarker(path: String = quittingMarkerPath) {
+        try? FileManager.default.removeItem(atPath: path)
+    }
+
+    /// Waits until the process is gone. False when it still runs after `timeout`.
+    static func waitForExit(
+        pid: pid_t,
+        timeout: TimeInterval = quitWait,
+        isAlive: (pid_t) -> Bool = ProcessTree.isAlive,
+        sleep: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }
+    ) -> Bool {
+        let step = 0.1
+        var waited = 0.0
+        while isAlive(pid) {
+            guard waited < timeout else { return false }
+            sleep(step)
+            waited += step
+        }
+        return true
     }
 
     // MARK: - A release copy outside /Applications
@@ -143,8 +202,9 @@ enum InstanceGuard {
     static func runningCopyNow() -> (copy: Copy, app: NSRunningApplication)? {
         guard let bundleID = Bundle.main.bundleIdentifier else { return nil }
         let own = NSRunningApplication.current
+        // `isTerminated` changes only when the run loop turns, so the kernel is asked too.
         let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
-            .filter { !$0.isTerminated }
+            .filter { !$0.isTerminated && ProcessTree.isAlive($0.processIdentifier) }
         let copies = others.map(copy(of:))
         guard let first = runningCopy(own: copy(of: own), all: copies),
               let app = others.first(where: { $0.processIdentifier == first.pid }) else { return nil }

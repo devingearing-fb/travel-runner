@@ -39,7 +39,7 @@ jobs:
           key: spm-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-${{ hashFiles('Package.resolved') }}
 
       - name: Check the syntax of the build scripts
-        run: bash -n build.sh && bash -n release.sh
+        run: bash -n build.sh && bash -n release.sh && bash -n scripts/smoke.sh
 
       - name: Build
         run: swift build

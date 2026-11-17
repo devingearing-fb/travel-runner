@@ -183,8 +183,123 @@ final class DbSetupProtocolTests: XCTestCase {
 
     func testTheHotelFixDoesNotResetTheDatabase() {
         let command = EnvironmentChecker.hotelDataFixCommand
-        XCTAssertEqual(command, "pnpm db:hotels")
+        // The dump goes where the DB setup of the app reads it. The path has a space.
+        XCTAssertEqual(command, "TRAVEL_HOTEL_DUMP='\(DbSetupRunner.hotelDumpPath())' pnpm db:hotels")
         XCTAssertFalse(command.contains("reset"))
         XCTAssertFalse(command.contains("db:setup"))
+    }
+
+    // MARK: - What the runner tells the scripts
+
+    /// The scripts read these names. Without `TRAVEL_DB_PROFILE` the prerequisites
+    /// step never checked the hotel source, so the reset ran before the hotel
+    /// download could fail.
+    func testAStepGetsTheProfileTheHotelDumpAndTheFlavor() {
+        let environment = DbSetupRunner.environment(
+            parent: ["PATH": "/test/bin", "TRAVEL_DB_PROFILE": "old", "TRAVEL_HOTEL_DUMP": "/old"],
+            seedScenarioID: "standard", profile: "reset", flavor: .hackathon, home: "/Users/a"
+        )
+        XCTAssertEqual(environment, [
+            "PATH": "/test/bin",
+            "TRAVEL_SEED_SCENARIO": "standard",
+            "TRAVEL_DB_PROFILE": "reset",
+            "TRAVEL_HOTEL_DUMP":
+                "/Users/a/Library/Application Support/Travel Runner Hackathon/hotels/travel_organizations.sql",
+            "TRAVEL_RUNNER_FLAVOR": "hackathon",
+        ])
+        // The two apps keep their dumps apart.
+        XCTAssertEqual(
+            DbSetupRunner.hotelDumpPath(flavor: .standard, home: "/Users/a"),
+            "/Users/a/Library/Application Support/Travel Runner/hotels/travel_organizations.sql"
+        )
+        // Negative control: a runner without a pipeline names no profile.
+        let bare = DbSetupRunner.environment(parent: [:], seedScenarioID: "standard")
+        XCTAssertNil(bare["TRAVEL_DB_PROFILE"])
+    }
+
+    /// The step command and its health check both get the profile of the pipeline.
+    func testTheStepAndItsHealthCheckGetTheProfile() async throws {
+        let cwd = FileManager.default.temporaryDirectory.appendingPathComponent("DbSetupProfile-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: cwd) }
+        let step = DbSetupStep(
+            id: "check-prerequisites", name: "Prerequisites",
+            command: "test \"$TRAVEL_DB_PROFILE\" = full && test -n \"$TRAVEL_HOTEL_DUMP\" && test -n \"$TRAVEL_RUNNER_FLAVOR\"",
+            healthCheckCommand: "check", timeoutSeconds: 10, isOptional: false, stepNumber: 1
+        )
+        let shell = FakeCommandRunner()
+        let tools = ToolEnvironment(home: cwd.path)
+        let passed = await DbSetupRunner(
+            portalCwd: cwd.path, logStore: LogStore(), seedScenarioID: "standard", profile: "full",
+            tools: tools, shell: shell
+        ).executeStepPublic(step)
+
+        XCTAssertTrue(passed, "\(step.logEntries.map(\.text))")
+        XCTAssertEqual(shell.calls.map(\.environment["TRAVEL_DB_PROFILE"]), ["full"])
+        XCTAssertEqual(shell.calls.first?.environment["TRAVEL_HOTEL_DUMP"], DbSetupRunner.hotelDumpPath())
+        XCTAssertEqual(shell.calls.first?.environment["TRAVEL_RUNNER_FLAVOR"], Flavor.current.rawValue)
+
+        // Negative control: the same step fails when the runner names another profile.
+        let other = await DbSetupRunner(
+            portalCwd: cwd.path, logStore: LogStore(), seedScenarioID: "standard", profile: "fast",
+            tools: tools, shell: FakeCommandRunner()
+        ).executeStepPublic(step)
+        XCTAssertFalse(other)
+    }
+
+    /// Stop All cancels the task of the start, and an automatic reset runs inside
+    /// it. The real shell ends a command at once in a cancelled task, so the health
+    /// check failed as "Cancelled" and the pipeline broke after the reset step:
+    /// a database with no hotels. Only `cancel()` of the runner stops a pipeline.
+    func testACancelledTaskDoesNotBreakThePipelineAtAHealthCheck() async throws {
+        let cwd = FileManager.default.temporaryDirectory.appendingPathComponent("DbSetupCancel-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: cwd, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: cwd) }
+        // Like `Shell.execute`: a command in a cancelled task does not run.
+        let shell = FakeCommandRunner { _ in
+            Task.isCancelled ? CommandResult(exitCode: -1, stdout: "", stderr: "Cancelled") : FakeCommandRunner.ok()
+        }
+        func makeStep(_ id: String, _ command: String) -> DbSetupStep {
+            DbSetupStep(
+                id: id, name: id, command: command, healthCheckCommand: "check-\(id)",
+                timeoutSeconds: 30, isOptional: false, stepNumber: 1
+            )
+        }
+        let marker = cwd.appendingPathComponent("started").path
+        let steps = [
+            makeStep("reset-database", "touch \(ShellQuote.quote(marker)); sleep 1"),
+            makeStep("load-hotels", "true"),
+        ]
+        let scenario = DbSeedScenario(id: "test", name: "Test", description: "", fileSummary: "", variables: [])
+        let pipeline = DbSetupPipeline(profile: "reset", seedScenario: scenario)
+        pipeline.steps = steps
+        let runner = DbSetupRunner(
+            portalCwd: cwd.path, logStore: LogStore(), seedScenarioID: "test", profile: "reset",
+            tools: ToolEnvironment(home: cwd.path), shell: shell
+        )
+
+        let run = Task { await runner.run(pipeline: pipeline) }
+        // The first step is in flight when the task is cancelled, as with Stop All.
+        for _ in 0..<200 where !FileManager.default.fileExists(atPath: marker) {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker))
+        run.cancel()
+        await run.value
+
+        XCTAssertEqual(steps.map(\.status), [.passed, .passed], "\(steps.map(\.errorMessage))")
+        XCTAssertEqual(shell.commands, ["check-reset-database", "check-load-hotels"])
+        XCTAssertTrue(pipeline.allRequiredPassed)
+        let wasCancelled = await runner.wasCancelled
+        XCTAssertFalse(wasCancelled)
+
+        // Control: the fake does answer "Cancelled" inside a cancelled task.
+        let direct = Task {
+            try? await Task.sleep(for: .seconds(30))
+            return await shell.run("direct", cwd: nil, environment: [:], timeout: .seconds(1), onLine: nil)
+        }
+        direct.cancel()
+        let answer = await direct.value
+        XCTAssertEqual(answer.exitCode, -1)
     }
 }

@@ -57,6 +57,11 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
 
     // MARK: - SPUUpdaterDelegate
 
+    /// Nil keeps the feed of Info.plist. A copy on the canary channel reads the canary feed.
+    func feedURLString(for updater: SPUUpdater) -> String? {
+        UpdatePolicy.feedURL(defaults: .standard, flavor: .current)
+    }
+
     /// An update was downloaded in the background. Sparkle installs it at quit;
     /// the pill lets the user install it now.
     func updater(

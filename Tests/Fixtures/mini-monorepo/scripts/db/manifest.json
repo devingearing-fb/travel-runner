@@ -1,0 +1,16 @@
+{
+  "version": 4,
+  "steps": [
+    {
+      "id": "check-prerequisites",
+      "name": "Prerequisites",
+      "command": "true",
+      "healthCheck": null,
+      "timeoutMs": 1000,
+      "optional": false
+    }
+  ],
+  "profiles": {
+    "reset": ["check-prerequisites"]
+  }
+}

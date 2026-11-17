@@ -233,12 +233,17 @@ final class ShellTests: XCTestCase {
         try "#!/bin/sh\necho v98.1.0\n".write(to: file, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
 
+        // The startup files of the person who runs the tests are not read: a
+        // profile that prints a line would change the output.
+        let zdotdir = home.appendingPathComponent("zdotdir")
+        try FileManager.default.createDirectory(at: zdotdir, withIntermediateDirectories: true)
         let with = ToolEnvironment(home: home.path, capture: .init(shellPath: [tools.path]))
-        let found = await LoginShell(tools: with).run("\(tool) --version")
+        let found = await ProfileFreeLoginShell(tools: with, zdotdir: zdotdir.path).run("\(tool) --version")
         XCTAssertEqual(found.trimmedOutput, "v98.1.0")
 
         // Negative control: without the directory the shell does not find it.
-        let missing = await LoginShell(tools: ToolEnvironment(home: home.path)).run("\(tool) --version")
+        let missing = await ProfileFreeLoginShell(tools: ToolEnvironment(home: home.path), zdotdir: zdotdir.path)
+            .run("\(tool) --version")
         XCTAssertEqual(missing.exitCode, 127)
     }
 }
