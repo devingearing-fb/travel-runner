@@ -1,0 +1,4 @@
+# Snapshot excerpt of fb-travel-monolith supabase/config.toml: the project id
+# names the database container (supabase_db_<project_id>).
+
+project_id = "fb-travel"

@@ -47,22 +47,18 @@ final class DbSeedScenarioTests: XCTestCase {
         ])
     }
 
-    /// The monorepo's own manifest (version 4), when the checkout sits beside this repo.
+    /// The monorepo's own manifest (version 4): the pinned snapshot, or the real
+    /// checkout with TR_INTEGRATION=1.
     func testMonorepoManifestLoadsItsScenariosAndSteps() throws {
-        let manifest = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .appendingPathComponent("fb-travel-monolith/scripts/db/manifest.json")
-        guard FileManager.default.fileExists(atPath: manifest.path) else {
-            throw XCTSkip("fb-travel-monolith is not checked out beside travel-runner")
-        }
+        let manifest = try MonolithCheckout.file("scripts/db/manifest.json")
         let catalog = try DbManifestLoader.loadSeedScenarios(from: manifest.path)
         XCTAssertEqual(catalog.defaultID, "standard")
         XCTAssertTrue(Set(catalog.items.map(\.id)).isSuperset(of: ["standard", "schema-only", "sold-out", "redis-cache"]))
 
         let steps = MainActor.assumeIsolated { DbManifestLoader.load(from: manifest.path, profile: "full") }
         XCTAssertEqual(steps.map(\.id), [
-            "check-prerequisites", "start-supabase", "reset-database", "load-hotels", "copy-event-data", "verify-data",
+            "check-prerequisites", "start-supabase", "fetch-hotels", "reset-database", "load-hotels",
+            "copy-event-data", "verify-data",
         ])
     }
 

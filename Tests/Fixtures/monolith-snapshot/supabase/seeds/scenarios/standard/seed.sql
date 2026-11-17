@@ -1,0 +1,1 @@
+-- Snapshot placeholder. The seed data is not copied: the tests read only scenario.json.

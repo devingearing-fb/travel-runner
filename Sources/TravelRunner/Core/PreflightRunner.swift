@@ -116,12 +116,13 @@ struct PreflightRunner: Sendable {
                     fix: "Run node --version in a terminal to see what it waits for"
                 )
             }
-            let version = result.trimmedOutput
-            guard !version.isEmpty else {
+            // A login profile can print lines first ("Now using node v22.3.0"): the
+            // version is the last line that is only a version.
+            guard let number = ToolVersion.parse(result.stdout) else {
                 return .failed(message: "Node.js not found", fix: "Install Node 22 via nvm or brew")
             }
-            let majorStr = version.dropFirst().split(separator: ".").first ?? ""
-            let major = Int(majorStr) ?? 0
+            let version = "v\(number)"
+            let major = EnvironmentChecker.major(of: number) ?? 0
             if major >= 22 {
                 return .passed(detail: version)
             } else if major >= 18 {
