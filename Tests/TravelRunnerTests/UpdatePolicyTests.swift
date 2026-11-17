@@ -1,4 +1,5 @@
 import Foundation
+import Sparkle
 import XCTest
 @testable import TravelRunner
 
@@ -193,10 +194,34 @@ final class UpdatePolicyTests: XCTestCase {
             ("database", UpdatePolicy.RestartState(databaseBusy: true)),
             ("fix", UpdatePolicy.RestartState(fixRunning: true)),
             ("reconfigure", UpdatePolicy.RestartState(reconfigureRunning: true)),
+            ("report or preflight", UpdatePolicy.RestartState(otherWorkRunning: true)),
         ]
         for (name, state) in busy {
             XCTAssertFalse(UpdatePolicy.mayRestartUnattended(state, isDev: false), name)
         }
+    }
+
+    /// The idle restart needs a downloaded update and Sparkle's install handler.
+    func testOnlyADownloadedUpdateWithAHandlerInstallsByItself() {
+        XCTAssertTrue(UpdatePolicy.canInstallUnattended(.ready(version: "0.13.7"), hasInstallHandler: true))
+        XCTAssertFalse(UpdatePolicy.canInstallUnattended(.ready(version: "0.13.7"), hasInstallHandler: false))
+        XCTAssertFalse(UpdatePolicy.canInstallUnattended(.available(version: "0.13.7"), hasInstallHandler: true))
+        XCTAssertFalse(UpdatePolicy.canInstallUnattended(nil, hasInstallHandler: true))
+    }
+
+    /// Only a copy on the newest version forgets the versions-behind record. A newest
+    /// version that needs a newer macOS keeps this copy behind.
+    func testOnlyACopyOnTheNewestVersionCountsAsUpToDate() {
+        func noUpdate(_ reason: SPUNoUpdateFoundReason?) -> NSError {
+            var info: [String: Any] = [:]
+            if let reason { info[SPUNoUpdateFoundReasonKey] = NSNumber(value: reason.rawValue) }
+            return NSError(domain: SUSparkleErrorDomain, code: Int(SUError.noUpdateError.rawValue), userInfo: info)
+        }
+        XCTAssertTrue(UpdateController.isOnLatestVersion(noUpdate(.onLatestVersion)))
+        XCTAssertTrue(UpdateController.isOnLatestVersion(noUpdate(.onNewerThanLatestVersion)))
+        XCTAssertFalse(UpdateController.isOnLatestVersion(noUpdate(.systemIsTooOld)))
+        XCTAssertFalse(UpdateController.isOnLatestVersion(noUpdate(.unknown)))
+        XCTAssertFalse(UpdateController.isOnLatestVersion(noUpdate(nil)))
     }
 
     func testADevBuildNeverRestartsByItself() {

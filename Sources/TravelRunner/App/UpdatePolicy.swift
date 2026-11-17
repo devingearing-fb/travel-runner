@@ -141,6 +141,8 @@ enum UpdatePolicy {
         var fixRunning = false
         /// New paths are being applied.
         var reconfigureRunning = false
+        /// A problem report saves its zip, or `/api/preflight` runs its checks.
+        var otherWorkRunning = false
     }
 
     /// How often the update controller looks at the app's state.
@@ -154,7 +156,13 @@ enum UpdatePolicy {
     static func mayRestartUnattended(_ state: RestartState, isDev: Bool) -> Bool {
         guard !isDev else { return false }
         return !state.stackRunning && !state.panelOpen && !state.databaseBusy
-            && !state.fixRunning && !state.reconfigureRunning
+            && !state.fixRunning && !state.reconfigureRunning && !state.otherWorkRunning
+    }
+
+    /// The idle restart needs a downloaded update and Sparkle's handler that installs it.
+    static func canInstallUnattended(_ pending: PendingUpdate?, hasInstallHandler: Bool) -> Bool {
+        guard case .ready = pending else { return false }
+        return hasInstallHandler
     }
 
     /// The idle ticks in a row after this tick. The restart runs at `idleTicksBeforeRestart`.

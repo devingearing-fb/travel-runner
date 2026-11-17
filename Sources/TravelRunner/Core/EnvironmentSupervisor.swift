@@ -64,6 +64,8 @@ final class EnvironmentSupervisor {
     private(set) var reconfigurePending = false
     /// Reconfigures that run now, "Stop and apply" included.
     private var reconfiguresRunning = 0
+    /// `/api/preflight` requests that run their checks now.
+    private var preflightRequestsRunning = 0
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
@@ -403,14 +405,25 @@ final class EnvironmentSupervisor {
 
     /// What a restart for an update would interrupt now. The window is the app's to report.
     func updateRestartState(panelOpen: Bool) async -> UpdatePolicy.RestartState {
-        // The quit stops the holds viewer too.
-        let stackRunning = await holdsLiveStack() || holdsViewer.pid != nil
-        return UpdatePolicy.RestartState(
-            stackRunning: stackRunning,
+        // The process runner answers first: the other checks then see the state of this moment.
+        let processRuns = await processRunner.hasRunningProcess()
+        var state = updateRestartStateNow(panelOpen: panelOpen)
+        state.stackRunning = state.stackRunning || processRuns
+        return state
+    }
+
+    /// `updateRestartState` without the process runner, read at once. The update
+    /// controller reads it again right before the install: a click may have come
+    /// while the process runner answered.
+    func updateRestartStateNow(panelOpen: Bool) -> UpdatePolicy.RestartState {
+        UpdatePolicy.RestartState(
+            // The quit stops the holds viewer too.
+            stackRunning: holdsLiveStackNow() || holdsViewer.pid != nil,
             panelOpen: panelOpen,
             databaseBusy: dbResetRunning || dbSetupPipeline?.isRunning == true,
             fixRunning: EnvironmentChecker.fixesRunning > 0,
-            reconfigureRunning: reconfiguresRunning > 0
+            reconfigureRunning: reconfiguresRunning > 0,
+            otherWorkRunning: reportExportRunning || preflightRequestsRunning > 0
         )
     }
 
@@ -421,6 +434,11 @@ final class EnvironmentSupervisor {
         // after its process ends. The process runner knows what runs. It answers
         // first: the other checks then see the state of this moment.
         if await processRunner.hasRunningProcess() { return true }
+        return holdsLiveStackNow()
+    }
+
+    /// `holdsLiveStack` without the process runner.
+    private func holdsLiveStackNow() -> Bool {
         if startTask != nil || isShuttingDown || !actionsInFlight.isEmpty { return true }
         if dbResetRunning || dbSetupPipeline?.isRunning == true { return true }
         let livePhases: Set<ServicePhase> = [.starting, .running, .stopping]
@@ -806,6 +824,8 @@ final class EnvironmentSupervisor {
     /// (Node, the ports, the folders), run now. Each check has a time limit, so
     /// the answer always comes. Without a config only the Node check runs.
     func preflightJSON() async -> String {
+        preflightRequestsRunning += 1
+        defer { preflightRequestsRunning -= 1 }
         let runner = preflightRunner
         var rows: [[String: String]] = []
         for check in runner.readOnlyChecks(for: loadedServices) {

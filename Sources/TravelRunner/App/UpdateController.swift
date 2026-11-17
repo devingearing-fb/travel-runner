@@ -20,6 +20,8 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
 
     /// What a restart would interrupt now. Without it the app never restarts by itself.
     @ObservationIgnored var restartState: (@MainActor () async -> UpdatePolicy.RestartState)?
+    /// The same state read at once, right before the install. Without it the app never restarts by itself.
+    @ObservationIgnored var restartStateNow: (@MainActor () -> UpdatePolicy.RestartState)?
     @ObservationIgnored private var idleTicks = 0
     @ObservationIgnored private var tickTask: Task<Void, Never>?
     @ObservationIgnored private let build: BuildInfo
@@ -71,17 +73,33 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
     /// Installs a downloaded update when nothing would be interrupted: the stack is
     /// stopped, the window is closed, and no database step, fix or reconfigure runs.
     private func restartIfIdle() async {
-        guard case .ready = pending, installHandler != nil, let restartState else {
+        guard UpdatePolicy.canInstallUnattended(pending, hasInstallHandler: installHandler != nil),
+              let restartState, let restartStateNow else {
             idleTicks = 0
             return
         }
         let state = await restartState()
         let idle = UpdatePolicy.mayRestartUnattended(state, isDev: build.isDev)
         idleTicks = UpdatePolicy.idleTicks(after: idleTicks, idle: idle)
-        // The update may have gone while the state was read.
-        guard idleTicks >= UpdatePolicy.idleTicksBeforeRestart, case .ready = pending, let installHandler else { return }
+        guard idleTicks >= UpdatePolicy.idleTicksBeforeRestart else { return }
+        // The update may have gone, or a click may have come, while the state was read.
+        guard UpdatePolicy.canInstallUnattended(pending, hasInstallHandler: installHandler != nil),
+              UpdatePolicy.mayRestartUnattended(restartStateNow(), isDev: build.isDev),
+              let installHandler else {
+            idleTicks = 0
+            return
+        }
         idleTicks = 0
         installHandler()
+    }
+
+    /// True when a check that found no update says this copy is on the newest
+    /// version, or newer.
+    nonisolated static func isOnLatestVersion(_ error: any Error) -> Bool {
+        let info = (error as NSError).userInfo
+        guard let raw = (info[SPUNoUpdateFoundReasonKey] as? NSNumber)?.int32Value,
+              let reason = SPUNoUpdateFoundReason(rawValue: raw) else { return false }
+        return reason == .onLatestVersion || reason == .onNewerThanLatestVersion
     }
 
     private func refreshBehindNotice() {
@@ -128,9 +146,11 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
         noteLatest(item)
     }
 
-    /// This copy is the newest version.
-    func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
-        guard !build.isDev else { return }
+    /// No newer version to install. Only a copy on the newest version forgets the
+    /// record: a newest version that needs a newer macOS, or another reason, keeps
+    /// this copy behind, and the banner and its 7 days stay.
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: any Error) {
+        guard !build.isDev, Self.isOnLatestVersion(error) else { return }
         behind = nil
         UpdatePolicy.clearBehind(defaults: defaults)
         refreshBehindNotice()
@@ -138,6 +158,9 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
 
     /// An update was downloaded in the background. Sparkle installs it at quit;
     /// the pill lets the user install it now, and an idle app installs it by itself.
+    /// Sparkle runs no more checks until then, so the banner keeps the newest
+    /// version of the last check. That is accepted: the install at the next quit
+    /// or idle moment updates past it, and the next launch checks again.
     func updater(
         _ updater: SPUUpdater,
         willInstallUpdateOnQuit item: SUAppcastItem,

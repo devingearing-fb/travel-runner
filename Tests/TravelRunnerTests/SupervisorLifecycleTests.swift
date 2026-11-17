@@ -456,6 +456,71 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertFalse(UpdatePolicy.mayRestartUnattended(resetting, isDev: false))
     }
 
+    /// A fix of the setup checks keeps the app running until it ends. A count that
+    /// never went down would block the restart for good.
+    func testAnUpdateRestartWaitsForAFixToEnd() async throws {
+        let gate = Gate()
+        let runner = FakeCommandRunner { call in
+            if call.command.contains(StripeLauncher.installCommand) { await gate.wait() }
+            return FakeCommandRunner.ok()
+        }
+        let checker = EnvironmentChecker(
+            monorepoPath: workDir.path, loginPath: "/nonexistent/login", streamServicesPath: "/nonexistent/stream",
+            flavor: .standard, shell: runner, tools: ToolEnvironment(home: workDir.path)
+        )
+        checker.buildChecks()
+        let idle = await supervisor.updateRestartState(panelOpen: false)
+        XCTAssertFalse(idle.fixRunning, "no fix runs yet")
+
+        let fix = Task { await checker.fix("stripe-cli") }
+        let held = await waitUntil(5) { self.supervisor.updateRestartStateNow(panelOpen: false).fixRunning }
+        XCTAssertTrue(held, "the fix runs")
+        XCTAssertFalse(UpdatePolicy.mayRestartUnattended(supervisor.updateRestartStateNow(panelOpen: false), isDev: false))
+
+        await gate.open()
+        await fix.value
+        let after = await supervisor.updateRestartState(panelOpen: false)
+        XCTAssertFalse(after.fixRunning, "the count goes down when the fix ends")
+    }
+
+    /// "Stop and apply" keeps the app running until the new paths are applied.
+    func testAnUpdateRestartWaitsForStopAndApplyToEnd() async throws {
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let ready = await waitUntil(40) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let loads = fakeConfigHost(services: ["other"])
+        XCTAssertFalse(supervisor.updateRestartStateNow(panelOpen: false).reconfigureRunning)
+
+        let task = supervisor.stopAndReconfigure()
+        XCTAssertTrue(supervisor.updateRestartStateNow(panelOpen: false).reconfigureRunning, "set before the stop ends")
+        let result = await task.value
+
+        XCTAssertEqual(result, .applied)
+        let after = await supervisor.updateRestartState(panelOpen: false)
+        XCTAssertFalse(after.reconfigureRunning, "the count goes down when the apply ends")
+        XCTAssertEqual(after, UpdatePolicy.RestartState())
+        await loads.stopControlServers()
+    }
+
+    /// A check through `/api/preflight` keeps the app running until it answers.
+    func testAnUpdateRestartWaitsForAPreflightRequest() async throws {
+        let gate = Gate()
+        supervisor.shell = FakeCommandRunner { _ in
+            await gate.wait()
+            return FakeCommandRunner.ok("v22.0.0")
+        }
+        XCTAssertFalse(supervisor.updateRestartStateNow(panelOpen: false).otherWorkRunning)
+
+        let request = Task { await self.supervisor.preflightJSON() }
+        let held = await waitUntil(5) { self.supervisor.updateRestartStateNow(panelOpen: false).otherWorkRunning }
+        XCTAssertTrue(held, "the preflight runs")
+
+        await gate.open()
+        _ = await request.value
+        XCTAssertFalse(supervisor.updateRestartStateNow(panelOpen: false).otherWorkRunning)
+    }
+
     /// Ticket "Local Sequin Cache CDC exited with code 9": the old process ended two
     /// seconds after the stop, when the restart was on its way, and counted as a crash.
     func testAProcessThatDiesLateDoesNotFailTheRestart() async throws {
