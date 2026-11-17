@@ -173,12 +173,16 @@ final class DbSetupProtocolTests: XCTestCase {
             ),
             hotels.checkDescription
         )
+        let failed = CommandResult(exitCode: 1, stdout: "", stderr: "Local Supabase is not running\n")
         XCTAssertEqual(
-            EnvironmentChecker.fixFailedText(for: "hotel-data"),
-            "Download failed — start the stack first (the download needs the local Supabase and the shared apps/booking-portal/.env), then retry"
+            EnvironmentChecker.fixFailedText(for: "hotel-data", result: failed, timeout: EnvironmentChecker.fixTimeout),
+            "Fix failed (exit 1): Local Supabase is not running — start the stack first (the download needs the local Supabase and the shared apps/booking-portal/.env), then retry"
         )
-        // Negative control: another row keeps the general text.
-        XCTAssertEqual(EnvironmentChecker.fixFailedText(for: "stream-modules"), "Fix failed — try manually")
+        // Negative control: another row has no hint.
+        XCTAssertEqual(
+            EnvironmentChecker.fixFailedText(for: "stream-modules", result: failed, timeout: EnvironmentChecker.installTimeout),
+            "Fix failed (exit 1): Local Supabase is not running"
+        )
     }
 
     func testTheHotelFixDoesNotResetTheDatabase() {

@@ -62,21 +62,35 @@ final class EnvironmentChecker {
 
     private(set) var checks: [HealthCheck] = []
 
+    /// The fix that the fix sheet shows. Nil when the sheet is closed.
+    var activeFix: FixRun?
+
     /// Runs the commands of the checks and the fixes.
     private let commandRunner: any CommandRunning
     private let tools: ToolEnvironment
+    /// The time stamps of a fix, and the waits of a fix that polls its check.
+    private let clock: RunnerClock
 
     /// A check command that hangs fails after this time.
-    nonisolated static let checkTimeout: Duration = .seconds(15)
-    /// A fix can install packages or load the hotels, so it gets a long time.
+    nonisolated static let checkTimeout: Duration = .seconds(20)
+    /// An install of packages or of a tool stops after this time.
+    nonisolated static let installTimeout: Duration = .seconds(15 * 60)
+    /// Another fix that runs a command (the hotel download) stops after this time.
     nonisolated static let fixTimeout: Duration = .seconds(20 * 60)
+    /// A fix that waits for the person (`stripe login`) or for an app checks again this often.
+    nonisolated static let fixPollInterval: Duration = .seconds(3)
+    /// How long the runner waits for `stripe login` in Terminal.
+    nonisolated static let stripeLoginWait: Duration = .seconds(3 * 60)
+    /// How long the runner waits for the container app to accept connections.
+    nonisolated static let containerRuntimeWait: Duration = .seconds(60)
 
     init(
         monorepoPath: String, loginPath: String, streamServicesPath: String, flavor: Flavor = .current,
-        shell: any CommandRunning = LoginShell(), tools: ToolEnvironment = .shared
+        shell: any CommandRunning = LoginShell(), tools: ToolEnvironment = .shared, clock: RunnerClock = .live
     ) {
         self.commandRunner = shell
         self.tools = tools
+        self.clock = clock
         self.flavor = flavor
         self.monorepoPath = NSString(string: monorepoPath).expandingTildeInPath
         self.loginPath = NSString(string: loginPath).expandingTildeInPath
@@ -222,12 +236,20 @@ final class EnvironmentChecker {
 
     /// The result of the pnpm row after its fix ran. When pnpm still reports another version, the fix
     /// installed the pin but another pnpm comes first on the PATH: the row names that one.
-    nonisolated static func pnpmStatusAfterFix(recheck: CheckStatus, fixSucceeded: Bool, firstOnPath: String?) -> CheckStatus {
+    /// `failure` is the text of a fix that failed, nil when the fix succeeded.
+    nonisolated static func pnpmStatusAfterFix(recheck: CheckStatus, failure: String?, firstOnPath: String?) -> CheckStatus {
         guard case .failing(let detail) = recheck else { return recheck }
         if detail.hasPrefix("v"), let firstOnPath, !firstOnPath.isEmpty {
             return .failing("\(detail). Another pnpm is first on the PATH: \(firstOnPath) — remove it, then re-check")
         }
-        return fixSucceeded ? recheck : .failing("Fix failed — try manually")
+        return statusAfterFix(recheck: recheck, failure: failure)
+    }
+
+    /// The result of a row after its fix ran: a check that passes now passes, whatever the
+    /// fix returned. Otherwise a failed fix shows why it failed.
+    nonisolated static func statusAfterFix(recheck: CheckStatus, failure: String?) -> CheckStatus {
+        if case .passing = recheck { return recheck }
+        return failure.map(CheckStatus.failing) ?? recheck
     }
 
     func buildChecks() {
@@ -241,6 +263,7 @@ final class EnvironmentChecker {
                         checkCommand: "docker ps",
                         checkDescription: "Verifies \(runtime.displayName) is running and accepting connections"),
             HealthCheck(id: "node", name: "Node.js 22+", section: .prerequisites,
+                        fixLabel: "How to install",
                         checkCommand: "node --version",
                         checkDescription: "Next.js 16 requires Node.js 22 or higher"),
             HealthCheck(id: "pnpm", name: "pnpm \(pnpmMajor)", section: .prerequisites,
@@ -296,9 +319,9 @@ final class EnvironmentChecker {
                         checkCommand: "ls ../fb-amateur-backend .backend-baseline",
                         checkDescription: "scripts/local-db.sh replays fb-amateur-backend's migrations. It uses a checkout beside the monorepo, or clones one into .backend-baseline/ on the first reset."),
             HealthCheck(id: "login-env", name: "Login .env.local", section: .supabase,
-                        fixLabel: "Create from template",
+                        fixLabel: "Add missing keys",
                         checkCommand: "grep ALLOW_LOCALHOST_REDIRECTS .env.local",
-                        checkDescription: "Must contain Supabase URL/keys and ALLOW_LOCALHOST_REDIRECTS=true for local auth flow",
+                        checkDescription: "Must contain ALLOW_LOCALHOST_REDIRECTS=true for the local auth flow. The runner adds the local Supabase keys when it starts the login. The fix adds only the keys that are missing, keeps your values, and saves a copy of the file first.",
                         checkPath: (loginPath as NSString).appendingPathComponent(".env.local")),
             HealthCheck(id: "hotel-data", name: "Hotel data cached", section: .supabase,
                         isRequired: false, fixLabel: "Download hotels",
@@ -357,14 +380,47 @@ final class EnvironmentChecker {
     nonisolated static let pyJWTFixCommand =
         "python3 -m pip install --user pyjwt || python3 -m pip install --user --break-system-packages pyjwt"
 
-    /// What a row shows when its fix failed.
-    nonisolated static func fixFailedText(for checkID: String) -> String {
-        switch checkID {
-        case "hotel-data":
-            "Download failed — start the stack first (the download needs the local Supabase and the shared apps/booking-portal/.env), then retry"
-        default:
-            "Fix failed — try manually"
+    /// pnpm prints this when GitHub Packages rejects the token of `~/.npmrc`.
+    nonisolated static let registryRejectedMarker = "ERR_PNPM_FETCH_401"
+    nonisolated static let registryRejectedText =
+        "GitHub Packages rejected your token — fix the 'GitHub Packages auth' row, then retry."
+
+    /// What the hotel row adds to a failure: the download needs the stack.
+    nonisolated static let hotelDataFixHint =
+        "start the stack first (the download needs the local Supabase and the shared apps/booking-portal/.env), then retry"
+
+    /// What a row and the fix sheet show when the command of a fix failed:
+    /// "Fix failed (exit N): <last error line>".
+    nonisolated static func fixFailedText(for checkID: String, result: CommandResult, timeout: Duration) -> String {
+        let output = result.stdout + "\n" + result.stderr
+        if output.contains(registryRejectedMarker) { return registryRejectedText }
+        var text: String
+        if result.timedOut {
+            text = "Fix stopped after \(durationText(timeout)): it did not finish"
+        } else if let line = lastErrorLine(result) {
+            text = "Fix failed (exit \(result.exitCode)): \(line)"
+        } else {
+            text = "Fix failed (exit \(result.exitCode))"
         }
+        if checkID == "hotel-data" { text += " — \(hotelDataFixHint)" }
+        return text
+    }
+
+    /// The last line of the error output that has text, or of the output when the error output has none.
+    nonisolated static func lastErrorLine(_ result: CommandResult) -> String? {
+        func last(_ text: String) -> String? {
+            text.components(separatedBy: .newlines).reversed()
+                .map { TerminalLineBuffer.stripAnsiEscapes($0).trimmingCharacters(in: .whitespaces) }
+                .first { !$0.isEmpty }
+        }
+        guard let line = last(result.stderr) ?? last(result.stdout) else { return nil }
+        return line.count > 200 ? String(line.prefix(200)) + "…" : line
+    }
+
+    /// "15 min" or "20 s".
+    nonisolated static func durationText(_ duration: Duration) -> String {
+        let seconds = duration.components.seconds
+        return seconds >= 60 && seconds % 60 == 0 ? "\(seconds / 60) min" : "\(seconds) s"
     }
 
     func runAllChecks() async {
@@ -388,30 +444,59 @@ final class EnvironmentChecker {
         await runAllChecks()
     }
 
+    /// Runs the fix of a check. A fix that runs something shows it in the fix sheet
+    /// (`activeFix`): its output, the time, Cancel. Then the check runs again.
+    /// One fix runs at a time.
     func fix(_ checkID: String) async {
-        guard let check = checks.first(where: { $0.id == checkID }) else { return }
-        check.status = .fixing
+        guard let check = checks.first(where: { $0.id == checkID }),
+              let action = fixAction(for: checkID) else { return }
+        if let activeFix, activeFix.isRunning { return }
 
-        guard let success = await runFix(checkID) else {
-            // Cancelled: nothing changed.
-            check.status = await runCheck(checkID)
+        switch action {
+        case .guidance:
+            activeFix = FixRun(checkID: checkID, checkName: check.name, action: action, startedAt: clock.date(), state: .guidance)
             return
-        }
-        if checkID == "pnpm" {
+        case .importFile:
+            check.status = .fixing
+            let imported = await runImport(checkID)
             let recheck = await runCheck(checkID)
+            // Nil: the developer cancelled and nothing changed.
+            check.status = imported == false
+                ? Self.statusAfterFix(recheck: recheck, failure: "Import failed — the file was not copied")
+                : recheck
+            return
+        default:
+            break
+        }
+
+        check.status = .fixing
+        let run = FixRun(checkID: checkID, checkName: check.name, action: action, startedAt: clock.date())
+        activeFix = run
+        let task = Task { await self.perform(action, checkID: checkID, run: run) }
+        run.task = task
+        let outcome = await task.value
+        run.finish(outcome, at: clock.date())
+
+        // The check runs again outside the task of the fix, so a cancel does not stop it.
+        let failure: String? = if case .failed(let text) = outcome { text } else { nil }
+        let recheck = await runCheck(checkID)
+        if checkID == "pnpm" {
             // The fix can add pnpm to a folder that only a new shell has on its PATH.
             await tools.resolve(runner: commandRunner)
             let (path, _) = await shellOutput("command -v pnpm")
             check.status = Self.pnpmStatusAfterFix(
-                recheck: recheck, fixSucceeded: success,
+                recheck: recheck, failure: failure,
                 firstOnPath: path.trimmingCharacters(in: .whitespacesAndNewlines)
             )
-        } else if success {
-            let newStatus = await runCheck(checkID)
-            check.status = newStatus
         } else {
-            check.status = .failing(Self.fixFailedText(for: checkID))
+            check.status = Self.statusAfterFix(recheck: recheck, failure: failure)
         }
+    }
+
+    /// Closes the fix sheet. A fix that still runs keeps the sheet.
+    func closeFixSheet() {
+        if let activeFix, activeFix.isRunning { return }
+        activeFix = nil
     }
 
     // MARK: - Check implementations
@@ -621,68 +706,159 @@ final class EnvironmentChecker {
     /// `pnpm db:hotels` stops when one of these is absent.
     nonisolated static let hotelDataFixNeeds = "The fix needs the local Supabase running and the shared apps/booking-portal/.env."
 
-    /// nil when the developer cancelled and nothing changed.
-    private func runFix(_ id: String) async -> Bool? {
+    /// The command that opens Terminal with `command` in a new window.
+    nonisolated static func terminalCommand(_ command: String) -> String {
+        let escaped = command.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        return "osascript -e \(ShellQuote.quote("tell application \"Terminal\" to do script \"\(escaped)\""))"
+    }
+
+    nonisolated static let nodeGuidance = "Install Node 22: `brew install node@22` or `nvm install 22`"
+
+    /// What the fix button of a check does. Nil when the check has no fix.
+    /// No fix resets the database or replaces a file without a copy.
+    func fixAction(for id: String) -> FixAction? {
+        func inFolder(_ folder: String, _ command: String) -> String {
+            "cd \(ShellQuote.quote(folder)) && \(command)"
+        }
         switch id {
         case "docker":
-            let runtime = ContainerRuntime.detect()
-            _ = await shell("open -a '\(runtime.appName)'")
-            for _ in 0..<10 {
-                try? await Task.sleep(for: .seconds(2))
-                if await shell("docker ps >/dev/null 2>&1") { return true }
-            }
-            return false
-
+            return .navigate(app: ContainerRuntime.detect().appName, waitFor: Self.containerRuntimeWait)
+        case "node":
+            return .guidance(
+                text: Self.nodeGuidance, copyCommand: "brew install node@22",
+                url: URL(string: "https://nodejs.org/en/download")
+            )
         case "pnpm":
-            return await fixShell(Self.pnpmFixCommand(pin: Self.pnpmPin(monorepo: monorepoPath), monorepo: monorepoPath))
-
+            return .command(Self.pnpmFixCommand(pin: Self.pnpmPin(monorepo: monorepoPath), monorepo: monorepoPath), timeout: Self.installTimeout)
         case "python-jwt":
-            return await fixShell(Self.pyJWTFixCommand)
-
+            return .command(Self.pyJWTFixCommand, timeout: Self.installTimeout)
         case "stripe-auth":
-            // Can't run interactive login from here — open terminal
-            _ = await shell("open -a Terminal")
-            return false
-
+            return .terminal(command: "stripe login", waitFor: Self.stripeLoginWait)
         case "workspace-modules":
-            return await fixShellInDir(monorepoPath, "pnpm install")
-
+            return .command(inFolder(monorepoPath, "pnpm install --frozen-lockfile"), timeout: Self.installTimeout)
         case "login-modules":
-            return await fixShellInDir(loginPath, "npm install")
-
+            return .command(inFolder(loginPath, "npm install"), timeout: Self.installTimeout)
         case "stream-modules":
-            return await fixShellInDir(streamServicesPath, "npm install")
-
-        case "booking-env":
-            return await importSharedEnv(.booking)
-
-        case "partner-env":
-            return await importSharedEnv(.partner)
-
+            return .command(inFolder(streamServicesPath, "npm install"), timeout: Self.installTimeout)
+        case "booking-env", "partner-env", "platform-env", "event-env", "agent-env":
+            return .importFile
         case "login-env":
-            return createLoginEnvLocal()
-
+            return .inApp
         case "hotel-data":
-            return await fixShellInDir(monorepoPath, Self.hotelDataFixCommand)
-
+            return .command(inFolder(monorepoPath, Self.hotelDataFixCommand), timeout: Self.fixTimeout)
         case "agent-node":
-            return await fixShell("brew install node@\(ServiceCatalog.agentNodeMajor)")
-
-        case "platform-env":
-            return importPlatformCoreEnv()
-
-        case "event-env":
-            return importEventDirectoryEnv()
-
-        case "agent-env":
-            return importAgentEnv()
-
+            return .command("brew install node@\(ServiceCatalog.agentNodeMajor)", timeout: Self.installTimeout)
         case "sb-linked":
             let script = (monorepoPath as NSString).appendingPathComponent("scripts/setup/link-project.sh")
-            return await fixShellInDir(monorepoPath, "bash \(ShellQuote.quote(script))")
-
+            return .command(inFolder(monorepoPath, "bash \(ShellQuote.quote(script))"), timeout: Self.fixTimeout)
         default:
-            return false
+            return nil
+        }
+    }
+
+    /// The work of a fix that shows the sheet. It runs in the task that Cancel stops.
+    private func perform(_ action: FixAction, checkID: String, run: FixRun) async -> FixRun.State {
+        switch action {
+        case .command(let command, let timeout):
+            run.append("$ \(command)")
+            let result = await streamCommand(command, timeout: timeout, into: run)
+            if Task.isCancelled { return .cancelled }
+            return result.succeeded
+                ? .succeeded
+                : .failed(Self.fixFailedText(for: checkID, result: result, timeout: timeout))
+
+        case .terminal(let command, let waitFor):
+            let opened = await runCommand(Self.terminalCommand(command))
+            if Task.isCancelled { return .cancelled }
+            guard opened.succeeded else {
+                return .failed(Self.fixFailedText(for: checkID, result: opened, timeout: Self.checkTimeout))
+            }
+            run.append("Opened Terminal: \(command)")
+            run.append("Finish it in Terminal. Travel Runner checks again every \(Self.durationText(Self.fixPollInterval)) for \(Self.durationText(waitFor)).")
+            return await waitForCheck(
+                checkID, upTo: waitFor,
+                notDone: "Not done after \(Self.durationText(waitFor)) — finish `\(command)` in Terminal, then re-check"
+            )
+
+        case .navigate(let app, let waitFor):
+            let opened = await runCommand("open -a \(ShellQuote.quote(app))")
+            if Task.isCancelled { return .cancelled }
+            guard opened.succeeded else {
+                return .failed(Self.fixFailedText(for: checkID, result: opened, timeout: Self.checkTimeout))
+            }
+            run.append("Opened \(app). Waiting for it to accept connections…")
+            return await waitForCheck(
+                checkID, upTo: waitFor,
+                notDone: "\(app) did not answer in \(Self.durationText(waitFor)) — wait for it to start, then re-check"
+            )
+
+        case .inApp:
+            return performInApp(checkID, run: run)
+
+        case .importFile, .guidance:
+            return .succeeded
+        }
+    }
+
+    /// Runs a command and gives each line of its output to the sheet, in order.
+    private func streamCommand(_ command: String, timeout: Duration, into run: FixRun) async -> CommandResult {
+        let (lines, continuation) = AsyncStream.makeStream(of: String.self)
+        let reader = Task { @MainActor in
+            for await line in lines { run.append(line) }
+        }
+        let result = await commandRunner.run(command, cwd: commandCwd, environment: [:], timeout: timeout) { line, _ in
+            continuation.yield(line)
+        }
+        continuation.finish()
+        await reader.value
+        return result
+    }
+
+    /// Runs the check again every `fixPollInterval` until it passes or `limit` is over.
+    private func waitForCheck(_ checkID: String, upTo limit: Duration, notDone: String) async -> FixRun.State {
+        let deadline = clock.uptime() + limit
+        while clock.uptime() < deadline {
+            do {
+                try await clock.sleep(for: Self.fixPollInterval)
+            } catch {
+                return .cancelled
+            }
+            if case .passing = await runCheck(checkID) { return .succeeded }
+            if Task.isCancelled { return .cancelled }
+        }
+        return .failed(notDone)
+    }
+
+    private func performInApp(_ checkID: String, run: FixRun) -> FixRun.State {
+        guard checkID == "login-env" else { return .failed("This check has no fix") }
+        let path = (loginPath as NSString).appendingPathComponent(".env.local")
+        do {
+            let report = try Self.addMissingLoginEnvKeys(at: path, now: clock.date())
+            if let backup = report.backup { run.append("Saved a copy: \(backup)") }
+            run.append(report.added.isEmpty
+                ? "Every key is there. Nothing was changed."
+                : "Added: \(report.added.joined(separator: ", "))")
+            if !report.kept.isEmpty {
+                run.append("Kept your values: \(report.kept.joined(separator: ", ")). Set them as below by hand if sign-in fails:")
+                for key in report.kept {
+                    if let value = Self.loginEnvTemplate.first(where: { $0.key == key })?.value { run.append("  \(key)=\(value)") }
+                }
+            }
+            return .succeeded
+        } catch {
+            return .failed("Fix failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Runs the import of a check. Nil when the developer cancelled and nothing changed.
+    private func runImport(_ id: String) async -> Bool? {
+        switch id {
+        case "booking-env": await importSharedEnv(.booking)
+        case "partner-env": await importSharedEnv(.partner)
+        case "platform-env": importPlatformCoreEnv()
+        case "event-env": importEventDirectoryEnv()
+        case "agent-env": importAgentEnv()
+        default: false
         }
     }
 
@@ -821,22 +997,52 @@ final class EnvironmentChecker {
 
     /// The login's non-Supabase local values. The runner adds the local stack's Supabase keys
     /// (from scripts/local-db.sh status) when it starts the login, so none are written here.
-    private func createLoginEnvLocal() -> Bool {
-        let content = """
-        NEXT_PUBLIC_SITE_URL=http://localhost:3000
-        NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL=http://localhost:3000
-        ALLOW_LOCALHOST_REDIRECTS=true
-        EMAIL_CONFIRMATION_REQUIRED=false
+    nonisolated static let loginEnvTemplate: [(key: String, value: String)] = [
+        ("NEXT_PUBLIC_SITE_URL", "http://localhost:3000"),
+        ("NEXT_PUBLIC_AMATEUR_LOCAL_UNIVERSAL_LOGIN_URL", "http://localhost:3000"),
+        ("ALLOW_LOCALHOST_REDIRECTS", "true"),
+        ("EMAIL_CONFIRMATION_REQUIRED", "false"),
+    ]
 
-        """
+    struct LoginEnvReport: Equatable, Sendable {
+        /// The name of the copy of the file, or nil when nothing was copied.
+        var backup: String?
+        /// The keys the fix wrote.
+        var added: [String]
+        /// The keys of the template that the file sets to another value. They stay.
+        var kept: [String]
+    }
 
-        let path = (loginPath as NSString).appendingPathComponent(".env.local")
-        do {
-            try content.write(toFile: path, atomically: true, encoding: .utf8)
-            return true
-        } catch {
-            return false
+    /// Adds the keys of `loginEnvTemplate` that the file does not set. A key that is
+    /// there keeps its value. Before it changes a file, it copies it to
+    /// `.env.local.bak-<timestamp>` next to it. A missing file is created.
+    nonisolated static func addMissingLoginEnvKeys(at path: String, now: Date) throws -> LoginEnvReport {
+        let fileManager = FileManager.default
+        let content = fileManager.fileExists(atPath: path) ? try String(contentsOfFile: path, encoding: .utf8) : nil
+        let values = content.map { AgentEnv.parse($0, dialect: .node) } ?? [:]
+        let missing = loginEnvTemplate.filter { values[$0.key] == nil }
+        let kept = loginEnvTemplate.compactMap { pair in
+            values[pair.key].flatMap { $0 == pair.value ? nil : pair.key }
         }
+        guard !missing.isEmpty else { return LoginEnvReport(backup: nil, added: [], kept: kept) }
+
+        var backup: String?
+        if content != nil {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.dateFormat = "yyyyMMdd-HHmmss"
+            let base = "\(path).bak-\(formatter.string(from: now))"
+            var target = base
+            var counter = 2
+            while fileManager.fileExists(atPath: target) {
+                target = "\(base)-\(counter)"
+                counter += 1
+            }
+            try fileManager.copyItem(atPath: path, toPath: target)
+            backup = (target as NSString).lastPathComponent
+        }
+        let added = try EnvCompatLayer(envFilePaths: [path]).addMissing(missing)
+        return LoginEnvReport(backup: backup, added: added, kept: kept)
     }
 
     /// The folder of the commands: the `.nvmrc` of the monorepo picks the Node,
@@ -860,20 +1066,8 @@ final class EnvironmentChecker {
         return result
     }
 
-    private func shell(_ command: String) async -> Bool {
-        await runCommand(command).succeeded
-    }
-
     private func shellOutput(_ command: String) async -> (String, Bool) {
         let result = await runCommand(command)
         return (result.stdout, result.succeeded)
-    }
-
-    private func fixShell(_ command: String) async -> Bool {
-        await runCommand(command, timeout: Self.fixTimeout).succeeded
-    }
-
-    private func fixShellInDir(_ dir: String, _ command: String) async -> Bool {
-        await fixShell("cd \(ShellQuote.quote(dir)) && \(command)")
     }
 }

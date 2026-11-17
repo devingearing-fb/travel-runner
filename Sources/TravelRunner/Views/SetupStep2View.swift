@@ -80,6 +80,12 @@ struct SetupStep2View: View {
             checker.buildChecks()
             await checker.runAllChecks()
         }
+        .sheet(item: Binding(
+            get: { checker.activeFix },
+            set: { if $0 == nil { checker.closeFixSheet() } }
+        )) { run in
+            FixLogSheet(run: run, onClose: checker.closeFixSheet)
+        }
     }
 
     // MARK: - Summary Bar
@@ -186,6 +192,8 @@ struct SetupStep2View: View {
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
                     .tint(.blue)
+                    // One fix runs at a time.
+                    .disabled(checker.activeFix?.isRunning == true)
                 }
             }
 
