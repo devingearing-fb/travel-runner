@@ -345,11 +345,6 @@ final class ToolEnvironment: @unchecked Sendable {
         "\(name) could not find \(tool) when it started. \(appName) read your shell again and found it at \(path). Restart \(name)."
     }
 
-    /// What the user reads when a tool is not on PATH.
-    static func notFoundText(tool: String, searchedPath: String, appName: String = Flavor.current.displayName) -> String {
-        "\(tool) was not found. \(appName) looked in: \(searchedPath). Install \(tool) or add its folder to ~/.zprofile, then restart the service."
-    }
-
     // MARK: - Tools report
 
     /// The tools that the "Tools" block of the diagnostics shows.

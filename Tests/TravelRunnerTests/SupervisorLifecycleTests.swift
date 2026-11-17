@@ -489,6 +489,43 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(supervisor.canPerform(.installDependencies, for: "web"))
     }
 
+    /// pnpm ends with 1, not 127, when `node_modules` is missing, so the service
+    /// restarts until the breaker trips. The halted row still offers the install,
+    /// and the banner says what is missing.
+    func testAPnpmRunWithoutPackagesThatTripsTheBreakerOffersTheInstall() async throws {
+        // A fake pnpm that says what the real one says without node_modules.
+        let bin = workDir.appendingPathComponent("fake bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let pnpm = bin.appendingPathComponent("pnpm")
+        try "#!/bin/sh\necho ' WARN   Local package.json exists, but node_modules missing, did you mean to install?' >&2\nexit 1\n"
+            .write(to: pnpm, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: pnpm.path)
+        try #"{"name":"web","scripts":{"dev":"next dev"}}"#.write(
+            to: workDir.appendingPathComponent("package.json"), atomically: true, encoding: .utf8
+        )
+        let shell = FakeCommandRunner { _ in
+            FakeCommandRunner.ok("__TR_ENV_START__\nPATH=\(bin.path):/usr/bin:/bin\n__TR_ENV_END__\n")
+        }
+        let tools = ToolEnvironment(home: workDir.appendingPathComponent("home").path)
+        await tools.resolve(runner: shell)
+        try makeSupervisor(tools: tools)
+        try load(daemon("web", ["pnpm", "dev"], probeTimeout: 60))
+
+        supervisor.restartService("web")
+
+        let expected = "web cannot start: its packages are not installed in \(workDir.path)."
+        let halted = await waitUntil(40) {
+            self.state("web").isCircuitBroken && self.state("web").condition?.kind == .halted(reason: "crash loop")
+        }
+        XCTAssertTrue(halted, state("web").condition?.text ?? "no condition")
+        XCTAssertEqual(state("web").exitCode, 1)
+        let condition = try XCTUnwrap(state("web").condition)
+        XCTAssertEqual(condition.detail, "Cause: \(expected)")
+        XCTAssertEqual(condition.actions, [.installDependencies, .openLog, .restart])
+        let said = await waitUntil(10) { self.supervisor.lastError == expected }
+        XCTAssertTrue(said, supervisor.lastError ?? "nil")
+    }
+
     /// Exit 126: the file exists but has no execute bit. The row names the file.
     func testExit126NamesTheFileThatIsNotExecutable() async throws {
         let script = workDir.appendingPathComponent("run.sh")

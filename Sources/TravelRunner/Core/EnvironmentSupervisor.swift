@@ -1349,6 +1349,8 @@ final class EnvironmentSupervisor {
         let definition = state.definition
         let probe = definition.probe
         let probePath = probe?.type == .http ? probe?.url.flatMap { URL(string: $0)?.path }.flatMap { $0.isEmpty ? nil : $0 } : nil
+        // The banner of this failure ("exited before it was ready", "crash-looping").
+        let banner = lastError
         Task {
             // The log keeps the lines of earlier launches; they are not the cause of this one.
             let tail = await logStore.entries(for: serviceID)
@@ -1363,6 +1365,16 @@ final class EnvironmentSupervisor {
             )
             state.likelyCause = likely
             state.condition = FailureAdvisor.advise(kind, context, now: clock.date())
+            // A pnpm run that ended with 1 because the packages or the script are
+            // missing: the banner says so too, like exit 127. A newer error stays.
+            switch kind {
+            case .exited, .probeTimeout, .crashLoop, .exhausted:
+                if let banner, lastError == banner, let finding = FailureAdvisor.commandFinding(context) {
+                    lastError = CommandDiagnosis.message(finding, name: definition.displayName)
+                }
+            default:
+                break
+            }
         }
     }
 

@@ -15,6 +15,8 @@ enum CommandDiagnosis {
         case scriptMissing(script: String, packageJSON: String)
         /// The command is a file that this checkout does not have.
         case fileMissing(file: String, folder: String)
+        /// The command is a path outside the checkout, and nothing is there.
+        case pathMissing(file: String)
         /// Exit 126: the file exists but cannot be run.
         case notExecutable(file: String)
         /// No cause was found.
@@ -58,7 +60,10 @@ enum CommandDiagnosis {
                 if first.contains("node_modules/") {
                     return .dependenciesMissing(repo: DependencyWatcher.installTarget(for: cwd).folder)
                 }
-                return .fileMissing(file: first, folder: cwd)
+                // A path outside the checkout (`/usr/local/bin/foo`) is not a file of the branch.
+                let folder = (cwd as NSString).standardizingPath
+                let inCheckout = !first.hasPrefix("/") || (path as NSString).standardizingPath.hasPrefix(folder + "/")
+                return inCheckout ? .fileMissing(file: first, folder: cwd) : .pathMissing(file: first)
             }
         }
         if let finding = packageFinding(command: command, cwd: cwd, logTail: logTail) { return finding }
@@ -166,6 +171,8 @@ enum CommandDiagnosis {
             "\(name) cannot start: this branch has no script `\(script)` in \(packageJSON). Switch branch or pull, then restart \(name)."
         case .fileMissing(let file, let folder):
             "\(name) cannot start: this branch has no file `\(file)` in \(folder). Switch branch or pull, then restart \(name)."
+        case .pathMissing(let file):
+            "\(name) cannot start: there is no file at \(file)."
         case .notExecutable(let file):
             "\(name) cannot start: \(file) is not executable (exit 126)."
         case .unknown(let command, let code):
@@ -180,7 +187,7 @@ enum CommandDiagnosis {
         case .toolFoundNow: [.restart]
         case .dependenciesMissing: [.installDependencies, .openLog]
         case .scriptMissing, .fileMissing: [.restart, .openLog]
-        case .notExecutable, .unknown: [.openLog, .restart]
+        case .pathMissing, .notExecutable, .unknown: [.openLog, .restart]
         }
     }
 }

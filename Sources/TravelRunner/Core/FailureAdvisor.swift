@@ -67,13 +67,13 @@ enum FailureAdvisor {
             let because = cause?.headline ?? context.likelyCause ?? "not clear from the log"
             return condition(
                 "Stopped retrying after \(AutoRestart.failuresToTrip) crashes in a minute.", "Cause: \(sentence(because))",
-                [.restart, .openLog], kind: .halted(reason: "crash loop")
+                haltedActions(cause), kind: .halted(reason: "crash loop")
             )
         case .exhausted(let restarts):
             let because = cause?.headline ?? context.likelyCause ?? "not clear from the log"
             return condition(
                 "\(name) did not come back after \(restarts) restarts.", "Cause: \(sentence(because))",
-                [.restart, .openLog], kind: .halted(reason: "exhausted")
+                haltedActions(cause), kind: .halted(reason: "exhausted")
             )
         case .runtimeDown:
             return condition(
@@ -164,8 +164,7 @@ enum FailureAdvisor {
                 ?? "The port is already in use by another process."
             return Cause(headline: headline, actions: [.stopForeignAndRetry(port: port)])
         }
-        // pnpm ends with 1, not 127, when the packages or the script are missing.
-        if let finding = CommandDiagnosis.diagnoseFailedRun(command: context.command, cwd: context.cwd, logTail: Array(tail)) {
+        if let finding = commandFinding(context) {
             return Cause(
                 headline: CommandDiagnosis.message(finding, name: context.name), actions: CommandDiagnosis.actions(finding)
             )
@@ -177,6 +176,23 @@ enum FailureAdvisor {
             )
         }
         return nil
+    }
+
+    /// What `CommandDiagnosis` finds in the log, when it is the cause that the
+    /// advisor names. pnpm ends with 1, not 127, when the packages or the script
+    /// are missing. A down container runtime and a taken port come first.
+    static func commandFinding(_ context: Context) -> CommandDiagnosis.Finding? {
+        let tail = Array(context.logTail.suffix(logWindow))
+        if CrashCause.showsContainerRuntimeDown(tail) || tail.contains(where: { $0.contains("EADDRINUSE") }) { return nil }
+        return CommandDiagnosis.diagnoseFailedRun(command: context.command, cwd: context.cwd, logTail: tail)
+    }
+
+    /// The buttons of a service that stopped retrying: the fix of the cause first.
+    /// A restart alone fails the same way when the cause has its own fix.
+    private static func haltedActions(_ cause: Cause?) -> [RecoveryAction] {
+        var actions = cause?.actions ?? []
+        for action in [RecoveryAction.restart, .openLog] where !actions.contains(action) { actions.append(action) }
+        return actions
     }
 
     private static let portPattern = try! NSRegularExpression(pattern: #":(\d{2,5})\b"#)

@@ -45,6 +45,11 @@ final class CommandDiagnosisTests: XCTestCase {
                 + "Open Health to see where each tool was found."
         )
         XCTAssertEqual(CommandDiagnosis.actions(finding), [.openHealth, .openLog])
+        // The hackathon app says its own name.
+        XCTAssertTrue(
+            CommandDiagnosis.message(finding, name: "Booking Portal", appName: Flavor.hackathon.displayName)
+                .contains("is not on \(Flavor.hackathon.displayName)'s PATH.")
+        )
     }
 
     func testAToolThatANewReadFoundSaysRestart() {
@@ -181,6 +186,17 @@ final class CommandDiagnosisTests: XCTestCase {
         )
     }
 
+    /// A path outside the checkout is not a file of the branch: no advice to switch branch.
+    func testAMissingPathOutsideTheCheckoutIsNotBlamedOnTheBranch() throws {
+        let finding = diagnose(127, ["/usr/local/bin/tr-no-such-tool-\(UUID().uuidString)"])
+        guard case .pathMissing(let file) = finding else { return XCTFail("\(finding)") }
+        XCTAssertEqual(CommandDiagnosis.message(finding, name: "Custom"), "Custom cannot start: there is no file at \(file).")
+        XCTAssertEqual(CommandDiagnosis.actions(finding), [.openLog, .restart])
+        // Negative control: an absolute path inside the checkout is a file of the branch.
+        let inside = dir.appendingPathComponent("scripts/run.sh").path
+        XCTAssertEqual(diagnose(127, [inside]), .fileMissing(file: inside, folder: dir.path))
+    }
+
     func testExit126NamesTheFileThatIsNotExecutable() {
         let zsh = diagnose(126, ["./scripts/run.sh"], log: ["zsh:1: permission denied: ./scripts/run.sh"])
         XCTAssertEqual(zsh, .notExecutable(file: "./scripts/run.sh"))
@@ -220,6 +236,14 @@ final class CommandDiagnosisTests: XCTestCase {
         let condition = FailureAdvisor.advise(.exited(code: 1), context, now: Date())
         XCTAssertEqual(condition.headline, "Booking Portal cannot start: its packages are not installed in \(dir.path).")
         XCTAssertEqual(condition.actions, [.installDependencies, .openLog])
+
+        // The breaker that stops the restarts keeps the fix: a restart alone fails the same way.
+        for kind in [FailureAdvisor.Kind.crashLoop, .exhausted(restarts: 5)] {
+            let halted = FailureAdvisor.advise(kind, context, now: Date())
+            XCTAssertEqual(halted.detail, "Cause: Booking Portal cannot start: its packages are not installed in \(dir.path).")
+            XCTAssertEqual(halted.actions, [.installDependencies, .openLog, .restart])
+        }
+        XCTAssertEqual(FailureAdvisor.commandFinding(context), .dependenciesMissing(repo: dir.path))
 
         let cannotRun = FailureAdvisor.advise(.cannotRun(.notExecutable(file: "./run.sh")), context, now: Date())
         XCTAssertEqual(cannotRun.headline, "Booking Portal cannot start: ./run.sh is not executable (exit 126).")
