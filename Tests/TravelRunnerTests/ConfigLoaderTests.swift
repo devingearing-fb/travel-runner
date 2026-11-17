@@ -92,6 +92,34 @@ final class ConfigLoaderTests: XCTestCase {
         XCTAssertEqual(config.resolvedProfile, .both)
     }
 
+    /// A path that the file does not give stays unset: no guess at the author's folders.
+    @MainActor
+    func testAPathTheFileDoesNotGiveStaysUnsetAndPreflightSaysSo() async throws {
+        let root: [String: Any] = ["version": 3, "paths": ["monorepo": monorepo], "services": []]
+        let config = try JSONDecoder().decode(
+            ServiceConfig.self,
+            from: ConfigLoader.upgradedData(JSONSerialization.data(withJSONObject: root), findMonorepo: { _ in nil })
+        )
+
+        XCTAssertEqual(config.paths, RepoPaths(monorepo: monorepo))
+        let login = try XCTUnwrap(config.services.first { $0.id == "universal-login" })
+        XCTAssertEqual(login.resolvedCwd, "")
+
+        let preflight = PreflightRunner()
+        let unset = try XCTUnwrap(preflight.allChecks(for: [login]).first { $0.id == "dir-unset" })
+        XCTAssertEqual(unset.name, "Folder of Universal Login")
+        guard case .failed(let message, _) = await preflight.run(check: unset) else {
+            return XCTFail("an unset folder must fail")
+        }
+        XCTAssertEqual(message, "No folder is set — open Settings → Reconfigure Repos")
+
+        let missing = PreflightCheck(id: "dir-gone", name: "gone exists", metadata: ["path": "/nowhere/gone"])
+        guard case .failed(let missingMessage, _) = await preflight.run(check: missing) else {
+            return XCTFail("a missing folder must fail")
+        }
+        XCTAssertEqual(missingMessage, "Directory not found — open Settings → Reconfigure Repos")
+    }
+
     // MARK: - A custom service that cannot run
 
     private func load(customServices: [[String: Any]]) throws -> (config: ServiceConfig, data: Data) {

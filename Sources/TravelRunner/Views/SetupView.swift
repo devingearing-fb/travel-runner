@@ -29,8 +29,14 @@ struct SetupView: View {
     @State private var loadTestPath: String = ""
     @State private var dropTargetHighlighted = false
     @State private var statusMessage: String? = nil
-    @State private var statusIsError = false
+    @State private var statusKind: StatusKind = .success
     @State private var loadedExistingPaths = false
+    /// The checkouts of the monorepo that the last drop found. Several give a chooser.
+    @State private var monorepoCheckouts: [MonorepoCheckout] = []
+
+    private enum StatusKind {
+        case success, warning, error
+    }
 
     var body: some View {
         switch currentStep {
@@ -42,9 +48,9 @@ struct SetupView: View {
                     checker: checker,
                     startsOnComplete: isFirstRun,
                     onBack: { currentStep = .paths },
-                    onComplete: {
+                    onComplete: { start in
                         if savePaths() {
-                            onComplete(.saved(start: isFirstRun))
+                            onComplete(.saved(start: start))
                         } else {
                             // Step 1 shows the error.
                             currentStep = .paths
@@ -86,16 +92,22 @@ struct SetupView: View {
                     dropZone
 
                     repoRow(role: .monorepo, path: $monorepoPath)
+                    if monorepoCheckouts.count > 1 {
+                        checkoutChooser
+                    }
                     repoRow(role: .universalLogin, path: $universalLoginPath)
                     repoRow(role: .streamServices, path: $streamServicesPath)
                     repoRow(role: .loadTest, path: $loadTestPath)
 
                     if let msg = statusMessage {
                         HStack {
-                            if statusIsError {
-                                Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
-                            } else {
+                            switch statusKind {
+                            case .success:
                                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                            case .warning:
+                                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                            case .error:
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
                             }
                             Text(msg).font(.caption).foregroundStyle(.secondary)
                         }
@@ -132,6 +144,33 @@ struct SetupView: View {
             .padding(14)
         }
         .onAppear { loadExistingPaths() }
+        // The first run keeps what was typed, also when the app quits before the end.
+        .onChange(of: draft) { _, paths in
+            if isFirstRun, loadedExistingPaths { SetupState.live.draftPaths = paths }
+        }
+    }
+
+    // MARK: - Worktree chooser
+
+    private var checkoutChooser: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Several checkouts of \(Flavor.current.monorepoName) match. Choose the one to run:")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("Checkout", selection: $monorepoPath) {
+                ForEach(monorepoCheckouts, id: \.path) { checkout in
+                    Text("\(InstanceGuard.displayPath(checkout.path, home: NSHomeDirectory())) — \(checkout.label)")
+                        .font(.system(.caption, design: .monospaced))
+                        .tag(checkout.path)
+                }
+            }
+            .pickerStyle(.radioGroup)
+            .labelsHidden()
+        }
+        .padding(10)
+        .background {
+            RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.06))
+        }
     }
 
     // MARK: - Drop Zone
@@ -204,6 +243,13 @@ struct SetupView: View {
                 }
             }
 
+            if role == .monorepo, let mismatch = RepoDetector.flavorMismatch(path: path.wrappedValue) {
+                Text(mismatch)
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             HStack(spacing: 8) {
                 TextField("Path to repo...", text: path)
                     .font(.system(.caption, design: .monospaced))
@@ -222,7 +268,17 @@ struct SetupView: View {
     // MARK: - Actions
 
     private var canProceed: Bool {
-        RepoDetector.validate(path: monorepoPath, role: .monorepo) && !universalLoginPath.isEmpty
+        RepoDetector.validate(path: monorepoPath, role: .monorepo)
+            && RepoDetector.validate(path: universalLoginPath, role: .universalLogin)
+    }
+
+    private var draft: RepoPaths {
+        RepoPaths(
+            monorepo: monorepoPath.isEmpty ? nil : monorepoPath,
+            universalLogin: universalLoginPath.isEmpty ? nil : universalLoginPath,
+            streamServices: streamServicesPath.isEmpty ? nil : streamServicesPath,
+            loadTest: loadTestPath.isEmpty ? nil : loadTestPath
+        )
     }
 
     /// The paths are saved at the end, not here: a wizard that stops at the checks leaves no config.
@@ -237,20 +293,16 @@ struct SetupView: View {
 
     /// False when the config file could not be written. The message then names the file and the reason.
     private func savePaths() -> Bool {
-        let paths = RepoPaths(
-            monorepo: monorepoPath,
-            universalLogin: universalLoginPath,
-            streamServices: streamServicesPath.isEmpty ? nil : streamServicesPath,
-            loadTest: loadTestPath.isEmpty ? nil : loadTestPath
-        )
+        let paths = draft
         do {
             try ConfigLoader.generate(paths: paths)
+            SetupState.live.markCompleted()
             statusMessage = "Saved"
-            statusIsError = false
+            statusKind = .success
             return true
         } catch {
             statusMessage = "Could not save \(ConfigLoader.configPath): \(error.localizedDescription)"
-            statusIsError = true
+            statusKind = .error
             return false
         }
     }
@@ -258,9 +310,11 @@ struct SetupView: View {
     private func loadExistingPaths() {
         // Once: "Back" from the checks must keep the paths that were typed.
         guard !loadedExistingPaths else { return }
-        loadedExistingPaths = true
-        guard !ConfigLoader.isFirstRun else { return }
-        let paths = ConfigLoader.existingPaths()
+        defer { loadedExistingPaths = true }
+        // A first run that stopped before the end left its paths as a draft.
+        let draft = isFirstRun ? SetupState.live.draftPaths : nil
+        guard draft != nil || !ConfigLoader.isFirstRun else { return }
+        let paths = draft ?? ConfigLoader.existingPaths()
         if let p = paths.monorepo, !p.isEmpty { monorepoPath = p }
         if let p = paths.universalLogin, !p.isEmpty { universalLoginPath = p }
         if let p = paths.streamServices, !p.isEmpty { streamServicesPath = p }
@@ -269,11 +323,13 @@ struct SetupView: View {
 
     private func applyDetected(_ detected: DetectedRepos) {
         var filled: [String] = []
-        statusIsError = false
 
+        monorepoCheckouts = detected.monorepoCheckouts
         if let p = detected.monorepo, monorepoPath.isEmpty || !RepoDetector.validate(path: monorepoPath, role: .monorepo) {
             monorepoPath = p
-            filled.append("Monorepo")
+            filled.append(detected.monorepoCheckouts.count > 1
+                ? "Monorepo (\(detected.monorepoCheckouts.count) checkouts — choose one below)"
+                : "Monorepo")
         }
         if let p = detected.universalLogin, universalLoginPath.isEmpty {
             universalLoginPath = p
@@ -292,12 +348,19 @@ struct SetupView: View {
         if monorepoPath.isEmpty { missing.append("Monorepo") }
         if universalLoginPath.isEmpty { missing.append("Universal Login") }
 
-        if filled.isEmpty {
+        if detected.monorepo == nil, monorepoPath.isEmpty,
+           let other = detected.otherFlavorMonorepo, let mismatch = RepoDetector.flavorMismatch(path: other) {
+            statusMessage = mismatch
+            statusKind = .error
+        } else if filled.isEmpty {
             statusMessage = "No new repos detected in this folder"
+            statusKind = .warning
         } else if missing.isEmpty {
             statusMessage = "Found \(filled.joined(separator: ", "))"
+            statusKind = .success
         } else {
             statusMessage = "Found \(filled.joined(separator: ", ")) — still need \(missing.joined(separator: ", "))"
+            statusKind = .warning
         }
     }
 

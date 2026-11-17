@@ -114,18 +114,13 @@ enum ConfigLoader {
         }
         guard let monorepo else { throw ConfigError.monorepoNotFound }
 
-        let parent = (ServiceCatalog.expand(monorepo) as NSString).deletingLastPathComponent
+        // A path that the file does not give stays unset. A guess at the author's
+        // folder layout pointed at folders that do not exist on other Macs.
         let paths = RepoPaths(
             monorepo: monorepo,
-            universalLogin: nonEmpty(rawPaths["universal_login"])
-                ?? cwd(of: "universal-login", in: rawServices)
-                ?? "~/Documents/Codebases/fb-amateur-universal-login",
-            streamServices: nonEmpty(rawPaths["stream_services"])
-                ?? cwd(of: "stream-services", in: rawServices)
-                ?? "~/Documents/Codebases/stream-services",
-            loadTest: nonEmpty(rawPaths["load_test"])
-                ?? cwd(of: "cache-apply-transport", in: rawServices)
-                ?? (parent as NSString).appendingPathComponent("travel-load-test")
+            universalLogin: nonEmpty(rawPaths["universal_login"]) ?? cwd(of: "universal-login", in: rawServices),
+            streamServices: nonEmpty(rawPaths["stream_services"]) ?? cwd(of: "stream-services", in: rawServices),
+            loadTest: nonEmpty(rawPaths["load_test"]) ?? cwd(of: "cache-apply-transport", in: rawServices)
         )
 
         // A custom service that cannot run stays in the file as it was written, so
