@@ -75,6 +75,8 @@ The API listens from launch, also before the setup wizard has saved a config.
 
 The checkout names the oldest runner that may reset it: `"runner": { "minVersion": "x.y.z" }` in `scripts/db/manifest.json`. A dev build (`./build.sh`) is never blocked. An older release still starts the services, but `db-reset`, `db-setup`, `retry` and `step` answer `409` with `{"ok": false, "error": "runner_too_old", "message": "...", "download_url": "..."}`, and `/api/status` has a `reset_blocked` text.
 
+Each service in `/api/status` has `phase` and `pid`. A failed service adds `reason` (what is wrong and what to do) and, when its log shows one, `likely_cause` (the log line). A skipped service adds `skip_reason`. `last_probe` is the last check of the startup probe, such as `connection refused` or `HTTP 404`.
+
 **Service IDs:** `supabase`, `universal-login`, `stripe`, `travel-portal`,
 `partner-portal`, `cache-apply-transport`, `capacity-contention`,
 `capacity-block-edit-race`, `capacity-overflow`, `stream-services-install`,

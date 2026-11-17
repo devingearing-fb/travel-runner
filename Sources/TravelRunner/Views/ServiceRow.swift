@@ -14,7 +14,12 @@ struct ServiceRow: View {
     @State private var lastVersion: Int = 0
 
     private var showSubtitle: Bool {
-        state.restartCount > 0 || state.isCircuitBroken || state.capturedArtifact != nil
+        state.restartCount > 0 || state.isCircuitBroken || state.capturedArtifact != nil || rowCondition != nil
+    }
+
+    /// Why a skipped or failed service is in that phase. A running one has none.
+    private var rowCondition: ServiceCondition? {
+        state.phase == .skipped || state.phase == .failed ? state.condition : nil
     }
 
     private var isActionInFlight: Bool {
@@ -138,7 +143,14 @@ struct ServiceRow: View {
 
             if showSubtitle {
                 HStack(spacing: 8) {
-                    if state.isCircuitBroken {
+                    if let condition = rowCondition {
+                        Text(condition.text)
+                            .font(.caption2)
+                            .foregroundStyle(state.phase == .failed ? .red : .secondary)
+                            .lineLimit(2)
+                            .help(condition.text)
+                    }
+                    if state.isCircuitBroken, rowCondition == nil {
                         Text("crash-looping — auto-restart stopped")
                             .font(.caption2)
                             .foregroundStyle(.red)

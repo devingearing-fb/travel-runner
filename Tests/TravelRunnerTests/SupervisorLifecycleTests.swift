@@ -576,6 +576,17 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(issue.errorMessage, "slow did not pass its startup probe in 3s (process alive: yes)")
         let log = try String(contentsOf: issues.appendingPathComponent("open/\(issue.id)/logs-slow.txt"), encoding: .utf8)
         XCTAssertTrue(log.contains("slow-start"), log)
+
+        // F4: the row says why, with the last check of the probe.
+        XCTAssertEqual(state("slow").lastProbe, .refused)
+        let said = await waitUntil(5) { self.state("slow").condition != nil }
+        XCTAssertTrue(said)
+        XCTAssertEqual(state("slow").condition?.headline, "slow did not answer on port \(port) within 3s.")
+        XCTAssertEqual(
+            state("slow").condition?.detail,
+            "The process is still running — it may still be compiling. Last check: connection refused."
+        )
+        XCTAssertEqual(supervisor.lastError, "slow did not pass its health probe in 3s (last check: connection refused)")
     }
 
     /// A daemon that crashes once while it starts and then hangs has two waiters: the
@@ -1292,6 +1303,69 @@ final class SupervisorLifecycleTests: XCTestCase {
         )
     }
 
+    /// Finding ux-triage-no-cause: FAILED with three raw lines and no cause. A failed
+    /// service now says why and offers the fix; the reason goes when it runs again.
+    func testAFailedServiceSaysWhyAndTheReasonGoesWhenItRuns() async throws {
+        let marker = workDir.appendingPathComponent("installed").path
+        let script = "if [ -f '\(marker)' ]; then exec \(webServer.joined(separator: " ")); "
+            + "else echo \"Error: Cannot find module 'next'\"; exit 1; fi"
+        try load(ServiceDefinition(
+            id: "web", name: "Web App", cmd: ["sh", "-c", script], cwd: workDir.path,
+            probe: ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30),
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        ))
+
+        supervisor.restartService("web")
+
+        // The exit says why at once; the wait for the probe ends up to two seconds later.
+        let said = await waitUntil(20) {
+            self.state("web").phase == .failed && self.state("web").condition != nil
+                && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(said, "web is \(state("web").phase.rawValue)")
+        let condition = try XCTUnwrap(state("web").condition)
+        XCTAssertEqual(condition.headline, "A package is missing — dependencies are out of date.")
+        XCTAssertEqual(condition.action, .installDependencies)
+        XCTAssertEqual(state("web").likelyCause, "Error: Cannot find module 'next'")
+        XCTAssertEqual(supervisor.lastError, "Web App exited before it was ready — see its log")
+        let failed = EnvironmentSupervisor.statusFields(state("web"))
+        XCTAssertEqual(failed["reason"], condition.text)
+        XCTAssertEqual(failed["likely_cause"], "Error: Cannot find module 'next'")
+        XCTAssertNil(failed["skip_reason"])
+
+        FileManager.default.createFile(atPath: marker, contents: nil)
+        supervisor.restartService("web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        XCTAssertNil(state("web").condition)
+        XCTAssertNil(state("web").likelyCause)
+        XCTAssertEqual(state("web").lastProbe, .ok)
+        let running = EnvironmentSupervisor.statusFields(state("web"))
+        XCTAssertNil(running["reason"])
+        XCTAssertNil(running["likely_cause"])
+        XCTAssertEqual(running["last_probe"], "ready")
+    }
+
+    /// The breaker gives its own reason, and the exit of the third crash does not
+    /// replace it.
+    func testATrippedBreakerSaysItStoppedRetrying() async throws {
+        try load(daemon("boom", ["sh", "-c", "echo boom-start; exit 1"], probeTimeout: 60))
+
+        supervisor.restartService("boom")
+
+        let tripped = await waitUntil(40) {
+            self.state("boom").isCircuitBroken && self.supervisor.actionsInFlight.isEmpty
+                && self.state("boom").condition != nil
+        }
+        XCTAssertTrue(tripped)
+        try await Task.sleep(for: .seconds(1))
+        let condition = try XCTUnwrap(state("boom").condition)
+        XCTAssertEqual(condition.kind, .halted(reason: "crash loop"))
+        XCTAssertEqual(condition.text, "Stopped retrying after 3 crashes in a minute. Cause: not clear from the log.")
+        XCTAssertEqual(condition.action, .restart)
+    }
+
     /// A daemon that ends with code 0 has no process, and nothing starts it again.
     /// The environment showed "starting" with no end.
     func testACleanExitOfADaemonGivesDegradedNotStarting() async throws {
@@ -1414,6 +1488,14 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(skips.count, 1)
         XCTAssertEqual(skips.first?.serviceId, "stripe")
         XCTAssertTrue(skips.first?.message.contains("stripe login") == true, "\(skips)")
+
+        // F4: a skip has a reason on the row and in the status API.
+        let condition = try XCTUnwrap(state("stripe").condition)
+        XCTAssertEqual(condition.kind, .optionalOff)
+        XCTAssertEqual(condition.headline, "Stripe CLI is not installed or not logged in — webhooks are off.")
+        let fields = EnvironmentSupervisor.statusFields(state("stripe"))
+        XCTAssertEqual(fields["skip_reason"], condition.text)
+        XCTAssertNil(fields["reason"])
     }
 
     /// A Stripe CLI that fails (an expired session, say) is skipped, not restarted in

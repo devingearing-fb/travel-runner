@@ -44,6 +44,22 @@ final class ServiceState {
     }
     var failureTimestamps: [Date] = []
     var isCircuitBroken: Bool = false
+    /// Why the service is failed or skipped, and the fix. Nil while it starts or runs.
+    var condition: ServiceCondition? = nil
+    /// The line of this launch's log that best says why it failed.
+    var likelyCause: String? = nil
+    /// The last check of the startup probe.
+    var lastProbe: ProbeOutcome? = nil
+    /// Counts the failure records. A record that reads the log writes its condition
+    /// only when no newer record came in the meantime.
+    @ObservationIgnored var failureRecordCount = 0
+
+    /// The service starts or runs: the old "why" no longer applies.
+    func clearCondition() {
+        condition = nil
+        likelyCause = nil
+        failureRecordCount += 1
+    }
 
     init(definition: ServiceDefinition) {
         self.id = definition.id

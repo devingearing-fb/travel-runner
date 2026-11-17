@@ -30,8 +30,8 @@ final class StdoutProbe: Probe, @unchecked Sendable {
         return nil
     }
 
-    func check() async -> Bool {
-        lock.withLock { matched }
+    func outcome() async -> ProbeOutcome {
+        lock.withLock { matched } ? .ok : .noMatchYet
     }
 
     func reset() {

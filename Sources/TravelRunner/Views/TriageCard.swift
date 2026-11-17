@@ -53,6 +53,21 @@ struct TriageCard: View {
                 }
             }
 
+            if let condition = state.condition {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(condition.headline)
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                    if let detail = condition.detail {
+                        Text(detail)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            }
+
             if !logTail.isEmpty {
                 VStack(alignment: .leading, spacing: 1) {
                     ForEach(logTail) { entry in
@@ -70,11 +85,22 @@ struct TriageCard: View {
             }
 
             HStack(spacing: 6) {
-                Button(action: onRestart) {
-                    Label("Restart", systemImage: "arrow.clockwise")
+                ForEach(conditionActions, id: \.self) { action in
+                    Button(action.title(runtime: runtimeName)) {
+                        supervisor.perform(action, for: state.id)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .tint(action == conditionActions.first ? .accentColor : nil)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
+
+                if !conditionActions.contains(.restart) {
+                    Button(action: onRestart) {
+                        Label("Restart", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                }
 
                 Button(action: onCascadeRestart) {
                     Label("Cascade", systemImage: "arrow.clockwise.circle")
@@ -82,7 +108,7 @@ struct TriageCard: View {
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
 
-                if let onClearCache {
+                if let onClearCache, !conditionActions.contains(.clearCacheAndRestart) {
                     Button(action: onClearCache) {
                         Label("Clear Cache", systemImage: "arrow.clockwise")
                     }
@@ -112,6 +138,13 @@ struct TriageCard: View {
             }
         }
     }
+
+    /// The buttons of the condition that this row can run.
+    private var conditionActions: [RecoveryAction] {
+        (state.condition?.actions ?? []).filter { supervisor.canPerform($0, for: state.id) }
+    }
+
+    private var runtimeName: String { ContainerRuntime.detect().appName }
 
     private func formatLogLine(_ entry: LogEntry) -> String {
         let raw = entry.text.trimmingCharacters(in: .whitespaces)
