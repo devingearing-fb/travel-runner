@@ -2911,7 +2911,9 @@ final class EnvironmentSupervisor {
         if let sid = serviceID {
             let raw: [LogEntry] = if let log { log } else { await logStore.entries(for: sid) }
             logEntries = raw.map { DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: sid, line: $0.text) }
-            likelyCause = CrashCause.likelyCause(in: raw.map(\.text), serviceID: sid, redactor: redactor)
+            likelyCause = stripeAwareCause(
+                CrashCause.likelyCause(in: raw.map(\.text), serviceID: sid, redactor: redactor), serviceID: sid
+            )
         }
         // The combined log has every service, the DB steps and the runner too.
         for id in await logStore.serviceIDs() where id != serviceID {
@@ -3104,7 +3106,7 @@ final class EnvironmentSupervisor {
         case .service(let id):
             guard let state = serviceStates[id] else { return nil }
             let lines = await logStore.entries(for: id).map(\.text)
-            let cause = CrashCause.likelyCause(in: lines, serviceID: id, redactor: redactor)
+            let cause = stripeAwareCause(CrashCause.likelyCause(in: lines, serviceID: id, redactor: redactor), serviceID: id)
             let exit = state.exitCode.map { " (exit code \($0))" } ?? ""
             return "\(state.definition.displayName) \(state.phase.rawValue)\(exit)" + (cause.map { " — \($0)" } ?? "")
         case .dbStep(let id):
@@ -3190,6 +3192,12 @@ final class EnvironmentSupervisor {
     /// The line in the Stripe log for each case where Stripe ends as skipped.
     nonisolated static func stripeStoppedLine(_ cause: String) -> String {
         "[travel-runner] Stripe stopped: \(cause)"
+    }
+
+    /// The cause of a failure. In test-key mode a Stripe 401 is a rejected key, not
+    /// an expired login.
+    private func stripeAwareCause(_ cause: String?, serviceID: String) -> String? {
+        serviceID == "stripe" ? StripeLauncher.exitCause(known: cause, mode: stripeMode) : cause
     }
 
     /// The Stripe mode for the booking portal of this stack.
@@ -3528,7 +3536,9 @@ final class EnvironmentSupervisor {
         // Kill a Stripe listener that an earlier session left. The pattern is the
         // command of the service, so any other `stripe listen` stays alive.
         if isInProfile("stripe"), let stripe = serviceStates["stripe"]?.definition {
-            await portTools.killCommands(PortOwner.commandPattern(for: stripe.cmd))
+            for pattern in StripeLauncher.stalePatterns(for: stripe.cmd) {
+                await portTools.killCommands(pattern)
+            }
         }
 
         if didKill {

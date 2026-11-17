@@ -63,14 +63,50 @@ enum StripeLauncher {
     static let forwardURL = "http://127.0.0.1:3002/api/webhooks/stripe"
     /// No update check at each start. The key is never an argument: it would show in `ps`.
     static let command = ["stripe", "listen", "--skip-update", "--forward-to", forwardURL]
+    /// The command of the runner before S1. The cleanup also kills a listener with
+    /// this command that an older runner left, so the portal gets no event twice.
+    /// Remove it one release after S1.
+    static let legacyCommand = ["stripe", "listen", "--forward-to", "http://localhost:3002/api/webhooks/stripe"]
+
+    /// The `pkill -f` patterns of the listeners that an earlier session left.
+    static func stalePatterns(for cmd: [String]) -> [String] {
+        let current = PortOwner.commandPattern(for: cmd)
+        guard cmd == command else { return [current] }
+        return [current, PortOwner.commandPattern(for: legacyCommand)]
+    }
 
     /// Installs the Stripe CLI.
     static let installCommand = "brew install stripe/stripe-cli/stripe"
     /// Proves that the CLI can call Stripe: `stripe config --list` exits 0 also for an expired key.
     static let authCheckCommand = "stripe balance retrieve >/dev/null 2>&1"
-    static let availabilityCommand = "which stripe >/dev/null 2>&1 && \(authCheckCommand)"
-    /// `stripe login` needs a terminal and a browser, so it runs in Terminal.
-    static let loginCommand = #"osascript -e 'tell application "Terminal" to activate' -e 'tell application "Terminal" to do script "stripe login"'"#
+    static let installedCommand = "which stripe >/dev/null 2>&1"
+    static let availabilityCommand = "\(installedCommand) && \(authCheckCommand)"
+    /// `stripe login` needs a terminal and a browser, so it runs in Terminal. Terminal
+    /// runs a `.command` file that it opens; this needs no Automation permission, as
+    /// an Apple event to Terminal would.
+    static let loginScriptName = "travel-runner-stripe-login.command"
+    static let loginScript = """
+        #!/bin/sh
+        # Travel Runner: log the Stripe CLI in. Close this window when it is done.
+        stripe login
+
+        """
+
+    /// Writes the login script to `directory` and returns its path, or nil when it cannot.
+    static func writeLoginScript(in directory: URL) -> String? {
+        let url = directory.appendingPathComponent(loginScriptName)
+        do {
+            try loginScript.write(to: url, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
+            return url.path
+        } catch {
+            return nil
+        }
+    }
+
+    static func loginCommand(script: String) -> String {
+        "open -a Terminal \(ShellQuote.quote(script))"
+    }
 
     static let noKeyReason = "no \(secretKeyName) in \(bookingPortalDirectory)/.env"
 
@@ -79,9 +115,11 @@ enum StripeLauncher {
         guard let bookingPortal, !bookingPortal.isEmpty else {
             return resolve(values: [])
         }
+        // The dotenv parser of the shared `.env`: it drops a ` # comment` and takes
+        // the last line of a key, as Next.js does.
         let values = envFiles.map { file in
             (file: "\(bookingPortalDirectory)/\(file)",
-             value: RunnerEnv.value(of: secretKeyName, inFile: (bookingPortal as NSString).appendingPathComponent(file)))
+             value: AgentEnv.sharedValues(file: (bookingPortal as NSString).appendingPathComponent(file))[secretKeyName])
         }
         return resolve(values: values)
     }
@@ -154,4 +192,44 @@ enum StripeLauncher {
     /// The setup fix "Log in…" waits this long for `stripe login` in Terminal.
     static let loginWait: Duration = .seconds(180)
     static let loginPollInterval: Duration = .seconds(5)
+
+    /// How the setup fix "Log in…" ended.
+    enum LoginOutcome: Equatable, Sendable {
+        case loggedIn
+        case notInstalled
+        case terminalNotOpened
+        case timedOut
+        /// The wait was cancelled; nothing changed.
+        case cancelled
+
+        /// The row text when the fix failed; nil when it did not fail.
+        var failedText: String? {
+            switch self {
+            case .loggedIn, .cancelled:
+                nil
+            case .notInstalled:
+                "The Stripe CLI is not installed — install it with: \(StripeLauncher.installCommand), then log in"
+            case .terminalNotOpened:
+                "Could not open Terminal — run stripe login in a terminal, then re-check"
+            case .timedOut:
+                "stripe login did not finish in \(StripeLauncher.loginWait.components.seconds / 60) min — run stripe login in a terminal, then re-check"
+            }
+        }
+    }
+
+    /// Runs `stripe login` in Terminal and waits until the CLI can call Stripe.
+    /// `run` runs a shell command; `scriptDirectory` gets the login script.
+    static func login(
+        run: (String) async -> Bool, scriptDirectory: URL, clock: RunnerClock
+    ) async -> LoginOutcome {
+        guard await run(installedCommand) else { return .notInstalled }
+        guard let script = writeLoginScript(in: scriptDirectory),
+              await run(loginCommand(script: script)) else { return .terminalNotOpened }
+        let deadline = clock.uptime() + loginWait
+        while clock.uptime() < deadline {
+            if await run(authCheckCommand) { return .loggedIn }
+            do { try await clock.sleep(for: loginPollInterval) } catch { return .cancelled }
+        }
+        return .timedOut
+    }
 }

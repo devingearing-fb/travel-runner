@@ -65,6 +65,10 @@ final class EnvironmentChecker {
     /// Runs the commands of the checks and the fixes.
     private let commandRunner: any CommandRunning
     private let tools: ToolEnvironment
+    /// The waits of the fixes. Tests give a fake.
+    private let clock: RunnerClock
+    /// The Stripe login fix writes its Terminal script here.
+    private let loginScriptDirectory: URL
 
     /// A check command that hangs fails after this time.
     nonisolated static let checkTimeout: Duration = .seconds(15)
@@ -73,10 +77,13 @@ final class EnvironmentChecker {
 
     init(
         monorepoPath: String, loginPath: String, streamServicesPath: String, flavor: Flavor = .current,
-        shell: any CommandRunning = LoginShell(), tools: ToolEnvironment = .shared
+        shell: any CommandRunning = LoginShell(), tools: ToolEnvironment = .shared,
+        clock: RunnerClock = .live, loginScriptDirectory: URL = FileManager.default.temporaryDirectory
     ) {
         self.commandRunner = shell
         self.tools = tools
+        self.clock = clock
+        self.loginScriptDirectory = loginScriptDirectory
         self.flavor = flavor
         self.monorepoPath = NSString(string: monorepoPath).expandingTildeInPath
         self.loginPath = NSString(string: loginPath).expandingTildeInPath
@@ -362,8 +369,6 @@ final class EnvironmentChecker {
         switch checkID {
         case "hotel-data":
             "Download failed — start the stack first (the download needs the local Supabase and the shared apps/booking-portal/.env), then retry"
-        case "stripe-auth":
-            "stripe login did not finish in \(StripeLauncher.loginWait.components.seconds / 60) min — run stripe login in a terminal, then re-check"
         default:
             "Fix failed — try manually"
         }
@@ -393,6 +398,16 @@ final class EnvironmentChecker {
     func fix(_ checkID: String) async {
         guard let check = checks.first(where: { $0.id == checkID }) else { return }
         check.status = .fixing
+
+        if checkID == "stripe-auth" {
+            // `stripe login` needs a terminal and a browser: it runs in Terminal, and
+            // the fix waits until the CLI can call Stripe. Each failure has its own text.
+            let outcome = await StripeLauncher.login(
+                run: { await self.shell($0) }, scriptDirectory: loginScriptDirectory, clock: clock
+            )
+            check.status = if let text = outcome.failedText { .failing(text) } else { await runCheck(checkID) }
+            return
+        }
 
         guard let success = await runFix(checkID) else {
             // Cancelled: nothing changed.
@@ -646,17 +661,6 @@ final class EnvironmentChecker {
 
         case "stripe-cli":
             return await fixShell(StripeLauncher.installCommand)
-
-        case "stripe-auth":
-            // `stripe login` needs a terminal and a browser: it runs in Terminal, and
-            // the fix waits until the CLI can call Stripe.
-            guard await shell(StripeLauncher.loginCommand) else { return false }
-            let deadline = ContinuousClock.now + StripeLauncher.loginWait
-            while ContinuousClock.now < deadline {
-                if await shell(StripeLauncher.authCheckCommand) { return true }
-                do { try await Task.sleep(for: StripeLauncher.loginPollInterval) } catch { return nil }
-            }
-            return false
 
         case "workspace-modules":
             return await fixShellInDir(monorepoPath, "pnpm install")

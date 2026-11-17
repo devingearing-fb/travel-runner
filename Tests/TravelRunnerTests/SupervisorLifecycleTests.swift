@@ -1561,6 +1561,29 @@ final class SupervisorLifecycleTests: XCTestCase {
             lines = await logLines("stripe")
         }
         XCTAssertTrue(lines.contains(expected), lines.joined(separator: "\n"))
+
+        // A ticket and Report a problem give the same cause, not "run stripe login".
+        let issues = workDir.appendingPathComponent("issues")
+        supervisor.diagnosticsTools = { _ in [] }
+        supervisor.debugTracker = DebugTracker(baseDir: issues.path, rateLimitSeconds: 0)
+        await supervisor.captureDebugIssue(trigger: "manual", serviceID: "stripe", summary: "Stripe stopped")
+        let causes = await supervisor.debugTracker?.listIssues(status: "open").map(\.likelyCause) ?? []
+        XCTAssertEqual(causes, ["Stripe rejected STRIPE_SECRET_KEY from apps/booking-portal/.env — import a current .env."])
+
+        let reports = workDir.appendingPathComponent("reports")
+        supervisor.makeReportExporter = {
+            ReportExporter(
+                destination: reports, temporaryDirectory: reports.appendingPathComponent("tmp"),
+                timeZone: .current, now: { Date() },
+                zip: { _, archive in
+                    try? Data("PK".utf8).write(to: archive)
+                    return FakeCommandRunner.ok()
+                }
+            )
+        }
+        let report = try await supervisor.exportReport(focus: .service(id: "stripe"))
+        XCTAssertTrue(report.summary.contains("Stripe rejected STRIPE_SECRET_KEY"), report.summary)
+        XCTAssertFalse(report.summary.contains("stripe login"), report.summary)
     }
 
     /// The row showed the first 20 characters of the webhook secret.
@@ -1613,6 +1636,15 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         XCTAssertEqual(calls.kills, [pid_t(inProfile.port)], "only the listener of the profile's service")
         XCTAssertEqual(calls.patterns, [PortOwner.commandPattern(for: stripeCmd)])
+        // A Stripe on the catalog command also kills the listener of the runner before S1.
+        calls.reset()
+        try supervisor.loadServices([service("stripe", StripeLauncher.command, port: nil)], profile: .booking)
+        await supervisor.cleanupStaleProcesses()
+        XCTAssertEqual(calls.patterns, StripeLauncher.stalePatterns(for: StripeLauncher.command))
+        XCTAssertEqual(calls.patterns.count, 2)
+        calls.reset()
+        try supervisor.loadServices(services, profile: .booking)
+        await supervisor.cleanupStaleProcesses()
         let lines = await logLines("universal-login")
         XCTAssertTrue(
             lines.contains("[travel-runner] Port \(container.port) is published by OrbStack Helper (a container). Not killed."),

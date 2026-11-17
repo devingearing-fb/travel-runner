@@ -54,6 +54,38 @@ final class StripeSupportTests: XCTestCase {
         XCTAssertEqual(StripeLauncher.resolve(bookingPortal: booking.path).mode, .testKey(source: "apps/booking-portal/.env"))
     }
 
+    /// The monolith's `.env.example` has `STRIPE_SECRET_KEY=  # shared`. dotenv drops
+    /// the comment; the runner must read the same key as the portal.
+    func testAnInlineCommentIsNotPartOfTheKey() throws {
+        for line in ["STRIPE_SECRET_KEY=\(testKey)  # shared", "STRIPE_SECRET_KEY=\"\(testKey)\" # shared"] {
+            try write(".env", line + "\n")
+
+            let resolution = StripeLauncher.resolve(bookingPortal: booking.path)
+
+            XCTAssertEqual(resolution.mode, .testKey(source: "apps/booking-portal/.env"), line)
+            XCTAssertEqual(resolution.environment, ["STRIPE_API_KEY": testKey], line)
+        }
+    }
+
+    /// A `.env.local` copied from `.env.example` has no key, only a comment.
+    func testACommentOnlyValueInEnvLocalDoesNotHideTheSharedKey() throws {
+        try write(".env", "STRIPE_SECRET_KEY=\(testKey)\n")
+        try write(".env.local", "STRIPE_SECRET_KEY=  # shared\n")
+
+        let resolution = StripeLauncher.resolve(bookingPortal: booking.path)
+
+        XCTAssertEqual(resolution.mode, .testKey(source: "apps/booking-portal/.env"))
+        XCTAssertEqual(resolution.environment, ["STRIPE_API_KEY": testKey])
+    }
+
+    /// dotenv takes the last line of a key.
+    func testTheLastAssignmentOfTheKeyWins() throws {
+        let later = "sk_test_laterLine789"
+        try write(".env", "STRIPE_SECRET_KEY=\(testKey)\nSTRIPE_SECRET_KEY=\(later)\n")
+
+        XCTAssertEqual(StripeLauncher.resolve(bookingPortal: booking.path).environment, ["STRIPE_API_KEY": later])
+    }
+
     func testWithoutAKeyStripeUsesTheLogin() {
         let resolution = StripeLauncher.resolve(bookingPortal: booking.path)
 
@@ -125,6 +157,19 @@ final class StripeSupportTests: XCTestCase {
         XCTAssertNil(login.env)
     }
 
+    // MARK: - Cleanup
+
+    /// A listener that the runner before S1 left has the old command; the cleanup kills it too.
+    func testTheCleanupAlsoKillsTheListenerOfTheOldCommand() {
+        XCTAssertEqual(StripeLauncher.stalePatterns(for: StripeLauncher.command), [
+            PortOwner.commandPattern(for: StripeLauncher.command),
+            "stripe listen --forward-to http://localhost:3002/api/webhooks/stripe",
+        ])
+        // Control: a command of a test or a config gets only its own pattern.
+        let other = ["stripe", "listen", "--forward-to", "http://127.0.0.1:9/hook"]
+        XCTAssertEqual(StripeLauncher.stalePatterns(for: other), [PortOwner.commandPattern(for: other)])
+    }
+
     // MARK: - Causes
 
     func testA401InTestKeyModeSaysTheKeyWasRejected() {
@@ -144,10 +189,11 @@ final class StripeSupportTests: XCTestCase {
 
     // MARK: - Setup checks
 
-    private func makeChecker(_ runner: FakeCommandRunner) -> EnvironmentChecker {
+    private func makeChecker(_ runner: FakeCommandRunner, clock: RunnerClock = FakeClock().clock) -> EnvironmentChecker {
         let checker = EnvironmentChecker(
             monorepoPath: monorepo.path, loginPath: "/nonexistent/login", streamServicesPath: "/nonexistent/stream",
-            flavor: .standard, shell: runner, tools: ToolEnvironment(home: "/nonexistent/home")
+            flavor: .standard, shell: runner, tools: ToolEnvironment(home: "/nonexistent/home"),
+            clock: clock, loginScriptDirectory: monorepo
         )
         checker.buildChecks()
         return checker
@@ -192,29 +238,70 @@ final class StripeSupportTests: XCTestCase {
         XCTAssertEqual(status("stripe-cli", in: checker), .passing("Found"))
     }
 
-    /// The fix opened Terminal and returned false: it never worked.
-    func testTheLoginFixRunsStripeLoginInTerminalAndWaitsForIt() async {
+    private var loginScript: String { monorepo.appendingPathComponent(StripeLauncher.loginScriptName).path }
+
+    /// The fix opened Terminal and returned false: it never worked. It now opens a
+    /// script in Terminal, which needs no Automation permission.
+    func testTheLoginFixRunsStripeLoginInTerminalAndWaitsForIt() async throws {
         let runner = FakeCommandRunner()
         let checker = makeChecker(runner)
 
         await checker.fix("stripe-auth")
 
         let commands = runner.commands
-        let login = commands.firstIndex(of: StripeLauncher.loginCommand)
-        XCTAssertNotNil(login, "\(commands)")
-        XCTAssertTrue(StripeLauncher.loginCommand.contains("do script \"stripe login\""))
+        XCTAssertFalse(commands.contains { $0.contains("osascript") }, "\(commands)")
+        let open = commands.firstIndex(of: StripeLauncher.loginCommand(script: loginScript))
+        XCTAssertNotNil(open, "\(commands)")
+        XCTAssertTrue(StripeLauncher.loginCommand(script: loginScript).hasPrefix("open -a Terminal "))
+        let script = try String(contentsOfFile: loginScript, encoding: .utf8)
+        XCTAssertTrue(script.hasPrefix("#!/bin/sh\n") && script.contains("\nstripe login\n"), script)
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: loginScript))
         let poll = commands.lastIndex(of: StripeLauncher.authCheckCommand)
         XCTAssertNotNil(poll)
-        if let login, let poll { XCTAssertLessThan(login, poll) }
+        if let open, let poll { XCTAssertLessThan(open, poll) }
         XCTAssertEqual(status("stripe-auth", in: checker), .passing("Authenticated (your stripe login)"))
     }
 
-    func testALoginFixThatCannotOpenTerminalFails() async {
-        let checker = makeChecker(FakeCommandRunner { _ in FakeCommandRunner.failed() })
+    func testTheLoginFixWithoutTheCLISaysToInstallIt() async {
+        let runner = FakeCommandRunner { _ in FakeCommandRunner.failed() }
+        let checker = makeChecker(runner)
 
         await checker.fix("stripe-auth")
 
-        XCTAssertEqual(status("stripe-auth", in: checker), .failing(EnvironmentChecker.fixFailedText(for: "stripe-auth")))
+        XCTAssertEqual(status("stripe-auth", in: checker), .failing(
+            "The Stripe CLI is not installed — install it with: brew install stripe/stripe-cli/stripe, then log in"
+        ))
+        XCTAssertEqual(runner.commands, [StripeLauncher.installedCommand], "Terminal is not opened")
+    }
+
+    func testALoginFixThatCannotOpenTerminalSaysSo() async {
+        let runner = FakeCommandRunner { call in
+            call.command.hasPrefix("open -a Terminal") ? FakeCommandRunner.failed() : FakeCommandRunner.ok()
+        }
+        let checker = makeChecker(runner)
+
+        await checker.fix("stripe-auth")
+
+        XCTAssertEqual(status("stripe-auth", in: checker), .failing(
+            "Could not open Terminal — run stripe login in a terminal, then re-check"
+        ))
+        XCTAssertFalse(runner.commands.contains(StripeLauncher.authCheckCommand), "no wait")
+    }
+
+    func testALoginThatDoesNotFinishTimesOutAfterThreeMinutes() async {
+        let runner = FakeCommandRunner { call in
+            call.command == StripeLauncher.authCheckCommand ? FakeCommandRunner.failed() : FakeCommandRunner.ok()
+        }
+        let time = FakeClock()
+        let checker = makeChecker(runner, clock: time.clock)
+
+        await checker.fix("stripe-auth")
+
+        XCTAssertEqual(status("stripe-auth", in: checker), .failing(
+            "stripe login did not finish in 3 min — run stripe login in a terminal, then re-check"
+        ))
+        XCTAssertEqual(time.uptime, .seconds(180))
+        XCTAssertEqual(runner.commands.filter { $0 == StripeLauncher.authCheckCommand }.count, 36)
     }
 
     // MARK: - Preflight
