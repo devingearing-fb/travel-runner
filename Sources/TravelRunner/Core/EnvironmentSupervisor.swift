@@ -62,6 +62,8 @@ final class EnvironmentSupervisor {
     /// True when Settings saved new paths while the stack ran. They load at the
     /// next launch, or at the next reconfigure with the stack stopped.
     private(set) var reconfigurePending = false
+    /// Reconfigures that run now, "Stop and apply" included.
+    private var reconfiguresRunning = 0
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
@@ -364,6 +366,8 @@ final class EnvironmentSupervisor {
     /// nothing and answers `.needsStop`: a new service state knows no process, so
     /// a load now would lose the processes that run.
     func reconfigure() async -> ReconfigureResult {
+        reconfiguresRunning += 1
+        defer { reconfiguresRunning -= 1 }
         guard await !holdsLiveStack() else {
             reconfigurePending = true
             return .needsStop
@@ -385,7 +389,9 @@ final class EnvironmentSupervisor {
     @discardableResult
     func stopAndReconfigure() -> Task<ReconfigureResult, Never> {
         let stop = beginStopAll()
+        reconfiguresRunning += 1
         return Task {
+            defer { reconfiguresRunning -= 1 }
             await stop.value
             let result = await reconfigure()
             if result == .needsStop {
@@ -393,6 +399,19 @@ final class EnvironmentSupervisor {
             }
             return result
         }
+    }
+
+    /// What a restart for an update would interrupt now. The window is the app's to report.
+    func updateRestartState(panelOpen: Bool) async -> UpdatePolicy.RestartState {
+        // The quit stops the holds viewer too.
+        let stackRunning = await holdsLiveStack() || holdsViewer.pid != nil
+        return UpdatePolicy.RestartState(
+            stackRunning: stackRunning,
+            panelOpen: panelOpen,
+            databaseBusy: dbResetRunning || dbSetupPipeline?.isRunning == true,
+            fixRunning: EnvironmentChecker.fixesRunning > 0,
+            reconfigureRunning: reconfiguresRunning > 0
+        )
     }
 
     /// True while the runner starts, stops or holds a process of the stack, or

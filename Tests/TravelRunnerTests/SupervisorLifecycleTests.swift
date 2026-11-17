@@ -428,6 +428,34 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(open, 0)
     }
 
+    /// An update installs by itself only when the restart interrupts nothing: a
+    /// running service, the open window or a database reset keep the app running.
+    func testAnUpdateRestartWaitsForAStoppedStackAndAClosedWindow() async throws {
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let running = await supervisor.updateRestartState(panelOpen: false)
+        XCTAssertTrue(running.stackRunning)
+        XCTAssertFalse(UpdatePolicy.mayRestartUnattended(running, isDev: false))
+
+        supervisor.stopAll()
+        let down = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(down)
+        let stopped = await supervisor.updateRestartState(panelOpen: false)
+        XCTAssertEqual(stopped, UpdatePolicy.RestartState())
+        XCTAssertTrue(UpdatePolicy.mayRestartUnattended(stopped, isDev: false))
+
+        let open = await supervisor.updateRestartState(panelOpen: true)
+        XCTAssertFalse(UpdatePolicy.mayRestartUnattended(open, isDev: false))
+
+        supervisor.dbResetRunning = true
+        let resetting = await supervisor.updateRestartState(panelOpen: false)
+        supervisor.dbResetRunning = false
+        XCTAssertTrue(resetting.databaseBusy)
+        XCTAssertFalse(UpdatePolicy.mayRestartUnattended(resetting, isDev: false))
+    }
+
     /// Ticket "Local Sequin Cache CDC exited with code 9": the old process ended two
     /// seconds after the stop, when the restart was on its way, and counted as a crash.
     func testAProcessThatDiesLateDoesNotFailTheRestart() async throws {

@@ -60,6 +60,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         updateController = UpdateController()
+        let supervisor = self.supervisor!
+        updateController.restartState = {
+            await supervisor.updateRestartState(panelOpen: WorkshopPanel.shared.isVisible)
+        }
 
         WorkshopPanel.shared.configure(supervisor: supervisor, updateController: updateController)
 

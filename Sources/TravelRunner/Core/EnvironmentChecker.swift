@@ -62,6 +62,9 @@ final class EnvironmentChecker {
 
     private(set) var checks: [HealthCheck] = []
 
+    /// Fixes that run now, in any checker. An update does not restart the app during one.
+    private(set) static var fixesRunning = 0
+
     /// Runs the commands of the checks and the fixes.
     private let commandRunner: any CommandRunning
     private let tools: ToolEnvironment
@@ -397,6 +400,8 @@ final class EnvironmentChecker {
 
     func fix(_ checkID: String) async {
         guard let check = checks.first(where: { $0.id == checkID }) else { return }
+        Self.fixesRunning += 1
+        defer { Self.fixesRunning -= 1 }
         check.status = .fixing
 
         if checkID == "stripe-auth" {

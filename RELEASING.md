@@ -33,6 +33,27 @@ The script, in order:
 GitHub never marks a prerelease as the latest release, and the installed apps read the
 appcast of the latest release. So no teammate gets the new version yet.
 
+### Release notes
+
+Sparkle's update window shows the notes of the appcast item. By default they are the
+subjects of the commits since the last full release. To write them by hand, give a
+file with one change per line:
+
+```bash
+RELEASE_NOTES=notes.txt ./release.sh 0.14.0
+```
+
+The appcast item also lists the versions of all full releases. An installed copy that
+has not updated for 7 days counts from it how many versions behind it is, and says so
+in a banner.
+
+### Updates on the teammates' Macs
+
+The app downloads an update in the background and shows "Update 0.14.0 ready — Restart
+to install". It installs the update by itself only when the stack is stopped, the window
+is closed, and no database step, fix or reconfigure runs. Otherwise it installs at the
+next quit, or when the teammate clicks the pill.
+
 Quit your own installed Travel Runner before you run the script: the smoke test starts
 the new build, and only one copy of the app runs at a time.
 

@@ -179,4 +179,124 @@ final class UpdatePolicyTests: XCTestCase {
         XCTAssertTrue(UpdatePolicy.mayProceed(isDev: true, backgroundCheck: false, automaticDownloads: true))
         XCTAssertTrue(UpdatePolicy.mayProceed(isDev: false, backgroundCheck: true, automaticDownloads: true))
     }
+
+    // MARK: - Restart without a click
+
+    func testAnIdleAppRestartsByItself() {
+        XCTAssertTrue(UpdatePolicy.mayRestartUnattended(UpdatePolicy.RestartState(), isDev: false))
+    }
+
+    func testAnythingThatARestartWouldInterruptKeepsTheAppRunning() {
+        let busy: [(String, UpdatePolicy.RestartState)] = [
+            ("stack", UpdatePolicy.RestartState(stackRunning: true)),
+            ("window", UpdatePolicy.RestartState(panelOpen: true)),
+            ("database", UpdatePolicy.RestartState(databaseBusy: true)),
+            ("fix", UpdatePolicy.RestartState(fixRunning: true)),
+            ("reconfigure", UpdatePolicy.RestartState(reconfigureRunning: true)),
+        ]
+        for (name, state) in busy {
+            XCTAssertFalse(UpdatePolicy.mayRestartUnattended(state, isDev: false), name)
+        }
+    }
+
+    func testADevBuildNeverRestartsByItself() {
+        XCTAssertFalse(UpdatePolicy.mayRestartUnattended(UpdatePolicy.RestartState(), isDev: true))
+    }
+
+    /// Somebody who just stopped the stack may start it again: one idle tick is not enough.
+    func testTheRestartWaitsForIdleTicksInARow() {
+        var ticks = UpdatePolicy.idleTicks(after: 0, idle: true)
+        XCTAssertLessThan(ticks, UpdatePolicy.idleTicksBeforeRestart)
+
+        ticks = UpdatePolicy.idleTicks(after: ticks, idle: false)
+        XCTAssertEqual(ticks, 0, "a busy tick starts the count again")
+
+        ticks = UpdatePolicy.idleTicks(after: ticks, idle: true)
+        ticks = UpdatePolicy.idleTicks(after: ticks, idle: true)
+        XCTAssertEqual(ticks, UpdatePolicy.idleTicksBeforeRestart)
+    }
+
+    // MARK: - Versions behind
+
+    func testTheVersionsBehindComeFromTheListInTheAppcast() {
+        XCTAssertEqual(
+            UpdatePolicy.versionsBehind(current: "0.13.4", latest: "0.13.7", released: "0.13.3 0.13.4 0.13.5 0.13.7"),
+            2,
+            "0.13.6 was never released to everyone"
+        )
+        XCTAssertEqual(
+            UpdatePolicy.versionsBehind(current: "0.13.4", latest: "0.14.0", released: "0.13.10 0.13.9 0.14.0 0.14.1"),
+            3,
+            "numbers, not text, and nothing above the newest"
+        )
+    }
+
+    func testAnAppcastWithoutTheListCountsAsOneVersion() {
+        XCTAssertEqual(UpdatePolicy.versionsBehind(current: "0.13.4", latest: "0.13.7", released: nil), 1)
+        XCTAssertEqual(UpdatePolicy.versionsBehind(current: "0.13.4", latest: "0.13.7", released: "garbage"), 1)
+    }
+
+    func testANewestVersionThatIsNotNewerIsNotBehind() {
+        XCTAssertEqual(UpdatePolicy.versionsBehind(current: "0.13.7", latest: "0.13.7", released: "0.13.7"), 0)
+        XCTAssertEqual(UpdatePolicy.versionsBehind(current: "0.13.8", latest: "0.13.7", released: "0.13.7"), 0)
+    }
+
+    func testTheBannerComesSevenDaysAfterTheFirstFinding() throws {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let record = try XCTUnwrap(UpdatePolicy.recordLatest(
+            defaults: defaults, current: "0.13.4", latest: "0.13.6", released: "0.13.5 0.13.6", now: start
+        ))
+        XCTAssertNil(UpdatePolicy.behindNotice(record, appName: "Travel Runner", now: start.addingTimeInterval(6 * 86_400)))
+
+        // A later check finds a newer version. The date of the first finding stays.
+        let later = try XCTUnwrap(UpdatePolicy.recordLatest(
+            defaults: defaults, current: "0.13.4", latest: "0.13.7",
+            released: "0.13.5 0.13.6 0.13.7", now: start.addingTimeInterval(5 * 86_400)
+        ))
+        XCTAssertEqual(later.since, start)
+
+        XCTAssertEqual(
+            UpdatePolicy.behindNotice(later, appName: "Travel Runner", now: start.addingTimeInterval(7 * 86_400)),
+            "This Travel Runner is 3 versions behind (you: 0.13.4, latest: 0.13.7). Old versions can mis-handle the database."
+        )
+    }
+
+    func testOneVersionBehindIsSingular() {
+        let record = UpdatePolicy.BehindRecord(
+            current: "0.13.6", latest: "0.13.7", versionsBehind: 1, since: Date(timeIntervalSince1970: 0)
+        )
+        XCTAssertEqual(
+            UpdatePolicy.behindNotice(record, appName: "Travel Runner", now: Date(timeIntervalSince1970: 8 * 86_400)),
+            "This Travel Runner is 1 version behind (you: 0.13.6, latest: 0.13.7). Old versions can mis-handle the database."
+        )
+    }
+
+    func testTheRecordSurvivesARelaunchOfTheSameVersion() throws {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let record = UpdatePolicy.recordLatest(
+            defaults: defaults, current: "0.13.4", latest: "0.13.7", released: nil, now: start
+        )
+
+        XCTAssertEqual(UpdatePolicy.storedBehind(defaults: defaults, current: "0.13.4"), record)
+    }
+
+    func testAnUpdatedCopyForgetsTheRecord() {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        _ = UpdatePolicy.recordLatest(defaults: defaults, current: "0.13.4", latest: "0.13.7", released: nil, now: start)
+
+        XCTAssertNil(UpdatePolicy.storedBehind(defaults: defaults, current: "0.13.7"))
+        XCTAssertNil(defaults.data(forKey: UpdatePolicy.behindKey), "the record is gone, also for the next launch")
+    }
+
+    func testACheckThatFindsNothingNewerForgetsTheRecord() {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        _ = UpdatePolicy.recordLatest(defaults: defaults, current: "0.13.4", latest: "0.13.7", released: nil, now: start)
+
+        let record = UpdatePolicy.recordLatest(
+            defaults: defaults, current: "0.13.4", latest: "0.13.4", released: nil, now: start.addingTimeInterval(86_400)
+        )
+
+        XCTAssertNil(record)
+        XCTAssertNil(UpdatePolicy.storedBehind(defaults: defaults, current: "0.13.4"))
+    }
 }

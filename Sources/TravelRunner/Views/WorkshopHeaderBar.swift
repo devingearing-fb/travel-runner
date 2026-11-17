@@ -186,6 +186,18 @@ struct WorkshopHeaderBar: View {
                     })
                 )
             }
+            if let notice = updates?.behindNotice {
+                // No dismiss: an old copy can mis-handle the database. The button asks
+                // before a restart that stops the stack, like the pill.
+                alertBanner(
+                    icon: "clock.arrow.circlepath",
+                    color: .orange,
+                    text: notice,
+                    subtitle: nil,
+                    action: nil,
+                    trailing: AnyView(UpdatePill(style: .updateNowButton))
+                )
+            }
             if supervisor.migrationsBannerVisible {
                 alertBanner(
                     icon: "arrow.triangle.2.circlepath",
@@ -275,6 +287,7 @@ struct WorkshopHeaderBar: View {
         subtitle: String?,
         link: (label: String, url: URL)? = nil,
         action: (label: String, handler: () -> Void)?,
+        trailing: AnyView? = nil,
         report: (() -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
     ) -> some View {
@@ -302,6 +315,7 @@ struct WorkshopHeaderBar: View {
                     .controlSize(.small)
                     .tint(color)
             }
+            if let trailing { trailing }
             if let report {
                 Button("Report") { report() }
                     .buttonStyle(.bordered)

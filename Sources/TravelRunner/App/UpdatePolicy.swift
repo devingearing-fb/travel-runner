@@ -115,7 +115,7 @@ enum UpdatePolicy {
         return nil
     }
 
-    /// What a click on the pill does.
+    /// What a click on the pill, or on "Update now", does.
     static func pillAction(pending: PendingUpdate, liveServices: Int, blockedReason: String?) -> PillAction {
         if let blockedReason { return .blocked(blockedReason) }
         switch pending {
@@ -125,5 +125,117 @@ enum UpdatePolicy {
             if let warning = restartWarning(liveServices: liveServices) { return .ask(warning) }
             return .install
         }
+    }
+
+    // MARK: - Restart without a click
+
+    /// What a restart of the app would interrupt now.
+    struct RestartState: Equatable, Sendable {
+        /// A service, a start, a stop or an action of the stack runs, or the holds viewer does.
+        var stackRunning = false
+        /// The window is open: somebody may be working in it.
+        var panelOpen = false
+        /// A database reset or setup runs.
+        var databaseBusy = false
+        /// A fix of the setup checks runs.
+        var fixRunning = false
+        /// New paths are being applied.
+        var reconfigureRunning = false
+    }
+
+    /// How often the update controller looks at the app's state.
+    static let tickInterval: Duration = .seconds(60)
+    /// The app must be idle at this many ticks in a row before it restarts by itself.
+    /// Somebody who just stopped the stack may start it again a moment later.
+    static let idleTicksBeforeRestart = 2
+
+    /// A downloaded update installs and relaunches without a click only when nothing
+    /// would be interrupted. A dev build never does: the release would replace it.
+    static func mayRestartUnattended(_ state: RestartState, isDev: Bool) -> Bool {
+        guard !isDev else { return false }
+        return !state.stackRunning && !state.panelOpen && !state.databaseBusy
+            && !state.fixRunning && !state.reconfigureRunning
+    }
+
+    /// The idle ticks in a row after this tick. The restart runs at `idleTicksBeforeRestart`.
+    static func idleTicks(after previous: Int, idle: Bool) -> Int {
+        idle ? previous + 1 : 0
+    }
+
+    // MARK: - Versions behind
+
+    /// The element of the appcast item that lists the released versions (`release.sh`),
+    /// separated by spaces. Sparkle keeps an element of another namespace under its full name.
+    static let releasedVersionsElement = "travelrunner:releasedVersions"
+    /// Where the app keeps what it knows about the newest version.
+    static let behindKey = "updateBehind_v1"
+    /// How long a newer version waits before the banner asks for the update.
+    static let behindNoticeDelay: TimeInterval = 7 * 24 * 60 * 60
+
+    /// This copy is behind the newest release, since `since`.
+    struct BehindRecord: Codable, Equatable, Sendable {
+        /// The version of this copy when the newer version was first seen.
+        var current: String
+        var latest: String
+        var versionsBehind: Int
+        var since: Date
+    }
+
+    /// The released versions above `current`, up to `latest`. An appcast without the
+    /// list (older than this release) counts as one version. 0 when `latest` is not newer.
+    static func versionsBehind(current: String, latest: String, released: String?) -> Int {
+        guard let mine = Compatibility.Version(runner: current),
+              let newest = Compatibility.Version(runner: latest),
+              mine < newest else { return 0 }
+        let versions = Set((released ?? "").split(whereSeparator: \.isWhitespace).map(String.init))
+            .compactMap { Compatibility.Version(manifest: $0) }
+        let between = versions.filter { mine < $0 && $0 <= newest }.count
+        return max(1, between)
+    }
+
+    /// Records the newest version that a check found. The date of the first finding stays
+    /// while this copy keeps its version, so the banner comes 7 days after it.
+    /// Returns nil, and forgets the record, when this copy is up to date.
+    static func recordLatest(
+        defaults: UserDefaults,
+        current: String,
+        latest: String,
+        released: String?,
+        now: Date
+    ) -> BehindRecord? {
+        let count = versionsBehind(current: current, latest: latest, released: released)
+        guard count > 0 else {
+            defaults.removeObject(forKey: behindKey)
+            return nil
+        }
+        let since = storedBehind(defaults: defaults, current: current)?.since ?? now
+        let record = BehindRecord(current: current, latest: latest, versionsBehind: count, since: since)
+        if let data = try? JSONEncoder().encode(record) { defaults.set(data, forKey: behindKey) }
+        return record
+    }
+
+    /// The record of an earlier run. A copy with a new version forgets it: it was updated.
+    static func storedBehind(defaults: UserDefaults, current: String) -> BehindRecord? {
+        guard let data = defaults.data(forKey: behindKey),
+              let record = try? JSONDecoder().decode(BehindRecord.self, from: data) else { return nil }
+        guard record.current == current else {
+            defaults.removeObject(forKey: behindKey)
+            return nil
+        }
+        return record
+    }
+
+    /// Forgets the record: a check found no newer version.
+    static func clearBehind(defaults: UserDefaults) {
+        defaults.removeObject(forKey: behindKey)
+    }
+
+    /// The banner text, 7 days after a newer version was first seen. `nil` before then.
+    static func behindNotice(_ record: BehindRecord?, appName: String, now: Date) -> String? {
+        guard let record, record.versionsBehind > 0,
+              now.timeIntervalSince(record.since) >= behindNoticeDelay else { return nil }
+        let versions = record.versionsBehind == 1 ? "1 version" : "\(record.versionsBehind) versions"
+        return "This \(appName) is \(versions) behind (you: \(record.current), latest: \(record.latest)). "
+            + "Old versions can mis-handle the database."
     }
 }
