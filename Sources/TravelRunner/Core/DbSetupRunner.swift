@@ -146,6 +146,7 @@ actor DbSetupRunner {
         let cwd = self.portalCwd
         let logStore = self.logStore
         let logKey = step.logKey
+        let stepName = step.name
 
         let (exitCode, timedOut) = await withCheckedContinuation { (continuation: CheckedContinuation<(Int32, Bool), Never>) in
             let process = Process()
@@ -220,6 +221,8 @@ actor DbSetupRunner {
                 }
                 return
             }
+            let pid = process.processIdentifier
+            Task { await logStore.markStart(serviceID: logKey, name: stepName, pid: pid) }
         }
 
         currentProcess = nil

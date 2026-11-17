@@ -121,7 +121,8 @@ struct ServiceConsoleView: View {
             .controlSize(.small)
 
             Button {
-                let allText = filteredEntries.map(\.text).joined(separator: "\n")
+                let redactor = supervisor.makeRedactor()
+                let allText = filteredEntries.map { redactor.redact($0.text) }.joined(separator: "\n")
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(allText, forType: .string)
             } label: {
@@ -141,7 +142,7 @@ struct ServiceConsoleView: View {
             }
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
-            .help("Clear")
+            .help("Clear view (the log file is kept)")
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 5)

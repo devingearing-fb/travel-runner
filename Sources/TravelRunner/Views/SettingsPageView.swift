@@ -253,29 +253,47 @@ struct SettingsPageView: View {
                 Divider().padding(.leading, 32)
 
                 settingsRow {
-                    HStack {
-                        Label("Debug Tracking", systemImage: "ant")
-                            .font(.system(.caption, design: .monospaced))
-                        Spacer()
-                        if supervisor.debugTrackingEnabled {
-                            let count = supervisor.debugOpenIssueCount
-                            if count > 0 {
-                                Button("\(count) open issue\(count == 1 ? "" : "s")") {
-                                    WorkshopPanel.shared.open(section: .issues)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Toggle(isOn: Binding(
+                                get: { supervisor.debugTrackingEnabled },
+                                set: { enabled in Task { await supervisor.setIssueCaptureEnabled(enabled) } }
+                            )) {
+                                Label("Issue capture", systemImage: "ant")
+                                    .font(.system(.caption, design: .monospaced))
+                            }
+                            .toggleStyle(.switch)
+                            .controlSize(.small)
+
+                            Spacer()
+
+                            if supervisor.debugTrackingEnabled {
+                                let count = supervisor.debugOpenIssueCount
+                                if count > 0 {
+                                    Button("\(count) open issue\(count == 1 ? "" : "s")") {
+                                        WorkshopPanel.shared.open(section: .issues)
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.orange)
+                                }
+                                Button("Show Folder") {
+                                    Task {
+                                        let folder = await supervisor.issueCaptureFolder()
+                                        try? FileManager.default.createDirectory(
+                                            atPath: folder, withIntermediateDirectories: true
+                                        )
+                                        NSWorkspace.shared.open(URL(fileURLWithPath: folder))
+                                    }
                                 }
                                 .buttonStyle(.borderless)
                                 .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.orange)
-                            } else {
-                                Text("Active")
-                                    .font(.system(.caption2, design: .monospaced))
-                                    .foregroundStyle(.green)
                             }
-                        } else {
-                            Text("Disabled")
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
                         }
+                        Text("Issue capture — saves failure details on this Mac only. Nothing is sent anywhere until you export a report.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }

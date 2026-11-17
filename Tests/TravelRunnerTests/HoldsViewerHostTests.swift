@@ -205,6 +205,50 @@ final class HoldsViewerHostTests: XCTestCase {
         XCTAssertTrue(reason.contains("boom: no config"), reason)
     }
 
+    /// The app always has a log store. A last line with no newline comes out
+    /// only when the process ends, just before the end is reported.
+    func testAViewerThatExitsShowsALastLineWithNoNewlineWhenALogStoreIsSet() async throws {
+        try writeViewer(in: repo, marker: "x", script: "process.stderr.write('boom: no config'); process.exit(3);")
+        let store = LogStore(sink: LogFileSink(directory: root.appendingPathComponent("logs"), version: "9.9.9"))
+        let host = makeHost()
+        host.logStore = store
+
+        await host.ensureRunning()
+        let settled = await waitUntil(10) { host.state != .starting }
+
+        XCTAssertTrue(settled)
+        guard case .failed(let reason) = host.state else { return XCTFail("state is \(host.state)") }
+        XCTAssertTrue(reason.contains("exited with code 3"), reason)
+        XCTAssertTrue(reason.contains("boom: no config"), reason)
+    }
+
+    func testAllTheOutputOfTheViewerGoesToTheHoldsViewerLog() async throws {
+        let script = "for (let i = 1; i <= 9; i++) console.error('line ' + i); console.log('last words'); process.exit(3);"
+        try writeViewer(in: repo, marker: "x", script: script)
+        let logs = root.appendingPathComponent("logs")
+        let store = LogStore(sink: LogFileSink(directory: logs, version: "9.9.9"))
+        let host = makeHost()
+        host.logStore = store
+
+        await host.ensureRunning()
+        let settled = await waitUntil(10) { host.state != .starting }
+        XCTAssertTrue(settled)
+
+        // The message keeps six lines and shows one. The log has all ten.
+        var lines: [String] = []
+        for _ in 0..<100 {
+            lines = await store.entries(for: "holds-viewer").map(\.text)
+            if lines.count == 10 { break }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertEqual(lines.filter { $0.hasPrefix("line ") }.count, 9, lines.joined(separator: "\n"))
+        XCTAssertTrue(lines.contains("last words"))
+        let file = try String(contentsOf: logs.appendingPathComponent("holds-viewer.log"), encoding: .utf8)
+        XCTAssertTrue(file.contains("[err] line 1\n"), file)
+        XCTAssertTrue(file.contains("[out] last words\n"), file)
+        XCTAssertTrue(file.contains("[travel-runner] ── started Holds viewer pid "), file)
+    }
+
     // MARK: - Lifecycle
 
     func testStopLeavesNoProcess() async throws {

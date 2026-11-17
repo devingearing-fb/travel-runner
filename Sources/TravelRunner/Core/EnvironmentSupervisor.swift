@@ -95,7 +95,8 @@ final class EnvironmentSupervisor {
 
     // MARK: - Internal Components
 
-    private(set) var logStore = LogStore()
+    /// The app gives it a file sink. Without one the logs stay in memory.
+    let logStore: LogStore
     /// The reader for the Rooms tab. It is not a service of the graph.
     let holdsViewer: HoldsViewerHost
     private let secretStore = SecretStore()
@@ -135,6 +136,9 @@ final class EnvironmentSupervisor {
     private var dbSetupRunner: DbSetupRunner?
     /// Nil while issue capture is off. Tests set a tracker with a temporary folder.
     var debugTracker: DebugTracker?
+    /// The tracker of this app, also while capture is off. One instance for the
+    /// whole run: it holds the rate limit.
+    private var issueTracker: DebugTracker?
     private var gitBranchWatcher: GitBranchWatcher?
     private var gitRepoRoots: [String: String] = [:]
     private var dependencyWatcher: DependencyWatcher?
@@ -170,12 +174,15 @@ final class EnvironmentSupervisor {
     var dbPipelineFactory: ((_ cwd: String, _ profile: String) -> DbSetupPipeline?)?
 
     init(
-        userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil, tools: ToolEnvironment = .shared
+        userDefaults: UserDefaults = .standard, holdsViewer: HoldsViewerHost? = nil,
+        tools: ToolEnvironment = .shared, logSink: LogFileSink? = nil
     ) {
         self.tools = tools
         self.processRunner = ProcessRunner(tools: tools)
         self.shell = LoginShell(tools: tools)
+        self.logStore = LogStore(sink: logSink)
         self.holdsViewer = holdsViewer ?? HoldsViewerHost()
+        self.holdsViewer.logStore = logStore
         self.userDefaults = userDefaults
         self.selectedDbSeedScenarioID = userDefaults.string(forKey: "dbSeedScenarioID")
         if holdsViewer == nil {
@@ -267,6 +274,8 @@ final class EnvironmentSupervisor {
             self.serviceStates = [:]
             let graph = try ServiceGraph(services: config.services)
             self.graph = graph
+            let redactor = makeRedactor()
+            Task { [logStore] in await logStore.setRunnerRedactor(redactor) }
             self.sortedServiceIDs = graph.sortedIDs
             self.profile = config.resolvedProfile
             self.profileMembers = config.resolvedProfile.members(of: config.services)
@@ -305,7 +314,7 @@ final class EnvironmentSupervisor {
             // Start control API server
             startControlServer()
 
-            // Initialize debug tracking (opt-in via config.json in the tickets folder on the Desktop)
+            // Issue capture is on unless the config in the issue folder says no.
             Task { await initDebugTracking() }
 
             // Initialize git branch watcher for all repos with cwds
@@ -584,7 +593,10 @@ final class EnvironmentSupervisor {
                         guard let self else { return "[]" }
                         let entries = await self.logStore.entries(for: serviceId)
                         let tail = entries.suffix(lines)
-                        let lines = tail.map { ["stream": $0.stream == .stdout ? "stdout" : "stderr", "text": $0.text] }
+                        let redactor = await MainActor.run { self.makeRedactor() }
+                        let lines = tail.map {
+                            ["stream": $0.stream == .stdout ? "stdout" : "stderr", "text": redactor.redact($0.text)]
+                        }
                         if let data = try? JSONSerialization.data(withJSONObject: lines, options: []),
                            let str = String(data: data, encoding: .utf8) { return str }
                         return "[]"
@@ -1644,12 +1656,12 @@ final class EnvironmentSupervisor {
             let available = await isStripeAvailable()
             if !available {
                 state.phase = .skipped
+                let cause = "the Stripe CLI is not installed or not logged in — run: stripe login, then start it from its row"
                 await logStore.append(
                     serviceID: serviceID,
-                    entry: LogEntry(stream: .stderr, text: Self.stripeStoppedLine(
-                        "the Stripe CLI is not installed or not logged in — run: stripe login, then start it from its row"
-                    ))
+                    entry: LogEntry(stream: .stderr, text: Self.stripeStoppedLine(cause))
                 )
+                await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
                 return nil
             }
         }
@@ -1879,6 +1891,7 @@ final class EnvironmentSupervisor {
         )
 
         state.pid = pid
+        await logStore.markStart(serviceID: sid, name: definition.displayName, pid: pid)
         return ServiceLaunch(
             pid: pid, definition: effectiveDefinition, stdoutProbe: capturedProbe, artifactName: artifactName
         )
@@ -2054,11 +2067,23 @@ final class EnvironmentSupervisor {
             state.pid = nil
             state.lastStopped = clock.date()
             state.failureTimestamps.removeAll()
-            let cause = "the Stripe CLI \(ServiceTermination.describe(termination)) — see the lines above "
-                + "(401: run stripe login), then start it from its row"
-            Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
-                stream: .stderr, text: Self.stripeStoppedLine(cause)
-            ))}
+            let exit = "the Stripe CLI \(ServiceTermination.describe(termination))"
+            // The log keeps the lines of earlier launches. An old 401 is not the
+            // cause of this exit.
+            let launched = state.lastStarted ?? .distantPast
+            Task {
+                let output = await logStore.entries(for: serviceID)
+                    .filter { $0.timestamp >= launched }.map(\.text)
+                let cause = if let known = CrashCause.knownCause(in: output, serviceID: serviceID) {
+                    "\(exit) — \(known)"
+                } else {
+                    "\(exit) — see the lines above (401: run stripe login), then start it from its row"
+                }
+                await logStore.append(serviceID: serviceID, entry: LogEntry(
+                    stream: .stderr, text: Self.stripeStoppedLine(cause)
+                ))
+                await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
+            }
             recalculateHealth()
             return
         }
@@ -2105,10 +2130,13 @@ final class EnvironmentSupervisor {
             state.lastStopped = clock.date()
             noteFailure(state, stableFor: stableFor)
             let action = restarts ? "restarting it" : "it stays stopped"
-            Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
-                stream: .stderr,
-                text: "[travel-runner] \(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))) — \(action)"
-            ))}
+            let killed = "\(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))) — \(action)"
+            Task {
+                await logStore.append(serviceID: serviceID, entry: LogEntry(
+                    stream: .stderr, text: "[travel-runner] \(killed)"
+                ))
+                await recordDebugEvent(kind: "outside_kill", serviceID: serviceID, message: killed)
+            }
             if restarts {
                 scheduleRestart(serviceID: serviceID, wasEarlyExit: (uptime ?? 0) < 10)
             }
@@ -2183,6 +2211,9 @@ final class EnvironmentSupervisor {
         case .crashLoop:
             state.isCircuitBroken = true
             lastError = "\(name) is crash-looping — auto-restart stopped"
+            Task { await recordDebugEvent(
+                kind: "breaker_trip", serviceID: serviceID, message: "\(name) is crash-looping — auto-restart stopped"
+            )}
             Task { await captureDebugIssue(
                 trigger: "circuit_breaker",
                 serviceID: serviceID,
@@ -2194,17 +2225,22 @@ final class EnvironmentSupervisor {
                 // The network stayed down. Stripe is optional: it degrades to skipped,
                 // and the next start (manual, start-all, or a wake) tries it again.
                 state.phase = .skipped
-                Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
-                    stream: .stderr,
-                    text: Self.stripeStoppedLine(
-                        "no network after \(AutoRestart.maxRestarts) tries — start it from its row when the network is back"
-                    )
-                ))}
+                let cause = "no network after \(AutoRestart.maxRestarts) tries — start it from its row when the network is back"
+                Task {
+                    await logStore.append(serviceID: serviceID, entry: LogEntry(
+                        stream: .stderr, text: Self.stripeStoppedLine(cause)
+                    ))
+                    await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
+                }
                 recalculateHealth()
                 return
             }
             state.isCircuitBroken = true
             lastError = "\(name) did not come back after \(AutoRestart.maxRestarts) restarts — auto-restart stopped"
+            Task { await recordDebugEvent(
+                kind: "breaker_trip", serviceID: serviceID,
+                message: "\(name) did not come back after \(AutoRestart.maxRestarts) restarts — auto-restart stopped"
+            )}
             Task { await captureDebugIssue(
                 trigger: "circuit_breaker",
                 serviceID: serviceID,
@@ -2259,6 +2295,10 @@ final class EnvironmentSupervisor {
                 guard await ContainerRuntime.ensureRunning(clock: clock) else {
                     state.isCircuitBroken = true
                     lastError = "\(runtime.displayName) is not running — open \(runtime.appName), then restart \(name)"
+                    await recordDebugEvent(
+                        kind: "breaker_trip", serviceID: serviceID,
+                        message: "\(runtime.displayName) is not running — the restart of \(name) stopped"
+                    )
                     return
                 }
                 guard serviceStates[serviceID]?.phase == .failed else { return }
@@ -2448,25 +2488,54 @@ final class EnvironmentSupervisor {
     // MARK: - Debug Tracking
 
     private func initDebugTracking() async {
+        // A config reload comes here again. The tracker and its poll stay.
+        guard issueTracker == nil else { return }
         let tracker = DebugTracker()
-        let enabled = await tracker.isEnabled()
-        debugTracker = enabled ? tracker : nil
-        debugTrackingEnabled = enabled
-        debugOpenIssueCount = enabled ? await tracker.openIssueCount() : 0
+        issueTracker = tracker
+        await refreshIssueCapture()
+        if debugTracker != nil {
+            await tracker.pruneClosedIssues()
+        }
 
+        // The config can change on disk, and issues can be closed there.
         Task {
             while !Task.isCancelled {
                 try? await clock.sleep(for: .seconds(30))
-                let tracker = DebugTracker()
-                let enabled = await tracker.isEnabled()
-                let count = enabled ? await tracker.openIssueCount() : 0
-                await MainActor.run {
-                    self.debugTrackingEnabled = enabled
-                    self.debugOpenIssueCount = count
-                    self.debugTracker = enabled ? tracker : nil
-                }
+                await self.refreshIssueCapture()
             }
         }
+    }
+
+    /// Reads the switch and the open count from the issue folder.
+    private func refreshIssueCapture() async {
+        guard let tracker = issueTracker else { return }
+        let enabled = await tracker.isEnabled()
+        let count = enabled ? await tracker.openIssueCount() : 0
+        debugTracker = enabled ? tracker : nil
+        debugTrackingEnabled = enabled
+        debugOpenIssueCount = count
+    }
+
+    /// The switch in Settings. It is saved in the config of the issue folder.
+    func setIssueCaptureEnabled(_ enabled: Bool) async {
+        let tracker = issueTracker ?? debugTracker ?? DebugTracker()
+        issueTracker = tracker
+        guard await tracker.setEnabled(enabled) else {
+            onActionFeedback?("Issue capture: the setting could not be saved", false)
+            return
+        }
+        await refreshIssueCapture()
+    }
+
+    /// The issue folder of this app, for "Show in Finder".
+    func issueCaptureFolder() async -> String {
+        await (issueTracker ?? debugTracker ?? DebugTracker()).folderPath
+    }
+
+    /// One line in `events.jsonl` for something that files no issue.
+    func recordDebugEvent(kind: String, serviceID: String?, message: String) async {
+        guard let tracker = debugTracker else { return }
+        await tracker.recordEvent(kind: kind, serviceId: serviceID, message: message, redactor: makeRedactor())
     }
 
     func captureDebugIssue(
@@ -2492,12 +2561,13 @@ final class EnvironmentSupervisor {
             )
         }
 
+        let redactor = makeRedactor()
         var logEntries: [DebugTracker.LogEntry] = []
         var likelyCause: String?
         if let sid = serviceID {
             let raw: [LogEntry] = if let log { log } else { await logStore.entries(for: sid) }
             logEntries = raw.map { DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: sid, line: $0.text) }
-            likelyCause = CrashCause.likelyCause(in: raw.map(\.text))
+            likelyCause = CrashCause.likelyCause(in: raw.map(\.text), serviceID: sid, redactor: redactor)
         }
 
         let _ = await tracker.captureIssue(
@@ -2507,10 +2577,21 @@ final class EnvironmentSupervisor {
             signatureText: signature,
             likelyCause: likelyCause,
             logEntries: logEntries,
-            stateSnapshots: snapshots
+            stateSnapshots: snapshots,
+            redactor: redactor
         )
 
         debugOpenIssueCount = await tracker.openIssueCount()
+    }
+
+    /// The redactor for text that leaves the app. It knows the secret values in the
+    /// env files of the services, as they are now.
+    func makeRedactor() -> Redactor {
+        let definitions = graph.map { Array($0.nodes.values) } ?? []
+        return Redactor(
+            envDirectories: definitions.compactMap(\.resolvedCwd),
+            environments: definitions.compactMap(\.env)
+        )
     }
 
     func listDebugIssues(status: String = "open") async -> [DebugTracker.Issue] {

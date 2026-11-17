@@ -57,13 +57,52 @@ struct LogCounts: Sendable {
     var debug: Int = 0
 }
 
+/// The thing in Finder that "Show Log File" goes to.
+enum LogRevealTarget: Equatable, Sendable {
+    case file(URL)
+    case folder(URL)
+}
+
 actor LogStore {
     private var buffers: [String: RingBuffer<LogEntry>] = [:]
     private var levelCounts: [String: LogCounts] = [:]
     private var versions: [String: Int] = [:]
     private let capacity = 500
+    /// The files on disk. Nil keeps the log in memory only, as the tests do.
+    private let sink: LogFileSink?
+
+    init(sink: LogFileSink? = nil) {
+        self.sink = sink
+    }
+
+    /// The log file of one id. Nil when the store writes no files.
+    nonisolated func fileURL(for serviceID: String) -> URL? {
+        sink?.fileURL(for: serviceID)
+    }
+
+    /// What "Show Log File" shows: the log file of the id, or the log folder
+    /// when the file is not there (no line was written yet, or the cleanup
+    /// removed it). Nil when the store writes no files.
+    nonisolated func revealTarget(for serviceID: String) -> LogRevealTarget? {
+        guard let sink else { return nil }
+        let file = sink.fileURL(for: serviceID)
+        if FileManager.default.fileExists(atPath: file.path) { return .file(file) }
+        return .folder(file.deletingLastPathComponent())
+    }
+
+    /// Writes the separator of a process start to the log file. The view does
+    /// not show it.
+    func markStart(serviceID: String, name: String, pid: Int32) {
+        sink?.writeStart(id: serviceID, name: name, pid: pid)
+    }
+
+    /// The `runner` log file gets its lines redacted with this redactor.
+    func setRunnerRedactor(_ redactor: Redactor) {
+        sink?.setRunnerRedactor(redactor)
+    }
 
     func append(serviceID: String, entry: LogEntry) {
+        sink?.write(id: serviceID, entries: [entry])
         if buffers[serviceID] == nil {
             buffers[serviceID] = RingBuffer(capacity: capacity)
         }
@@ -73,6 +112,7 @@ actor LogStore {
     }
 
     func appendBatch(serviceID: String, entries: [LogEntry]) {
+        sink?.write(id: serviceID, entries: entries)
         if buffers[serviceID] == nil {
             buffers[serviceID] = RingBuffer(capacity: capacity)
         }
@@ -106,6 +146,7 @@ actor LogStore {
         levelCounts[serviceID] ?? LogCounts()
     }
 
+    /// Clears the view. The log file is kept.
     func clear(serviceID: String) {
         buffers[serviceID] = nil
         levelCounts[serviceID] = nil

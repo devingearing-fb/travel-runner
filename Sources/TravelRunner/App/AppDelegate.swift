@@ -21,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // this runs waits for it.
         ToolEnvironment.shared.beginResolve(runner: LoginShell())
 
-        supervisor = EnvironmentSupervisor()
+        supervisor = EnvironmentSupervisor(logSink: .live())
         supervisor.loadConfig()
 
         supervisor.onServiceCrash = { [weak self] serviceName, exitCode in

@@ -23,7 +23,11 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// a test, so no test reads the shell of this Mac.
     private func makeSupervisor(tools: ToolEnvironment) throws {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "SupervisorLifecycleTests-\(UUID().uuidString)"))
-        supervisor = EnvironmentSupervisor(userDefaults: defaults, tools: tools)
+        // The log files of a test go to its own folder.
+        supervisor = EnvironmentSupervisor(
+            userDefaults: defaults, tools: tools,
+            logSink: LogFileSink(directory: workDir.appendingPathComponent("logs"), version: "9.9.9")
+        )
         // The port cleanup of a test kills only a process that the test started. A
         // stranger can take the free port after `freePort` lets it go.
         let ownedDirectory = workDir.lastPathComponent
@@ -121,6 +125,24 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.serviceStates[id]!
     }
 
+    /// Turns issue capture on, in a folder of the test. No config: that means on.
+    private func captureIssues() -> DebugTracker {
+        let tracker = DebugTracker(baseDir: workDir.appendingPathComponent("issues").path)
+        supervisor.debugTracker = tracker
+        return tracker
+    }
+
+    /// The events of one kind in `events.jsonl`. It waits for the first one.
+    private func events(_ kind: String, in tracker: DebugTracker) async -> [DebugTracker.Event] {
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let found = await tracker.listEvents().filter { $0.kind == kind }
+            if !found.isEmpty { return found }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return []
+    }
+
     private func waitUntil(_ seconds: Double, _ condition: @MainActor () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline {
@@ -138,7 +160,39 @@ final class SupervisorLifecycleTests: XCTestCase {
         state(id).phase == .running && supervisor.actionsInFlight.isEmpty
     }
 
+    private func logFile(_ id: String) -> [String] {
+        let url = workDir.appendingPathComponent("logs/\(id).log")
+        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        return text.split(separator: "\n").map(String.init)
+    }
+
     // MARK: - Tests
+
+    func testEachStartWritesASeparatorAndTheOutputToTheLogFile() async throws {
+        try load(daemon("web", ["sh", "-c", "echo hello from web; exec \(webServer.joined(separator: " "))"]))
+
+        supervisor.restartService("web")
+        let started = await waitUntil(20) { self.settled("web") }
+        XCTAssertTrue(started)
+        let firstPid = try XCTUnwrap(state("web").pid)
+        let wrote = await waitUntil(5) { self.logFile("web").contains { $0.hasSuffix("[out] hello from web") } }
+        XCTAssertTrue(wrote, logFile("web").joined(separator: "\n"))
+
+        supervisor.restartService("web")
+        let restarted = await waitUntil(20) { self.settled("web") && self.state("web").pid != firstPid }
+        XCTAssertTrue(restarted)
+        let secondPid = try XCTUnwrap(state("web").pid)
+        let both = await waitUntil(5) { self.logFile("web").filter { $0.contains("── started web pid ") }.count == 2 }
+        XCTAssertTrue(both, logFile("web").joined(separator: "\n"))
+
+        let separators = logFile("web").filter { $0.contains("[travel-runner] ── started") }
+        XCTAssertTrue(separators[0].hasSuffix("[out] [travel-runner] ── started web pid \(firstPid) (runner v9.9.9) ──"), separators[0])
+        XCTAssertTrue(separators[1].hasSuffix("[out] [travel-runner] ── started web pid \(secondPid) (runner v9.9.9) ──"), separators[1])
+        // The file has the time on each line. The view does not show the separator.
+        XCTAssertTrue(logFile("web").allSatisfy { $0.range(of: #"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}[+-]\d{4} \[(out|err)\] "#, options: .regularExpression) != nil })
+        let view = await logLines("web")
+        XCTAssertFalse(view.contains { $0.contains("── started") })
+    }
 
     /// Tickets "Travel Portal exited with code 1" with EADDRINUSE in the log: two
     /// requests for one service each started a process.
@@ -274,6 +328,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// Tickets with 32 and 41 recurrences: each automatic restart cleared the failure
     /// history, so the circuit breaker never saw three failures.
     func testACrashLoopStopsAtTheThirdFailure() async throws {
+        let tracker = captureIssues()
         try load(daemon("boom", ["sh", "-c", "echo boom-start; exit 1"], probeTimeout: 60))
 
         supervisor.restartService("boom")
@@ -290,6 +345,11 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("boom").phase, .failed)
         XCTAssertEqual(supervisor.health, .degraded)
         XCTAssertEqual(state("boom").restartCount, 2)
+
+        // The trip is in the event log, once.
+        let trips = await events("breaker_trip", in: tracker)
+        XCTAssertEqual(trips.map(\.serviceId), ["boom"])
+        XCTAssertEqual(trips.first?.message, "boom is crash-looping — auto-restart stopped")
     }
 
     /// A tripped breaker must not outlive a deliberate restart: the next failure of
@@ -321,6 +381,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// Tickets "exited with code 143": something outside the runner stopped the
     /// process. The runner brings it back, and it is not a crash.
     func testAKillFromOutsideIsRestartedWithoutACrashReport() async throws {
+        let tracker = captureIssues()
         try load(daemon("web", webServer))
         supervisor.restartService("web")
         let ready = await waitUntil(30) { self.settled("web") }
@@ -337,6 +398,14 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("web").restartCount, 1)
         let lines = await logLines("web")
         XCTAssertTrue(lines.contains { $0.contains("was stopped from outside Travel Runner (SIGTERM)") })
+
+        // No issue, but the event log has the kill.
+        let kills = await events("outside_kill", in: tracker)
+        XCTAssertEqual(
+            kills.map(\.message), ["web was stopped from outside Travel Runner (SIGTERM) — restarting it"]
+        )
+        let open = await tracker.openIssueCount()
+        XCTAssertEqual(open, 0)
     }
 
     /// Ticket "Local Sequin Cache CDC exited with code 9": the old process ended two
@@ -447,7 +516,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         let issues = workDir.appendingPathComponent("issues")
         try FileManager.default.createDirectory(at: issues, withIntermediateDirectories: true)
         try #"{"enabled": true}"#.write(to: issues.appendingPathComponent("config.json"), atomically: true, encoding: .utf8)
-        supervisor.debugTracker = DebugTracker(baseDir: issues.path)
+        // No rate limit: the two waiters end a few seconds apart, and this test counts both.
+        supervisor.debugTracker = DebugTracker(baseDir: issues.path, rateLimitSeconds: 0)
         let script = "if [ -f ran-once ]; then sleep 60; else touch ran-once; exit 1; fi"
         try load(daemon("flaky", ["sh", "-c", script], probeTimeout: 10))
 
@@ -874,6 +944,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// 105 tickets: Stripe ended as "skipped" with no line that says why. The CLI
     /// check is a fake; the test does not run the Stripe CLI.
     func testStripeWithoutItsCliIsSkippedWithTheCauseInItsLog() async throws {
+        let tracker = captureIssues()
         try load(stripe("echo stripe-start; sleep 30"))
         supervisor.stripeAvailability = { false }
         var feedback: [String] = []
@@ -891,6 +962,11 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertFalse(lines.contains("stripe-start"), "the process must not start")
         XCTAssertEqual(feedback, ["Stripe CLI skipped — see its log"])
         XCTAssertEqual(supervisor.health, .healthy, "Stripe is optional")
+
+        let skips = await events("stripe_skip", in: tracker)
+        XCTAssertEqual(skips.count, 1)
+        XCTAssertEqual(skips.first?.serviceId, "stripe")
+        XCTAssertTrue(skips.first?.message.contains("stripe login") == true, "\(skips)")
     }
 
     /// A Stripe CLI that fails (an expired session, say) is skipped, not restarted in
@@ -916,6 +992,49 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("stripe").phase, .skipped)
         XCTAssertEqual(supervisor.health, .healthy, "Stripe is optional")
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
+    /// The Stripe line said "see the lines above". Now it names the cause it finds there.
+    func testAStripeCrashWithA401SaysThatTheSessionExpired() async throws {
+        try load(stripe("echo 'Authorization failed, status=401'; sleep 2; exit 1"))
+        supervisor.stripeAvailability = { true }
+
+        supervisor.restartService("stripe")
+
+        let skipped = await waitUntil(20) { self.state("stripe").phase == .skipped }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        let expected = "[travel-runner] Stripe stopped: the Stripe CLI exited with code 1 — "
+            + "Stripe session expired — run `stripe login`, then restart Stripe"
+        var lines: [String] = []
+        for _ in 0..<100 where !lines.contains(expected) {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines("stripe")
+        }
+        XCTAssertTrue(lines.contains(expected), lines.joined(separator: "\n"))
+    }
+
+    /// The Stripe log is not cleared on a restart. A 401 from an earlier launch
+    /// labelled a later exit as an expired session.
+    func testAnOld401InTheStripeLogIsNotTheCauseOfALaterExit() async throws {
+        try load(stripe("echo stripe-start; sleep 2; exit 1"))
+        supervisor.stripeAvailability = { true }
+        await supervisor.logStore.append(serviceID: "stripe", entry: LogEntry(
+            timestamp: Date().addingTimeInterval(-600), stream: .stderr, text: "Authorization failed, status=401"
+        ))
+
+        supervisor.restartService("stripe")
+
+        let skipped = await waitUntil(20) { self.state("stripe").phase == .skipped }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        let prefix = "[travel-runner] Stripe stopped: the Stripe CLI exited with code 1"
+        var lines: [String] = []
+        for _ in 0..<100 where !lines.contains(where: { $0.hasPrefix(prefix) }) {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines("stripe")
+        }
+        let stopped = lines.first { $0.hasPrefix(prefix) }
+        XCTAssertNotNil(stopped, lines.joined(separator: "\n"))
+        XCTAssertEqual(stopped?.contains("Stripe session expired"), false, stopped ?? "")
     }
 
     /// The row showed the first 20 characters of the webhook secret.

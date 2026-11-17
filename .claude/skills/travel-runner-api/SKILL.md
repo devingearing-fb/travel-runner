@@ -345,7 +345,7 @@ curl -s -X POST http://localhost:19900/api/db-setup/step/verify-data
 
 ### GET /api/debug/issues
 
-List open debug-tracking issues (no query parameters; closed issues are only on disk). Returns `[]` if debug-tracking is not enabled.
+List open debug-tracking issues (no query parameters; closed issues are only on disk). Returns `[]` if issue capture is off (it is on by default; Settings has the switch).
 
 ```bash
 curl -s http://localhost:19900/api/debug/issues | python3 -m json.tool
@@ -451,7 +451,7 @@ Same as above with `partner-portal` (port 3006). If it is `SKIPPED`, it is not i
 1. `GET /api/debug/issues` — check for auto-captured issues first
 2. If an issue exists, read it for pre-captured context (logs, state, git branches)
 3. After fixing the root cause, close it: `POST /api/debug/issues/close/{id}`
-4. Issues persist at `~/Desktop/debug-tracking/open/` if the API is unavailable
+4. Issues persist on disk if the API is unavailable: `~/Library/Application Support/Travel Runner/issues/open/`, or `~/Desktop/debug-tracking/open/` on a Mac that has a config there
 
 ### "Database won't reset"
 
