@@ -683,10 +683,10 @@ final class EnvironmentChecker {
         return nil
     }
 
-    /// The checkout that `scripts/local-db.sh` replays. Its managed clone needs the
-    /// remote, so the row asks it, with no password prompt.
+    /// The checkout that `scripts/local-db.sh` replays, as its login shell picks it. Its
+    /// managed clone needs the remote, so the row asks it, with no password prompt.
     private func backendBaselineStatus() async -> CheckStatus {
-        switch BackendBaseline.source(root: monorepoPath) {
+        switch await BackendBaseline.resolve(root: monorepoPath, shell: commandRunner) {
         case .environment(let dir):
             return .passing("FB_AMATEUR_BACKEND_DIR: \((dir as NSString).abbreviatingWithTildeInPath)")
         case .sibling(let dir):

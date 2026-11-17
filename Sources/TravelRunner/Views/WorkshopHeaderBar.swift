@@ -4,6 +4,7 @@ struct WorkshopHeaderBar: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
     @Environment(UpdateController.self) var updates: UpdateController?
     @State private var confirmingReset = false
+    @State private var confirmingResetWithoutHotels = false
 
     private var healthLabel: String {
         switch supervisor.health {
@@ -212,18 +213,29 @@ struct WorkshopHeaderBar: View {
             }
             if let notice = supervisor.hotelSourceNotice {
                 let isDbSetupRunning = supervisor.dbResetRunning || supervisor.dbSetupPipeline?.isRunning == true
-                let canReset = supervisor.compatibilityNotice == nil && !isDbSetupRunning
+                // The data can still be there: the reset asks first, as "Reset and reseed…" does.
+                let canReset = notice.beforeReset && supervisor.compatibilityNotice == nil && !isDbSetupRunning
                     && supervisor.manifestHasProfile(HotelCatalog.withoutHotelsProfile)
                 alertBanner(
                     icon: "building.2",
                     color: .orange,
-                    text: notice,
+                    text: notice.text,
                     subtitle: nil,
                     action: (HotelCatalog.importButtonTitle, { supervisor.importSharedEnvForHotels() }),
                     secondaryAction: canReset
-                        ? (HotelCatalog.resetWithoutHotelsTitle, { supervisor.resetWithoutHotels() }) : nil,
+                        ? ("\(HotelCatalog.resetWithoutHotelsTitle)…", { confirmingResetWithoutHotels = true }) : nil,
                     onDismiss: { supervisor.dismissHotelSourceNotice() }
                 )
+                .confirmationDialog(
+                    DbResetPolicy.resetConfirmationTitle,
+                    isPresented: $confirmingResetWithoutHotels,
+                    titleVisibility: .visible
+                ) {
+                    Button(HotelCatalog.resetWithoutHotelsTitle, role: .destructive) { supervisor.resetWithoutHotels() }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text(notice.resetConfirmation)
+                }
             }
             if supervisor.hotelCatalogBannerVisible, let notice = supervisor.hotelCatalogNotice {
                 let isDbSetupRunning = supervisor.dbResetRunning || supervisor.dbSetupPipeline?.isRunning == true

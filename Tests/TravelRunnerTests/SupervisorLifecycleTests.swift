@@ -2026,6 +2026,10 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.dismissHotelCatalogBanner()
         await supervisor.refreshHotelCatalog(cwd: workDir.path)
         XCTAssertFalse(supervisor.hotelCatalogBannerVisible)
+        // Positive control: a changed count shows the banner again.
+        count = "4"
+        await supervisor.refreshHotelCatalog(cwd: workDir.path)
+        XCTAssertTrue(supervisor.hotelCatalogBannerVisible)
         XCTAssertEqual(resets, 0)
     }
 
@@ -2035,7 +2039,12 @@ final class SupervisorLifecycleTests: XCTestCase {
     func testAResetThatCannotGetTheHotelsStopsBeforeTheResetAndOffersAWayOut() async throws {
         try loadSupabase()
         supervisor.shell = FakeCommandRunner()
-        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        // Another checkout built the database: the confirmation says so.
+        supervisor.databaseQuery = { _, sql in
+            sql.contains("seed_state")
+                ? DbQueryResult(exitCode: 0, stdout: #"{"checkout_path":"/elsewhere/mono","branch":"dev"}"#, stderr: "")
+                : DbQueryResult(exitCode: 0, stdout: "", stderr: "")
+        }
         supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
         let marker = workDir.appendingPathComponent("reset-ran")
         let line = "Hotels cannot be downloaded yet: No dev credentials: apps/booking-portal/.env is missing "
@@ -2055,7 +2064,11 @@ final class SupervisorLifecycleTests: XCTestCase {
         let stopped = await waitUntil(30) { !self.supervisor.dbResetRunning }
         XCTAssertTrue(stopped)
 
-        XCTAssertEqual(supervisor.hotelSourceNotice, line)
+        XCTAssertEqual(supervisor.hotelSourceNotice?.text, line)
+        XCTAssertEqual(supervisor.hotelSourceNotice?.beforeReset, true)
+        let confirmation = try XCTUnwrap(supervisor.hotelSourceNotice?.resetConfirmation)
+        XCTAssertTrue(confirmation.hasPrefix(DbResetPolicy.resetConfirmationBody), confirmation)
+        XCTAssertTrue(confirmation.contains("This database was last built from /elsewhere/mono (dev)."), confirmation)
         XCTAssertEqual(supervisor.lastError, "DB setup failed at check-prerequisites: \(line)")
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "nothing was reset")
 
@@ -2073,6 +2086,32 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(failed)
         XCTAssertNil(supervisor.hotelSourceNotice)
         XCTAssertEqual(supervisor.lastError, "DB setup failed at check-prerequisites: Missing: Docker is not running")
+    }
+
+    /// Review of D3: the guard that refuses a branch with no `fast` profile. Without it
+    /// the loader would run `reset`, hotels and all.
+    func testResetWithoutHotelsOnABranchWithoutTheFastProfileChangesNothing() async throws {
+        try loadSupabase()
+        let fake = try checkoutLackingAMigration(profiles: ["reset"])
+        supervisor.dbResetAction = nil
+        supervisor.dbPipelineFactory = nil
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+
+        supervisor.resetWithoutHotels()
+
+        XCTAssertEqual(supervisor.lastError, HotelCatalog.noWithoutHotelsProfileText)
+        XCTAssertNil(supervisor.dbSetupPipeline)
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertEqual(fake.resets(), 0)
+
+        // Positive control: with the profile the guard lets it through; this checkout
+        // has no seed scenario, so the next guard stops it.
+        _ = try checkoutLackingAMigration(profiles: ["reset", HotelCatalog.withoutHotelsProfile])
+        supervisor.dbResetAction = nil
+        supervisor.lastError = nil
+        supervisor.resetWithoutHotels()
+        XCTAssertNotNil(supervisor.lastError)
+        XCTAssertNotEqual(supervisor.lastError, HotelCatalog.noWithoutHotelsProfileText)
     }
 
     /// "Load hotels" runs the load step alone, never the reset, also when the pipeline

@@ -39,8 +39,6 @@ struct PreflightRunner: Sendable {
     var clock = RunnerClock.live
     /// A check command that hangs fails after this time and does not hold the start.
     static let checkTimeout: Duration = .seconds(15)
-    /// The environment of the runner: `FB_AMATEUR_BACKEND_DIR` picks the backend baseline.
-    var environment: [String: String] = ProcessInfo.processInfo.environment
 
     func allChecks(for services: [ServiceDefinition]) -> [PreflightCheck] {
         var checks: [PreflightCheck] = [
@@ -195,11 +193,13 @@ struct PreflightRunner: Sendable {
         }
     }
 
-    /// The managed clone of the backend baseline needs the remote: `db:start` clones it,
-    /// and every reset fetches it. Without access, a start that must clone stops here,
-    /// before anything runs. With a clone in place the start works, and the row warns.
+    /// The managed clone of the backend baseline needs the remote: `db:start` clones it
+    /// when it has no workspace, and every reset fetches it. Without access, a start that
+    /// must clone stops here, before anything runs. With a clone or a workspace in place
+    /// the start works, and the row warns. The checkout is the one the login shell of
+    /// the script picks.
     private func backendBaseline(root: String) async -> PreflightResult {
-        switch BackendBaseline.source(root: root, environment: environment) {
+        switch await BackendBaseline.resolve(root: root, shell: shell) {
         case .environment:
             return .passed(detail: "FB_AMATEUR_BACKEND_DIR")
         case .sibling:
@@ -216,7 +216,8 @@ struct PreflightRunner: Sendable {
             let message = result.timedOut
                 ? "\(BackendBaseline.noAccessText) (git did not answer in \(BackendBaseline.accessTimeout.components.seconds) s)"
                 : BackendBaseline.noAccessText
-            return cloned ? .warning(message: message) : .failed(message: message, fix: "gh auth setup-git")
+            let mustClone = !cloned && !BackendBaseline.workspaceExists(root: root)
+            return mustClone ? .failed(message: message, fix: "gh auth setup-git") : .warning(message: message)
         }
     }
 

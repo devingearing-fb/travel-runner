@@ -41,6 +41,9 @@ enum DbResetPolicy {
         var branch: String?
         var backendSha: String?
         var flavor: String?
+        /// True when the last reset left the hotels out on purpose ("Reset without
+        /// hotels"). Nil when no reset recorded it.
+        var hotelsSkipped: Bool?
 
         /// Reads the answer of `SELECT row_to_json(s) FROM travel_runner.seed_state s`.
         /// The last line holds the JSON: a login profile can print before it.
@@ -55,7 +58,8 @@ enum DbResetPolicy {
             }
             return BuiltFrom(
                 checkoutPath: text("checkout_path"), branch: text("branch"),
-                backendSha: text("backend_sha"), flavor: text("flavor")
+                backendSha: text("backend_sha"), flavor: text("flavor"),
+                hotelsSkipped: object["hotels_skipped"] as? Bool
             )
         }
     }
@@ -157,6 +161,18 @@ enum DbResetPolicy {
         return "This database was last built from \(path)\(branch). Resetting replaces it for every checkout that shares project `\(project)`."
     }
 
+    /// The other-checkout line of a reset confirmation, or nil when this checkout
+    /// built the database or the builder is not known.
+    static func otherCheckoutLine(_ builtFrom: BuiltFrom?, current: Checkout, project: String) -> String? {
+        guard builtElsewhere(builtFrom, current: current) else { return nil }
+        return builtFrom.map { otherCheckoutText($0, project: project) }
+    }
+
+    /// The body of a reset confirmation.
+    static func resetConfirmation(otherCheckout: String?) -> String {
+        [resetConfirmationBody, otherCheckout].compactMap { $0 }.joined(separator: " ")
+    }
+
     static let appliedText =
         "Migrations applied. Types and seed data were not regenerated — reset if scenario data looks wrong."
 
@@ -201,8 +217,7 @@ enum DbResetPolicy {
         hasMigrateProfile: Bool
     ) -> Notice? {
         guard !status.isCurrent else { return nil }
-        let elsewhere = builtElsewhere(builtFrom, current: current)
-        let otherCheckout = elsewhere ? builtFrom.map { otherCheckoutText($0, project: project) } : nil
+        let otherCheckout = otherCheckoutLine(builtFrom, current: current, project: project)
         let headline: String
         let detail: String?
         if !status.extra.isEmpty && !status.missingBootstrap {
@@ -217,7 +232,7 @@ enum DbResetPolicy {
             headline: headline,
             detail: detail,
             offersApply: canApply,
-            resetConfirmation: [resetConfirmationBody, otherCheckout].compactMap { $0 }.joined(separator: " ")
+            resetConfirmation: resetConfirmation(otherCheckout: otherCheckout)
         )
     }
 

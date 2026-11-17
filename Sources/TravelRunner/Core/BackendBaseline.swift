@@ -23,10 +23,30 @@ enum BackendBaseline {
         }
     }
 
-    /// The checkout that `local-db.sh` would use for the monorepo at `root`.
-    static func source(
-        root: String, environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> Source {
+    /// The checkout that `local-db.sh` would use for the monorepo at `root`, in the
+    /// login shell that runs it. A shell profile can set `FB_AMATEUR_BACKEND_DIR` that
+    /// the runner itself does not have, for example when it opens from Finder.
+    static func resolve(root: String, shell: any CommandRunning) async -> Source {
+        let result = await shell.run(environmentCommand, cwd: root, timeout: .seconds(15))
+        let dir = result.exitCode == 0 ? environmentValue(result.stdout) : nil
+        return source(root: root, environment: dir.map { ["FB_AMATEUR_BACKEND_DIR": $0] } ?? [:])
+    }
+
+    /// Prints `FB_AMATEUR_BACKEND_DIR` as the login shell sets it, after a marker: a
+    /// profile can print lines of its own before it.
+    static let environmentCommand = #"printf 'FB_AMATEUR_BACKEND_DIR=%s\n' "${FB_AMATEUR_BACKEND_DIR:-}""#
+
+    /// The value of `environmentCommand`, or nil when it is not set.
+    static func environmentValue(_ output: String) -> String? {
+        let marker = "FB_AMATEUR_BACKEND_DIR="
+        guard let line = output.split(whereSeparator: \.isNewline).last(where: { $0.hasPrefix(marker) }) else { return nil }
+        let value = String(line.dropFirst(marker.count))
+        return value.isEmpty ? nil : value
+    }
+
+    /// The checkout that `local-db.sh` would use for the monorepo at `root`, given the
+    /// environment of the script.
+    static func source(root: String, environment: [String: String]) -> Source {
         let fm = FileManager.default
         func hasMigrations(_ dir: String) -> Bool {
             fm.fileExists(atPath: (dir as NSString).appendingPathComponent("supabase/migrations"))
@@ -36,6 +56,14 @@ enum BackendBaseline {
         if hasMigrations(sibling) { return .sibling(sibling) }
         let clone = (root as NSString).appendingPathComponent(".backend-baseline")
         return .managedClone(clone, cloned: fm.fileExists(atPath: (clone as NSString).appendingPathComponent(".git")))
+    }
+
+    /// True when `local-db.sh` has built its Supabase workspace. Then `db:start` builds
+    /// nothing and clones nothing; only a reset needs the backend checkout.
+    static func workspaceExists(root: String) -> Bool {
+        FileManager.default.fileExists(
+            atPath: (root as NSString).appendingPathComponent(".supabase-workspace/supabase/config.toml")
+        )
     }
 
     /// True when the folder is a monorepo whose DB scripts use a backend baseline.

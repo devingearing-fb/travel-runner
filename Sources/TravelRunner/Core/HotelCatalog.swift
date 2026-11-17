@@ -30,30 +30,53 @@ enum HotelCatalog {
 
     /// The steps that check or fetch the hotels before the reset.
     static let sourceStepIDs: Set<String> = ["check-prerequisites", "fetch-hotels"]
+    /// The step that loads the hotels. It downloads the dump first when none is cached.
+    static let loadStepID = "load-hotels"
 
     static let cannotDownloadPrefix = "Hotels cannot be downloaded yet: "
 
-    static func cannotDownloadText(reason: String) -> String {
+    /// `nothingReset` is true for a stop before the reset.
+    static func cannotDownloadText(reason: String, nothingReset: Bool = true) -> String {
         let reason = reason.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
-        return "\(cannotDownloadPrefix)\(reason). Nothing was reset."
+        return "\(cannotDownloadPrefix)\(reason)." + (nothingReset ? " Nothing was reset." : "")
     }
 
-    /// The banner text when a step stopped a reset because the hotels cannot be had, or
-    /// nil. `resetRan` is true when the reset step of the run passed: then the database
-    /// was changed, and this banner is not the one to show.
-    static func sourceFailure(stepID: String, exitCode: Int32?, message: String?, resetRan: Bool) -> String? {
-        guard sourceStepIDs.contains(stepID), !resetRan,
-              let exitCode, sourceExitCodes.contains(exitCode) else { return nil }
+    /// The banner when the hotels cannot be had.
+    struct SourceNotice: Equatable, Sendable {
+        let text: String
+        /// A stop before the reset: nothing changed, and a reset without hotels is a
+        /// way out. After a reset, or for "Load hotels", only the import is.
+        let beforeReset: Bool
+        /// The body of the "Reset without hotels…" confirmation.
+        var resetConfirmation = HotelCatalog.withoutHotelsConfirmation(otherCheckout: nil)
+    }
+
+    /// The banner when a step stopped because the hotels cannot be had, or nil.
+    /// `resetRan` is true when the reset step of the run passed: then the database was
+    /// changed, and the stop before the reset is not the one to report.
+    static func sourceFailure(stepID: String, exitCode: Int32?, message: String?, resetRan: Bool) -> SourceNotice? {
+        guard let exitCode, sourceExitCodes.contains(exitCode) else { return nil }
         let message = (message ?? "").trimmingCharacters(in: .whitespaces)
+        let reason = message.isEmpty ? "exit code \(exitCode)" : message
+        if stepID == loadStepID {
+            return SourceNotice(text: cannotDownloadText(reason: reason, nothingReset: false), beforeReset: false)
+        }
+        guard sourceStepIDs.contains(stepID), !resetRan else { return nil }
         // check-prerequisites gives the whole line itself.
         if let range = message.range(of: cannotDownloadPrefix) {
-            return String(message[range.lowerBound...])
+            return SourceNotice(text: String(message[range.lowerBound...]), beforeReset: true)
         }
-        return cannotDownloadText(reason: message.isEmpty ? "exit code \(exitCode)" : message)
+        return SourceNotice(text: cannotDownloadText(reason: reason), beforeReset: true)
     }
 
     static let importButtonTitle = "Import shared .env…"
     static let resetWithoutHotelsTitle = "Reset without hotels"
+
+    /// The body of the "Reset without hotels…" confirmation: the reset text, with the
+    /// line about a database that another checkout built.
+    static func withoutHotelsConfirmation(otherCheckout: String?) -> String {
+        DbResetPolicy.resetConfirmation(otherCheckout: otherCheckout) + " No hotels are loaded."
+    }
     /// The manifest profile that resets and seeds without the hotel steps.
     static let withoutHotelsProfile = "fast"
     static let noWithoutHotelsProfileText =
@@ -93,16 +116,6 @@ enum HotelCatalog {
     static func count(_ result: DbQueryResult) -> Int? {
         guard result.exitCode == 0, let line = DbQueryResult.lastLine(of: result.stdout) else { return nil }
         return Int(line)
-    }
-
-    /// `seed_state.hotels_skipped` of the answer of `SELECT row_to_json(s) …`: true when the
-    /// last reset left the hotels out on purpose. Nil when no reset recorded it.
-    static func hotelsSkipped(seedState output: String) -> Bool? {
-        guard let line = DbQueryResult.lastLine(of: output),
-              let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any] else {
-            return nil
-        }
-        return object["hotels_skipped"] as? Bool
     }
 
     /// The banner after Start when hotel search would find nothing.

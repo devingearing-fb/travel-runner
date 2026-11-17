@@ -32,7 +32,7 @@ final class HotelCatalogTests: XCTestCase {
         XCTAssertEqual(
             HotelCatalog.sourceFailure(
                 stepID: "check-prerequisites", exitCode: 11, message: "Missing: Docker is not running. \(line)", resetRan: false
-            ),
+            )?.text,
             line
         )
         // fetch-hotels gives the reason only.
@@ -41,13 +41,46 @@ final class HotelCatalogTests: XCTestCase {
                 stepID: "fetch-hotels", exitCode: 12, message: "Cannot reach dev Supabase (x.supabase.co) — check network or VPN",
                 resetRan: false
             ),
-            "Hotels cannot be downloaded yet: Cannot reach dev Supabase (x.supabase.co) — check network or VPN. Nothing was reset."
+            HotelCatalog.SourceNotice(
+                text: "Hotels cannot be downloaded yet: Cannot reach dev Supabase (x.supabase.co) — check network or VPN. Nothing was reset.",
+                beforeReset: true
+            )
         )
         // Negative controls: a tool failure (exit 1), a later step, and a run whose reset passed.
         XCTAssertNil(HotelCatalog.sourceFailure(stepID: "check-prerequisites", exitCode: 1, message: line, resetRan: false))
-        XCTAssertNil(HotelCatalog.sourceFailure(stepID: "load-hotels", exitCode: 11, message: line, resetRan: false))
+        XCTAssertNil(HotelCatalog.sourceFailure(stepID: "verify-data", exitCode: 11, message: line, resetRan: false))
         XCTAssertNil(HotelCatalog.sourceFailure(stepID: "fetch-hotels", exitCode: 13, message: line, resetRan: true))
         XCTAssertNil(HotelCatalog.sourceFailure(stepID: "fetch-hotels", exitCode: nil, message: line, resetRan: false))
+    }
+
+    /// load-hotels downloads the dump when none is cached, so it exits 10 to 13 too.
+    /// The banner offers the import, and does not say that nothing was reset.
+    func testALoadThatCannotGetTheHotelsOffersOnlyTheImport() {
+        let reason = "No dev credentials: apps/booking-portal/.env is missing AMATEUR_SUPABASE_URL"
+        for resetRan in [false, true] {
+            XCTAssertEqual(
+                HotelCatalog.sourceFailure(stepID: "load-hotels", exitCode: 10, message: reason, resetRan: resetRan),
+                HotelCatalog.SourceNotice(text: "Hotels cannot be downloaded yet: \(reason).", beforeReset: false)
+            )
+        }
+        // Negative control: a load that fails for another reason (exit 1) is no hotel banner.
+        XCTAssertNil(HotelCatalog.sourceFailure(stepID: "load-hotels", exitCode: 1, message: reason, resetRan: true))
+    }
+
+    /// The confirmation of "Reset without hotels…" is the reset text, with the line
+    /// about another checkout's data when there is one.
+    func testTheResetWithoutHotelsConfirmationNamesAnotherCheckout() {
+        let other = DbResetPolicy.otherCheckoutLine(
+            DbResetPolicy.BuiltFrom(checkoutPath: "/elsewhere/mono", branch: "dev"),
+            current: DbResetPolicy.Checkout(path: "/here/mono"), project: "fb-travel"
+        )
+        let text = HotelCatalog.withoutHotelsConfirmation(otherCheckout: other)
+        XCTAssertTrue(text.hasPrefix(DbResetPolicy.resetConfirmationBody), text)
+        XCTAssertTrue(text.contains("This database was last built from /elsewhere/mono (dev)."), text)
+        // Negative control: this checkout built it, so there is no such line.
+        XCTAssertNil(DbResetPolicy.otherCheckoutLine(
+            DbResetPolicy.BuiltFrom(checkoutPath: "/here/mono"), current: DbResetPolicy.Checkout(path: "/here/mono"), project: "fb-travel"
+        ))
     }
 
     // MARK: - The catalog after Start
@@ -69,11 +102,12 @@ final class HotelCatalogTests: XCTestCase {
     func testTheCountAndTheSeedStateAreReadFromTheQuery() {
         XCTAssertEqual(HotelCatalog.count(DbQueryResult(exitCode: 0, stdout: "notice\n12", stderr: "")), 12)
         XCTAssertNil(HotelCatalog.count(DbQueryResult(exitCode: 1, stdout: "", stderr: "relation does not exist")))
-        XCTAssertEqual(HotelCatalog.hotelsSkipped(seedState: #"{"scenario_id":"standard","hotels_skipped":true}"#), true)
-        XCTAssertEqual(HotelCatalog.hotelsSkipped(seedState: #"{"hotels_skipped":false}"#), false)
+        func skipped(_ json: String) -> Bool? { DbResetPolicy.BuiltFrom.parse(json)?.hotelsSkipped }
+        XCTAssertEqual(skipped(#"{"scenario_id":"standard","hotels_skipped":true}"#), true)
+        XCTAssertEqual(skipped(#"{"hotels_skipped":false}"#), false)
         // An older table, and a null: not known.
-        XCTAssertNil(HotelCatalog.hotelsSkipped(seedState: #"{"scenario_id":"standard"}"#))
-        XCTAssertNil(HotelCatalog.hotelsSkipped(seedState: #"{"hotels_skipped":null}"#))
+        XCTAssertNil(skipped(#"{"scenario_id":"standard"}"#))
+        XCTAssertNil(skipped(#"{"hotels_skipped":null}"#))
     }
 
     // MARK: - The Environment Check rows
@@ -244,7 +278,7 @@ final class HotelCatalogTests: XCTestCase {
         let shell = FakeCommandRunner { call in
             call.command.contains("ls-remote") ? FakeCommandRunner.failed(128, stderr: "terminal prompts disabled") : FakeCommandRunner.ok()
         }
-        let runner = PreflightRunner(shell: shell, environment: [:])
+        let runner = PreflightRunner(shell: shell)
 
         let check = try XCTUnwrap(runner.allChecks(for: [supabase]).first { $0.id == "backend-baseline" })
         XCTAssertFalse(runner.readOnlyChecks(for: [supabase]).contains { $0.id == "backend-baseline" })
@@ -252,8 +286,11 @@ final class HotelCatalogTests: XCTestCase {
 
         guard case .failed(let message, _) = result else { return XCTFail("\(result)") }
         XCTAssertEqual(message, BackendBaseline.noAccessText)
-        XCTAssertEqual(shell.calls.map(\.command), [BackendBaseline.accessCommand(url: "https://example.invalid/fb-amateur-backend.git")])
-        XCTAssertEqual(shell.calls.first?.timeout, .seconds(15))
+        XCTAssertEqual(
+            shell.calls.map(\.command),
+            [BackendBaseline.environmentCommand, BackendBaseline.accessCommand(url: "https://example.invalid/fb-amateur-backend.git")]
+        )
+        XCTAssertEqual(shell.calls.last?.timeout, .seconds(15))
 
         // A clone in place starts without the remote: the check only warns.
         try write("", to: ".backend-baseline/.git/HEAD", in: root)
@@ -263,10 +300,72 @@ final class HotelCatalogTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: dir.appendingPathComponent("fb-amateur-backend/supabase/migrations"), withIntermediateDirectories: true
         )
-        let calls = shell.calls.count
+        let asks = shell.commands.filter { $0.contains("ls-remote") }.count
         let sibling = await runner.run(check: check)
         XCTAssertTrue(sibling.isPassed, "\(sibling)")
-        XCTAssertEqual(shell.calls.count, calls)
+        XCTAssertEqual(shell.commands.filter { $0.contains("ls-remote") }.count, asks)
+    }
+
+    private func supabase(root: URL) -> ServiceDefinition {
+        ServiceDefinition(
+            id: "supabase", name: "Supabase", cmd: ["pnpm", "db:start"], cwd: root.path, probe: nil,
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: "ground", reuseIfRunning: nil
+        )
+    }
+
+    /// The script runs in a login shell, which can set FB_AMATEUR_BACKEND_DIR that the
+    /// runner (opened from Finder) does not have. Then nothing clones, and the remote is
+    /// not asked.
+    func testThePreflightTakesTheBackendDirOfTheLoginShell() async throws {
+        let root = dir.appendingPathComponent("fb-travel-monolith")
+        try write("BACKEND_REPO=\"https://example.invalid/fb-amateur-backend.git\"\n", to: "scripts/local-db.sh", in: root)
+        var backendDir = "/own/fb-amateur-backend"
+        let shell = FakeCommandRunner { call in
+            if call.command == BackendBaseline.environmentCommand {
+                return FakeCommandRunner.ok("profile says hello\nFB_AMATEUR_BACKEND_DIR=\(backendDir)\n")
+            }
+            return call.command.contains("ls-remote") ? FakeCommandRunner.failed(128, stderr: "terminal prompts disabled") : FakeCommandRunner.ok()
+        }
+        let runner = PreflightRunner(shell: shell)
+        let check = try XCTUnwrap(runner.allChecks(for: [supabase(root: root)]).first { $0.id == "backend-baseline" })
+
+        let result = await runner.run(check: check)
+
+        XCTAssertTrue(result.isPassed, "\(result)")
+        XCTAssertFalse(shell.commands.contains { $0.contains("ls-remote") }, "\(shell.commands)")
+
+        // Negative control: a login shell without the variable falls back to the clone, and asks.
+        backendDir = ""
+        let clone = await runner.run(check: check)
+        XCTAssertTrue(clone.isFailed, "\(clone)")
+        XCTAssertTrue(shell.commands.contains { $0.contains("ls-remote") })
+    }
+
+    /// With the Supabase workspace in place, `db:start` builds nothing and clones
+    /// nothing: no access only warns.
+    func testThePreflightLetsAStartWithAWorkspaceRunWithoutTheRemote() async throws {
+        let root = dir.appendingPathComponent("fb-travel-monolith")
+        try write("BACKEND_REPO=\"https://example.invalid/fb-amateur-backend.git\"\n", to: "scripts/local-db.sh", in: root)
+        let shell = FakeCommandRunner { call in
+            call.command.contains("ls-remote") ? FakeCommandRunner.failed(128, stderr: "terminal prompts disabled") : FakeCommandRunner.ok()
+        }
+        let runner = PreflightRunner(shell: shell)
+        let check = try XCTUnwrap(runner.allChecks(for: [supabase(root: root)]).first { $0.id == "backend-baseline" })
+        let first = await runner.run(check: check)
+        XCTAssertTrue(first.isFailed, "control: no workspace and no clone fails")
+
+        try write("[api]\n", to: ".supabase-workspace/supabase/config.toml", in: root)
+        let result = await runner.run(check: check)
+
+        guard case .warning(let message) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(message, BackendBaseline.noAccessText)
+    }
+
+    func testTheLoginShellValueIsReadAfterTheMarker() {
+        XCTAssertEqual(BackendBaseline.environmentValue("noise\nFB_AMATEUR_BACKEND_DIR=/a b/c\n"), "/a b/c")
+        XCTAssertNil(BackendBaseline.environmentValue("FB_AMATEUR_BACKEND_DIR=\n"))
+        XCTAssertNil(BackendBaseline.environmentValue("FB_AMATEUR_BACKEND_DIR is not a line of the marker"))
+        XCTAssertEqual(BackendBaseline.environmentCommand, #"printf 'FB_AMATEUR_BACKEND_DIR=%s\n' "${FB_AMATEUR_BACKEND_DIR:-}""#)
     }
 
     func testAFolderWithoutTheDbScriptHasNoBaselineCheck() {

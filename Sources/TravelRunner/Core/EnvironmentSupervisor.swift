@@ -33,9 +33,9 @@ final class EnvironmentSupervisor {
     var migrationApplyError: String? = nil
     /// Set after "Apply migrations" passed, until the person closes it.
     var migrationsAppliedNotice: String? = nil
-    /// Set when a DB setup stopped before the reset because the hotels cannot be
+    /// Set when a DB setup or "Load hotels" stopped because the hotels cannot be
     /// downloaded, until the next setup or a dismiss.
-    var hotelSourceNotice: String? = nil
+    var hotelSourceNotice: HotelCatalog.SourceNotice? = nil
     /// Set after Start when the hotel catalog is empty and no reset left the hotels
     /// out on purpose.
     var hotelCatalogNotice: HotelCatalog.EmptyNotice? = nil
@@ -1562,8 +1562,9 @@ final class EnvironmentSupervisor {
         )
         Task {
             guard await checker.importSharedEnv(.booking) == true else { return }
+            let wasLoad = hotelSourceNotice?.beforeReset == false
             hotelSourceNotice = nil
-            onActionFeedback?("Shared .env imported — run the reset again", true)
+            onActionFeedback?("Shared .env imported — \(wasLoad ? "load the hotels" : "run the reset") again", true)
         }
     }
 
@@ -1589,10 +1590,7 @@ final class EnvironmentSupervisor {
         let count = HotelCatalog.count(await queryDatabase(cwd: cwd, sql: HotelCatalog.countSQL))
         var skipped: Bool?
         if let count, count < HotelCatalog.minimumHotels {
-            let state = await queryDatabase(
-                cwd: cwd, sql: "SELECT row_to_json(s) FROM travel_runner.seed_state s WHERE singleton"
-            )
-            skipped = state.exitCode == 0 ? HotelCatalog.hotelsSkipped(seedState: state.stdout) : nil
+            skipped = await readBuiltFrom(cwd: cwd)?.hotelsSkipped
         }
         let notice = HotelCatalog.emptyNotice(count: count, hotelsSkipped: skipped)
         if notice != hotelCatalogNotice { hotelCatalogBannerDismissed = false }
@@ -1739,11 +1737,21 @@ final class EnvironmentSupervisor {
                 ? DbResetPolicy.emptySetupFailedText(step: failed.name, message: message)
                 : "DB setup failed at \(failed.name): \(message)"
             if isApply { migrationApplyError = message }
-            // A stop before the reset because the hotels cannot be had: the banner offers the way out.
-            hotelSourceNotice = HotelCatalog.sourceFailure(
+            // A stop because the hotels cannot be had: the banner offers the way out.
+            var notice = HotelCatalog.sourceFailure(
                 stepID: failed.id, exitCode: failed.exitCode, message: failed.errorMessage,
                 resetRan: run.pipeline?.steps.contains { $0.id == "reset-database" && $0.status == .passed } == true
             )
+            if notice?.beforeReset == true {
+                // The reset it offers asks first, and names another checkout's data.
+                let other = DbResetPolicy.otherCheckoutLine(
+                    await readBuiltFrom(cwd: run.cwd),
+                    current: DbResetPolicy.Checkout(path: run.cwd, branch: gitBranches["supabase"]),
+                    project: SupabaseProject.projectName(root: run.cwd)
+                )
+                notice?.resetConfirmation = HotelCatalog.withoutHotelsConfirmation(otherCheckout: other)
+            }
+            hotelSourceNotice = notice
             await captureDbSetupFailure(failed, runner: run.runner)
         } else if let reason = run.reason, lastError == reason {
             // The run ended with no failed step: it was cancelled between two steps.
