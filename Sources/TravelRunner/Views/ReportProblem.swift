@@ -49,7 +49,7 @@ enum ReportProblem {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(report.summary, forType: .string)
                 NSWorkspace.shared.activateFileViewerSelecting([report.zipURL])
-                supervisor.onActionFeedback?(ReportExporter.savedMessage, true)
+                supervisor.onActionFeedback?(report.message, true)
             } catch {
                 supervisor.onActionFeedback?("Report not saved: \(error.localizedDescription)", false)
             }

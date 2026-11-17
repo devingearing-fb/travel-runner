@@ -165,7 +165,10 @@ final class ReportExporterTests: XCTestCase {
             XCTFail("the export should fail")
         } catch let error as ReportExporter.ExportError {
             XCTAssertEqual(error, .zipFailed("ditto: No space left on device"))
-            XCTAssertEqual(error.localizedDescription, "the zip could not be made (ditto: No space left on device)")
+            XCTAssertEqual(
+                error.localizedDescription,
+                "the zip could not be made (ditto: No space left on device). Press Report again. If it fails again, use Copy Diagnostics Bundle under Diagnostics and paste that in Slack."
+            )
         }
         let left = (try? FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("Downloads").path)) ?? []
         XCTAssertEqual(left, [])
@@ -173,7 +176,82 @@ final class ReportExporterTests: XCTestCase {
         XCTAssertEqual(staging, [])
     }
 
+    /// A zip step that macOS stops in Downloads, as ditto reports it.
+    private func deniedInDownloads(_ calls: ZipCalls) -> @Sendable (URL, URL) async -> CommandResult {
+        { folder, archive in
+            guard archive.deletingLastPathComponent().lastPathComponent != "Downloads" else {
+                return FakeCommandRunner.failed(1, stderr: "ditto: \(archive.path): Operation not permitted")
+            }
+            calls.append(folder: folder, archive: archive, contents: folder)
+            try? Data("PK".utf8).write(to: archive)
+            return FakeCommandRunner.ok()
+        }
+    }
+
+    func testWhenMacOSStopsTheWriteToDownloadsTheZipGoesToTheFallbackFolder() async throws {
+        let calls = ZipCalls()
+        var (exporter, _) = exporter(zip: deniedInDownloads(calls))
+        let reports = root.appendingPathComponent("Application Support/Travel Runner/reports")
+        exporter.fallbackDestination = reports
+
+        let report = try await exporter.export(input())
+
+        let zipURL = reports.appendingPathComponent("TravelRunner-report-20261116-0914-v0.13.5.zip")
+        XCTAssertEqual(report.zipURL, zipURL)
+        XCTAssertTrue(report.inFallback)
+        XCTAssertEqual(report.message, ReportExporter.fallbackSavedMessage)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: zipURL.path))
+        XCTAssertTrue(report.summary.components(separatedBy: "\n")[0].hasSuffix(": \(zipURL.lastPathComponent)"))
+        XCTAssertEqual(calls.archives, [zipURL])
+        let left = (try? FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("Downloads").path)) ?? []
+        XCTAssertEqual(left, [])
+    }
+
+    func testWithoutAFallbackAStoppedWriteSaysHowToAllowIt() async throws {
+        let (exporter, _) = exporter(zip: deniedInDownloads(ZipCalls()))
+
+        do {
+            _ = try await exporter.export(input())
+            XCTFail("the export should fail")
+        } catch let error as ReportExporter.ExportError {
+            XCTAssertEqual(error, .notPermitted)
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Travel Runner may not save to Downloads. Allow it in System Settings > Privacy & Security > Files and Folders, then press Report again."
+            )
+        }
+    }
+
+    func testAReportInDownloadsSaysDownloads() async throws {
+        let report = try await exporter().0.export(input())
+        XCTAssertFalse(report.inFallback)
+        XCTAssertEqual(report.message, ReportExporter.savedMessage)
+    }
+
     // MARK: - The folder
+
+    func testJustAfterARotationTheLogHasTheEndOfTheRotatedFile() throws {
+        let fm = FileManager.default
+        let logs = root.appendingPathComponent("Logs")
+        try fm.createDirectory(at: logs, withIntermediateDirectories: true)
+        let rotated = (1...(ReportExporter.maxLogLines + 10))
+            .map { "2026-11-16T09:14:03.412+0000 [err] old \($0)" }.joined(separator: "\n")
+        try rotated.write(to: logs.appendingPathComponent("stripe.1.log"), atomically: true, encoding: .utf8)
+        try "2026-11-16T09:14:04.000+0000 [out] new 1\n2026-11-16T09:14:04.100+0000 [out] new 2\n"
+            .write(to: logs.appendingPathComponent("stripe.log"), atomically: true, encoding: .utf8)
+
+        var input = input()
+        input.logDirectory = logs
+        let folder = root.appendingPathComponent("report")
+        try exporter().0.stage(input, summary: "s", into: folder)
+
+        let lines = try read(folder.appendingPathComponent("logs/stripe.log")).split(separator: "\n")
+        XCTAssertEqual(lines.count, ReportExporter.maxLogLines)
+        XCTAssertEqual(lines.first, "2026-11-16T09:14:03.412+0000 [err] old 13")
+        XCTAssertEqual(lines[lines.count - 3], "2026-11-16T09:14:03.412+0000 [err] old \(ReportExporter.maxLogLines + 10)")
+        XCTAssertEqual(lines.last, "2026-11-16T09:14:04.100+0000 [out] new 2")
+        XCTAssertFalse(fm.fileExists(atPath: folder.appendingPathComponent("logs/stripe.1.log").path))
+    }
 
     func testTheFolderHasTheDiagnosticsTheLogsTheIssuesAndTheEventsAllRedacted() async throws {
         let fm = FileManager.default
@@ -250,7 +328,8 @@ final class ReportExporterTests: XCTestCase {
         XCTAssertEqual(portal.first, "2026-11-16T09:14:03.412+0000 [out] line 6")
         XCTAssertEqual(
             try read(folder.appendingPathComponent("logs/stripe.log")),
-            "2026-11-16T09:14:03.412+0000 [err] STRIPE_SECRET_KEY=‹redacted:stripe-key›\n"
+            // A short log starts with the end of its rotated file.
+            "old\n2026-11-16T09:14:03.412+0000 [err] STRIPE_SECRET_KEY=‹redacted:stripe-key›\n"
         )
         XCTAssertEqual(
             try read(folder.appendingPathComponent("logs/db-setup-seed.log")),
@@ -326,6 +405,41 @@ final class ReportExporterTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(
             atPath: try XCTUnwrap(calls.contents.last).appendingPathComponent("issues/closed/\(id)/issue.json").path
         ))
+    }
+}
+
+extension ReportExporterTests {
+    @MainActor
+    func testASecondReportWhileOneIsSavingIsRefused() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "ReportExporterTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        supervisor.diagnosticsTools = { _ in [] }
+        supervisor.debugTracker = DebugTracker(baseDir: root.appendingPathComponent("issues").path, rateLimitSeconds: 0)
+        // The zip step waits until the test lets it go.
+        let (release, releaseContinuation) = AsyncStream<Void>.makeStream()
+        let (exporter, _) = exporter(zip: { _, archive in
+            for await _ in release { break }
+            try? Data("PK".utf8).write(to: archive)
+            return FakeCommandRunner.ok()
+        })
+        supervisor.makeReportExporter = { exporter }
+
+        let first = Task { try await supervisor.exportReport() }
+        for _ in 0..<1000 where !supervisor.reportExportRunning { await Task.yield() }
+        XCTAssertTrue(supervisor.reportExportRunning)
+
+        do {
+            _ = try await supervisor.exportReport()
+            XCTFail("a second report should not start")
+        } catch let error as ReportExporter.ExportError {
+            XCTAssertEqual(error, .alreadyRunning)
+        }
+        XCTAssertTrue(supervisor.reportExportRunning)
+
+        releaseContinuation.yield()
+        releaseContinuation.finish()
+        _ = try await first.value
+        XCTAssertFalse(supervisor.reportExportRunning)
     }
 }
 

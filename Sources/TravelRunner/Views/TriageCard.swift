@@ -70,30 +70,34 @@ struct TriageCard: View {
             }
 
             HStack(spacing: 6) {
-                Button(action: onRestart) {
-                    Label("Restart", systemImage: "arrow.clockwise")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
-
-                Button(action: onCascadeRestart) {
-                    Label("Cascade", systemImage: "arrow.clockwise.circle")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.mini)
-
-                if let onClearCache {
-                    Button(action: onClearCache) {
-                        Label("Clear Cache", systemImage: "arrow.clockwise")
+                HStack(spacing: 6) {
+                    Button(action: onRestart) {
+                        Label("Restart", systemImage: "arrow.clockwise")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
-                    .tint(.orange)
-                }
 
-                if isActionInFlight {
-                    ProgressView().controlSize(.mini)
+                    Button(action: onCascadeRestart) {
+                        Label("Cascade", systemImage: "arrow.clockwise.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+
+                    if let onClearCache {
+                        Button(action: onClearCache) {
+                            Label("Clear Cache", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .tint(.orange)
+                    }
+
+                    if isActionInFlight {
+                        ProgressView().controlSize(.mini)
+                    }
                 }
+                // Report stays on while a restart hangs: that is when it is needed.
+                .disabled(isActionInFlight)
 
                 Spacer()
 
@@ -107,7 +111,6 @@ struct TriageCard: View {
                 .disabled(supervisor.reportExportRunning)
                 .help("Save a report zip to Downloads and copy a summary for Slack")
             }
-            .disabled(isActionInFlight)
         }
         .padding(10)
         .background(Color.red.opacity(0.08))

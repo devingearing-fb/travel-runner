@@ -30,7 +30,7 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 1. Read the red card on Status, or the banner at the top. A failed service shows its last log lines; a failed DB step shows its error and its log (the terminal button).
 2. Try the button on it: **Restart**, **Clear Cache**, or **Retry** on a DB step.
 3. Still broken? Press **Report**. It is on the red card, on a failed DB step, on the error banner, in an issue on the Issues tab, under Diagnostics, and in the menu bar menu (**Report a Problem…**).
-4. The runner saves `TravelRunner-report-<yyyyMMdd-HHmm>-v<version>.zip` to Downloads, shows it in Finder, and copies a three-line summary.
+4. The runner saves `TravelRunner-report-<yyyyMMdd-HHmm>-v<version>.zip` to Downloads, shows it in Finder, and copies a three-line summary. If macOS does not let it write to Downloads, the zip goes to `~/Library/Application Support/Travel Runner/reports` instead; to use Downloads, allow it in System Settings > Privacy & Security > Files and Folders.
 5. Paste the summary in Slack, attach the zip, and send it to Devin.
 
 The report holds `diagnostics.json` (the app version, macOS, the tools and their PATH, the profile, the database mode, the start checks, the DB setup steps, the pending migrations, the repo paths and each service), the last 2000 lines of each log, the newest open issues, and `events.jsonl`. Secret values are masked (`‹redacted:kind›`). Open the zip and read it before you share it. Nothing is sent anywhere by the app.

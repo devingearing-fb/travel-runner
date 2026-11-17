@@ -211,6 +211,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showStatusMenu() {
         let menu = NSMenu()
+        // Each item sets its own enabled state; AppKit would enable every item with an action.
+        menu.autoenablesItems = false
 
         for serviceID in supervisor.sortedServiceIDs {
             guard let state = supervisor.serviceStates[serviceID] else { continue }

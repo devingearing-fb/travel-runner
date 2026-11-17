@@ -42,18 +42,31 @@ struct ReportExporter: Sendable {
     struct Report: Sendable, Equatable {
         let zipURL: URL
         let summary: String
+        /// True when macOS did not let the app write to Downloads and the zip
+        /// went to `fallbackDestination`.
+        var inFallback = false
+
+        /// The toast for this report.
+        var message: String { inFallback ? ReportExporter.fallbackSavedMessage : ReportExporter.savedMessage }
     }
 
     enum ExportError: Error, LocalizedError, Equatable {
         case alreadyRunning
         case stagingFailed(String)
         case zipFailed(String)
+        /// macOS did not let the app write to Downloads, and no other folder worked.
+        case notPermitted
 
         var errorDescription: String? {
             switch self {
-            case .alreadyRunning: "a report is already being saved"
-            case .stagingFailed(let reason): "the report folder could not be written (\(reason))"
-            case .zipFailed(let reason): "the zip could not be made (\(reason))"
+            case .alreadyRunning:
+                "a report is already being saved. Wait for it to finish, then try again."
+            case .stagingFailed(let reason):
+                "the report folder could not be written (\(reason)). Free some disk space, then press Report again."
+            case .zipFailed(let reason):
+                "the zip could not be made (\(reason)). Press Report again. If it fails again, use Copy Diagnostics Bundle under Diagnostics and paste that in Slack."
+            case .notPermitted:
+                "Travel Runner may not save to Downloads. Allow it in System Settings > Privacy & Security > Files and Folders, then press Report again."
             }
         }
     }
@@ -62,6 +75,8 @@ struct ReportExporter: Sendable {
 
     /// The toast after a report was saved.
     static let savedMessage = "Report saved to Downloads and summary copied. Attach the zip in Slack for Devin."
+    /// The toast after a report was saved outside Downloads.
+    static let fallbackSavedMessage = "Travel Runner may not save to Downloads, so the report is in Application Support (shown in Finder). Summary copied. Attach the zip in Slack for Devin."
     /// The sheet before the first report.
     static let privacyNotice = "This report contains logs from your local services. Secrets are masked. Review the folder before sharing."
 
@@ -76,6 +91,9 @@ struct ReportExporter: Sendable {
 
     /// Where the zip goes: Downloads.
     var destination: URL
+    /// Where the zip goes when macOS does not let the app write to Downloads
+    /// (a protected folder). It needs no permission prompt. Nil: no second try.
+    var fallbackDestination: URL?
     /// Where the folder is put together before it is zipped.
     var temporaryDirectory: URL = FileManager.default.temporaryDirectory
     var timeZone: TimeZone = .current
@@ -87,7 +105,15 @@ struct ReportExporter: Sendable {
     static func live() -> ReportExporter {
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Downloads")
-        return ReportExporter(destination: downloads)
+        let reports = URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Library/Application Support/\(Flavor.current.displayName)/reports")
+        return ReportExporter(destination: downloads, fallbackDestination: reports)
+    }
+
+    /// True when the zip step failed because macOS did not allow the write.
+    static func isPermissionError(_ result: CommandResult) -> Bool {
+        let text = (result.stderr + "\n" + result.stdout).lowercased()
+        return text.contains("operation not permitted") || text.contains("permission denied")
     }
 
     /// `ditto` makes the zip that Finder makes. It is part of macOS.
@@ -171,10 +197,22 @@ struct ReportExporter: Sendable {
     // MARK: - Export
 
     /// Builds the folder, zips it into Downloads and deletes the folder. A zip
-    /// that failed half way is deleted too.
+    /// that failed half way is deleted too. When macOS does not let the app
+    /// write to Downloads, the zip goes to `fallbackDestination`.
     func export(_ input: Input) async throws -> Report {
-        let fm = FileManager.default
         let date = now()
+        do {
+            return try await export(input, into: destination, date: date)
+        } catch ExportError.notPermitted {
+            guard let fallbackDestination else { throw ExportError.notPermitted }
+            var report = try await export(input, into: fallbackDestination, date: date)
+            report.inFallback = true
+            return report
+        }
+    }
+
+    private func export(_ input: Input, into destination: URL, date: Date) async throws -> Report {
+        let fm = FileManager.default
         let base = Self.baseName(version: input.snapshot.app.version, date: date, timeZone: timeZone)
         let name = Self.freeName(base, in: destination) { fm.fileExists(atPath: $0) }
         let zipURL = destination.appendingPathComponent("\(name).zip")
@@ -193,6 +231,7 @@ struct ReportExporter: Sendable {
         let result = await zip(folder, zipURL)
         guard result.succeeded, fm.fileExists(atPath: zipURL.path) else {
             try? fm.removeItem(at: zipURL)
+            if Self.isPermissionError(result) { throw ExportError.notPermitted }
             let reason = result.timedOut ? "ditto did not finish in time"
                 : result.stderr.trimmingCharacters(in: .whitespacesAndNewlines).split(whereSeparator: \.isNewline).last
                     .map(String.init) ?? "ditto exit code \(result.exitCode)"
@@ -223,10 +262,13 @@ struct ReportExporter: Sendable {
         if let directory = input.logDirectory {
             for file in currentLogFiles(in: directory) {
                 guard let data = try? Data(contentsOf: file) else { continue }
-                let lines = String(decoding: data, as: UTF8.self)
-                    .split(omittingEmptySubsequences: true, whereSeparator: \.isNewline)
-                    .suffix(Self.maxLogLines)
-                    .map { redactor.redact(String($0)) }
+                var tail = Self.lines(data).suffix(Self.maxLogLines)
+                // Just after the sink rotated the file, its earlier lines are in `<id>.1.log`.
+                if tail.count < Self.maxLogLines,
+                   let rotated = try? Data(contentsOf: file.deletingPathExtension().appendingPathExtension("1.log")) {
+                    tail = Self.lines(rotated).suffix(Self.maxLogLines - tail.count) + tail
+                }
+                let lines = tail.map { redactor.redact(String($0)) }
                 try write(lines.joined(separator: "\n") + "\n", to: logs.appendingPathComponent(file.lastPathComponent))
                 written.insert(file.lastPathComponent)
             }
@@ -270,6 +312,10 @@ struct ReportExporter: Sendable {
                 return stem.isEmpty || !stem.allSatisfy(\.isNumber)
             }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    private static func lines(_ data: Data) -> [Substring] {
+        String(decoding: data, as: UTF8.self).split(omittingEmptySubsequences: true, whereSeparator: \.isNewline)
     }
 
     private func write(_ text: String, to url: URL) throws {
