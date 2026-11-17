@@ -134,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Phase 4: Kill by service port as a fallback. Only the ports that Stop All
         // clears: the services of the profile and those this session started, never a
         // reuse_if_running service (Supabase persists between sessions).
+        defer { supervisor.markCleanExit() }
         guard !siblingRunsStack else { return }
         killProcessesOnPorts(supervisor.sweepPorts)
     }

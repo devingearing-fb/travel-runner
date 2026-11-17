@@ -174,6 +174,10 @@ final class EnvironmentSupervisor {
     var issueCapturePollInterval: Duration = .seconds(30)
     private var issueCapturePollStarted = false
     private var issueLaunchPruneDone = false
+    /// The tools of an issue's `diagnostics.json`. Tests give a fake; nil runs the
+    /// tools report in the shell of the supervisor.
+    @ObservationIgnored var diagnosticsTools: (@Sendable (_ cwd: String?) async -> [ToolReport])?
+    @ObservationIgnored private var cachedDiagnosticsTools: (at: Date, reports: [ToolReport])?
     private var gitBranchWatcher: GitBranchWatcher?
     private var gitRepoRoots: [String: String] = [:]
     private var dependencyWatcher: DependencyWatcher?
@@ -2745,13 +2749,35 @@ final class EnvironmentSupervisor {
     /// poll and the launch prune stay single.
     func initDebugTracking() async {
         let tracker = currentIssueTracker()
-        let prune = !issueLaunchPruneDone
+        let launch = !issueLaunchPruneDone
         issueLaunchPruneDone = true
         startIssueCapturePoll()
         await refreshIssueCapture()
-        if prune, debugTracker != nil {
+        guard launch else { return }
+        let previous = await tracker.beginRun(pid: getpid())
+        if debugTracker != nil {
             await tracker.pruneClosedIssues()
         }
+        if let previous {
+            await captureDebugIssue(
+                trigger: "unclean_exit",
+                serviceID: nil,
+                summary: Self.uncleanExitText(previous),
+                signature: "unclean exit"
+            )
+        }
+    }
+
+    /// The issue text of a run that left its marker behind.
+    static func uncleanExitText(_ marker: DebugTracker.RunMarker, appName: String = Flavor.current.displayName) -> String {
+        let version = marker.appVersion.map { "v\($0)" } ?? "version unknown"
+        return "The last run of \(appName) (\(version), pid \(marker.pid), started \(marker.startedAt)) "
+            + "did not quit cleanly. It crashed, was force-quit, or the Mac lost power."
+    }
+
+    /// A clean quit: the next launch finds no marker of this run.
+    func markCleanExit() {
+        issueTracker?.endRun()
     }
 
     /// The one tracker of this run. It holds the rate limit.
@@ -2841,6 +2867,12 @@ final class EnvironmentSupervisor {
             logEntries = raw.map { DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: sid, line: $0.text) }
             likelyCause = CrashCause.likelyCause(in: raw.map(\.text), serviceID: sid, redactor: redactor)
         }
+        // The combined log has every service, the DB steps and the runner too.
+        for id in await logStore.serviceIDs() where id != serviceID {
+            logEntries += await logStore.entries(for: id).map {
+                DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: id, line: $0.text)
+            }
+        }
 
         let _ = await tracker.captureIssue(
             trigger: trigger,
@@ -2850,7 +2882,8 @@ final class EnvironmentSupervisor {
             likelyCause: likelyCause,
             logEntries: logEntries,
             stateSnapshots: snapshots,
-            redactor: redactor
+            redactor: redactor,
+            diagnostics: { [weak self] in await self?.diagnosticsSnapshot() }
         )
 
         debugOpenIssueCount = await tracker.openIssueCount()
@@ -2864,6 +2897,84 @@ final class EnvironmentSupervisor {
             envDirectories: definitions.compactMap(\.resolvedCwd),
             environments: definitions.compactMap(\.env)
         )
+    }
+
+    /// How long the tools of the last snapshot stay good. A crash loop files many
+    /// issues; the tools are read once for them.
+    static let diagnosticsToolsMaxAge: TimeInterval = 600
+
+    /// This Mac and the stack now, for the `diagnostics.json` of an issue. The
+    /// state is read first: the tools take some seconds and the state can change
+    /// meanwhile.
+    func diagnosticsSnapshot(home: String = NSHomeDirectory()) async -> DiagnosticsSnapshot {
+        let now = clock.date()
+        let services = sortedServiceIDs.compactMap { serviceStates[$0] }
+            + serviceStates.values.filter { !sortedServiceIDs.contains($0.id) }.sorted { $0.id < $1.id }
+        let pipeline = dbSetupPipeline.map { pipeline in
+            DiagnosticsSnapshot.DbPipeline(
+                profile: pipeline.profile,
+                seedScenario: pipeline.seedScenario.id,
+                running: pipeline.isRunning,
+                steps: pipeline.steps.map {
+                    DiagnosticsSnapshot.DbStep(
+                        id: $0.id, name: $0.name, status: $0.status.rawValue,
+                        optional: $0.isOptional, error: $0.errorMessage
+                    )
+                }
+            )
+        }
+        var snapshot = DiagnosticsSnapshot(
+            generatedAt: ISO8601DateFormatter().string(from: now),
+            app: DiagnosticsSnapshot.App(.current),
+            machine: .current,
+            tools: [],
+            toolPath: nil,
+            profile: profile.rawValue,
+            dbMode: dbMode.rawValue,
+            health: health.rawValue,
+            lastError: lastError,
+            preflight: preflightChecks.map { DiagnosticsSnapshot.Check(id: $0.id, name: $0.name, result: $0.result) },
+            dbPipeline: pipeline,
+            pendingMigrations: pendingMigrations,
+            repoPaths: DiagnosticsSnapshot.repoPaths(config?.paths, home: home),
+            gitBranches: gitBranches,
+            services: services.map { state in
+                DiagnosticsSnapshot.Service(
+                    id: state.id,
+                    phase: state.phase.rawValue,
+                    inProfile: isInProfile(state.id),
+                    pid: state.pid,
+                    exitCode: state.exitCode,
+                    restartCount: state.restartCount,
+                    circuitBroken: state.isCircuitBroken,
+                    uptimeSeconds: state.lastStarted.map { Int(now.timeIntervalSince($0)) }
+                )
+            }
+        )
+        let tools = await diagnosticsToolReports()
+        snapshot.tools = tools.map { DiagnosticsSnapshot.Tool($0, home: home) }
+        snapshot.toolPath = tools.map(\.searchedPath).first { !$0.isEmpty }
+            .map { DiagnosticsSnapshot.tilde($0, home: home) }
+        return snapshot
+    }
+
+    /// The tools report of the diagnostics, read again when it is old or has a
+    /// tool that was not read.
+    private func diagnosticsToolReports() async -> [ToolReport] {
+        if let cached = cachedDiagnosticsTools,
+           clock.date().timeIntervalSince(cached.at) < Self.diagnosticsToolsMaxAge {
+            return cached.reports
+        }
+        let cwd = monorepoPath.flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : nil }
+        let reports: [ToolReport] = if let diagnosticsTools {
+            await diagnosticsTools(cwd)
+        } else {
+            await tools.report(runner: shell, cwd: cwd)
+        }
+        if !reports.contains(where: \.isUnread) {
+            cachedDiagnosticsTools = (clock.date(), reports)
+        }
+        return reports
     }
 
     func listDebugIssues(status: String = "open") async -> [DebugTracker.Issue] {

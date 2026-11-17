@@ -20,6 +20,7 @@ actor DebugTracker {
             let dbSetupFailure: Bool?
             let preflightFailure: Bool?
             let probeTimeout: Bool?
+            let uncleanExit: Bool?
 
             enum CodingKeys: String, CodingKey {
                 case serviceCrash = "service_crash"
@@ -27,6 +28,7 @@ actor DebugTracker {
                 case dbSetupFailure = "db_setup_failure"
                 case preflightFailure = "preflight_failure"
                 case probeTimeout = "probe_timeout"
+                case uncleanExit = "unclean_exit"
             }
         }
 
@@ -160,6 +162,26 @@ actor DebugTracker {
         }
     }
 
+    // MARK: - Run marker
+
+    /// `running.marker`: this app runs. A clean quit deletes it, so a marker
+    /// that is there at launch is a run that crashed, was force-quit or lost power.
+    struct RunMarker: Codable, Equatable, Sendable {
+        var pid: Int32
+        var startedAt: String
+        var appVersion: String?
+        var appBuild: String?
+        var appCommit: String?
+
+        enum CodingKeys: String, CodingKey {
+            case pid
+            case startedAt = "started_at"
+            case appVersion = "app_version"
+            case appBuild = "app_build"
+            case appCommit = "app_commit"
+        }
+    }
+
     // MARK: - Log entry
 
     struct LogEntry: Sendable {
@@ -175,6 +197,8 @@ actor DebugTracker {
     private let openDir: String
     private let closedDir: String
     private let eventsPath: String
+    /// A clean quit deletes this file from outside the actor.
+    nonisolated let runMarkerPath: String
     private let buildInfo: BuildInfo
     private let rateLimitSeconds: TimeInterval
     private let defaultRetentionDays: Int?
@@ -239,6 +263,7 @@ actor DebugTracker {
         self.openDir = (root as NSString).appendingPathComponent("open")
         self.closedDir = (root as NSString).appendingPathComponent("closed")
         self.eventsPath = (root as NSString).appendingPathComponent("events.jsonl")
+        self.runMarkerPath = (root as NSString).appendingPathComponent("running.marker")
     }
 
     var folderPath: String { baseDir }
@@ -291,6 +316,7 @@ actor DebugTracker {
         case "db_setup_failure":  return auto.dbSetupFailure ?? true
         case "preflight_failure": return auto.preflightFailure ?? true
         case "probe_timeout":     return auto.probeTimeout ?? true
+        case "unclean_exit":      return auto.uncleanExit ?? true
         default:                  return true
         }
     }
@@ -307,8 +333,9 @@ actor DebugTracker {
         likelyCause: String? = nil,
         logEntries: [LogEntry] = [],
         stateSnapshots: [ServiceStateSnapshot] = [],
-        redactor: Redactor = .patterns
-    ) -> String? {
+        redactor: Redactor = .patterns,
+        diagnostics: (@Sendable () async -> DiagnosticsSnapshot?)? = nil
+    ) async -> String? {
         guard isAutoCaptureEnabled(trigger: trigger) else { return nil }
 
         // Nothing goes into an issue before the redactor has seen it.
@@ -316,10 +343,9 @@ actor DebugTracker {
         let signatureText = signatureText.map(redactor.redact)
         let likelyCause = likelyCause.map(redactor.redact)
 
-        // `signatureText` replaces the message for dedup when the message has details that vary.
-        let normalized = normalizeError(signatureText ?? errorMessage)
-        let signatureInput = "\(trigger):\(serviceId ?? "all"):\(normalized)"
-        let signature = sha256(signatureInput)
+        let signature = Self.signature(
+            trigger: trigger, serviceId: serviceId, message: signatureText ?? errorMessage, likelyCause: likelyCause
+        )
 
         let config = loadConfig()
         // 7 days: recurring crashes (e.g. daily wake/network races) should bump
@@ -412,7 +438,54 @@ actor DebugTracker {
             writeJSON(stateSnapshots, to: (folderPath as NSString).appendingPathComponent("state-snapshot.json"))
         }
 
+        // Only a new issue reads this Mac: the tools take some seconds to answer.
+        // The issue is on disk first, so a repeat that comes in the meantime finds it.
+        if let diagnostics, let snapshot = await diagnostics() {
+            writeJSON(
+                snapshot.redacted(by: redactor),
+                to: (folderPath as NSString).appendingPathComponent("diagnostics.json")
+            )
+        }
+
         return folderId
+    }
+
+    /// The key that makes two failures one issue: trigger, service, message and
+    /// likely cause. The varying parts (times, pids, UUIDs, addresses) are taken
+    /// out first. A failure without a cause keeps the key of the issues from
+    /// before the cause was part of it.
+    static func signature(trigger: String, serviceId: String?, message: String, likelyCause: String?) -> String {
+        var input = "\(trigger):\(serviceId ?? "all"):\(normalizeError(message))"
+        if let likelyCause, !likelyCause.isEmpty {
+            input += ":\(normalizeError(likelyCause))"
+        }
+        return sha256(input)
+    }
+
+    // MARK: - Run marker
+
+    /// Writes the marker of this run and gives the marker of the last run when it
+    /// is still there: that run did not quit cleanly. The marker is written also
+    /// while capture is off. It holds no failure detail, and capture can be on at
+    /// the next launch.
+    func beginRun(pid: Int32) -> RunMarker? {
+        let previous = (try? Data(contentsOf: URL(fileURLWithPath: runMarkerPath)))
+            .flatMap { try? jsonDecoder.decode(RunMarker.self, from: $0) }
+        let marker = RunMarker(
+            pid: pid,
+            startedAt: isoString(now()),
+            appVersion: buildInfo.version,
+            appBuild: buildInfo.build,
+            appCommit: buildInfo.commit
+        )
+        ensureDirectory(baseDir)
+        writeJSON(marker, to: runMarkerPath)
+        return previous
+    }
+
+    /// A clean quit. `applicationWillTerminate` calls it and cannot wait for the actor.
+    nonisolated func endRun() {
+        try? FileManager.default.removeItem(atPath: runMarkerPath)
     }
 
     // MARK: - List / Read / Close
@@ -598,7 +671,7 @@ actor DebugTracker {
 
     // MARK: - Private helpers
 
-    private func normalizeError(_ message: String) -> String {
+    private static func normalizeError(_ message: String) -> String {
         var result = message
         let range = NSRange(result.startIndex..., in: result)
 
@@ -613,7 +686,7 @@ actor DebugTracker {
         return result
     }
 
-    private func sha256(_ input: String) -> String {
+    private static func sha256(_ input: String) -> String {
         let digest = SHA256.hash(data: Data(input.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
@@ -680,29 +753,34 @@ actor DebugTracker {
         maxOtherLines: Int,
         redactor: Redactor
     ) {
+        // Each line starts with its time of day: "09:14:03.412".
+        let time = DateFormatter()
+        time.dateFormat = "HH:mm:ss.SSS"
+        time.locale = Locale(identifier: "en_US_POSIX")
+        time.timeZone = TimeZone.current
+
         // Failing service logs
         if let sid = serviceId {
             let serviceEntries = logEntries
                 .filter { $0.serviceId == sid }
                 .suffix(maxFailingLines)
-            let lines = serviceEntries.map { redactor.redact($0.line) }
+            let lines = serviceEntries.map { "\(time.string(from: $0.timestamp)) \(redactor.redact($0.line))" }
             let content = lines.joined(separator: "\n")
             let path = (folderPath as NSString).appendingPathComponent("logs-\(sid).txt")
             writeFile(Data(content.utf8), to: path)
         }
 
-        // All-services combined log
+        // All-services combined log: the tail of every service, in time order.
         let grouped = Dictionary(grouping: logEntries, by: { $0.serviceId })
-        var allLines: [(Date, String)] = []
-        for (sid, entries) in grouped {
-            let tail = entries.suffix(maxOtherLines)
-            for entry in tail {
+        var allLines: [(date: Date, order: Int, text: String)] = []
+        for sid in grouped.keys.sorted() {
+            for entry in grouped[sid, default: []].suffix(maxOtherLines) {
                 let redacted = redactor.redact(entry.line)
-                allLines.append((entry.timestamp, "[\(sid)] \(redacted)"))
+                allLines.append((entry.timestamp, allLines.count, "\(time.string(from: entry.timestamp)) [\(sid)] \(redacted)"))
             }
         }
-        allLines.sort { $0.0 < $1.0 }
-        let combined = allLines.map { $0.1 }.joined(separator: "\n")
+        allLines.sort { ($0.date, $0.order) < ($1.date, $1.order) }
+        let combined = allLines.map(\.text).joined(separator: "\n")
         let allPath = (folderPath as NSString).appendingPathComponent("logs-all.txt")
         writeFile(Data(combined.utf8), to: allPath)
     }

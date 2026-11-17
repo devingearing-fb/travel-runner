@@ -39,6 +39,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.onServiceCrash = { [weak self] name, code in
             self?.crashes.append((name, code))
         }
+        // The diagnostics of an issue read no tool of this Mac.
+        supervisor.diagnosticsTools = { _ in [] }
     }
 
     /// Gives the supervisor a shell that holds each "where is the tool" question
