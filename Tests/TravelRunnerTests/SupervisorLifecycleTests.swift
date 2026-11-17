@@ -1970,6 +1970,147 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(state("portal").lastStarted)
     }
 
+    // MARK: - Hotels (D3)
+
+    /// Findings "onboarding hotels need the shared env": after Start the hotel catalog
+    /// was empty and nothing said so. The banner says it, and nothing loads or resets
+    /// by itself; the portals start.
+    func testAnEmptyHotelCatalogRaisesTheBannerAndStartsNothing() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        var count = "12"
+        var skipped = "false"
+        var resets = 0
+        supervisor.databaseQuery = { _, sql in
+            if sql.contains("pg_tables") { return DbQueryResult(exitCode: 0, stdout: "42", stderr: "") }
+            if sql == HotelCatalog.countSQL { return DbQueryResult(exitCode: 0, stdout: count, stderr: "") }
+            if sql.contains("seed_state") {
+                return DbQueryResult(exitCode: 0, stdout: #"{"scenario_id":"standard","hotels_skipped":\#(skipped)}"#, stderr: "")
+            }
+            return DbQueryResult(exitCode: 0, stdout: "", stderr: "")
+        }
+        supervisor.dbResetAction = { _ in
+            resets += 1
+            return true
+        }
+        let portal = ServiceDefinition(
+            id: "portal", name: "portal", cmd: ["sleep", "60"], cwd: workDir.path, probe: nil,
+            type: .daemon, restart: .never, dependsOn: ["supabase"], env: nil, phase: "portal", reuseIfRunning: nil
+        )
+        try supervisor.loadServices([daemon("supabase", webServer), portal])
+
+        supervisor.startAll()
+
+        let healthy = await waitUntil(40) { self.supervisor.health == .healthy }
+        XCTAssertTrue(healthy, "health is \(supervisor.health), error: \(supervisor.lastError ?? "none")")
+        XCTAssertEqual(
+            supervisor.hotelCatalogNotice?.text, "Hotel catalog is empty (12 hotels) — hotel search will return nothing."
+        )
+        XCTAssertTrue(supervisor.hotelCatalogBannerVisible)
+        XCTAssertEqual(resets, 0)
+        XCTAssertNil(supervisor.dbSetupPipeline)
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertNotNil(state("portal").lastStarted)
+        XCTAssertNil(supervisor.lastError)
+
+        // Negative controls: a reset that left the hotels out, and a full catalog.
+        skipped = "true"
+        await supervisor.refreshHotelCatalog(cwd: workDir.path)
+        XCTAssertNil(supervisor.hotelCatalogNotice)
+        skipped = "false"
+        count = "209823"
+        await supervisor.refreshHotelCatalog(cwd: workDir.path)
+        XCTAssertNil(supervisor.hotelCatalogNotice)
+        // A dismiss holds until the catalog changes.
+        count = "3"
+        await supervisor.refreshHotelCatalog(cwd: workDir.path)
+        supervisor.dismissHotelCatalogBanner()
+        await supervisor.refreshHotelCatalog(cwd: workDir.path)
+        XCTAssertFalse(supervisor.hotelCatalogBannerVisible)
+        XCTAssertEqual(resets, 0)
+    }
+
+    /// Findings "hotel seed needs a shared env marked optional": the reset wiped the
+    /// database, then the hotel download failed. Now the prerequisites stop first, and
+    /// the banner offers the shared .env or a reset without hotels.
+    func testAResetThatCannotGetTheHotelsStopsBeforeTheResetAndOffersAWayOut() async throws {
+        try loadSupabase()
+        supervisor.shell = FakeCommandRunner()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let marker = workDir.appendingPathComponent("reset-ran")
+        let line = "Hotels cannot be downloaded yet: No dev credentials: apps/booking-portal/.env is missing "
+            + "AMATEUR_SUPABASE_URL / ANON_KEY / SIGNING_KEY. Nothing was reset."
+        var prerequisites = "echo '##db:health:fail:\(line)'; echo '##db:status:failed:\(line)'; exit 10"
+        var profiles: [String] = []
+        supervisor.dbPipelineFactory = { _, profile in
+            profiles.append(profile)
+            let command = profile == HotelCatalog.withoutHotelsProfile ? "echo '##db:status:done'" : prerequisites
+            return self.pipeline(
+                [self.step("check-prerequisites", command), self.step("reset-database", "touch '\(marker.path)'")],
+                profile: profile
+            )
+        }
+
+        supervisor.resetDatabase()
+        let stopped = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(stopped)
+
+        XCTAssertEqual(supervisor.hotelSourceNotice, line)
+        XCTAssertEqual(supervisor.lastError, "DB setup failed at check-prerequisites: \(line)")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "nothing was reset")
+
+        supervisor.resetWithoutHotels()
+        let reset = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(reset)
+        XCTAssertEqual(profiles, ["reset", HotelCatalog.withoutHotelsProfile])
+        XCTAssertNil(supervisor.hotelSourceNotice)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+
+        // Negative control: a missing tool (exit 1) is no hotel banner.
+        prerequisites = "echo '##db:status:failed:Missing: Docker is not running'; exit 1"
+        supervisor.resetDatabase()
+        let failed = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(failed)
+        XCTAssertNil(supervisor.hotelSourceNotice)
+        XCTAssertEqual(supervisor.lastError, "DB setup failed at check-prerequisites: Missing: Docker is not running")
+    }
+
+    /// "Load hotels" runs the load step alone, never the reset, also when the pipeline
+    /// on screen has no load step. The banner goes once the catalog is full.
+    func testLoadHotelsRunsOnlyTheLoadStep() async throws {
+        try loadSupabase()
+        supervisor.shell = FakeCommandRunner()
+        var count = "0"
+        supervisor.databaseQuery = { _, sql in
+            if sql == HotelCatalog.countSQL { return DbQueryResult(exitCode: 0, stdout: count, stderr: "") }
+            if sql.contains("seed_state") { return DbQueryResult(exitCode: 0, stdout: #"{"hotels_skipped":false}"#, stderr: "") }
+            return DbQueryResult(exitCode: 0, stdout: "", stderr: "")
+        }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let marker = workDir.appendingPathComponent("reset-ran")
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline(
+                [self.step("reset-database", "touch '\(marker.path)'"), self.step("load-hotels", "echo '##db:status:done'")],
+                profile: profile
+            )
+        }
+        supervisor.dbSetupPipeline = pipeline([step("reset-database", "true")], profile: HotelCatalog.withoutHotelsProfile)
+        await supervisor.refreshHotelCatalog(cwd: workDir.path)
+        XCTAssertNotNil(supervisor.hotelCatalogNotice)
+
+        count = "209823"
+        supervisor.loadHotels()
+        let done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+
+        let pipeline = try XCTUnwrap(supervisor.dbSetupPipeline)
+        XCTAssertEqual(pipeline.steps.first { $0.id == "load-hotels" }?.status, .passed)
+        XCTAssertEqual(pipeline.steps.first { $0.id == "reset-database" }?.status, .pending)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "nothing was reset")
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertNil(supervisor.hotelCatalogNotice)
+    }
+
     /// Positive control of the guard against the loader's fallback to `reset`: a
     /// manifest with a `migrate` profile runs only the migrate steps, with no seed
     /// scenario selected.

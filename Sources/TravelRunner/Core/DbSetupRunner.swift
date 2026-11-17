@@ -201,6 +201,9 @@ actor DbSetupRunner {
     /// - `TRAVEL_HOTEL_DUMP`: where the hotel dump is kept (`hotelDumpPath`).
     /// - `TRAVEL_RUNNER_FLAVOR`: which app built the database. A packaged app has
     ///   its flavor in Info.plist only, so the scripts cannot read it there.
+    ///
+    /// `GIT_TERMINAL_PROMPT=0`: a reset can clone or fetch the backend baseline, and
+    /// git must fail then, not wait for a password nobody can type.
     nonisolated static func environment(
         parent: [String: String],
         seedScenarioID: String,
@@ -213,6 +216,7 @@ actor DbSetupRunner {
         if let profile { environment["TRAVEL_DB_PROFILE"] = profile }
         environment["TRAVEL_HOTEL_DUMP"] = hotelDumpPath(flavor: flavor, home: home)
         environment[Flavor.environmentKey] = flavor.rawValue
+        environment.merge(BackendBaseline.noPromptEnvironment) { _, new in new }
         return environment
     }
 
@@ -321,6 +325,7 @@ actor DbSetupRunner {
             step.healthFailures = []
             step.progress = nil
             step.progressLabel = nil
+            step.exitCode = nil
         }
 
         // A step that starts during a resolve waits for the new PATH.
@@ -358,6 +363,7 @@ actor DbSetupRunner {
             await MainActor.run {
                 step.status = .failed
                 step.completedAt = .now
+                step.exitCode = exitCode
                 if step.errorMessage == nil {
                     step.errorMessage = msg
                     step.recoveryGuidance = guidance

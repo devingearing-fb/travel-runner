@@ -39,6 +39,8 @@ struct PreflightRunner: Sendable {
     var clock = RunnerClock.live
     /// A check command that hangs fails after this time and does not hold the start.
     static let checkTimeout: Duration = .seconds(15)
+    /// The environment of the runner: `FB_AMATEUR_BACKEND_DIR` picks the backend baseline.
+    var environment: [String: String] = ProcessInfo.processInfo.environment
 
     func allChecks(for services: [ServiceDefinition]) -> [PreflightCheck] {
         var checks: [PreflightCheck] = [
@@ -50,6 +52,11 @@ struct PreflightRunner: Sendable {
             ),
             PreflightCheck(id: "stripe-auth", name: "Stripe CLI Auth"),
         ]
+
+        // `pnpm db:start` clones the backend baseline when there is no checkout of it.
+        if let root = services.first(where: { $0.id == "supabase" })?.resolvedCwd, BackendBaseline.applies(root: root) {
+            checks.append(PreflightCheck(id: "backend-baseline", name: "Backend migration baseline", metadata: ["root": root]))
+        }
 
         for (serviceID, label) in [("travel-portal", "Booking"), ("partner-portal", "Partner")] {
             guard let cwd = services.first(where: { $0.id == serviceID })?.resolvedCwd else { continue }
@@ -139,6 +146,9 @@ struct PreflightRunner: Sendable {
                 ? .passed(detail: "Authenticated")
                 : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
 
+        case "backend-baseline":
+            return await backendBaseline(root: check.metadata["root"] ?? "")
+
         case let id where id.hasPrefix("env-diff"):
             // The monolith's scripts/env-check.mjs checks the app's shared .env (a teammate's
             // copy or pnpm env:pull) and the blank .env.local keys that would hide it. A missing
@@ -182,6 +192,31 @@ struct PreflightRunner: Sendable {
             }
 
             return .passed(detail: "OK")
+        }
+    }
+
+    /// The managed clone of the backend baseline needs the remote: `db:start` clones it,
+    /// and every reset fetches it. Without access, a start that must clone stops here,
+    /// before anything runs. With a clone in place the start works, and the row warns.
+    private func backendBaseline(root: String) async -> PreflightResult {
+        switch BackendBaseline.source(root: root, environment: environment) {
+        case .environment:
+            return .passed(detail: "FB_AMATEUR_BACKEND_DIR")
+        case .sibling:
+            return .passed(detail: "Sibling checkout")
+        case .managedClone(_, let cloned):
+            // A script that names no remote: nothing to ask.
+            guard let url = BackendBaseline.repositoryURL(root: root) else {
+                return .passed(detail: cloned ? "Managed clone" : "Cloned on the first start")
+            }
+            let result = await shell.run(BackendBaseline.accessCommand(url: url), cwd: root, timeout: BackendBaseline.accessTimeout)
+            if result.succeeded {
+                return .passed(detail: cloned ? "Managed clone; the remote answers" : "Cloned on the first start; the remote answers")
+            }
+            let message = result.timedOut
+                ? "\(BackendBaseline.noAccessText) (git did not answer in \(BackendBaseline.accessTimeout.components.seconds) s)"
+                : BackendBaseline.noAccessText
+            return cloned ? .warning(message: message) : .failed(message: message, fix: "gh auth setup-git")
         }
     }
 

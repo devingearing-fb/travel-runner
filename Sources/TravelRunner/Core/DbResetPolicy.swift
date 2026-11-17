@@ -161,7 +161,9 @@ enum DbResetPolicy {
         "Migrations applied. Types and seed data were not regenerated — reset if scenario data looks wrong."
 
     static func emptySetupFailedText(step: String, message: String) -> String {
-        "Database setup failed at \(step): \(message). Portals were not started."
+        // A script message can end with its own full stop.
+        let message = message.trimmingCharacters(in: CharacterSet(charactersIn: ". "))
+        return "Database setup failed at \(step): \(message). Portals were not started."
     }
 
     /// A setup passed after Start All stopped before the portals.

@@ -210,6 +210,33 @@ struct WorkshopHeaderBar: View {
                     Text(notice.resetConfirmation)
                 }
             }
+            if let notice = supervisor.hotelSourceNotice {
+                let isDbSetupRunning = supervisor.dbResetRunning || supervisor.dbSetupPipeline?.isRunning == true
+                let canReset = supervisor.compatibilityNotice == nil && !isDbSetupRunning
+                    && supervisor.manifestHasProfile(HotelCatalog.withoutHotelsProfile)
+                alertBanner(
+                    icon: "building.2",
+                    color: .orange,
+                    text: notice,
+                    subtitle: nil,
+                    action: (HotelCatalog.importButtonTitle, { supervisor.importSharedEnvForHotels() }),
+                    secondaryAction: canReset
+                        ? (HotelCatalog.resetWithoutHotelsTitle, { supervisor.resetWithoutHotels() }) : nil,
+                    onDismiss: { supervisor.dismissHotelSourceNotice() }
+                )
+            }
+            if supervisor.hotelCatalogBannerVisible, let notice = supervisor.hotelCatalogNotice {
+                let isDbSetupRunning = supervisor.dbResetRunning || supervisor.dbSetupPipeline?.isRunning == true
+                let canLoad = supervisor.compatibilityNotice == nil && !isDbSetupRunning
+                alertBanner(
+                    icon: "building.2",
+                    color: .orange,
+                    text: notice.text,
+                    subtitle: nil,
+                    action: canLoad ? (HotelCatalog.loadHotelsTitle, { supervisor.loadHotels() }) : nil,
+                    onDismiss: { supervisor.dismissHotelCatalogBanner() }
+                )
+            }
             if let note = supervisor.migrationsAppliedNotice {
                 alertBanner(
                     icon: "checkmark.circle.fill",

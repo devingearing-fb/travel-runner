@@ -137,8 +137,10 @@ enum ServiceCatalog {
         let qstashToken = "eyJVc2VySUQiOiJkZWZhdWx0VXNlciIsIlBhc3N3b3JkIjoiZGVmYXVsdFBhc3N3b3JkIn0="
 
         return [
+            // db:start can clone the backend baseline: git must fail, not wait for a password.
             service("supabase", "Supabase", ["pnpm", "db:start"], cwd: monorepo,
-                    probe: tcp(54322, timeout: 300), restart: .onFailure, phase: "ground", reuse: true),
+                    probe: tcp(54322, timeout: 300), restart: .onFailure, phase: "ground",
+                    env: BackendBaseline.noPromptEnvironment, reuse: true),
             service("universal-login", "Universal Login", ["npm", "run", "dev"], cwd: login,
                     probe: tcp(3000), restart: .onFailure, phase: "gateway", dependsOn: ["supabase"]),
             service("stripe", "Stripe CLI",

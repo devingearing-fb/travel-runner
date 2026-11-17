@@ -79,6 +79,9 @@ final class DbSetupStep: Identifiable {
     /// Every `health:fail` detail of this run, in order.
     var healthFailures: [String] = []
     var errorMessage: String? = nil
+    /// The exit code of a step command that failed. The scripts name some causes by
+    /// it (10 to 13: the hotels cannot be had).
+    var exitCode: Int32? = nil
     var recoveryGuidance: String? = nil
     var logEntries: [LogEntry] = []
     var startedAt: Date? = nil

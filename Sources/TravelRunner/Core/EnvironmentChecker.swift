@@ -22,7 +22,12 @@ final class HealthCheck: Identifiable {
     nonisolated let id: String
     nonisolated let name: String
     nonisolated let section: CheckSection
-    nonisolated let isRequired: Bool
+    /// Required unless a later result says otherwise (see `requiredNow`).
+    nonisolated let requiredByDefault: Bool
+    /// Set by a check whose need depends on another result: the shared booking `.env`
+    /// is required only while no valid hotel dump is cached.
+    var requiredNow: Bool? = nil
+    var isRequired: Bool { requiredNow ?? requiredByDefault }
     nonisolated let fixLabel: String?
     nonisolated let checkCommand: String
     nonisolated let checkDescription: String
@@ -38,7 +43,7 @@ final class HealthCheck: Identifiable {
         self.id = id
         self.name = name
         self.section = section
-        self.isRequired = isRequired
+        self.requiredByDefault = isRequired
         self.fixLabel = fixLabel
         self.checkCommand = checkCommand
         self.checkDescription = checkDescription
@@ -61,6 +66,8 @@ final class EnvironmentChecker {
     private var partnerPath: String { (monorepoPath as NSString).appendingPathComponent("apps/partner-portal") }
 
     private(set) var checks: [HealthCheck] = []
+    /// Where the app keeps the hotel dump. Tests give a folder of their own.
+    var hotelDumpPath = DbSetupRunner.hotelDumpPath()
 
     /// Runs the commands of the checks and the fixes.
     private let commandRunner: any CommandRunning
@@ -125,6 +132,7 @@ final class EnvironmentChecker {
         case "workspace-modules": "both portals will not run"
         case "login-modules": "the login will not run"
         case "login-env": "sign-in on localhost will not work"
+        case "booking-env": "the first reset cannot download the hotels"
         default: nil
         }
     }
@@ -294,17 +302,17 @@ final class EnvironmentChecker {
             HealthCheck(id: "backend-baseline", name: "Backend migration baseline", section: .supabase,
                         isRequired: false,
                         checkCommand: "ls ../fb-amateur-backend .backend-baseline",
-                        checkDescription: "scripts/local-db.sh replays fb-amateur-backend's migrations. It uses a checkout beside the monorepo, or clones one into .backend-baseline/ on the first reset."),
+                        checkDescription: "scripts/local-db.sh replays fb-amateur-backend's migrations. It uses FB_AMATEUR_BACKEND_DIR, a checkout beside the monorepo (../fb-amateur-backend, used as it is), or its own clone in .backend-baseline/, which it clones and fetches over HTTPS. For the clone the check asks the remote, with no password prompt. A sibling that is behind gives old migrations: pull it, or move it away so the managed clone is used."),
             HealthCheck(id: "login-env", name: "Login .env.local", section: .supabase,
                         fixLabel: "Create from template",
                         checkCommand: "grep ALLOW_LOCALHOST_REDIRECTS .env.local",
                         checkDescription: "Must contain Supabase URL/keys and ALLOW_LOCALHOST_REDIRECTS=true for local auth flow",
                         checkPath: (loginPath as NSString).appendingPathComponent(".env.local")),
-            HealthCheck(id: "hotel-data", name: "Hotel data cached", section: .supabase,
-                        isRequired: false, fixLabel: "Download hotels",
-                        checkCommand: "ls \(ShellQuote.quote(DbSetupRunner.hotelDumpPath()))",
-                        checkDescription: "~200K hotel records cached locally. First db:setup pulls from remote (~3-5 min). Reused on subsequent runs. The fix downloads the file only; it does not reset the database. \(Self.hotelDataFixNeeds)",
-                        checkPath: DbSetupRunner.hotelDumpPath()),
+            HealthCheck(id: "hotel-data", name: "Hotel catalog source", section: .supabase,
+                        isRequired: false, fixLabel: "Import…",
+                        checkCommand: "node scripts/db/fetch-hotels.mjs --verify",
+                        checkDescription: Self.hotelSourceDescription,
+                        checkPath: hotelDumpPath),
 
             // Optional
             HealthCheck(id: "sb-linked", name: "Supabase project linked", section: .optional,
@@ -359,18 +367,15 @@ final class EnvironmentChecker {
 
     /// What a row shows when its fix failed.
     nonisolated static func fixFailedText(for checkID: String) -> String {
-        switch checkID {
-        case "hotel-data":
-            "Download failed — start the stack first (the download needs the local Supabase and the shared apps/booking-portal/.env), then retry"
-        default:
-            "Fix failed — try manually"
-        }
+        "Fix failed — try manually"
     }
 
     func runAllChecks() async {
         for check in checks {
             check.status = .pending
         }
+        // Each round reads the hotel dump once, for its row and for the booking .env row.
+        hotelCache = nil
         await withTaskGroup(of: Void.self) { group in
             for check in checks {
                 group.addTask { [self] in
@@ -409,6 +414,11 @@ final class EnvironmentChecker {
         } else if success {
             let newStatus = await runCheck(checkID)
             check.status = newStatus
+            // The shared booking .env is also the source of the hotels: both rows change.
+            for other in Self.linkedChecks(of: checkID) {
+                guard let row = checks.first(where: { $0.id == other }) else { continue }
+                row.status = await runCheck(other)
+            }
         } else {
             check.status = .failing(Self.fixFailedText(for: checkID))
         }
@@ -500,14 +510,17 @@ final class EnvironmentChecker {
             let result = try await check(
                 SharedEnvFiles.command(monorepo: monorepoPath, app: app), label: "The check of the .env file"
             )
-            return SharedEnvFiles.status(SharedEnvFiles.decode(result.stdout, app: app))
+            let status = SharedEnvFiles.status(SharedEnvFiles.decode(result.stdout, app: app))
+            guard app == .booking else { return status }
+            // Without a valid hotel dump, the first reset downloads the hotels with its keys.
+            let required = await cachedHotelDump() == nil
+            checks.first { $0.id == id }?.requiredNow = required
+            return Self.bookingEnvStatus(
+                status, required: required, hotelKeysPresent: HotelCatalog.devKeysPresent(monorepo: monorepoPath)
+            )
 
         case "backend-baseline":
-            let sibling = ((monorepoPath as NSString).deletingLastPathComponent as NSString)
-                .appendingPathComponent("fb-amateur-backend")
-            if exists(sibling) { return .passing("Sibling checkout") }
-            let clone = (monorepoPath as NSString).appendingPathComponent(".backend-baseline")
-            return exists(clone) ? .passing(".backend-baseline/") : .warning("Cloned on the first DB reset")
+            return await backendBaselineStatus()
 
         case "login-env":
             let path = (loginPath as NSString).appendingPathComponent(".env.local")
@@ -521,10 +534,9 @@ final class EnvironmentChecker {
             return .warning("Exists but may be incomplete")
 
         case "hotel-data":
-            // The dump of the app, or one still in the checkout: the next fetch moves it.
-            let cached = exists(DbSetupRunner.hotelDumpPath())
-                || exists(DbSetupRunner.checkoutHotelDumpPath(root: monorepoPath))
-            return cached ? .passing("Cached") : .warning("Not cached — will be slow on first db:setup")
+            return HotelCatalog.sourceStatus(
+                cached: await cachedHotelDump(), keysPresent: HotelCatalog.devKeysPresent(monorepo: monorepoPath)
+            )
 
         case "sb-linked":
             let path = (monorepoPath as NSString).appendingPathComponent("supabase/.temp/project-ref")
@@ -611,15 +623,94 @@ final class EnvironmentChecker {
         }
     }
 
-    // MARK: - Fix implementations
+    // MARK: - Hotel source and backend baseline
 
-    /// Downloads the hotel dump when it is missing. It never resets the database.
-    /// The dump goes where the DB setup of the app looks for it.
-    nonisolated static var hotelDataFixCommand: String {
-        "TRAVEL_HOTEL_DUMP=\(ShellQuote.quote(DbSetupRunner.hotelDumpPath())) pnpm db:hotels"
+    nonisolated static let hotelSourceDescription =
+        "The first reset loads about 200,000 hotels. The row passes with a valid cached dump, or with the dev keys (AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY, AMATEUR_SUPABASE_SIGNING_KEY) in the shared apps/booking-portal/.env, which the download needs. Import… copies the shared .env a teammate sent you. Before a reset changes anything, it checks again that the hotels can be had."
+
+    /// The rows that a fix of this row changes too.
+    nonisolated static func linkedChecks(of checkID: String) -> [String] {
+        switch checkID {
+        case "hotel-data": ["booking-env"]
+        case "booking-env": ["hotel-data"]
+        default: []
+        }
     }
-    /// `pnpm db:hotels` stops when one of these is absent.
-    nonisolated static let hotelDataFixNeeds = "The fix needs the local Supabase running and the shared apps/booking-portal/.env."
+
+    /// The booking `.env` row. While no hotel dump is cached it is required, and a file
+    /// that lacks the dev keys of the download fails: the first reset would stop.
+    nonisolated static func bookingEnvStatus(_ status: CheckStatus, required: Bool, hotelKeysPresent: Bool) -> CheckStatus {
+        guard required, !hotelKeysPresent else { return status }
+        switch status {
+        case .warning(let message):
+            return .failing("\(message). Without it the first reset cannot download the hotels")
+        case .passing:
+            return .failing("No dev keys for the hotel download (AMATEUR_SUPABASE_URL, ANON_KEY, SIGNING_KEY) — import a fresh copy")
+        default:
+            return status
+        }
+    }
+
+    /// `fetch-hotels.mjs --verify` for one dump path.
+    nonisolated static func hotelVerifyCommand(monorepo: String, dump: String) -> String {
+        "TRAVEL_HOTEL_DUMP=\(ShellQuote.quote(dump)) "
+            + ShellQuote.join(["node", (monorepo as NSString).appendingPathComponent("scripts/db/fetch-hotels.mjs"), "--verify"])
+    }
+
+    /// The read of the hotel dump of this round of checks.
+    private var hotelCache: Task<String?, Never>?
+
+    /// "Cached — 209,823 rows, 2026-08-11" for a valid dump, or nil.
+    private func cachedHotelDump() async -> String? {
+        if let hotelCache { return await hotelCache.value }
+        let task = Task { await self.readHotelCache() }
+        hotelCache = task
+        return await task.value
+    }
+
+    /// The dump of the app, or one still in the checkout (the next fetch moves it). The
+    /// checkout's script decides if it is whole. A checkout without the script takes any file.
+    private func readHotelCache() async -> String? {
+        let paths = [hotelDumpPath, DbSetupRunner.checkoutHotelDumpPath(root: monorepoPath)]
+        let script = (monorepoPath as NSString).appendingPathComponent("scripts/db/fetch-hotels.mjs")
+        guard exists(script) else { return paths.contains(where: exists) ? "Cached" : nil }
+        for path in paths where exists(path) {
+            let result = await runCommand(Self.hotelVerifyCommand(monorepo: monorepoPath, dump: path))
+            if let detail = HotelCatalog.cachedDetail(verifyOutput: result.stdout, succeeded: result.succeeded) {
+                return detail
+            }
+        }
+        return nil
+    }
+
+    /// The checkout that `scripts/local-db.sh` replays. Its managed clone needs the
+    /// remote, so the row asks it, with no password prompt.
+    private func backendBaselineStatus() async -> CheckStatus {
+        switch BackendBaseline.source(root: monorepoPath) {
+        case .environment(let dir):
+            return .passing("FB_AMATEUR_BACKEND_DIR: \((dir as NSString).abbreviatingWithTildeInPath)")
+        case .sibling(let dir):
+            let result = await runCommand(BackendBaseline.siblingCommand(dir: dir))
+            return BackendBaseline.siblingStatus(BackendBaseline.siblingState(result.stdout))
+        case .managedClone(_, let cloned):
+            guard let url = BackendBaseline.repositoryURL(root: monorepoPath) else {
+                return cloned ? .passing(".backend-baseline/") : .warning("Cloned on the first DB reset")
+            }
+            let result = await runCommand(BackendBaseline.accessCommand(url: url), timeout: BackendBaseline.accessTimeout)
+            return Self.backendAccessStatus(succeeded: result.succeeded, cloned: cloned)
+        }
+    }
+
+    /// Without access, a first clone cannot happen: the row fails. A clone in place
+    /// still starts the stack; only a reset needs the remote, so the row warns.
+    nonisolated static func backendAccessStatus(succeeded: Bool, cloned: Bool) -> CheckStatus {
+        if succeeded {
+            return .passing(cloned ? ".backend-baseline/ — the remote answers" : "Cloned on the first start — the remote answers")
+        }
+        return cloned ? .warning(BackendBaseline.noAccessText) : .failing(BackendBaseline.noAccessText)
+    }
+
+    // MARK: - Fix implementations
 
     /// nil when the developer cancelled and nothing changed.
     private func runFix(_ id: String) async -> Bool? {
@@ -663,7 +754,8 @@ final class EnvironmentChecker {
             return createLoginEnvLocal()
 
         case "hotel-data":
-            return await fixShellInDir(monorepoPath, Self.hotelDataFixCommand)
+            // The hotels come from the dev keys of the shared booking .env.
+            return await importSharedEnv(.booking)
 
         case "agent-node":
             return await fixShell("brew install node@\(ServiceCatalog.agentNodeMajor)")
@@ -690,7 +782,7 @@ final class EnvironmentChecker {
 
     /// Copies a shared `.env` the developer picks into the monolith, after the monolith's
     /// env-check confirms it is this app's file. The runner keeps no copy.
-    private func importSharedEnv(_ app: SharedEnvFiles.App) async -> Bool? {
+    func importSharedEnv(_ app: SharedEnvFiles.App) async -> Bool? {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
         panel.canChooseDirectories = false

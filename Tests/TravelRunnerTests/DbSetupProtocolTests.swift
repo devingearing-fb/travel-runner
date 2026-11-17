@@ -160,33 +160,22 @@ final class DbSetupProtocolTests: XCTestCase {
         XCTAssertTrue(checker.checks.contains { $0.id == "node" })
     }
 
-    /// `pnpm db:hotels` needs a running local Supabase and the shared env. The row says so
-    /// before the fix and after it fails.
-    func testTheHotelFixSaysWhatItNeeds() throws {
+    /// Findings "hotel seed needs a shared env marked optional": the row is the source of
+    /// the hotels, and its fix imports the shared .env. No fix of it resets or downloads.
+    func testTheHotelRowIsTheSourceAndItsFixImportsTheSharedEnv() throws {
         let checker = EnvironmentChecker(monorepoPath: "/nonexistent/mono", loginPath: "/nonexistent/login",
                                          streamServicesPath: "/nonexistent/stream")
         checker.buildChecks()
         let hotels = try XCTUnwrap(checker.checks.first { $0.id == "hotel-data" })
-        XCTAssertTrue(
-            hotels.checkDescription.hasSuffix(
-                "The fix downloads the file only; it does not reset the database. The fix needs the local Supabase running and the shared apps/booking-portal/.env."
-            ),
-            hotels.checkDescription
-        )
-        XCTAssertEqual(
-            EnvironmentChecker.fixFailedText(for: "hotel-data"),
-            "Download failed — start the stack first (the download needs the local Supabase and the shared apps/booking-portal/.env), then retry"
-        )
-        // Negative control: another row keeps the general text.
-        XCTAssertEqual(EnvironmentChecker.fixFailedText(for: "stream-modules"), "Fix failed — try manually")
-    }
-
-    func testTheHotelFixDoesNotResetTheDatabase() {
-        let command = EnvironmentChecker.hotelDataFixCommand
-        // The dump goes where the DB setup of the app reads it. The path has a space.
-        XCTAssertEqual(command, "TRAVEL_HOTEL_DUMP='\(DbSetupRunner.hotelDumpPath())' pnpm db:hotels")
-        XCTAssertFalse(command.contains("reset"))
-        XCTAssertFalse(command.contains("db:setup"))
+        XCTAssertEqual(hotels.name, "Hotel catalog source")
+        XCTAssertEqual(hotels.fixLabel, "Import…")
+        XCTAssertFalse(hotels.isRequired)
+        XCTAssertFalse(hotels.checkDescription.contains("pnpm db:hotels"))
+        XCTAssertEqual(EnvironmentChecker.linkedChecks(of: "hotel-data"), ["booking-env"])
+        XCTAssertEqual(EnvironmentChecker.linkedChecks(of: "booking-env"), ["hotel-data"])
+        // Negative control: another row changes no other row.
+        XCTAssertEqual(EnvironmentChecker.linkedChecks(of: "stream-modules"), [])
+        XCTAssertEqual(EnvironmentChecker.fixFailedText(for: "hotel-data"), "Fix failed — try manually")
     }
 
     // MARK: - What the runner tells the scripts
@@ -206,6 +195,8 @@ final class DbSetupProtocolTests: XCTestCase {
             "TRAVEL_HOTEL_DUMP":
                 "/Users/a/Library/Application Support/Travel Runner Hackathon/hotels/travel_organizations.sql",
             "TRAVEL_RUNNER_FLAVOR": "hackathon",
+            // A reset can clone the backend baseline: git must not wait for a password.
+            "GIT_TERMINAL_PROMPT": "0",
         ])
         // The two apps keep their dumps apart.
         XCTAssertEqual(
