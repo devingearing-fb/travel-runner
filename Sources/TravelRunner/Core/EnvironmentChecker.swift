@@ -283,8 +283,8 @@ final class EnvironmentChecker {
                         checkDescription: "Optional — this checkout is from before the .env dump scripts, and its contract data copy (copy-remote-data.py) still needs PyJWT. A newer checkout does not."),
             HealthCheck(id: "registry-auth", name: "GitHub Packages auth", section: .prerequisites,
                         fixLabel: "Set token",
-                        checkCommand: "pnpm config get --location=user \(RegistryAuth.tokenKey)",
-                        checkDescription: "User-level token for the @fastbreak-amateur packages. The check reads it from your user config and asks GitHub Packages for @fastbreak-amateur/fb-toolkit with it. The token needs read:packages, and SSO for the org. Set token saves it in ~/.npmrc, after a copy of the file."),
+                        checkCommand: RegistryAuth.readCommand,
+                        checkDescription: "User-level token for the @fastbreak-amateur packages. The check reads the last token line of ~/.npmrc ($NPM_CONFIG_USERCONFIG when set), as pnpm does, and asks GitHub Packages for @fastbreak-amateur/fb-toolkit with it. The token needs read:packages, and SSO for the org. Set token saves it in ~/.npmrc, after a copy of the file."),
             HealthCheck(id: "stripe-cli", name: "Stripe CLI", section: .prerequisites,
                         isRequired: false,
                         checkCommand: "which stripe",
@@ -573,7 +573,7 @@ final class EnvironmentChecker {
             return ok ? .passing("Installed") : .warning("Not installed — only monolith checkouts from before the .env dump script need it")
 
         case "registry-auth":
-            return RegistryAuth.status(await registryOutcome(token: try await registryToken()))
+            return RegistryAuth.status(await registryOutcome(token: await registryToken()))
 
         case "stripe-cli":
             let ok = try await check("which stripe >/dev/null 2>&1", label: "which stripe").succeeded
@@ -884,15 +884,14 @@ final class EnvironmentChecker {
 
     // MARK: - GitHub Packages token
 
-    /// The token of the user config. pnpm reads it as an install does; when pnpm
-    /// gives none (it is not installed yet, or hides the value), the file decides.
-    private func registryToken() async throws -> String? {
-        let result = try await check(RegistryAuth.readCommand, label: "pnpm config get")
-        if result.succeeded, let token = RegistryAuth.token(fromConfigGet: result.stdout) { return token }
-        let path = registry.npmrcPath
-        return await Task.detached {
-            (try? String(contentsOfFile: path, encoding: .utf8)).flatMap(RegistryAuth.token(fromNpmrc:))
-        }.value
+    /// The user config that pnpm reads, with the variables of the user's shell.
+    private var npmrcPath: String { registry.npmrcPath(variables: tools.capture.variables) }
+
+    /// The token of the user config. The file is read directly: `pnpm config get`
+    /// cannot print a protected auth key.
+    private func registryToken() async -> String? {
+        let path = npmrcPath
+        return await Task.detached { RegistryAuth.token(atPath: path) }.value
     }
 
     private func registryOutcome(token: String?) async -> RegistryAuth.Outcome {
@@ -925,10 +924,11 @@ final class EnvironmentChecker {
         }
         do {
             let registry = registry
+            let path = npmrcPath
             let now = clock.date()
-            _ = try await Task.detached { try registry.save(token: token, now: now) }.value
+            _ = try await Task.detached { try registry.save(token: token, toPath: path, now: now) }.value
         } catch {
-            return RegistryTokenError("Could not write \(registry.npmrcPath): \(error.localizedDescription)")
+            return RegistryTokenError("Could not write \(npmrcPath): \(error.localizedDescription)")
         }
         tokenEntryOpen = false
         if let check = checks.first(where: { $0.id == "registry-auth" }) {

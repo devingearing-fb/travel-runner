@@ -333,7 +333,8 @@ final class EnvironmentCheckerTests: XCTestCase {
         XCTAssertEqual(status("docker", in: checker), .failing("docker ps did not answer in 20 s"))
         XCTAssertEqual(status("node", in: checker), .failing("node --version did not answer in 20 s"))
         XCTAssertEqual(status("pnpm", in: checker), .failing("pnpm --version did not answer in 20 s"))
-        XCTAssertEqual(status("registry-auth", in: checker), .failing("pnpm config get did not answer in 20 s"))
+        // The registry row reads the file and runs no command, so a hung pnpm cannot fail it.
+        XCTAssertEqual(status("registry-auth", in: checker), .failing(RegistryAuth.noTokenText))
         // An optional check warns, so it does not block the wizard.
         XCTAssertEqual(status("stripe-cli", in: checker), .warning("which stripe did not answer in 20 s"))
         XCTAssertEqual(status("stripe-auth", in: checker), .warning("stripe balance retrieve did not answer in 20 s"))
@@ -688,12 +689,26 @@ final class EnvironmentCheckerTests: XCTestCase {
 
     private static let token = "ghp_testTOKEN123"
 
-    func testTheTokenComesFromPnpmConfigGet() {
-        XCTAssertEqual(RegistryAuth.token(fromConfigGet: "ghp_abc\n"), "ghp_abc")
-        XCTAssertEqual(RegistryAuth.token(fromConfigGet: "Update available!\nghp_abc\n"), "ghp_abc")
-        XCTAssertNil(RegistryAuth.token(fromConfigGet: "undefined\n"))
-        XCTAssertNil(RegistryAuth.token(fromConfigGet: ""))
-        XCTAssertNil(RegistryAuth.token(fromConfigGet: "(protected)\n"))
+    /// The user config is `$NPM_CONFIG_USERCONFIG` of the user's shell when it is set, else `~/.npmrc`.
+    func testTheUserConfigFollowsNpmConfigUserconfig() {
+        let registry = RegistryAuth(home: "/Users/dev")
+        XCTAssertEqual(registry.npmrcPath(variables: [:]), "/Users/dev/.npmrc")
+        XCTAssertEqual(registry.npmrcPath(variables: ["NPM_CONFIG_USERCONFIG": ""]), "/Users/dev/.npmrc")
+        XCTAssertEqual(registry.npmrcPath(variables: ["NPM_CONFIG_USERCONFIG": "/etc/dev/npmrc"]), "/etc/dev/npmrc")
+    }
+
+    /// npm and pnpm take the last line when the key is there twice. So does the check.
+    func testTheLastTokenLineWins() {
+        let npmrc = "//npm.pkg.github.com/:_authToken=ghp_first\nsave-exact=true\n//npm.pkg.github.com/:_authToken=ghp_stale\n"
+        XCTAssertEqual(RegistryAuth.token(fromNpmrc: npmrc), "ghp_stale")
+    }
+
+    /// A save leaves one token line: the new one. No old token stays in effect.
+    func testSavingReplacesEveryTokenLine() {
+        let npmrc = "//npm.pkg.github.com/:_authToken=ghp_first\nsave-exact=true\n//npm.pkg.github.com/:_authToken=ghp_stale\n"
+        let saved = RegistryAuth.settingToken("ghp_new", in: npmrc)
+        XCTAssertEqual(saved, "save-exact=true\n//npm.pkg.github.com/:_authToken=ghp_new\n")
+        XCTAssertEqual(RegistryAuth.token(fromNpmrc: saved), "ghp_new")
     }
 
     func testTheTokenOfAnNpmrcFile() {
@@ -719,17 +734,30 @@ final class EnvironmentCheckerTests: XCTestCase {
         guard case .warning = RegistryAuth.status(.fromEnvironment("GITHUB_TOKEN")) else { return XCTFail("an env reference must warn") }
     }
 
-    /// A runner whose `pnpm config get` prints `token`.
-    private func tokenRunner(_ token: String) -> FakeCommandRunner {
+    /// A runner whose pnpm refuses to print the token, as pnpm 10 does: it hands
+    /// `config get` to npm, which refuses a protected key. The check must not need it.
+    private func protectedPnpmRunner() -> FakeCommandRunner {
         FakeCommandRunner { call in
-            call.command == RegistryAuth.readCommand ? FakeCommandRunner.ok(token + "\n") : FakeCommandRunner.ok()
+            call.command.contains("pnpm config get")
+                ? FakeCommandRunner.failed(1, stderr: "npm error The \(RegistryAuth.tokenKey) option is protected, and cannot be retrieved in this way")
+                : FakeCommandRunner.ok()
         }
+    }
+
+    /// A user config in a new folder that holds `content`. The caller removes the folder.
+    private func npmrcFile(_ content: String) throws -> (folder: URL, path: String) {
+        let directory = try temporaryFolder()
+        let path = directory.appendingPathComponent(".npmrc").path
+        try content.write(toFile: path, atomically: true, encoding: .utf8)
+        return (directory, path)
     }
 
     /// The check sends the token to GitHub Packages; a 401 fails the row with its text.
     func testTheCheckTestsTheTokenWithGitHubPackages() async throws {
+        let npmrc = try npmrcFile("\(RegistryAuth.tokenKey)=\(Self.token)\n")
+        defer { try? FileManager.default.removeItem(at: npmrc.folder) }
         let stub = StubURLProtocol.session { _ in .success(401) }
-        let checker = makeChecker(tokenRunner(Self.token), registry: RegistryAuth(npmrcPath: "/nonexistent/home/.npmrc", session: stub.session))
+        let checker = makeChecker(protectedPnpmRunner(), registry: RegistryAuth(npmrcPath: npmrc.path, session: stub.session))
 
         await checker.runAllChecks()
 
@@ -739,18 +767,22 @@ final class EnvironmentCheckerTests: XCTestCase {
         XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer \(Self.token)")
     }
 
-    func testAWorkingTokenPasses() async {
+    func testAWorkingTokenPasses() async throws {
+        let npmrc = try npmrcFile("\(RegistryAuth.tokenKey)=\(Self.token)\n")
+        defer { try? FileManager.default.removeItem(at: npmrc.folder) }
         let stub = StubURLProtocol.session { _ in .success(200) }
-        let checker = makeChecker(tokenRunner(Self.token), registry: RegistryAuth(npmrcPath: "/nonexistent/home/.npmrc", session: stub.session))
+        let checker = makeChecker(protectedPnpmRunner(), registry: RegistryAuth(npmrcPath: npmrc.path, session: stub.session))
 
         await checker.runAllChecks()
 
         XCTAssertEqual(status("registry-auth", in: checker), .passing("Token works"))
     }
 
-    func testATokenWithoutAccessFails() async {
+    func testATokenWithoutAccessFails() async throws {
+        let npmrc = try npmrcFile("\(RegistryAuth.tokenKey)=\(Self.token)\n")
+        defer { try? FileManager.default.removeItem(at: npmrc.folder) }
         let stub = StubURLProtocol.session { _ in .success(403) }
-        let checker = makeChecker(tokenRunner(Self.token), registry: RegistryAuth(npmrcPath: "/nonexistent/home/.npmrc", session: stub.session))
+        let checker = makeChecker(protectedPnpmRunner(), registry: RegistryAuth(npmrcPath: npmrc.path, session: stub.session))
 
         await checker.runAllChecks()
 
@@ -758,8 +790,10 @@ final class EnvironmentCheckerTests: XCTestCase {
     }
 
     /// Offline the token cannot be tested. The row warns and does not block the wizard.
-    func testOfflineTheRowWarnsAndDoesNotBlock() async {
-        let checker = makeChecker(tokenRunner(Self.token))
+    func testOfflineTheRowWarnsAndDoesNotBlock() async throws {
+        let npmrc = try npmrcFile("\(RegistryAuth.tokenKey)=\(Self.token)\n")
+        defer { try? FileManager.default.removeItem(at: npmrc.folder) }
+        let checker = makeChecker(protectedPnpmRunner(), registry: Self.offlineRegistry(npmrcPath: npmrc.path))
 
         await checker.runAllChecks()
 
@@ -773,7 +807,7 @@ final class EnvironmentCheckerTests: XCTestCase {
     /// No token: nothing goes to the network.
     func testNoTokenFailsWithoutARequest() async {
         let stub = StubURLProtocol.session { _ in .success(200) }
-        let checker = makeChecker(tokenRunner("undefined"), registry: RegistryAuth(npmrcPath: "/nonexistent/home/.npmrc", session: stub.session))
+        let checker = makeChecker(protectedPnpmRunner(), registry: RegistryAuth(npmrcPath: "/nonexistent/home/.npmrc", session: stub.session))
 
         await checker.runAllChecks()
 
@@ -781,22 +815,43 @@ final class EnvironmentCheckerTests: XCTestCase {
         XCTAssertTrue(stub.requests().isEmpty)
     }
 
-    /// Without pnpm the row reads the token from the file.
-    func testWithoutPnpmTheFileGivesTheToken() async throws {
-        let directory = try temporaryFolder()
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let npmrc = directory.appendingPathComponent(".npmrc").path
-        try "//npm.pkg.github.com/:_authToken=\(Self.token)\n".write(toFile: npmrc, atomically: true, encoding: .utf8)
+    /// The row tests the last token line, the one pnpm install uses, and runs no command for it.
+    func testTheCheckTestsTheLastTokenLineWithoutACommand() async throws {
+        let npmrc = try npmrcFile("\(RegistryAuth.tokenKey)=ghp_first\n\(RegistryAuth.tokenKey)=\(Self.token)\n")
+        defer { try? FileManager.default.removeItem(at: npmrc.folder) }
         let stub = StubURLProtocol.session { _ in .success(200) }
-        let runner = FakeCommandRunner { call in
-            call.command == RegistryAuth.readCommand ? FakeCommandRunner.failed(127, stderr: "zsh: command not found: pnpm") : FakeCommandRunner.ok()
-        }
-        let checker = makeChecker(runner, registry: RegistryAuth(npmrcPath: npmrc, session: stub.session))
+        let runner = protectedPnpmRunner()
+        let checker = makeChecker(runner, registry: RegistryAuth(npmrcPath: npmrc.path, session: stub.session))
 
         await checker.runAllChecks()
 
         XCTAssertEqual(status("registry-auth", in: checker), .passing("Token works"))
-        XCTAssertEqual(stub.requests().first?.value(forHTTPHeaderField: "Authorization"), "Bearer \(Self.token)")
+        XCTAssertEqual(stub.requests().map { $0.value(forHTTPHeaderField: "Authorization") }, ["Bearer \(Self.token)"])
+        XCTAssertFalse(runner.commands.contains { $0.contains("_authToken") }, "the token is read from the file")
+    }
+
+    /// A user config that is a link stays a link: the save writes the file it points to.
+    /// The copy holds the old token, so it is 0600 too.
+    func testSavingThroughALinkKeepsTheLink() async throws {
+        let npmrc = try npmrcFile("\(RegistryAuth.tokenKey)=ghp_old\n")
+        defer { try? FileManager.default.removeItem(at: npmrc.folder) }
+        let dotfiles = npmrc.folder.appendingPathComponent("dotfiles")
+        try FileManager.default.createDirectory(at: dotfiles, withIntermediateDirectories: true)
+        let managed = dotfiles.appendingPathComponent("npmrc").path
+        try FileManager.default.moveItem(atPath: npmrc.path, toPath: managed)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: managed)
+        try FileManager.default.createSymbolicLink(atPath: npmrc.path, withDestinationPath: managed)
+        let registry = RegistryAuth(npmrcPath: npmrc.path, session: StubURLProtocol.session { _ in .success(200) }.session)
+
+        let backup = try XCTUnwrap(registry.save(token: Self.token, toPath: npmrc.path, now: Date()))
+
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: npmrc.path), managed)
+        XCTAssertEqual(try String(contentsOfFile: managed, encoding: .utf8), "\(RegistryAuth.tokenKey)=\(Self.token)\n")
+        let backupPath = npmrc.folder.appendingPathComponent(backup).path
+        XCTAssertEqual(try String(contentsOfFile: backupPath, encoding: .utf8), "\(RegistryAuth.tokenKey)=ghp_old\n")
+        XCTAssertNil(try? FileManager.default.destinationOfSymbolicLink(atPath: backupPath), "the copy is a file")
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: backupPath)[.posixPermissions] as? Int, 0o600)
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: managed)[.posixPermissions] as? Int, 0o600)
     }
 
     func testTheFixAsksForTheTokenInItsOwnSheet() async {
@@ -840,7 +895,7 @@ final class EnvironmentCheckerTests: XCTestCase {
             XCTAssertFalse(call.command.contains(Self.token), call.command)
             XCTAssertFalse(call.environment.values.contains(Self.token), call.command)
         }
-        // The row runs again. pnpm of the fake gives no token, so the file decides.
+        // The row runs again and reads the file.
         XCTAssertEqual(status("registry-auth", in: checker), .passing("Token works"))
     }
 

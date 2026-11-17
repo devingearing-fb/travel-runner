@@ -1,18 +1,33 @@
 import Foundation
 
 /// The token of GitHub Packages, which serves the @fastbreak-amateur packages.
-/// The check reads the token from the user config of pnpm and asks GitHub
-/// Packages whether it can read a package with it.
+/// The check reads the token from the user config of npm and pnpm and asks
+/// GitHub Packages whether it can read a package with it.
+///
+/// The file is the source of truth. `pnpm config get` cannot read the token:
+/// pnpm 10 hands the call to npm, which refuses a protected auth key.
 struct RegistryAuth: Sendable {
-    /// The user config of pnpm and npm (`--location=user`).
-    let npmrcPath: String
+    /// The user config when a test gives one. Nil: `$NPM_CONFIG_USERCONFIG`, else `~/.npmrc`.
+    let npmrcOverride: String?
+    let home: String
     /// The session of the test request. Tests give one with a stub protocol.
     let session: URLSession
 
-    init(npmrcPath: String = (NSHomeDirectory() as NSString).appendingPathComponent(".npmrc"),
+    init(npmrcPath: String? = nil, home: String = NSHomeDirectory(),
          session: URLSession = RegistryAuth.defaultSession) {
-        self.npmrcPath = npmrcPath
+        self.npmrcOverride = npmrcPath
+        self.home = home
         self.session = session
+    }
+
+    /// The user config that npm and pnpm read: `$NPM_CONFIG_USERCONFIG` of the
+    /// user's shell when it is set, else `~/.npmrc`.
+    func npmrcPath(variables: [String: String]) -> String {
+        if let npmrcOverride { return npmrcOverride }
+        if let value = variables["NPM_CONFIG_USERCONFIG"], !value.isEmpty {
+            return (value as NSString).expandingTildeInPath
+        }
+        return (home as NSString).appendingPathComponent(".npmrc")
     }
 
     nonisolated static let defaultSession: URLSession = {
@@ -27,34 +42,30 @@ struct RegistryAuth: Sendable {
     /// A package of the org. A token that can read it can install the monorepo.
     nonisolated static let testURL = URL(string: "https://npm.pkg.github.com/@fastbreak-amateur%2Ffb-toolkit")!
 
-    /// Prints the token of the user config. pnpm prints "undefined" when there is none.
+    /// What the check reads, as a command the user can run: the last token line of the user config.
     nonisolated static let readCommand =
-        "COREPACK_ENABLE_DOWNLOAD_PROMPT=0 pnpm config get --location=user '\(tokenKey)'"
+        "grep '^\(tokenKey)=' \"${NPM_CONFIG_USERCONFIG:-$HOME/.npmrc}\" | tail -1"
 
     /// Prints the token of the GitHub CLI login.
     nonisolated static let ghTokenCommand = "gh auth token"
 
     // MARK: - Reading the token
 
-    /// The token in the output of `pnpm config get`, or nil when none is set.
-    nonisolated static func token(fromConfigGet output: String) -> String? {
-        let value = output.components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .last { !$0.isEmpty } ?? ""
-        return ["", "undefined", "null", "(protected)"].contains(value) ? nil : value
+    /// The token of an `.npmrc`, or nil when the file sets none. When the key is
+    /// there twice, the last line wins, as it does for npm and pnpm.
+    nonisolated static func token(fromNpmrc content: String) -> String? {
+        guard var value = content.components(separatedBy: .newlines).compactMap(valueOfTokenLine).last else {
+            return nil
+        }
+        if value.count >= 2, let first = value.first, first == value.last, first == "\"" || first == "'" {
+            value = String(value.dropFirst().dropLast())
+        }
+        return value.isEmpty ? nil : value
     }
 
-    /// The token of an `.npmrc`, or nil when the file sets none.
-    nonisolated static func token(fromNpmrc content: String) -> String? {
-        for line in content.components(separatedBy: .newlines) {
-            guard let rest = valueOfTokenLine(line) else { continue }
-            var value = rest
-            if value.count >= 2, let first = value.first, first == value.last, first == "\"" || first == "'" {
-                value = String(value.dropFirst().dropLast())
-            }
-            return value.isEmpty ? nil : value
-        }
-        return nil
+    /// The token of the file, or nil when there is no file or no token.
+    nonisolated static func token(atPath path: String) -> String? {
+        (try? String(contentsOfFile: path, encoding: .utf8)).flatMap(token(fromNpmrc:))
     }
 
     /// The text after `=` when the line sets the token, else nil.
@@ -144,38 +155,44 @@ struct RegistryAuth: Sendable {
 
     // MARK: - Saving the token
 
-    /// Sets the token in the `.npmrc`: it replaces the line of the token, or adds one.
-    /// Other lines stay as they are.
+    /// Sets the token in the `.npmrc`: it replaces the last line of the token, or adds one.
+    /// It removes the earlier token lines, so that no old token is left. Other lines stay as they are.
     nonisolated static func settingToken(_ token: String, in content: String) -> String {
         var lines = content.isEmpty ? [] : content.components(separatedBy: "\n")
         if lines.last == "" { lines.removeLast() }
         let line = "\(tokenKey)=\(token)"
-        if let index = lines.firstIndex(where: { valueOfTokenLine($0) != nil }) {
+        if let index = lines.lastIndex(where: { valueOfTokenLine($0) != nil }) {
             lines[index] = line
+            lines = lines.enumerated()
+                .filter { $0.offset == index || valueOfTokenLine($0.element) == nil }
+                .map(\.element)
         } else {
             lines.append(line)
         }
         return lines.joined(separator: "\n") + "\n"
     }
 
-    /// Writes the token to the user config, after a copy of the file. The token
-    /// never goes on a command line: the app writes the file itself.
+    /// Writes the token to the user config at `path`, after a copy of the file. The
+    /// token never goes on a command line: the app writes the file itself. When the
+    /// config is a link (a dotfile manager), the app writes the file it points to.
     /// Returns the name of the copy, or nil when there was no file.
-    func save(token: String, now: Date) throws -> String? {
+    func save(token: String, toPath path: String, now: Date) throws -> String? {
         let fileManager = FileManager.default
-        let exists = fileManager.fileExists(atPath: npmrcPath)
-        let content = exists ? try String(contentsOfFile: npmrcPath, encoding: .utf8) : ""
-        let backup = exists ? try BackupCopy.make(of: npmrcPath, now: now) : nil
-        try Data(Self.settingToken(token, in: content).utf8).write(to: URL(fileURLWithPath: npmrcPath), options: .atomic)
-        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: npmrcPath)
+        let target = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+        let exists = fileManager.fileExists(atPath: target.path)
+        let content = exists ? try String(contentsOf: target, encoding: .utf8) : ""
+        let backup = exists ? try BackupCopy.make(of: path, now: now, permissions: 0o600) : nil
+        try Data(Self.settingToken(token, in: content).utf8).write(to: target, options: .atomic)
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
         return backup
     }
 }
 
 /// A copy of a file next to it, `<file>.bak-<timestamp>`, before a fix changes the file.
 enum BackupCopy {
-    /// Copies the file and returns the name of the copy.
-    nonisolated static func make(of path: String, now: Date) throws -> String {
+    /// Copies the file and returns the name of the copy. When `path` is a link, the
+    /// copy holds the content of the file it points to. `permissions` sets the mode of the copy.
+    nonisolated static func make(of path: String, now: Date, permissions: Int? = nil) throws -> String {
         let fileManager = FileManager.default
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -187,7 +204,11 @@ enum BackupCopy {
             target = "\(base)-\(counter)"
             counter += 1
         }
-        try fileManager.copyItem(atPath: path, toPath: target)
+        let source = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        try fileManager.copyItem(atPath: source, toPath: target)
+        if let permissions {
+            try fileManager.setAttributes([.posixPermissions: permissions], ofItemAtPath: target)
+        }
         return (target as NSString).lastPathComponent
     }
 }
