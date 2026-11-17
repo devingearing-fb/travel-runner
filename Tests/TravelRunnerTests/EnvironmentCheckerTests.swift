@@ -448,7 +448,8 @@ final class EnvironmentCheckerTests: XCTestCase {
         XCTAssertNotNil(checker.checks.first { $0.id == "node" })
     }
 
-    /// On an old checkout a missing PyJWT warns. It is optional, so it does not block the wizard.
+    /// On an old checkout a missing PyJWT warns that the database setup stops. It is optional,
+    /// so it does not block the wizard.
     func testAMissingPyJWTWarnsAndDoesNotBlock() async throws {
         let mono = try makeCheckout(prerequisites: oldPrerequisites)
         defer { try? FileManager.default.removeItem(at: mono) }
@@ -459,9 +460,9 @@ final class EnvironmentCheckerTests: XCTestCase {
 
         await checker.runAllChecks()
 
-        guard case .warning = status("python-jwt", in: checker) else {
-            return XCTFail("want a warning, got \(String(describing: status("python-jwt", in: checker)))")
-        }
+        // The warning says that this checkout's database setup stops without PyJWT.
+        XCTAssertEqual(status("python-jwt", in: checker),
+                       .warning("Not installed — this checkout's database setup stops without it. Use Install PyJWT, or pull the monolith."))
         XCTAssertFalse(checker.blockers.contains { $0.id == "python-jwt" })
         XCTAssertFalse(checker.unresolved.contains { $0.id == "python-jwt" })
     }

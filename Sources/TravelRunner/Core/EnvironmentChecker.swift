@@ -120,7 +120,7 @@ final class EnvironmentChecker {
         case "docker": "the local database will not start"
         case "node": "the portals and the login will not run"
         case "pnpm": "installs and both portals will not run"
-        case "python-jwt": "the contract data copy of the database setup will fail"
+        case "python-jwt": "the database setup of this checkout stops at its first step"
         case "registry-auth": "pnpm install cannot download the @fastbreak-amateur packages"
         case "workspace-modules": "both portals will not run"
         case "login-modules": "the login will not run"
@@ -250,7 +250,7 @@ final class EnvironmentChecker {
             HealthCheck(id: "python-jwt", name: "Python 3 + PyJWT", section: .prerequisites,
                         isRequired: false, fixLabel: "Install PyJWT",
                         checkCommand: "python3 -c 'import jwt'",
-                        checkDescription: "Optional — this checkout is from before the .env dump scripts, and its contract data copy (copy-remote-data.py) still needs PyJWT. A newer checkout does not."),
+                        checkDescription: "Optional for the wizard, but this checkout is from before the .env dump scripts: its database setup stops at the first step without PyJWT. A newer checkout does not need it."),
             HealthCheck(id: "registry-auth", name: "GitHub Packages auth", section: .prerequisites,
                         checkCommand: "grep //npm.pkg.github.com/:_authToken ~/.npmrc",
                         checkDescription: "User-level token for @fastbreak-amateur packages. Set it once with: pnpm config set --location=user \"//npm.pkg.github.com/:_authToken\" <token>"),
@@ -467,7 +467,7 @@ final class EnvironmentChecker {
 
         case "python-jwt":
             let ok = try await check("python3 -c 'import jwt' 2>/dev/null", label: "python3 -c 'import jwt'").succeeded
-            return ok ? .passing("Installed") : .warning("Not installed — only monolith checkouts from before the .env dump script need it")
+            return ok ? .passing("Installed") : .warning("Not installed — this checkout's database setup stops without it. Use Install PyJWT, or pull the monolith.")
 
         case "registry-auth":
             let ok = try await check(
