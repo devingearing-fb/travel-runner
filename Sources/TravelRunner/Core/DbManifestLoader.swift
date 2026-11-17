@@ -21,6 +21,9 @@ enum DbManifestLoader {
             if let id = step["id"] as? String { stepMap[id] = step }
         }
 
+        // `idleTimeoutMs` of a step, else of the manifest, else 180 s.
+        let defaultIdleMs = (json["idleTimeoutMs"] as? Int) ?? DbSetupStep.defaultIdleTimeoutSeconds * 1000
+
         var result: [DbSetupStep] = []
         for (index, stepID) in profileStepIDs.enumerated() {
             guard let definition = stepMap[stepID] else { continue }
@@ -31,7 +34,8 @@ enum DbManifestLoader {
                 healthCheckCommand: definition["healthCheck"] as? String,
                 timeoutSeconds: ((definition["timeoutMs"] as? Int) ?? 60000) / 1000,
                 isOptional: definition["optional"] as? Bool ?? false,
-                stepNumber: index + 1
+                stepNumber: index + 1,
+                idleTimeoutSeconds: max(1, ((definition["idleTimeoutMs"] as? Int) ?? defaultIdleMs) / 1000)
             )
             result.append(step)
         }

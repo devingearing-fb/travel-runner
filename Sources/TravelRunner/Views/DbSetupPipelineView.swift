@@ -85,6 +85,9 @@ struct DbSetupPipelineView: View {
         } else if pipeline.firstFailed != nil {
             Image(systemName: "xmark.circle.fill")
                 .foregroundStyle(.red)
+        } else if pipeline.firstCancelled != nil {
+            Image(systemName: "stop.circle")
+                .foregroundStyle(.secondary)
         } else {
             Image(systemName: "circle.dashed")
                 .foregroundStyle(.secondary)
@@ -118,6 +121,13 @@ struct DbSetupPipelineView: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
+
+                if pipeline.firstCancelled != nil {
+                    Text(DbSetupPipeline.cancelledMessage)
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer()
         }
@@ -228,7 +238,7 @@ struct DbSetupStepRow: View {
                     .foregroundStyle(.secondary)
             }
 
-            if step.status == .failed || step.status == .timedOut {
+            if step.status == .failed || step.status == .timedOut || step.status == .cancelled {
                 Button("Retry") { onRetry() }
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
@@ -291,6 +301,10 @@ struct DbSetupStepRow: View {
             Image(systemName: "clock.badge.exclamationmark")
                 .font(.caption2)
                 .foregroundStyle(.orange)
+        case .cancelled:
+            Image(systemName: "stop.circle")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
     }
 

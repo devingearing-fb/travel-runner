@@ -410,9 +410,9 @@ final class DbSeedScenarioTests: XCTestCase {
 
         XCTAssertFalse(failed)
         XCTAssertEqual(timedOut.status, .failed)
-        XCTAssertEqual(timedOut.errorMessage, "Health check timed out after 60s")
+        XCTAssertEqual(timedOut.errorMessage, "Health check timed out after 30s")
         XCTAssertEqual(hanging.calls.map(\.command), ["check-the-data"])
-        XCTAssertEqual(hanging.calls.first?.timeout, .seconds(60))
+        XCTAssertEqual(hanging.calls.first?.timeout, .seconds(30))
 
         // Control: a health check that fails at once has its own text, and one that passes, passes.
         let failing = step()
@@ -461,8 +461,8 @@ final class DbSeedScenarioTests: XCTestCase {
         let success = await run.value
 
         XCTAssertFalse(success)
-        XCTAssertEqual(cancelledStep.status, .failed)
-        XCTAssertEqual(cancelledStep.errorMessage, "Cancelled")
+        XCTAssertEqual(cancelledStep.status, .cancelled)
+        XCTAssertNil(cancelledStep.errorMessage, "a cancel is not a fault")
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker), "the step ran after the cancel")
 
         // Control: without a cancel the same step runs.

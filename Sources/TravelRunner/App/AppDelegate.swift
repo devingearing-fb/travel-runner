@@ -103,61 +103,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !siblingRunsStack { supervisor.resetEnvToLocalhost() }
 
         // Phase 1: Collect the full process tree BEFORE sending signals.
-        // Killing a parent reparents its children to launchd, making them
-        // invisible to pgrep -P.
-        var allPids = Set<pid_t>()
+        // Killing a parent reparents its children to launchd.
+        var allPids: [pid_t] = []
         for (_, state) in supervisor.serviceStates {
-            if let pid = state.pid {
-                allPids.insert(pid)
-                collectDescendants(of: pid, into: &allPids)
-            }
+            if let pid = state.pid { allPids += ProcessTree.tree(of: pid) }
         }
 
         // The holds viewer of the Rooms tab is not a service, so it is not in the loop above.
-        if let pid = supervisor.holdsViewer.pid {
-            allPids.insert(pid)
-            collectDescendants(of: pid, into: &allPids)
-        }
+        if let pid = supervisor.holdsViewer.pid { allPids += ProcessTree.tree(of: pid) }
 
-        // Phase 2: SIGTERM everything we collected
-        for pid in allPids {
-            kill(pid, SIGTERM)
-        }
+        // A DB step that runs (a reset, a hotel load) is not a service either.
+        if let pid = supervisor.dbStepProcessID { allPids += ProcessTree.tree(of: pid) }
 
-        Thread.sleep(forTimeInterval: 1.0)
-
-        // Phase 3: SIGKILL anything still alive
-        for pid in allPids {
-            kill(pid, SIGKILL)
-        }
+        // Phase 2 and 3: SIGTERM, then SIGKILL to what is still alive after a second.
+        ProcessTree.terminateNow(Array(Set(allPids)))
 
         // Phase 4: Kill by service port as a fallback. Only the ports that Stop All
         // clears: the services of the profile and those this session started, never a
         // reuse_if_running service (Supabase persists between sessions).
         guard !siblingRunsStack else { return }
         killProcessesOnPorts(supervisor.sweepPorts)
-    }
-
-    private func collectDescendants(of pid: pid_t, into result: inout Set<pid_t>) {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        task.arguments = ["-P", "\(pid)"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        do {
-            try task.run()
-            task.waitUntilExit()
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let text = String(data: data, encoding: .utf8) else { return }
-            for pidStr in text.split(separator: "\n") {
-                if let child = pid_t(pidStr.trimmingCharacters(in: .whitespaces)) {
-                    if result.insert(child).inserted {
-                        collectDescendants(of: child, into: &result)
-                    }
-                }
-            }
-        } catch {}
     }
 
     /// A container runtime is never killed: its port helper serves every container.

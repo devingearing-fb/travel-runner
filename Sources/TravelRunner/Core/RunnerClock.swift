@@ -21,4 +21,14 @@ struct RunnerClock: Sendable {
         uptime: { start.duration(to: .now) },
         wait: { try await Task.sleep(for: $0) }
     )
+
+    private static let awakeStart = SuspendingClock.now
+
+    /// Real time that stops while the Mac sleeps. A step that runs when the lid
+    /// closes has used no time of its limit when the Mac wakes.
+    static let awake = RunnerClock(
+        date: { Date() },
+        uptime: { awakeStart.duration(to: .now) },
+        wait: { try await SuspendingClock().sleep(for: $0) }
+    )
 }

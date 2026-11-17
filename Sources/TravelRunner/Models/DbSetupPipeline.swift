@@ -9,6 +9,8 @@ enum DbStepStatus: String, Sendable {
     case failed = "FAILED"
     case skipped = "SKIPPED"
     case timedOut = "TIMED_OUT"
+    /// The developer, Stop All or a quit stopped the step. It is not a fault.
+    case cancelled = "CANCELLED"
 
     var color: Color {
         switch self {
@@ -18,6 +20,7 @@ enum DbStepStatus: String, Sendable {
         case .failed: .red
         case .skipped: .secondary
         case .timedOut: .orange
+        case .cancelled: .secondary
         }
     }
 }
@@ -29,13 +32,34 @@ final class DbSetupStep: Identifiable {
     nonisolated let name: String
     nonisolated let command: String
     nonisolated let healthCheckCommand: String?
+    /// The fixed time limit of the manifest (`timeoutMs`).
     nonisolated let timeoutSeconds: Int
+    /// The step is stopped when it prints nothing for this long (`idleTimeoutMs`).
+    nonisolated let idleTimeoutSeconds: Int
     nonisolated let isOptional: Bool
     nonisolated let stepNumber: Int
 
     /// The log store key of this step's output. The runner writes under it and a
     /// failure issue reads from it.
     nonisolated var logKey: String { "db-setup-\(id)" }
+
+    /// A step with no `idleTimeoutMs` in the manifest is stopped after 180 s with no output.
+    nonisolated static let defaultIdleTimeoutSeconds = 180
+
+    /// The least time that the slow steps get, whatever the manifest says. A cold
+    /// machine pulls images and loads about 200,000 hotels; the idle limit catches a
+    /// step that hangs long before this.
+    nonisolated static let hardCapSeconds: [String: Int] = [
+        "start-supabase": 900,
+        "reset-database": 900,
+        "load-hotels": 900,
+        "fetch-hotels": 1800,
+    ]
+
+    /// The longest time the step may run, output or not.
+    nonisolated var hardCapSeconds: Int {
+        max(timeoutSeconds, Self.hardCapSeconds[id] ?? 0)
+    }
 
     var status: DbStepStatus = .pending
     /// Fraction from 0 to 1.
@@ -66,12 +90,14 @@ final class DbSetupStep: Identifiable {
     }
 
     nonisolated init(id: String, name: String, command: String, healthCheckCommand: String?,
-                     timeoutSeconds: Int, isOptional: Bool, stepNumber: Int) {
+                     timeoutSeconds: Int, isOptional: Bool, stepNumber: Int,
+                     idleTimeoutSeconds: Int = DbSetupStep.defaultIdleTimeoutSeconds) {
         self.id = id
         self.name = name
         self.command = command
         self.healthCheckCommand = healthCheckCommand
         self.timeoutSeconds = timeoutSeconds
+        self.idleTimeoutSeconds = idleTimeoutSeconds
         self.isOptional = isOptional
         self.stepNumber = stepNumber
     }
@@ -100,6 +126,14 @@ final class DbSetupPipeline {
     var firstFailed: DbSetupStep? {
         steps.first { $0.status == .failed || $0.status == .timedOut }
     }
+
+    /// The step that a cancel stopped, when the last run was cancelled.
+    var firstCancelled: DbSetupStep? {
+        steps.first { $0.status == .cancelled }
+    }
+
+    /// What the pipeline shows after a cancel.
+    nonisolated static let cancelledMessage = "Cancelled. The database may be half-built — Run All to finish."
 
     var allRequiredPassed: Bool {
         steps.filter { !$0.isOptional }.allSatisfy { $0.status == .passed }

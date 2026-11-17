@@ -1794,6 +1794,61 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(supervisor.lastError, "No DB setup pipeline for the profile reset.")
     }
 
+    /// A DB setup whose step starts a child that writes its pid to `child` and waits.
+    /// The step runs in a shell that reads no startup files.
+    private func runChildStep() async throws -> (step: DbSetupStep, child: pid_t) {
+        try loadSupabase()
+        supervisor.shell = FakeCommandRunner()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let running = step("load-hotels", "sleep 60 & echo $! > child; wait")
+        supervisor.dbPipelineFactory = { _, _ in self.pipeline([running, self.step("verify-data", "true")]) }
+
+        supervisor.runDbSetup(profile: "reset")
+        let file = workDir.appendingPathComponent("child").path
+        var child: pid_t?
+        for _ in 0..<200 where child == nil {
+            child = (try? String(contentsOfFile: file, encoding: .utf8))
+                .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            if child == nil { try await Task.sleep(for: .milliseconds(25)) }
+        }
+        return (running, try XCTUnwrap(child, "the step did not start its child"))
+    }
+
+    /// Findings "Cancel reported as failure; UI unlocks early" and "Timeout and
+    /// Cancel kill only the wrapper": Cancel ends the step's tree, the DB controls
+    /// stay locked until it is gone, and a cancel sets no error and files no issue.
+    func testCancelEndsTheStepTreeAndIsNotAFailure() async throws {
+        let tracker = captureIssues()
+        let (step, child) = try await runChildStep()
+        defer { if kill(child, 0) == 0 { kill(child, SIGKILL) } }
+
+        supervisor.cancelDbSetup()
+        XCTAssertTrue(supervisor.dbResetRunning, "the controls unlock only when the processes are gone")
+        let unlocked = await waitUntil(10) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(unlocked)
+
+        XCTAssertNotEqual(kill(child, 0), 0, "the child of the step still runs")
+        let ended = await waitUntil(10) { self.supervisor.dbSetupPipeline?.isRunning == false }
+        XCTAssertTrue(ended)
+        XCTAssertEqual(step.status, .cancelled)
+        XCTAssertNil(step.errorMessage)
+        XCTAssertNil(supervisor.lastError)
+        let issues = await tracker.listOpenIssues()
+        XCTAssertTrue(issues.isEmpty, "a cancel filed an issue")
+    }
+
+    /// Stop All ends a DB step that runs, with its child processes.
+    func testStopAllEndsTheRunningDbStep() async throws {
+        let (step, child) = try await runChildStep()
+        defer { if kill(child, 0) == 0 { kill(child, SIGKILL) } }
+
+        supervisor.stopAll()
+        let stopped = await waitUntil(15) { self.supervisor.health == .stopped && step.status == .cancelled }
+        XCTAssertTrue(stopped, "step is \(step.status.rawValue)")
+        XCTAssertNotEqual(kill(child, 0), 0, "the child of the step still runs")
+    }
+
     // MARK: - Time from the clock of the test
 
     /// The wait for a late database with the times of the app (2 s between

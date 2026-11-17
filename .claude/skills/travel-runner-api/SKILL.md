@@ -293,7 +293,7 @@ curl -s -X POST http://localhost:19900/api/db-setup/retry/load-hotels
 
 ### POST /api/db-setup/cancel
 
-Cancel a running database setup pipeline.
+Cancel a running database setup pipeline. The step and its child processes are stopped (SIGTERM, then SIGKILL); `running` stays true until they are gone.
 
 ```bash
 curl -s -X POST http://localhost:19900/api/db-setup/cancel
@@ -325,7 +325,7 @@ curl -s http://localhost:19900/api/db-setup/status | python3 -m json.tool
 }
 ```
 
-**Step status values:** `PENDING`, `RUNNING`, `CHECKING` (health check), `PASSED`, `FAILED`, `SKIPPED`, `TIMED_OUT`
+**Step status values:** `PENDING`, `RUNNING`, `CHECKING` (health check), `PASSED`, `FAILED`, `SKIPPED`, `TIMED_OUT` (no output for 180 s, or past the step's hard cap), `CANCELLED` (Cancel, Stop All or a quit; not a failure, no `error`)
 
 Failed steps include `error` and `recovery` fields with diagnostic info; steps may also carry `health_result`. `profile` and the seed scenarios are `null` when no pipeline has run.
 

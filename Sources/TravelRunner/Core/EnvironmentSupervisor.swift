@@ -210,6 +210,8 @@ final class EnvironmentSupervisor {
     /// is read. Nil from the closure starts nothing and sets `lastError`, like a
     /// missing scenario.
     var dbPipelineFactory: ((_ cwd: String, _ profile: String) -> DbSetupPipeline?)?
+    /// How a DB step command starts. Tests give a shell that reads no startup files.
+    var dbStepLauncher: StepLauncher = .loginShell
     /// The version that the checkout's `runner.minVersion` is compared with. Nil is
     /// never blocked. Tests set it.
     @ObservationIgnored var runnerVersion: String? = Compatibility.comparableVersion(of: .current)
@@ -695,6 +697,11 @@ final class EnvironmentSupervisor {
         return Task {
             for serviceID in sortedServiceIDs {
                 serviceStates[serviceID]?.phase = .stopping
+            }
+
+            // A DB step is part of the stack: Stop All ends it and its child processes.
+            if dbResetRunning || dbSetupPipeline?.isRunning == true {
+                await dbSetupRunner?.cancel()
             }
 
             // Read before the stop: the ports of the services that this session started.
@@ -1539,7 +1546,7 @@ final class EnvironmentSupervisor {
             await waitForEnvResetOfLoad()
             let success = await runner.executeStepPublic(step)
             dbResetRunning = false
-            if !success {
+            if !success, step.status != .cancelled {
                 lastError = "DB setup failed at \(step.name): \(step.errorMessage ?? "unknown error")"
                 await captureDbSetupFailure(step, runner: runner)
             }
@@ -1604,10 +1611,21 @@ final class EnvironmentSupervisor {
         return "{}"
     }
 
+    /// Stops the DB step that runs and its process tree. The DB controls stay
+    /// locked until the processes are gone.
     func cancelDbSetup() {
-        Task { await dbSetupRunner?.cancel() }
-        dbResetRunning = false
+        guard let runner = dbSetupRunner else {
+            dbResetRunning = false
+            return
+        }
+        Task {
+            await runner.cancel()
+            if dbSetupRunner === runner { dbResetRunning = false }
+        }
     }
+
+    /// The pid of the DB step process that runs now. The app stops its tree as it quits.
+    var dbStepProcessID: pid_t? { dbSetupRunner?.runningProcessID }
 
     func dismissDbSetup() {
         dbSetupPipeline = nil
@@ -3173,7 +3191,7 @@ final class EnvironmentSupervisor {
     private func makeDbSetupRunner(cwd: String, pipeline: DbSetupPipeline) -> DbSetupRunner {
         DbSetupRunner(
             portalCwd: cwd, logStore: logStore, seedScenarioID: pipeline.seedScenario.id,
-            profile: pipeline.profile, tools: tools, shell: shell
+            profile: pipeline.profile, tools: tools, shell: shell, launcher: dbStepLauncher
         )
     }
 

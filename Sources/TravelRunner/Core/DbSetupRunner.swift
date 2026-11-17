@@ -1,17 +1,241 @@
 import Foundation
 
-/// Thread-safe one-shot guard for continuation resumption.
-private final class CompletionGuard: @unchecked Sendable {
-    private var completed = false
-    private let lock = NSLock()
+/// How a step command starts. The live one is a login shell (`zsh -l -c`). Tests
+/// give `/bin/sh`, so they do not read the startup files of the person who runs them.
+struct StepLauncher: Sendable {
+    var executable: String
+    var arguments: @Sendable (_ command: String) -> [String]
 
-    /// Attempt to claim the one-shot. Returns `true` exactly once.
-    func claim() -> Bool {
+    static let loginShell = StepLauncher(executable: "/bin/zsh", arguments: { ["-l", "-c", $0] })
+}
+
+/// Why the runner stopped a step that still ran.
+enum StepTimeout: Sendable, Equatable {
+    /// The step printed nothing for this many seconds.
+    case idle(seconds: Int)
+    /// The step ran longer than its hard cap.
+    case cap(seconds: Int)
+
+    /// The limit that has passed at `now`, or nil. All times are of one clock.
+    static func check(
+        now: Duration, startedAt: Duration, lastOutputAt: Duration, idleSeconds: Int, capSeconds: Int
+    ) -> StepTimeout? {
+        if now - startedAt >= .seconds(capSeconds) { return .cap(seconds: capSeconds) }
+        if now - lastOutputAt >= .seconds(idleSeconds) { return .idle(seconds: idleSeconds) }
+        return nil
+    }
+
+    /// The error of the step. `progressLabel` is the last progress text of the step,
+    /// `lastLine` its last line of output.
+    func message(stepName: String, progressLabel: String?, lastLine: String?) -> String {
+        switch self {
+        case .idle(let seconds):
+            let doing = progressLabel ?? stepName
+            return "No output for \(seconds) s while: \(doing). Last line: \(lastLine ?? "none")."
+        case .cap(let seconds):
+            return "Timed out after \(seconds) s"
+        }
+    }
+
+    var guidance: String {
+        switch self {
+        case .idle:
+            return "The step stopped printing and was stopped. Check the log, then retry the step."
+        case .cap:
+            return "The step took too long and was stopped. Check the log, then retry the step."
+        }
+    }
+}
+
+/// The time stamps of one step, shared by its output reader and its watchdog.
+private final class StepWatch: @unchecked Sendable {
+    private let lock = NSLock()
+    let startedAt: Duration
+    private var lastOutput: Duration
+    private var expired: StepTimeout?
+
+    init(now: Duration) {
+        startedAt = now
+        lastOutput = now
+    }
+
+    var lastOutputAt: Duration {
         lock.lock()
         defer { lock.unlock() }
-        if completed { return false }
-        completed = true
-        return true
+        return lastOutput
+    }
+
+    func output(at now: Duration) {
+        lock.lock()
+        lastOutput = now
+        lock.unlock()
+    }
+
+    var timeout: StepTimeout? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return expired
+        }
+        set {
+            lock.lock()
+            expired = newValue
+            lock.unlock()
+        }
+    }
+}
+
+/// One line of a step or of its health check.
+private struct OutputLine: Sendable {
+    let text: String
+    let stream: LogEntry.Stream
+}
+
+/// The exit code of a step process, given once by its termination handler.
+private final class ExitSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var code: Int32?
+    private var waiter: CheckedContinuation<Int32, Never>?
+
+    func resolve(_ value: Int32) {
+        lock.lock()
+        guard code == nil else {
+            lock.unlock()
+            return
+        }
+        code = value
+        let waiting = waiter
+        waiter = nil
+        lock.unlock()
+        waiting?.resume(returning: value)
+    }
+
+    func wait() async -> Int32 {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if let code {
+                lock.unlock()
+                continuation.resume(returning: code)
+            } else {
+                waiter = continuation
+                lock.unlock()
+            }
+        }
+    }
+}
+
+/// Reads the pipe of a step into one stream of lines, in order. When the process
+/// ends it reads what is left in the pipe, so the last lines (often the
+/// `##db:status:failed` line) are never lost.
+private final class StepOutputReader: @unchecked Sendable {
+    private let lock = NSLock()
+    private let handle: FileHandle
+    private let decoder = UTF8ChunkDecoder()
+    private let lines = TerminalLineBuffer()
+    private let continuation: AsyncStream<OutputLine>.Continuation
+    private let onOutput: @Sendable () -> Void
+    private var finished = false
+
+    /// How long the stream waits for a child process that keeps the pipe open
+    /// after the step has ended.
+    private static let pipeGrace: DispatchTimeInterval = .seconds(1)
+
+    init(
+        handle: FileHandle, continuation: AsyncStream<OutputLine>.Continuation,
+        onOutput: @escaping @Sendable () -> Void
+    ) {
+        self.handle = handle
+        self.continuation = continuation
+        self.onOutput = onOutput
+        // A read of an empty pipe returns at once, so the end of the process can
+        // read the rest without a wait.
+        let fd = handle.fileDescriptor
+        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
+        handle.readabilityHandler = { [weak self] _ in self?.readAvailable() }
+    }
+
+    func readAvailable() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else { return }
+        if drain() { close() }
+    }
+
+    /// The process ended. Reads the rest of the pipe, and ends the stream at the
+    /// end of the pipe, or after a short grace.
+    func processEnded() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else { return }
+        if drain() {
+            close()
+            return
+        }
+        DispatchQueue.global().asyncAfter(deadline: .now() + Self.pipeGrace) { [self] in
+            finish()
+        }
+    }
+
+    /// Ends the stream now.
+    func finish() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !finished else { return }
+        _ = drain()
+        close()
+    }
+
+    /// Reads until the pipe is empty. True at the end of the stream.
+    private func drain() -> Bool {
+        var buffer = [UInt8](repeating: 0, count: 65_536)
+        let fd = handle.fileDescriptor
+        while true {
+            let count = read(fd, &buffer, buffer.count)
+            if count > 0 {
+                onOutput()
+                emit(decoder.decode(Data(buffer[0..<count])))
+            } else if count == 0 {
+                return true
+            } else if errno != EINTR {
+                return false
+            }
+        }
+    }
+
+    private func emit(_ text: String) {
+        for line in lines.feed(text) {
+            continuation.yield(OutputLine(text: line, stream: .stdout))
+        }
+    }
+
+    private func close() {
+        finished = true
+        handle.readabilityHandler = nil
+        emit(decoder.flush())
+        if let rest = lines.flush() {
+            continuation.yield(OutputLine(text: rest, stream: .stdout))
+        }
+        continuation.finish()
+    }
+}
+
+/// The pid of the step process that runs now. The app reads it as it quits,
+/// outside the actor.
+private final class RunningProcess: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: pid_t?
+
+    var pid: pid_t? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return value
+        }
+        set {
+            lock.lock()
+            value = newValue
+            lock.unlock()
+        }
     }
 }
 
@@ -22,19 +246,30 @@ actor DbSetupRunner {
     /// The profile of the pipeline. The prerequisites step reads it: a profile
     /// with a hotel step checks the hotel source before anything is reset.
     private let profile: String?
-    private var currentProcess: Process?
+    /// Set by `cancel()`. A runner serves one run, so a cancel before the run
+    /// starts still stops it.
     private var cancelled = false
+    /// The step process that runs now.
+    private let running = RunningProcess()
+    /// The health check that runs now.
+    private var healthCheck: Task<CommandResult, Never>?
     /// The PATH of the step commands.
     private let tools: ToolEnvironment
     /// Runs the health checks of the steps.
     private let shell: any CommandRunning
+    private let launcher: StepLauncher
+    /// The clock of the step limits. It stops while the Mac sleeps.
+    private let clock: RunnerClock
 
     /// A health check that hangs fails after this time.
-    static let healthCheckTimeout: Duration = .seconds(60)
+    static let healthCheckTimeout: Duration = .seconds(30)
+    /// How often the watchdog of a step looks at its limits.
+    static let watchInterval: Duration = .seconds(1)
 
     init(
         portalCwd: String, logStore: LogStore, seedScenarioID: String, profile: String? = nil,
-        tools: ToolEnvironment = .shared, shell: (any CommandRunning)? = nil
+        tools: ToolEnvironment = .shared, shell: (any CommandRunning)? = nil,
+        launcher: StepLauncher = .loginShell, clock: RunnerClock = .awake
     ) {
         self.portalCwd = portalCwd
         self.logStore = logStore
@@ -42,7 +277,13 @@ actor DbSetupRunner {
         self.profile = profile
         self.tools = tools
         self.shell = shell ?? LoginShell(tools: tools)
+        self.launcher = launcher
+        self.clock = clock
     }
+
+    /// The pid of the step process that runs now, or nil. The app stops its tree
+    /// as it quits.
+    nonisolated var runningProcessID: pid_t? { running.pid }
 
     /// What every step and every health check gets from the runner. The scripts
     /// of the checkout read these names (`scripts/db`):
@@ -80,8 +321,6 @@ actor DbSetupRunner {
     }
 
     func run(pipeline: DbSetupPipeline, from startStepId: String? = nil) async {
-        cancelled = false
-
         await MainActor.run {
             pipeline.isRunning = true
             pipeline.startedAt = .now
@@ -134,9 +373,17 @@ actor DbSetupRunner {
     /// True after `cancel()`: the developer stopped the run, so its failed step is not a fault.
     var wasCancelled: Bool { cancelled }
 
-    func cancel() {
+    /// Stops the run: the step process and every process below it (SIGTERM, then
+    /// SIGKILL), and the health check. It returns when they are gone.
+    func cancel() async {
         cancelled = true
-        currentProcess?.terminate()
+        if let pid = running.pid {
+            await ProcessTree.terminate(ProcessTree.tree(of: pid))
+        }
+        if let healthCheck {
+            healthCheck.cancel()
+            _ = await healthCheck.value
+        }
     }
 
     // MARK: - Step Execution
@@ -164,105 +411,26 @@ actor DbSetupRunner {
         await tools.settled()
         // A cancel during the wait finds no process to end, so the step ends here.
         if cancelled {
-            await MainActor.run {
-                step.status = .failed
-                step.completedAt = .now
-                step.errorMessage = "Cancelled"
-            }
+            await Self.markCancelled(step)
             return false
         }
-        let command = tools.wrap(step.command, cwd: portalCwd)
-        let timeout = step.timeoutSeconds
-        let cwd = self.portalCwd
-        let logStore = self.logStore
-        let logKey = step.logKey
-        let stepName = step.name
 
-        let (exitCode, timedOut) = await withCheckedContinuation { (continuation: CheckedContinuation<(Int32, Bool), Never>) in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            process.arguments = ["-l", "-c", command]
-            process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-            process.environment = Self.environment(
-                parent: ProcessInfo.processInfo.environment,
-                seedScenarioID: seedScenarioID, profile: profile
-            )
+        let (exitCode, timeout) = await runCommand(of: step)
 
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = pipe
-
-            let guard_ = CompletionGuard()
-            let lineBuffer = TerminalLineBuffer()
-
-            pipe.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-                for line in lineBuffer.feed(text) {
-                    if line.hasPrefix("##db:") {
-                        let payload = String(line.dropFirst(5))
-                        Task { @MainActor in
-                            Self.parseProtocolLine(payload, step: step)
-                        }
-                    } else {
-                        let entry = LogEntry(stream: .stdout, text: line)
-                        Task { @MainActor in
-                            step.logEntries.append(entry)
-                        }
-                        Task {
-                            await logStore.append(serviceID: logKey, entry: entry)
-                        }
-                    }
-                }
-            }
-
-            self.currentProcess = process
-
-            // Timeout watchdog — cancelled on normal exit so it doesn't linger
-            // for the full timeout after the process has already completed.
-            let watchdog = Task {
-                try? await Task.sleep(for: .seconds(timeout))
-                guard !Task.isCancelled else { return }
-                if guard_.claim() {
-                    process.terminate()
-                    continuation.resume(returning: (-1, true))
-                }
-            }
-
-            process.terminationHandler = { proc in
-                watchdog.cancel()
-                pipe.fileHandleForReading.readabilityHandler = nil
-                if let remaining = lineBuffer.flush() {
-                    let entry = LogEntry(stream: .stdout, text: remaining)
-                    Task { @MainActor in step.logEntries.append(entry) }
-                    Task { await logStore.append(serviceID: logKey, entry: entry) }
-                }
-                if guard_.claim() {
-                    continuation.resume(returning: (proc.terminationStatus, false))
-                }
-            }
-
-            do {
-                try process.run()
-            } catch {
-                watchdog.cancel()
-                if guard_.claim() {
-                    continuation.resume(returning: (-1, false))
-                }
-                return
-            }
-            let pid = process.processIdentifier
-            Task { await logStore.markStart(serviceID: logKey, name: stepName, pid: pid) }
+        if cancelled {
+            await Self.markCancelled(step)
+            return false
         }
 
-        currentProcess = nil
-
-        if timedOut {
+        if let timeout {
             await MainActor.run {
                 step.status = .timedOut
                 step.completedAt = .now
-                step.errorMessage = "Timed out after \(step.timeoutSeconds)s"
-                step.recoveryGuidance = "The step took too long. Check if the process is stuck."
+                step.errorMessage = timeout.message(
+                    stepName: step.name, progressLabel: step.progressLabel,
+                    lastLine: step.logEntries.last?.text
+                )
+                step.recoveryGuidance = timeout.guidance
             }
             return false
         }
@@ -286,7 +454,12 @@ actor DbSetupRunner {
         if let healthCmd = step.healthCheckCommand {
             await MainActor.run { step.status = .healthCheck }
 
-            let health = await runHealthCheck(healthCmd)
+            let health = await runHealthCheck(healthCmd, step: step)
+
+            if cancelled {
+                await Self.markCancelled(step)
+                return false
+            }
 
             if !health.succeeded {
                 await MainActor.run {
@@ -309,6 +482,107 @@ actor DbSetupRunner {
             step.completedAt = .now
         }
         return true
+    }
+
+    /// A cancel is not a fault: the step has no error, and no issue is filed.
+    private static func markCancelled(_ step: DbSetupStep) async {
+        await MainActor.run {
+            step.status = .cancelled
+            step.completedAt = .now
+            step.errorMessage = nil
+            step.recoveryGuidance = nil
+        }
+    }
+
+    /// Runs the command of a step to its end. It returns once every line of the
+    /// step is in the step's log, so the caller reads the whole output.
+    /// - Returns: the exit code (128 plus the signal for a kill, -1 when the
+    ///   command did not start), and the limit that stopped the step, if any.
+    private func runCommand(of step: DbSetupStep) async -> (exitCode: Int32, timeout: StepTimeout?) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: launcher.executable)
+        process.arguments = launcher.arguments(tools.wrap(step.command, cwd: portalCwd))
+        process.currentDirectoryURL = URL(fileURLWithPath: portalCwd)
+        process.environment = Self.environment(
+            parent: ProcessInfo.processInfo.environment,
+            seedScenarioID: seedScenarioID, profile: profile
+        )
+        process.standardInput = FileHandle.nullDevice
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        let clock = self.clock
+        let watch = StepWatch(now: clock.uptime())
+        let (lines, continuation) = AsyncStream<OutputLine>.makeStream()
+        let reader = StepOutputReader(handle: pipe.fileHandleForReading, continuation: continuation) {
+            watch.output(at: clock.uptime())
+        }
+        let exit = ExitSignal()
+        process.terminationHandler = { ended in
+            reader.processEnded()
+            exit.resolve(ended.terminationReason == .uncaughtSignal
+                ? 128 + ended.terminationStatus
+                : ended.terminationStatus)
+        }
+
+        do {
+            try process.run()
+        } catch {
+            reader.finish()
+            await Self.record(lines, step: step, logStore: logStore)
+            let entry = LogEntry(stream: .stderr, text: "The step did not start: \(error.localizedDescription)")
+            await MainActor.run { step.logEntries.append(entry) }
+            return (-1, nil)
+        }
+        let pid = process.processIdentifier
+        running.pid = pid
+        await logStore.markStart(serviceID: step.logKey, name: step.name, pid: pid)
+
+        let logStore = self.logStore
+        let consumer = Task.detached { await Self.record(lines, step: step, logStore: logStore) }
+        let (idle, cap) = (step.idleTimeoutSeconds, step.hardCapSeconds)
+        let watchdog = Task.detached {
+            await Self.watch(pid: pid, watch: watch, idleSeconds: idle, capSeconds: cap, clock: clock)
+        }
+
+        let code = await exit.wait()
+        watchdog.cancel()
+        await consumer.value
+        running.pid = nil
+        return (code, watch.timeout)
+    }
+
+    /// Stops the step tree when it prints nothing for `idleSeconds` or runs past
+    /// `capSeconds`. Ends when its task is cancelled.
+    private static func watch(
+        pid: pid_t, watch: StepWatch, idleSeconds: Int, capSeconds: Int, clock: RunnerClock
+    ) async {
+        while true {
+            do { try await clock.wait(watchInterval) } catch { return }
+            guard let timeout = StepTimeout.check(
+                now: clock.uptime(), startedAt: watch.startedAt, lastOutputAt: watch.lastOutputAt,
+                idleSeconds: idleSeconds, capSeconds: capSeconds
+            ) else { continue }
+            watch.timeout = timeout
+            await ProcessTree.terminate(ProcessTree.tree(of: pid))
+            return
+        }
+    }
+
+    /// The one consumer of the lines of a step: `##db:` lines go to the step, the
+    /// rest to its log, in the order the step printed them.
+    private static func record(_ lines: AsyncStream<OutputLine>, step: DbSetupStep, logStore: LogStore) async {
+        for await line in lines {
+            if line.text.hasPrefix("##db:") {
+                let payload = String(line.text.dropFirst(5))
+                await MainActor.run { parseProtocolLine(payload, step: step) }
+            } else {
+                let entry = LogEntry(stream: line.stream, text: line.text)
+                await MainActor.run { step.logEntries.append(entry) }
+                await logStore.append(serviceID: step.logKey, entry: entry)
+            }
+        }
     }
 
     // MARK: - Protocol Line Parser
@@ -426,16 +700,32 @@ actor DbSetupRunner {
     // MARK: - Health Check
 
     /// `cancel()` is the only stop of a pipeline. Stop All cancels the task of the
-    /// start, and an automatic reset runs inside that task. The step command is
-    /// its own process and runs to its end; the shell of the health check ends a
-    /// command at once when its task is cancelled. Without this own task the step
-    /// in flight would pass, its check would fail as "Cancelled", and the pipeline
+    /// start, and an automatic reset runs inside that task. The shell of the health
+    /// check ends a command at once when its task is cancelled, so the check runs in
+    /// its own task, which `cancel()` cancels. Without this own task the step in
+    /// flight would pass, its check would fail as "Cancelled", and the pipeline
     /// would break: a database that is reset and has no hotels.
-    private func runHealthCheck(_ command: String) async -> CommandResult {
-        let (shell, cwd) = (shell, portalCwd)
+    ///
+    /// The output of the check goes to the log of the step, and its `##db:` lines
+    /// to the step.
+    private func runHealthCheck(_ command: String, step: DbSetupStep) async -> CommandResult {
+        let (shell, cwd, logStore) = (shell, portalCwd, logStore)
         let environment = Self.environment(parent: [:], seedScenarioID: seedScenarioID, profile: profile)
-        return await Task {
-            await shell.run(command, cwd: cwd, environment: environment, timeout: Self.healthCheckTimeout)
-        }.value
+        let task = Task {
+            let (lines, continuation) = AsyncStream<OutputLine>.makeStream()
+            let consumer = Task { await Self.record(lines, step: step, logStore: logStore) }
+            let result = await shell.run(
+                command, cwd: cwd, environment: environment, timeout: Self.healthCheckTimeout
+            ) { text, stream in
+                continuation.yield(OutputLine(text: text, stream: stream))
+            }
+            continuation.finish()
+            await consumer.value
+            return result
+        }
+        healthCheck = task
+        let result = await task.value
+        healthCheck = nil
+        return result
     }
 }

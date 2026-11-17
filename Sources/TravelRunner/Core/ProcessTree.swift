@@ -26,8 +26,53 @@ enum ProcessTree {
         return result
     }
 
+    /// `root` and every process below it, children first. Read the tree before the
+    /// first signal: a child of a dead parent moves to launchd.
+    static func tree(of root: pid_t) -> [pid_t] {
+        descendants(of: root) + [root]
+    }
+
     static func isAlive(_ pid: pid_t) -> Bool {
         kill(pid, 0) == 0 || errno == EPERM
+    }
+
+    /// Sends SIGTERM, then SIGKILL to what is still alive after `grace`. It returns
+    /// when the processes are gone, so the caller can start them again. A cancelled
+    /// task does not cut the wait short: a stop must finish.
+    static func terminate(_ pids: [pid_t], grace: Duration = .seconds(2)) async {
+        guard !pids.isEmpty else { return }
+        for pid in pids { kill(pid, SIGTERM) }
+        if await waitUntilGone(pids, timeout: grace) { return }
+        for pid in pids where isAlive(pid) { kill(pid, SIGKILL) }
+        _ = await waitUntilGone(pids, timeout: .seconds(1))
+    }
+
+    /// `terminate` for a caller that cannot wait on a task: the app as it quits.
+    static func terminateNow(_ pids: [pid_t], grace: Duration = .seconds(1)) {
+        guard !pids.isEmpty else { return }
+        for pid in pids { kill(pid, SIGTERM) }
+        let deadline = ContinuousClock.now + grace
+        while pids.contains(where: isAlive), ContinuousClock.now < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        for pid in pids where isAlive(pid) { kill(pid, SIGKILL) }
+    }
+
+    private static func waitUntilGone(_ pids: [pid_t], timeout: Duration) async -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while true {
+            if !pids.contains(where: isAlive) { return true }
+            if ContinuousClock.now >= deadline { return false }
+            await pause(milliseconds: 50)
+        }
+    }
+
+    private static func pause(milliseconds: Int) async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(milliseconds)) {
+                continuation.resume()
+            }
+        }
     }
 
     /// The parent of each process. Empty when the system does not give the table.
