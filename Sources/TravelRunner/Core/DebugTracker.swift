@@ -218,6 +218,9 @@ actor DebugTracker {
         return e
     }()
     private let jsonDecoder = JSONDecoder()
+    /// The `diagnostics.json` writes that run after their issue was filed.
+    private var pendingDiagnostics: [Int: Task<Void, Never>] = [:]
+    private var nextDiagnosticsID = 0
 
     // MARK: - Normalisation patterns
 
@@ -233,6 +236,23 @@ actor DebugTracker {
     private static let hexAddrRegex = try! NSRegularExpression(
         pattern: #"0x[0-9a-fA-F]{6,}"#
     )
+    // A cause is a raw log line, so it has more parts that vary from crash to crash.
+    /// A date and time, with a `T` or a space: `2026-11-17 10:52:49.123 UTC`.
+    private static let causeTimestampRegex = try! NSRegularExpression(
+        pattern: #"\d{4}-\d{2}-\d{2}[T ]\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s?(?:Z|[+-]\d{2}:?\d{2}|[A-Z]{3,4})\b)?"#
+    )
+    /// A time of day: `10:52:49` or `10:52:49.123`.
+    private static let causeTimeRegex = try! NSRegularExpression(
+        pattern: #"\b\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\b"#
+    )
+    /// A random temp name after `tmp.` or `tmp-`, or a run of 8 or more letters
+    /// and digits with a digit in it after `.`, `-` or `_`: `_buildManifest.js.tmp.o8dzt0rqxf`.
+    private static let causeRandomNameRegex = try! NSRegularExpression(
+        pattern: #"(?i)(?:(?<=tmp[.\-_])[0-9a-z]{6,}|(?<=[.\-_])(?=[0-9a-z]*\d)[0-9a-z]{8,})\b"#
+    )
+    /// Any run of 3 or more digits, and any number in brackets: pids, ports,
+    /// durations, counts. `postgres[61]` in a container has a short pid.
+    private static let causeNumberRegex = try! NSRegularExpression(pattern: #"\d{3,}|(?<=[\[(])\d+(?=[\])])"#)
 
     // MARK: - Init
 
@@ -439,15 +459,35 @@ actor DebugTracker {
         }
 
         // Only a new issue reads this Mac: the tools take some seconds to answer.
-        // The issue is on disk first, so a repeat that comes in the meantime finds it.
-        if let diagnostics, let snapshot = await diagnostics() {
-            writeJSON(
-                snapshot.redacted(by: redactor),
-                to: (folderPath as NSString).appendingPathComponent("diagnostics.json")
-            )
+        // The issue is on disk first, so a repeat that comes in the meantime finds
+        // it, and the caller does not wait for the tools.
+        if let diagnostics {
+            let id = nextDiagnosticsID
+            nextDiagnosticsID += 1
+            // The task runs on this actor, so it starts after the line below.
+            pendingDiagnostics[id] = Task {
+                if let snapshot = await diagnostics() {
+                    self.writeDiagnostics(snapshot.redacted(by: redactor), folderPath: folderPath)
+                }
+                self.pendingDiagnostics[id] = nil
+            }
         }
 
         return folderId
+    }
+
+    /// Writes `diagnostics.json` when the issue is still open there. An issue
+    /// closed meanwhile gets none: the write must not make its folder again.
+    private func writeDiagnostics(_ snapshot: DiagnosticsSnapshot, folderPath: String) {
+        guard fm.fileExists(atPath: (folderPath as NSString).appendingPathComponent("issue.json")) else { return }
+        writeJSON(snapshot, to: (folderPath as NSString).appendingPathComponent("diagnostics.json"))
+    }
+
+    /// Waits for the `diagnostics.json` of the issues filed so far. Tests use it.
+    func diagnosticsWritten() async {
+        while let task = pendingDiagnostics.values.first {
+            await task.value
+        }
     }
 
     /// The key that makes two failures one issue: trigger, service, message and
@@ -457,7 +497,7 @@ actor DebugTracker {
     static func signature(trigger: String, serviceId: String?, message: String, likelyCause: String?) -> String {
         var input = "\(trigger):\(serviceId ?? "all"):\(normalizeError(message))"
         if let likelyCause, !likelyCause.isEmpty {
-            input += ":\(normalizeError(likelyCause))"
+            input += ":\(normalizeCause(likelyCause))"
         }
         return sha256(input)
     }
@@ -683,6 +723,22 @@ actor DebugTracker {
         let r4 = NSRange(result.startIndex..., in: result)
         result = Self.hexAddrRegex.stringByReplacingMatches(in: result, range: r4, withTemplate: "<ADDR>")
 
+        return result
+    }
+
+    /// The cause is a raw log line. Times, numbers and temp names in it vary from
+    /// crash to crash; without them a crash loop is one issue, not one per crash.
+    static func normalizeCause(_ cause: String) -> String {
+        var result = normalizeError(cause)
+        for (regex, template) in [
+            (causeTimestampRegex, "<TS>"),
+            (causeTimeRegex, "<TIME>"),
+            (causeRandomNameRegex, "<RAND>"),
+            (causeNumberRegex, "<N>"),
+        ] {
+            let range = NSRange(result.startIndex..., in: result)
+            result = regex.stringByReplacingMatches(in: result, range: range, withTemplate: template)
+        }
         return result
     }
 

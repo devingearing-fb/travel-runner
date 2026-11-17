@@ -25,6 +25,8 @@ final class LogFileSink: @unchecked Sendable {
     private let version: String
     private let now: @Sendable () -> Date
     private let formatter: DateFormatter
+    /// When this run opened the folder. Lines before it are from an earlier run.
+    private let openedAt: Date
 
     private let lock = NSLock()
     private var files: [String: OpenFile] = [:]
@@ -70,6 +72,7 @@ final class LogFileSink: @unchecked Sendable {
         formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSZ"
         self.formatter = formatter
         self.lastPrune = now()
+        self.openedAt = now()
         try? FileManager.default.createDirectory(
             at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]
         )
@@ -97,6 +100,33 @@ final class LogFileSink: @unchecked Sendable {
         let name = String(id.unicodeScalars.map { allowed.contains($0) ? Character($0) : "_" })
         let trimmed = name.trimmingCharacters(in: CharacterSet(charactersIn: "."))
         return trimmed.isEmpty ? "_" : trimmed
+    }
+
+    // MARK: - Reading
+
+    /// The last lines that an earlier run wrote to the log of the id, oldest
+    /// first. The rotated file is read too when the current one has too few.
+    func earlierRunTail(id: String, maxLines: Int) -> [LogEntry] {
+        guard maxLines > 0 else { return [] }
+        lock.lock()
+        defer { lock.unlock() }
+        var entries: [LogEntry] = []
+        for url in [fileURL(for: id), rotatedURL(for: id, index: 1)] {
+            guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+            let lines = text.split(whereSeparator: \.isNewline).compactMap(parse)
+                .filter { $0.timestamp < openedAt }
+            entries = lines.suffix(maxLines - entries.count) + entries
+            if entries.count >= maxLines { break }
+        }
+        return entries
+    }
+
+    /// One file line, `2026-11-16T09:14:03.412-0700 [out] text`, back into an entry.
+    private func parse(_ line: Substring) -> LogEntry? {
+        let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
+        guard parts.count == 3, let date = formatter.date(from: String(parts[0])) else { return nil }
+        let stream: LogEntry.Stream = parts[1] == "[err]" ? .stderr : .stdout
+        return LogEntry(timestamp: date, stream: stream, text: String(parts[2]))
     }
 
     // MARK: - Writing

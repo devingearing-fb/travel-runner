@@ -110,6 +110,54 @@ final class DebugTrackerTests: XCTestCase {
         XCTAssertEqual(open, 2)
     }
 
+    /// A cause is a raw log line. Times, pids, durations and temp names in it
+    /// vary from crash to crash, and each pair is still one cause.
+    func testACauseThatDiffersOnlyInATimeANumberOrATempNameIsTheSameCause() {
+        let pairs: [(String, String)] = [
+            ("2026-11-17 10:52:49.123 UTC [61] FATAL: could not open file", "2026-11-17 11:03:02.004 UTC [87] FATAL: could not open file"),
+            ("[10:52:49.123] Error: listen EADDRINUSE", "[11:01:07.900] Error: listen EADDRINUSE"),
+            ("postgres[1234]: FATAL: the database system is shutting down", "postgres[98765]: FATAL: the database system is shutting down"),
+            ("worker (4411) exited after 5023ms", "worker (9182) exited after 611ms"),
+            (
+                "Error: ENOENT: no such file or directory, rename '.next/static/development/_buildManifest.js.tmp.o8dzt0rqxf'",
+                "Error: ENOENT: no such file or directory, rename '.next/static/development/_buildManifest.js.tmp.k2b9qwz1mf'"
+            ),
+        ]
+        for (first, second) in pairs {
+            XCTAssertEqual(
+                DebugTracker.signature(trigger: "service_crash", serviceId: "x", message: "x exited", likelyCause: first),
+                DebugTracker.signature(trigger: "service_crash", serviceId: "x", message: "x exited", likelyCause: second),
+                first
+            )
+        }
+        // Negative control: a different error is a different cause.
+        XCTAssertNotEqual(
+            DebugTracker.signature(trigger: "service_crash", serviceId: "x", message: "x exited", likelyCause: "Error: listen EADDRINUSE"),
+            DebugTracker.signature(trigger: "service_crash", serviceId: "x", message: "x exited", likelyCause: "Error: listen EACCES")
+        )
+        XCTAssertEqual(DebugTracker.normalizeCause("next-auth and @supabase/realtime-js"), "next-auth and @supabase/realtime-js")
+    }
+
+    /// A crash loop whose cause line has a new time each crash is one issue.
+    func testACrashLoopWithATimeInTheCauseIsOneIssue() async throws {
+        try writeConfig(#"{"enabled": true}"#)
+        let clock = TestClock()
+        let tracker = DebugTracker(baseDir: root.path, now: { clock.now })
+        var filed: [String?] = []
+        for second in 0..<3 {
+            filed.append(await tracker.captureIssue(
+                trigger: "service_crash", serviceId: "stripe", errorMessage: "Stripe exited with code 1",
+                likelyCause: "2026-11-17 10:5\(second):49 [\(4000 + second)] Error: webhook secret expired"
+            ))
+            clock.advance(120)
+        }
+
+        XCTAssertNotNil(filed[0])
+        XCTAssertEqual(filed.dropFirst().compactMap { $0 }, [])
+        let open = await tracker.openIssueCount()
+        XCTAssertEqual(open, 1)
+    }
+
     /// An open issue from before the cause was in the signature still gets its
     /// recurrences when the failure has no cause line.
     func testAFailureWithoutACauseKeepsTheOldSignature() {
@@ -840,6 +888,7 @@ final class DebugTrackerTests: XCTestCase {
         )
 
         XCTAssertNil(repeated)
+        await tracker.diagnosticsWritten()
         XCTAssertEqual(reads.value, 1)
         let url = root.appendingPathComponent("open/\(try XCTUnwrap(first))/diagnostics.json")
         let written = try JSONDecoder().decode(DiagnosticsSnapshot.self, from: Data(contentsOf: url))
@@ -866,6 +915,7 @@ final class DebugTrackerTests: XCTestCase {
 
         await supervisor.captureDebugIssue(trigger: "manual", serviceID: nil, summary: "Something is wrong")
 
+        await supervisor.debugTracker?.diagnosticsWritten()
         let listed = await supervisor.listDebugIssues()
         let issue = try XCTUnwrap(listed.first)
         let url = root.appendingPathComponent("open/\(issue.id)/diagnostics.json")
@@ -898,8 +948,9 @@ final class DebugTrackerTests: XCTestCase {
         XCTAssertEqual(issues.map(\.trigger), ["unclean_exit"])
         XCTAssertEqual(
             issues.first?.errorMessage,
-            "The last run of \(Flavor.current.displayName) (v0.13.4, pid 4242, started 2026-11-16T09:14:03.412Z) "
-                + "did not quit cleanly. It crashed, was force-quit, or the Mac lost power."
+            "The last run did not quit cleanly. Look in ~/Library/Logs/DiagnosticReports. "
+                + "It was \(Flavor.current.displayName) v0.13.4, pid 4242, started 2026-11-16T09:14:03.412Z. "
+                + "It crashed, was force-quit, or the Mac lost power."
         )
         // The marker is this run's now.
         let current = try JSONDecoder().decode(
@@ -916,6 +967,45 @@ final class DebugTrackerTests: XCTestCase {
         let after = await second.listDebugIssues()
         XCTAssertEqual(after.count, 1, "a clean quit files nothing")
         XCTAssertEqual(after.first?.recurrenceCount, 0)
+    }
+
+    /// Finding "an unclean-exit ticket cannot say why the app died": the issue
+    /// has the tail of the last run's runner log, says where the full log is,
+    /// and its summary says where to look.
+    @MainActor
+    func testAnUncleanExitIssueHasTheLastRunsRunnerLog() async throws {
+        try writeConfig(#"{"enabled": true}"#)
+        try #"{"app_version": "0.13.4", "pid": 4242, "started_at": "2026-11-16T09:14:03.412Z"}"#.write(
+            to: root.appendingPathComponent("running.marker"), atomically: true, encoding: .utf8
+        )
+        let logs = root.appendingPathComponent("Logs")
+        let earlier = LogFileSink(directory: logs, version: "0.13.4", now: { Date(timeIntervalSinceNow: -600) })
+        earlier.write(id: LogFileSink.runnerLogID, entries: [
+            LogEntry(timestamp: Date(timeIntervalSinceNow: -601), stream: .stdout, text: "health check of supabase"),
+            LogEntry(timestamp: Date(timeIntervalSinceNow: -600), stream: .stderr, text: "restart of supabase failed"),
+        ])
+        let sink = LogFileSink(directory: logs, version: "0.14.0")
+        let path = root.path
+        let supervisor = EnvironmentSupervisor(
+            userDefaults: try XCTUnwrap(UserDefaults(suiteName: "DebugTrackerTests-\(UUID().uuidString)")), logSink: sink
+        )
+        supervisor.diagnosticsTools = { _ in [] }
+        supervisor.makeIssueTracker = { DebugTracker(baseDir: path) }
+        // This run's own runner line is not the last run's.
+        await supervisor.logStore.append(serviceID: LogFileSink.runnerLogID, entry: LogEntry(stream: .stdout, text: "launched"))
+
+        await supervisor.initDebugTracking()
+
+        let issues = await supervisor.listDebugIssues()
+        let issue = try XCTUnwrap(issues.first)
+        XCTAssertEqual(issue.trigger, "unclean_exit")
+        XCTAssertTrue(issue.summary.contains("Look in logs-all.txt [runner-last-run] and ~/Library/Logs/DiagnosticReports"), issue.summary)
+        XCTAssertTrue(issue.errorMessage.hasSuffix("Its full runner log: \(logs.appendingPathComponent("runner.log").path)"), issue.errorMessage)
+        let all = try String(contentsOf: root.appendingPathComponent("open/\(issue.id)/logs-all.txt"), encoding: .utf8)
+        XCTAssertEqual(
+            try withoutTimes(all),
+            "[runner-last-run] health check of supabase\n[runner-last-run] restart of supabase failed\n[runner] launched"
+        )
     }
 
     /// With capture off, the marker is still written, and no issue is filed.

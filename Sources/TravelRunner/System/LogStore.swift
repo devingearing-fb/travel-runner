@@ -80,6 +80,12 @@ actor LogStore {
         sink?.fileURL(for: serviceID)
     }
 
+    /// The last lines that an earlier run of the app wrote to the log of the id.
+    /// Empty when the store writes no files.
+    nonisolated func earlierRunTail(for serviceID: String, maxLines: Int) -> [LogEntry] {
+        sink?.earlierRunTail(id: serviceID, maxLines: maxLines) ?? []
+    }
+
     /// What "Show Log File" shows: the log file of the id, or the log folder
     /// when the file is not there (no line was written yet, or the cleanup
     /// removed it). Nil when the store writes no files.

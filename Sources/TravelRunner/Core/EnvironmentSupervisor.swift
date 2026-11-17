@@ -2759,20 +2759,47 @@ final class EnvironmentSupervisor {
             await tracker.pruneClosedIssues()
         }
         if let previous {
+            // The new run's logs say nothing about the crash; the runner log of
+            // the last run on disk can.
+            let runnerID = LogFileSink.runnerLogID
+            let lastRun = logStore.earlierRunTail(for: runnerID, maxLines: Self.uncleanExitLogLines)
             await captureDebugIssue(
                 trigger: "unclean_exit",
                 serviceID: nil,
-                summary: Self.uncleanExitText(previous),
-                signature: "unclean exit"
+                summary: Self.uncleanExitText(
+                    previous,
+                    runnerLog: logStore.fileURL(for: runnerID).map { DiagnosticsSnapshot.tilde($0.path, home: NSHomeDirectory()) }
+                ),
+                signature: "unclean exit",
+                extraLog: lastRun.map {
+                    DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: Self.lastRunLogID, line: $0.text)
+                }
             )
         }
     }
 
-    /// The issue text of a run that left its marker behind.
-    static func uncleanExitText(_ marker: DebugTracker.RunMarker, appName: String = Flavor.current.displayName) -> String {
+    /// The id of the last run's runner log in the issue logs.
+    static let lastRunLogID = "runner-last-run"
+    /// How many lines of the last run's runner log an unclean-exit issue gets.
+    static let uncleanExitLogLines = 200
+
+    /// The issue text of a run that left its marker behind. Its start says where
+    /// to look: the issue summary keeps only the first 120 characters.
+    static func uncleanExitText(
+        _ marker: DebugTracker.RunMarker,
+        appName: String = Flavor.current.displayName,
+        runnerLog: String? = nil
+    ) -> String {
         let version = marker.appVersion.map { "v\($0)" } ?? "version unknown"
-        return "The last run of \(appName) (\(version), pid \(marker.pid), started \(marker.startedAt)) "
-            + "did not quit cleanly. It crashed, was force-quit, or the Mac lost power."
+        var text = "The last run did not quit cleanly. Look in "
+            + (runnerLog == nil ? "" : "logs-all.txt [\(lastRunLogID)] and ")
+            + "~/Library/Logs/DiagnosticReports. "
+            + "It was \(appName) \(version), pid \(marker.pid), started \(marker.startedAt). "
+            + "It crashed, was force-quit, or the Mac lost power."
+        if let runnerLog {
+            text += " Its full runner log: \(runnerLog)"
+        }
+        return text
     }
 
     /// A clean quit: the next launch finds no marker of this run.
@@ -2843,7 +2870,8 @@ final class EnvironmentSupervisor {
         errorMessage: String? = nil,
         recoveryGuidance: String? = nil,
         signature: String? = nil,
-        log: [LogEntry]? = nil
+        log: [LogEntry]? = nil,
+        extraLog: [DebugTracker.LogEntry] = []
     ) async {
         guard let tracker = debugTracker else { return }
 
@@ -2873,7 +2901,11 @@ final class EnvironmentSupervisor {
                 DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: id, line: $0.text)
             }
         }
+        logEntries += extraLog
 
+        // The state of the failure, read now. The tools are read after the
+        // issue is filed, so the caller does not wait for them.
+        let state = diagnosticsState()
         let _ = await tracker.captureIssue(
             trigger: trigger,
             serviceId: serviceID,
@@ -2883,7 +2915,7 @@ final class EnvironmentSupervisor {
             logEntries: logEntries,
             stateSnapshots: snapshots,
             redactor: redactor,
-            diagnostics: { [weak self] in await self?.diagnosticsSnapshot() }
+            diagnostics: { [weak self] in await self?.withDiagnosticsTools(state) }
         )
 
         debugOpenIssueCount = await tracker.openIssueCount()
@@ -2907,6 +2939,11 @@ final class EnvironmentSupervisor {
     /// state is read first: the tools take some seconds and the state can change
     /// meanwhile.
     func diagnosticsSnapshot(home: String = NSHomeDirectory()) async -> DiagnosticsSnapshot {
+        await withDiagnosticsTools(diagnosticsState(home: home), home: home)
+    }
+
+    /// The snapshot without its tools: the stack, read at once.
+    private func diagnosticsState(home: String = NSHomeDirectory()) -> DiagnosticsSnapshot {
         let now = clock.date()
         let services = sortedServiceIDs.compactMap { serviceStates[$0] }
             + serviceStates.values.filter { !sortedServiceIDs.contains($0.id) }.sorted { $0.id < $1.id }
@@ -2923,7 +2960,7 @@ final class EnvironmentSupervisor {
                 }
             )
         }
-        var snapshot = DiagnosticsSnapshot(
+        return DiagnosticsSnapshot(
             generatedAt: ISO8601DateFormatter().string(from: now),
             app: DiagnosticsSnapshot.App(.current),
             machine: .current,
@@ -2951,6 +2988,13 @@ final class EnvironmentSupervisor {
                 )
             }
         )
+    }
+
+    /// The snapshot with the tools of this Mac.
+    private func withDiagnosticsTools(
+        _ state: DiagnosticsSnapshot, home: String = NSHomeDirectory()
+    ) async -> DiagnosticsSnapshot {
+        var snapshot = state
         let tools = await diagnosticsToolReports()
         snapshot.tools = tools.map { DiagnosticsSnapshot.Tool($0, home: home) }
         snapshot.toolPath = tools.map(\.searchedPath).first { !$0.isEmpty }

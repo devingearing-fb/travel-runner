@@ -59,7 +59,7 @@ curl -s http://localhost:19900/api/debug/issues | python3 -m json.tool
 
 The ID is `yyyyMMdd'T'HHmmss` (local time) + `_` + the trigger (underscores as dashes) + `-<service_id>` when there is one. `service_id` is `""` when the issue has no service (e.g. manual captures). A repeat of the same error within the dedup window (7 days by default) bumps `recurrence_count` on the open issue instead of creating a new one. An automatic repeat within 60 seconds of the last capture of the same error writes nothing; the next write of the issue (a later repeat, or the close) adds it to `recurrence_count`. Manual captures have no such limit. `recurrence_timestamps` keeps the newest 20 times; the count keeps all.
 
-When the service's output shows why it failed, `summary` ends with ` — <likely cause>`, for example `service_crash [travel-portal]: Travel Portal exited with code 1 — Error: listen EADDRINUSE: address already in use :::3002`. The same text is in `likely_cause` in `issue.json`. The dedup signature is trigger, service, message and likely cause, with times, pids, UUIDs and addresses taken out. The same failure with a new cause is a new issue.
+When the service's output shows why it failed, `summary` ends with ` — <likely cause>`, for example `service_crash [travel-portal]: Travel Portal exited with code 1 — Error: listen EADDRINUSE: address already in use :::3002`. The same text is in `likely_cause` in `issue.json`. The dedup signature is trigger, service, message and likely cause, with times, pids, UUIDs and addresses taken out. In the cause, any time, any number of 3 or more digits, any number in brackets and any random temp name are taken out too. The same failure with a new cause is a new issue.
 
 `issue.json` also records the Travel Runner that filed the issue: `app_version`, `app_build`, `app_commit`, `app_build_kind` (`release` or `dev`) and `app_flavor`. These fields describe the first capture. When the issue recurs, `last_app_version`, `last_app_build` and `last_app_commit` record the Travel Runner of the last recurrence. Issues from before these fields have none. Check them first: a fix may already be in a newer version, unless the issue recurred on that version.
 
@@ -147,7 +147,7 @@ These are not failures of the service, so they make no issue and no crash notifi
 ### "Something is broken"
 
 1. `GET /api/debug/issues` — check for auto-captured open issues first
-2. If found, read `~/Desktop/debug-tracking/open/{id}/issue.json` for pre-captured context (error message, `likely_cause`, trigger, recurrence), `diagnostics.json` for the Mac and the stack (build, macOS, tools, profile, DB mode, checks, DB steps, pending migrations) and `state-snapshot.json` for service states
+2. If found, read `~/Desktop/debug-tracking/open/{id}/issue.json` for pre-captured context (error message, `likely_cause`, trigger, recurrence), `diagnostics.json` for the Mac and the stack (written a moment after the issue) (build, macOS, tools, profile, DB mode, checks, DB steps, pending migrations) and `state-snapshot.json` for service states
 3. Review the captured logs: `logs-{service_id}.txt` and `logs-all.txt` in the same folder. Each line starts with its time (`HH:mm:ss.SSS`)
 4. If no issue found, fall back to `GET /api/status` and `GET /api/logs/{serviceId}` via the travel-runner-api skill
 
@@ -192,7 +192,7 @@ Closed issues older than 30 days are deleted in the Application Support folder. 
 
 `events.jsonl` counts what files no issue: `stripe_skip` (Stripe ended as skipped), `outside_kill` (a service was stopped from outside the runner) and `breaker_trip` (auto-restart stopped). Each line has `at`, `kind`, `service_id`, `message` and `app_version`, with secrets redacted. At 1 MB the file moves to `events.1.jsonl`. Nothing is written while capture is off.
 
-A `running.marker` that is still there at launch means the last run crashed, was force-quit or lost power. The launch files an `unclean_exit` issue for it (`auto_capture.unclean_exit` in `config.json` turns this off).
+A `running.marker` that is still there at launch means the last run crashed, was force-quit or lost power. The launch files an `unclean_exit` issue for it (`auto_capture.unclean_exit` in `config.json` turns this off). Its `logs-all.txt` has the tail of the last run's runner log as `[runner-last-run]`, and its message names the full runner log. A crash report, if any, is in `~/Library/Logs/DiagnosticReports`.
 
 Read the files directly for anything beyond the open-issue list, or when the API is not available (travel-runner not running):
 
