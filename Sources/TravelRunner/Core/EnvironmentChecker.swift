@@ -255,13 +255,13 @@ final class EnvironmentChecker {
                         checkCommand: "grep //npm.pkg.github.com/:_authToken ~/.npmrc",
                         checkDescription: "User-level token for @fastbreak-amateur packages. Set it once with: pnpm config set --location=user \"//npm.pkg.github.com/:_authToken\" <token>"),
             HealthCheck(id: "stripe-cli", name: "Stripe CLI", section: .prerequisites,
-                        isRequired: false,
+                        isRequired: false, fixLabel: StripeLauncher.installCommand,
                         checkCommand: "which stripe",
-                        checkDescription: "Optional — needed only for webhook/payment testing"),
+                        checkDescription: "Optional — needed only for webhook/payment testing. Install it with: \(StripeLauncher.installCommand)"),
             HealthCheck(id: "stripe-auth", name: "Stripe CLI Auth", section: .prerequisites,
-                        isRequired: false, fixLabel: "stripe login",
-                        checkCommand: "stripe config --list",
-                        checkDescription: "Optional — Stripe CLI must be authenticated to forward webhook events"),
+                        isRequired: false, fixLabel: "Log in…",
+                        checkCommand: "stripe balance retrieve",
+                        checkDescription: "Optional — the Stripe CLI forwards webhook events. It uses the sk_test_ STRIPE_SECRET_KEY of apps/booking-portal/.env (or .env.local), so no login is needed. Without a test key it uses your own stripe login; Log in… runs stripe login in Terminal."),
 
             // Dependencies
             HealthCheck(id: "workspace-modules", name: "Monorepo dependencies", section: .dependencies,
@@ -362,6 +362,8 @@ final class EnvironmentChecker {
         switch checkID {
         case "hotel-data":
             "Download failed — start the stack first (the download needs the local Supabase and the shared apps/booking-portal/.env), then retry"
+        case "stripe-auth":
+            "stripe login did not finish in \(StripeLauncher.loginWait.components.seconds / 60) min — run stripe login in a terminal, then re-check"
         default:
             "Fix failed — try manually"
         }
@@ -480,8 +482,11 @@ final class EnvironmentChecker {
             return ok ? .passing("Found") : .warning("Not installed — webhooks won't work")
 
         case "stripe-auth":
-            let result = try await check("stripe balance retrieve >/dev/null 2>&1", label: "stripe balance retrieve")
-            return result.succeeded ? .passing("Authenticated") : .warning("Session invalid or expired — run: stripe login")
+            // With the test key of the portal the CLI needs no login.
+            let mode = StripeLauncher.resolve(bookingPortal: bookingPath).mode
+            if mode.isTestKey { return StripeLauncher.authStatus(mode, loggedIn: nil) }
+            let result = try await check(StripeLauncher.authCheckCommand, label: "stripe balance retrieve")
+            return StripeLauncher.authStatus(mode, loggedIn: result.succeeded)
 
         case "workspace-modules":
             let path = (monorepoPath as NSString).appendingPathComponent("node_modules/.modules.yaml")
@@ -639,9 +644,18 @@ final class EnvironmentChecker {
         case "python-jwt":
             return await fixShell(Self.pyJWTFixCommand)
 
+        case "stripe-cli":
+            return await fixShell(StripeLauncher.installCommand)
+
         case "stripe-auth":
-            // Can't run interactive login from here — open terminal
-            _ = await shell("open -a Terminal")
+            // `stripe login` needs a terminal and a browser: it runs in Terminal, and
+            // the fix waits until the CLI can call Stripe.
+            guard await shell(StripeLauncher.loginCommand) else { return false }
+            let deadline = ContinuousClock.now + StripeLauncher.loginWait
+            while ContinuousClock.now < deadline {
+                if await shell(StripeLauncher.authCheckCommand) { return true }
+                do { try await Task.sleep(for: StripeLauncher.loginPollInterval) } catch { return nil }
+            }
             return false
 
         case "workspace-modules":

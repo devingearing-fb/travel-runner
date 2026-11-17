@@ -1489,6 +1489,80 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(stopped?.contains("Stripe session expired"), false, stopped ?? "")
     }
 
+    /// A Stripe service and a booking portal whose `.env` has a made-up test key.
+    private func loadStripeWithTestKey(_ key: String, script: String) throws {
+        let booking = workDir.appendingPathComponent("booking-portal")
+        try FileManager.default.createDirectory(at: booking, withIntermediateDirectories: true)
+        try "STRIPE_SECRET_KEY=\(key)\n".write(to: booking.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+        let portal = ServiceDefinition(
+            id: "travel-portal", name: "Travel Portal", cmd: ["sleep", "1"], cwd: booking.path, probe: nil,
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([stripe(script), portal])
+        supervisor.health = .healthy
+    }
+
+    /// S1: 45 tickets were an expired personal `stripe login`. With the portal's test
+    /// key Stripe needs no login. The key is in the env of the check and of the
+    /// process, never in a command or in the state.
+    func testStripeStartsOnThePortalTestKeyWithoutALogin() async throws {
+        let key = "sk_test_madeUpForTheLifecycle1"
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        // The script prints whether it got the key, not the key.
+        try loadStripeWithTestKey(key, script: #"if [ "$STRIPE_API_KEY" = "\#(key)" ]; then echo key-in-env; fi; sleep 30"#)
+
+        supervisor.restartService("stripe")
+
+        var lines: [String] = []
+        for _ in 0..<200 where !lines.contains("key-in-env") {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines("stripe")
+        }
+        XCTAssertTrue(lines.contains("key-in-env"), lines.joined(separator: "\n"))
+        XCTAssertTrue(lines.contains(StripeMode.testKey(source: "apps/booking-portal/.env").logLine), lines.joined(separator: "\n"))
+        XCTAssertEqual(state("stripe").modeNote, "Test key from apps/booking-portal/.env")
+
+        let check = try XCTUnwrap(shell.calls.first { $0.command == StripeLauncher.availabilityCommand })
+        XCTAssertEqual(check.environment, ["STRIPE_API_KEY": key])
+        XCTAssertFalse(shell.calls.contains { $0.command.contains(key) }, "the key is never in a command")
+        XCTAssertNil(state("stripe").definition.env, "the state keeps no key")
+        XCTAssertFalse(lines.contains { $0.contains(key) }, "the log never shows the key")
+    }
+
+    /// Control: without a key the check runs on the login, with no key in its env.
+    func testStripeWithoutAKeyUsesTheLogin() async throws {
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        try load(stripe("echo stripe-start; sleep 30"))
+
+        supervisor.restartService("stripe")
+
+        let running = await waitUntil(15) { self.state("stripe").phase == .running }
+        XCTAssertTrue(running, "stripe is \(state("stripe").phase.rawValue)")
+        XCTAssertEqual(state("stripe").modeNote, "Your stripe login")
+        XCTAssertEqual(shell.calls.first { $0.command == StripeLauncher.availabilityCommand }?.environment, [:])
+    }
+
+    /// In test-key mode a 401 means the key is wrong; `stripe login` does not fix that.
+    func testA401OnTheTestKeySaysTheKeyWasRejected() async throws {
+        supervisor.shell = FakeCommandRunner()
+        try loadStripeWithTestKey("sk_test_madeUpForTheLifecycle2", script: "echo 'Authorization failed, status=401'; sleep 2; exit 1")
+
+        supervisor.restartService("stripe")
+
+        let skipped = await waitUntil(20) { self.state("stripe").phase == .skipped }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        let expected = "[travel-runner] Stripe stopped: the Stripe CLI exited with code 1 — "
+            + "Stripe rejected STRIPE_SECRET_KEY from apps/booking-portal/.env — import a current .env."
+        var lines: [String] = []
+        for _ in 0..<100 where !lines.contains(expected) {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines("stripe")
+        }
+        XCTAssertTrue(lines.contains(expected), lines.joined(separator: "\n"))
+    }
+
     /// The row showed the first 20 characters of the webhook secret.
     func testTheRowShowsOnlyTheEndOfTheWebhookSecret() {
         let state = ServiceState(definition: stripe("true"))

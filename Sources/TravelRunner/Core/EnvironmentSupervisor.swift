@@ -139,8 +139,8 @@ final class EnvironmentSupervisor {
     @ObservationIgnored var shell: any CommandRunning
     /// The port cleanup reads listeners and kills through these tools.
     @ObservationIgnored var portTools = PortTools.live
-    /// The check that the Stripe CLI is installed and logged in. Tests set it; nil
-    /// runs the CLI.
+    /// The check that the Stripe CLI is installed and can call Stripe, with the test
+    /// key or the login. Tests set it; nil runs the CLI.
     @ObservationIgnored var stripeAvailability: (@Sendable () async -> Bool)?
     /// The time of every wait, deadline and time stamp of the supervisor. Tests
     /// set a fake.
@@ -191,6 +191,8 @@ final class EnvironmentSupervisor {
     private var stripeReconnectingSince: Date? = nil
     private var localSupabaseKeys: LocalSupabaseKeys?
     private var stripeWebhookSecret: String?
+    /// How the last start of the Stripe CLI signed in. An exit reads it for its cause.
+    private var stripeMode: StripeMode?
     /// The stop and start of one service run one at a time (see `KeyedLock`).
     private let lifecycle = KeyedLock()
     /// Services with a manual restart (or a cache clear) that waits for its turn.
@@ -1900,12 +1902,19 @@ final class EnvironmentSupervisor {
             }
         }
 
-        // Skip Stripe if the CLI isn't installed or authenticated
+        // Skip Stripe if the CLI isn't installed or cannot call Stripe. It uses the
+        // test key of the booking portal, or the login without one.
+        var stripeKey: StripeKeyResolution?
         if serviceID == "stripe" {
-            let available = await isStripeAvailable()
+            let resolution = stripeResolution()
+            stripeKey = resolution
+            stripeMode = resolution.mode
+            state.modeNote = resolution.mode.rowText
+            await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: resolution.mode.logLine))
+            let available = await isStripeAvailable(resolution)
             if !available {
                 state.phase = .skipped
-                let cause = "the Stripe CLI is not installed or not logged in — run: stripe login, then start it from its row"
+                let cause = StripeLauncher.unavailableCause(resolution.mode)
                 await logStore.append(
                     serviceID: serviceID,
                     entry: LogEntry(stream: .stderr, text: Self.stripeStoppedLine(cause))
@@ -2091,7 +2100,9 @@ final class EnvironmentSupervisor {
         let streamDefinition = streamAwareDefinition(for: definition, serviceID: serviceID)
         let lanDefinition = lanAwareDefinition(for: streamDefinition, serviceID: serviceID)
         let agentDefinition = agentLaunch.map { AgentLauncher.definition(lanDefinition, launch: $0) } ?? lanDefinition
-        let effectiveDefinition = EventDirectoryLauncher.definition(agentDefinition, env: eventDirectoryEnv)
+        let eventDefinition = EventDirectoryLauncher.definition(agentDefinition, env: eventDirectoryEnv)
+        // The key goes to the process env only: the command and the state keep no copy.
+        let effectiveDefinition = stripeKey.map { StripeLauncher.definition(eventDefinition, resolution: $0) } ?? eventDefinition
 
         let sid = serviceID
         let pid = try await processRunner.start(
@@ -2331,13 +2342,16 @@ final class EnvironmentSupervisor {
             // The log keeps the lines of earlier launches. An old 401 is not the
             // cause of this exit.
             let launched = state.lastStarted ?? .distantPast
+            let mode = stripeMode
             Task {
                 let output = await logStore.entries(for: serviceID)
                     .filter { $0.timestamp >= launched }.map(\.text)
-                let cause = if let known = CrashCause.knownCause(in: output, serviceID: serviceID) {
+                let cause = if let known = StripeLauncher.exitCause(
+                    known: CrashCause.knownCause(in: output, serviceID: serviceID), mode: mode
+                ) {
                     "\(exit) — \(known)"
                 } else {
-                    "\(exit) — see the lines above. If they show 401, run: stripe login. Then start it from its row."
+                    "\(exit) — \(StripeLauncher.unknownExitHint(mode))"
                 }
                 await logStore.append(serviceID: serviceID, entry: LogEntry(
                     stream: .stderr, text: Self.stripeStoppedLine(cause)
@@ -3178,14 +3192,21 @@ final class EnvironmentSupervisor {
         "[travel-runner] Stripe stopped: \(cause)"
     }
 
-    private func isStripeAvailable() async -> Bool {
+    /// The Stripe mode for the booking portal of this stack.
+    private func stripeResolution() -> StripeKeyResolution {
+        StripeLauncher.resolve(bookingPortal: graph?.nodes["travel-portal"]?.resolvedCwd ?? config?.paths?.bookingPortal)
+    }
+
+    private func isStripeAvailable(_ resolution: StripeKeyResolution? = nil) async -> Bool {
         if let stripeAvailability { return await stripeAvailability() }
         // `stripe config --list` only proves that a credential is stored; it
         // still exits zero for expired API keys. Exercise the authenticated API
         // so invalid sessions are skipped before `stripe listen` can crash.
-        return await runShellCommand(
-            "which stripe >/dev/null 2>&1 && stripe balance retrieve >/dev/null 2>&1", timeout: .seconds(15)
-        )
+        // The test key goes in the env of the check, as it does for the listener.
+        let resolution = resolution ?? stripeResolution()
+        return await shell.run(
+            StripeLauncher.availabilityCommand, environment: resolution.environment, timeout: .seconds(15)
+        ).succeeded
     }
 
     private func canReachHost(_ host: String) async -> Bool {

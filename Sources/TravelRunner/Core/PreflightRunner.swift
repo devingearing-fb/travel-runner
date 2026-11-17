@@ -48,7 +48,11 @@ struct PreflightRunner: Sendable {
                 id: "node-version", name: "Node.js \u{2265} 22",
                 metadata: (nodeCwd(for: services)).map { ["cwd": $0] } ?? [:]
             ),
-            PreflightCheck(id: "stripe-auth", name: "Stripe CLI Auth"),
+            // The booking portal: the CLI uses the test key of its env.
+            PreflightCheck(
+                id: "stripe-auth", name: "Stripe CLI Auth",
+                metadata: services.first(where: { $0.id == "travel-portal" })?.resolvedCwd.map { ["cwd": $0] } ?? [:]
+            ),
         ]
 
         for (serviceID, label) in [("travel-portal", "Booking"), ("partner-portal", "Partner")] {
@@ -129,15 +133,25 @@ struct PreflightRunner: Sendable {
         case "stripe-auth":
             let hasStripe = await run("which stripe >/dev/null 2>&1").succeeded
             if !hasStripe { return .warning(message: "Not installed — Stripe will be skipped") }
-            let auth = await run("stripe balance retrieve >/dev/null 2>&1")
+            let key = StripeLauncher.resolve(bookingPortal: check.metadata["cwd"])
+            let auth = await shell.run(
+                StripeLauncher.authCheckCommand, environment: key.environment, timeout: Self.checkTimeout
+            )
             if auth.timedOut {
                 return .warning(
                     message: "\(Shell.timeoutText("stripe balance retrieve", after: Self.checkTimeout)) — Stripe will be skipped"
                 )
             }
-            return auth.succeeded
-                ? .passed(detail: "Authenticated")
-                : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
+            switch key.mode {
+            case .testKey(let source):
+                return auth.succeeded
+                    ? .passed(detail: "Test key from \(source)")
+                    : .warning(message: "Stripe did not accept STRIPE_SECRET_KEY from \(source), or there is no network — Stripe will be skipped; import a current .env")
+            case .login:
+                return auth.succeeded
+                    ? .passed(detail: "Authenticated")
+                    : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
+            }
 
         case let id where id.hasPrefix("env-diff"):
             // The monolith's scripts/env-check.mjs checks the app's shared .env (a teammate's

@@ -142,7 +142,7 @@ enum ServiceCatalog {
             service("universal-login", "Universal Login", ["npm", "run", "dev"], cwd: login,
                     probe: tcp(3000), restart: .onFailure, phase: "gateway", dependsOn: ["supabase"]),
             service("stripe", "Stripe CLI",
-                    ["stripe", "listen", "--forward-to", "http://localhost:3002/api/webhooks/stripe"],
+                    StripeLauncher.command,
                     probe: ProbeConfig(type: .stdoutRegex, port: nil, host: nil, url: nil,
                                        pattern: "whsec_[A-Za-z0-9]+", artifact: "STRIPE_WEBHOOK_SECRET", timeout: nil),
                     restart: .onFailure, phase: "gateway", dependsOn: ["universal-login"]),

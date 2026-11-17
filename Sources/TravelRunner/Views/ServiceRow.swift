@@ -14,7 +14,7 @@ struct ServiceRow: View {
     @State private var lastVersion: Int = 0
 
     private var showSubtitle: Bool {
-        state.restartCount > 0 || state.isCircuitBroken || state.capturedArtifact != nil
+        state.restartCount > 0 || state.isCircuitBroken || state.capturedArtifact != nil || state.modeNote != nil
     }
 
     private var isActionInFlight: Bool {
@@ -147,6 +147,11 @@ struct ServiceRow: View {
                             .font(.caption2)
                             .foregroundStyle(.orange)
                             .contentTransition(.numericText())
+                    }
+                    if let mode = state.modeNote {
+                        Text(mode)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                     if let artifact = state.capturedArtifactSummary {
                         Text(artifact)
