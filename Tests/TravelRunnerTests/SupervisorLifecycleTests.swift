@@ -2143,8 +2143,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(done)
 
         let pipeline = try XCTUnwrap(supervisor.dbSetupPipeline)
-        XCTAssertEqual(pipeline.steps.first { $0.id == "load-hotels" }?.status, .passed)
-        XCTAssertEqual(pipeline.steps.first { $0.id == "reset-database" }?.status, .pending)
+        XCTAssertEqual(pipeline.steps.map(\.id), ["load-hotels"], "the pipeline holds only the load")
+        XCTAssertEqual(pipeline.steps.first?.status, .passed)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "nothing was reset")
         XCTAssertNil(supervisor.lastError)
         XCTAssertNil(supervisor.hotelCatalogNotice)
@@ -2245,7 +2245,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(fetch.status, .passed)
         XCTAssertEqual(fetch.command, "echo fetch --force")
         XCTAssertEqual(fetch.logEntries.map(\.text), ["fetch --force"])
-        XCTAssertEqual(pipeline.steps.first { $0.id == "reset-database" }?.status, .pending)
+        XCTAssertEqual(pipeline.steps.map(\.id), [HotelCatalog.fetchStepID], "the pipeline holds only the fetch")
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "nothing was reset")
         XCTAssertEqual(supervisor.hotelDump, .missing, "the dump is read again after a fetch")
 
@@ -2257,6 +2257,97 @@ final class SupervisorLifecycleTests: XCTestCase {
         let loaded = await waitUntil(30) { !self.supervisor.dbResetRunning }
         XCTAssertTrue(loaded)
         XCTAssertEqual(supervisor.dbSetupPipeline?.steps.first?.command, "echo load")
+    }
+
+    /// A failed "Re-download hotels" shows Retry and Run All. Both rerun only the
+    /// fetch: neither goes on to the reset. Before, the stored pipeline was the whole
+    /// `reset` profile, so one click wiped the database with no confirmation.
+    func testRetryAndRunAllAfterAFailedReDownloadNeverReset() async throws {
+        try loadSupabase()
+        supervisor.shell = FakeCommandRunner()
+        supervisor.hotelDumpPath = workDir.appendingPathComponent("hotels/travel_organizations.sql").path
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let marker = workDir.appendingPathComponent("reset-ran")
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([
+                self.step("check-prerequisites", "true"),
+                self.step(HotelCatalog.fetchStepID, "f() { echo fetch $@; return 12 }; f"),
+                self.step("reset-database", "touch '\(marker.path)'"),
+                self.step(HotelCatalog.loadStepID, "true"),
+            ], profile: profile)
+        }
+
+        supervisor.redownloadHotels()
+        var done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+        let shown = try XCTUnwrap(supervisor.dbSetupPipeline)
+        XCTAssertEqual(shown.firstFailed?.id, HotelCatalog.fetchStepID)
+
+        // Retry of the failed row, then Run All: each runs the fetch again, with --force.
+        for stepID in [HotelCatalog.fetchStepID, shown.steps.first?.id ?? ""] {
+            supervisor.runDbSetup(from: stepID)
+            done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+            XCTAssertTrue(done)
+            let pipeline = try XCTUnwrap(supervisor.dbSetupPipeline)
+            XCTAssertEqual(pipeline.steps.map(\.id), [HotelCatalog.fetchStepID])
+            XCTAssertEqual(pipeline.steps.first?.logEntries.map(\.text), ["fetch --force"])
+            XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "nothing was reset")
+        }
+
+        // The fetch from DB Tools is a new run of the step, with no --force.
+        supervisor.runDbSetupStep(HotelCatalog.fetchStepID)
+        done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+        XCTAssertEqual(supervisor.dbSetupPipeline?.steps.first?.logEntries.map(\.text), ["fetch"])
+
+        // Negative control: Run All of a full pipeline does reach the reset.
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([self.step("reset-database", "touch '\(marker.path)'")], profile: profile)
+        }
+        supervisor.dbSetupPipeline = nil
+        supervisor.runDbSetup(from: "reset-database")
+        done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    /// One step from DB Tools reads its step from a profile the branch has. A branch
+    /// with no `full` profile used to stop with "Profile 'full' is not defined".
+    func testOneStepFromDbToolsUsesAProfileThatHasTheStep() async throws {
+        try loadSupabase()
+        let folder = workDir.appendingPathComponent("scripts/db")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let manifest = #"""
+        {"version":4,"steps":[
+          {"id":"reset-database","command":"echo reset"},
+          {"id":"verify-data","command":"echo '##db:status:done'"}
+        ],"profiles":{"reset":["reset-database","verify-data"]}}
+        """#
+        try Data(manifest.utf8).write(to: folder.appendingPathComponent("manifest.json"))
+        supervisor.dbResetAction = nil
+        supervisor.dbPipelineFactory = nil
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        // A checkout with no seed scenarios seeds supabase/seed.sql.
+        let supabase = workDir.appendingPathComponent("supabase")
+        try FileManager.default.createDirectory(at: supabase, withIntermediateDirectories: true)
+        try Data().write(to: supabase.appendingPathComponent("seed.sql"))
+
+        supervisor.runDbSetupStep("verify-data")
+        let done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+
+        let pipeline = try XCTUnwrap(supervisor.dbSetupPipeline, supervisor.lastError ?? "no pipeline")
+        XCTAssertEqual(pipeline.profile, "reset")
+        XCTAssertEqual(pipeline.steps.map(\.id), ["verify-data"])
+        XCTAssertEqual(pipeline.steps.first?.status, .passed)
+
+        // Control: a profile the person chose still has to exist.
+        supervisor.dbSetupPipeline = nil
+        supervisor.runDbSetup(profile: "full")
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertEqual(supervisor.lastError, "Profile 'full' is not defined on this branch")
     }
 
     /// Finding seed-no-post-reset-refresh: after a reset the running portals hold the

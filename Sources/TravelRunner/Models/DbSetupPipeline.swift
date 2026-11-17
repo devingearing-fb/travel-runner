@@ -128,6 +128,10 @@ final class DbSetupPipeline {
     var steps: [DbSetupStep] = []
     /// Where the steps come from when it is not the checkout's manifest.
     var stepsSource: String? = nil
+    /// The pipeline of one step from DB Tools ("Load hotels only", "Re-download
+    /// hotels"): it holds only that step, and Retry and Run All rerun only that step.
+    /// They never go on to a reset.
+    var isSingleStep = false
     var isRunning = false
     var startedAt: Date? = nil
     var completedAt: Date? = nil

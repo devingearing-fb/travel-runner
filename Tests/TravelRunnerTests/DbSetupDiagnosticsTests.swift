@@ -106,6 +106,39 @@ final class DbSetupDiagnosticsTests: XCTestCase {
         )
         XCTAssertEqual(migration.message, "Migration 20260101000000_blocks.sql: FK constraint violation")
 
+        // The CLI prints each file before it applies it: the last one failed.
+        let many = DbSetupDiagnostics.diagnose(
+            stepID: "reset-database",
+            output: [
+                "Applying migration 0001_init.sql...", "Applying migration 0100_hotels.sql...",
+                "Applying migration 0150_blocks.sql...", "ERROR: syntax error at or near \"tabel\"",
+            ],
+            exitCode: 1, scriptMessage: nil
+        )
+        XCTAssertEqual(many.message, "Migration 0150_blocks.sql failed")
+
+        // Negative control: a seed that fails after every migration applied is no
+        // migration failure, and the file of the last migration is not named.
+        for seedLine in ["Seeding data from supabase/seed.sql...", "psql:<stdin>:12: ERROR:  duplicate key value"] {
+            let seed = DbSetupDiagnostics.diagnose(
+                stepID: "reset-database",
+                output: ["Applying migration 0001_init.sql...", "Applying migration 0150_blocks.sql...",
+                         seedLine, "ERROR: duplicate key value violates unique constraint"],
+                exitCode: 1, scriptMessage: nil
+            )
+            XCTAssertFalse(seed.message.contains("Migration"), seed.message)
+            XCTAssertNotEqual(seed.guidance, "Check the migration file for errors (supabase/migrations or the backend baseline).")
+        }
+
+        // A cause that every step has wins over the catch-all for a migration.
+        let dockerInReset = DbSetupDiagnostics.diagnose(
+            stepID: "reset-database",
+            output: ["Applying migration 0001_init.sql...",
+                     "error: Cannot connect to the Docker daemon. Is the docker daemon running?"],
+            exitCode: 1, scriptMessage: nil
+        )
+        XCTAssertEqual(dockerInReset.message, "Docker is not running")
+
         let docker = DbSetupDiagnostics.diagnose(
             stepID: "start-supabase",
             output: ["Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"],

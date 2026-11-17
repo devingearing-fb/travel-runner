@@ -1664,8 +1664,9 @@ final class EnvironmentSupervisor {
     /// The checks and the guard. Nil when nothing may start; the reason is then in
     /// `lastError`, or another setup runs.
     /// `reusePipeline` false builds a new pipeline for a step, also when one is shown.
-    /// `stepArguments` go after the command of the step `stepId` ("Re-download
-    /// hotels": `--force`).
+    /// A single step gets a pipeline of that step alone, so its Retry and Run All
+    /// never reach a reset. `stepArguments` go after the command of the step `stepId`
+    /// ("Re-download hotels": `--force`); only that one-step pipeline holds them.
     private func beginDbSetup(
         cwd: String?, profile: String, reason: String?, origin: DbSetupOrigin, from stepId: String?,
         singleStep: Bool = false, reusePipeline: Bool = true, stepArguments: String? = nil
@@ -1679,17 +1680,24 @@ final class EnvironmentSupervisor {
 
         var pipeline: DbSetupPipeline?
         var runner: DbSetupRunner?
+        var singleStep = singleStep
         if dbResetAction == nil {
-            if reusePipeline, stepId != nil, let existingPipeline = dbSetupPipeline {
+            // A Retry or Run All of a shown pipeline reuses it. A step from DB Tools
+            // does not reuse a one-step pipeline: that holds the arguments of its action.
+            if reusePipeline, let stepId, let existingPipeline = dbSetupPipeline,
+               existingPipeline.steps.contains(where: { $0.id == stepId }),
+               !(singleStep && existingPipeline.isSingleStep) {
                 pipeline = existingPipeline
+                singleStep = singleStep || existingPipeline.isSingleStep
             } else {
                 guard let newPipeline = makeDbSetupPipeline(cwd: cwd, profile: profile) else { return nil }
+                if singleStep {
+                    guard let step = newPipeline.steps.first(where: { $0.id == stepId }) else { return nil }
+                    newPipeline.steps = [stepArguments.map { step.appending(arguments: $0) } ?? step]
+                    newPipeline.isSingleStep = true
+                }
                 dbSetupPipeline = newPipeline
                 pipeline = newPipeline
-            }
-            if singleStep, pipeline?.steps.contains(where: { $0.id == stepId }) != true { return nil }
-            if let stepArguments, let pipeline, let index = pipeline.steps.firstIndex(where: { $0.id == stepId }) {
-                pipeline.steps[index] = pipeline.steps[index].appending(arguments: stepArguments)
             }
             if let pipeline {
                 runner = makeDbSetupRunner(cwd: cwd, pipeline: pipeline)
@@ -1895,9 +1903,20 @@ final class EnvironmentSupervisor {
     /// failure issue as every other setup.
     func runDbSetupStep(_ stepId: String) {
         guard let run = beginDbSetup(
-            cwd: supabaseCwd, profile: "full", reason: nil, origin: .singleStep, from: stepId, singleStep: true
+            cwd: supabaseCwd, profile: singleStepProfile(stepId), reason: nil, origin: .singleStep, from: stepId,
+            singleStep: true
         ) else { return }
         Task { await completeDbSetup(run) }
+    }
+
+    /// The profile that a single step is read from. The runner picks it, not the
+    /// person, so a branch without `full` uses another profile that has the step.
+    private func singleStepProfile(_ stepId: String) -> String {
+        guard let cwd = supabaseCwd else { return "full" }
+        let manifest = (cwd as NSString).appendingPathComponent("scripts/db/manifest.json")
+        guard let profiles = DbManifestLoader.profiles(from: manifest) else { return "full" }
+        let preferred = ["full", "reset"] + profiles.keys.sorted()
+        return preferred.first { profiles[$0]?.contains(stepId) == true } ?? "full"
     }
 
     /// The issue of a failed DB step. It names the step and holds the step's log.

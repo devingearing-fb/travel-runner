@@ -22,6 +22,10 @@ enum DbSetupDiagnostics {
         let exitCode: Int32
         /// The step output and the script's own message, lowercased.
         let text: String
+        /// The output of the last migration that ran, lowercased: from the last
+        /// "Applying migration" line up to the seed. Nil when no migration ran or the
+        /// migrations finished. A failed migration prints its error here.
+        var migrationText: String? = nil
 
         /// The first line that contains `needle` (case does not matter).
         func line(containing needle: String) -> String? {
@@ -38,16 +42,20 @@ enum DbSetupDiagnostics {
         let all: [String]
         /// The output must contain one of these (lowercase). Empty: no condition.
         let any: [String]
+        /// The output of the last migration must contain each of these (lowercase).
+        /// Empty: no condition. Not empty: a run with no failed migration never matches.
+        let migration: [String]
         let diagnose: @Sendable (Failure) -> Diagnosis
 
         init(
             steps: Set<String>? = nil, exitCode: Int32? = nil, all: [String] = [], any: [String] = [],
-            diagnose: @escaping @Sendable (Failure) -> Diagnosis
+            migration: [String] = [], diagnose: @escaping @Sendable (Failure) -> Diagnosis
         ) {
             self.steps = steps
             self.exitCode = exitCode
             self.all = all
             self.any = any
+            self.migration = migration
             self.diagnose = diagnose
         }
 
@@ -55,6 +63,9 @@ enum DbSetupDiagnostics {
             if let steps, !steps.contains(failure.stepID) { return false }
             if let exitCode, exitCode != failure.exitCode { return false }
             guard all.allSatisfy(failure.text.contains) else { return false }
+            if !migration.isEmpty {
+                guard let text = failure.migrationText, migration.allSatisfy(text.contains) else { return false }
+            }
             return any.isEmpty || any.contains(where: failure.text.contains)
         }
     }
@@ -70,7 +81,7 @@ enum DbSetupDiagnostics {
     static let retryGuidance = "Read the log below, or copy the error and log to share them. Then retry the step."
 
     /// The rules, in order. Exit codes first, then the rules of one step, then the
-    /// rules for every step.
+    /// rules for every step, then the catch-all for a failed migration.
     static let rules: [Rule] = [
         // The hotel source (exit codes of fetch-hotels, check-prerequisites, load-hotels).
         Rule(steps: hotelSteps, exitCode: 10) { _ in
@@ -104,30 +115,23 @@ enum DbSetupDiagnostics {
         Rule(steps: ["load-hotels"], exitCode: 14) { _ in
             Diagnosis(
                 message: "The local database is not reachable, or has no hotel table",
-                guidance: "Run All: it starts Supabase and resets the database before it loads the hotels.",
+                guidance: "Start Supabase and reset the database (Run All of a full setup, or Reset Database), then load the hotels again.",
                 action: .retryFromStep
             )
         },
 
         // One step.
-        Rule(steps: ["reset-database"], all: ["applying migration", "violates foreign key"]) { failure in
+        Rule(steps: ["reset-database"], migration: ["violates foreign key"]) { failure in
             Diagnosis(
                 message: "Migration \(migrationFile(failure)): FK constraint violation",
                 guidance: "Pull the latest monorepo and fb-amateur-backend, then retry.",
                 action: .retryFromStep
             )
         },
-        Rule(steps: ["reset-database"], all: ["applying migration", "already exists"]) { failure in
+        Rule(steps: ["reset-database"], migration: ["already exists"]) { failure in
             Diagnosis(
                 message: "Migration \(migrationFile(failure)): object already exists",
                 guidance: "Run pnpm db:stop && pnpm db:start at the monorepo root for a clean slate, then retry.",
-                action: .retryFromStep
-            )
-        },
-        Rule(steps: ["reset-database"], all: ["applying migration", "error"]) { failure in
-            Diagnosis(
-                message: "Migration \(migrationFile(failure)) failed",
-                guidance: "Check the migration file for errors (supabase/migrations or the backend baseline).",
                 action: .retryFromStep
             )
         },
@@ -191,6 +195,15 @@ enum DbSetupDiagnostics {
                 action: .retryFromStep
             )
         },
+
+        // A migration that failed for a cause no rule above knows.
+        Rule(steps: ["reset-database"], migration: ["error"]) { failure in
+            Diagnosis(
+                message: "Migration \(migrationFile(failure)) failed",
+                guidance: "Check the migration file for errors (supabase/migrations or the backend baseline).",
+                action: .retryFromStep
+            )
+        },
     ]
 
     /// The diagnosis of a step that exited with `exitCode`. `scriptMessage` is the
@@ -199,7 +212,10 @@ enum DbSetupDiagnostics {
         let script = scriptMessage?.trimmingCharacters(in: .whitespacesAndNewlines)
         let scriptText = (script?.isEmpty == false) ? script : nil
         let text = (output + [scriptText ?? ""]).joined(separator: "\n").lowercased()
-        let failure = Failure(stepID: stepID, output: output, exitCode: exitCode, text: text)
+        let failure = Failure(
+            stepID: stepID, output: output, exitCode: exitCode, text: text,
+            migrationText: migrationText(output, scriptMessage: scriptText)
+        )
 
         if let rule = rules.first(where: { $0.matches(failure) }) {
             let found = rule.diagnose(failure)
@@ -240,10 +256,29 @@ enum DbSetupDiagnostics {
 
     static let maxLineLength = 300
 
+    // MARK: - Migrations
+
+    /// The output of the last migration, lowercased, with the script's message when
+    /// the output ends in it. Nil when no migration ran, or when a seed line follows
+    /// it: the migrations then finished, and the error is not theirs.
+    static func migrationText(_ output: [String], scriptMessage: String?) -> String? {
+        guard let start = output.lastIndex(where: { $0.contains("Applying migration") }) else { return nil }
+        let rest = output[start...].dropFirst()
+        if rest.contains(where: isAfterMigrations) { return nil }
+        return ([output[start]] + rest + [scriptMessage ?? ""]).joined(separator: "\n").lowercased()
+    }
+
+    /// A line that comes only after every migration applied: the CLI's seed and
+    /// finish lines, or a psql line of the scenario seed.
+    static func isAfterMigrations(_ line: String) -> Bool {
+        let text = line.trimmingCharacters(in: .whitespaces).lowercased()
+        return text.hasPrefix("seeding ") || text.hasPrefix("finished supabase db reset") || text.hasPrefix("psql:")
+    }
+
+    /// The file of the last "Applying migration" line: the CLI prints each file
+    /// before it applies it, so the last one is the one that failed.
     private static func migrationFile(_ failure: Failure) -> String {
-        let line = failure.output.first {
-            $0.contains("Applying migration") && $0.lowercased().contains("error")
-        } ?? failure.output.first { $0.contains("Applying migration") }
+        let line = failure.output.last { $0.contains("Applying migration") }
         // "Applying migration 20260101000000_blocks.sql..." names the file.
         guard let line, let range = line.range(of: #"[\w.-]+?\.sql"#, options: .regularExpression) else {
             return "unknown"
