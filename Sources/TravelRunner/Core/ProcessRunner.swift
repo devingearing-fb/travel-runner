@@ -89,50 +89,38 @@ actor ProcessRunner {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
-        let stdoutHandle = stdoutPipe.fileHandleForReading
-        let stderrHandle = stderrPipe.fileHandleForReading
-        let stdoutBuffer = TerminalLineBuffer()
-        let stderrBuffer = TerminalLineBuffer()
-        let stdoutDecoder = UTF8ChunkDecoder()
-        let stderrDecoder = UTF8ChunkDecoder()
-
-        stdoutHandle.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let lines = stdoutBuffer.feed(stdoutDecoder.decode(data))
-            guard !lines.isEmpty else { return }
-            onStdout(lines)
-        }
-
-        stderrHandle.readabilityHandler = { handle in
-            let data = handle.availableData
-            guard !data.isEmpty else { return }
-            let lines = stderrBuffer.feed(stderrDecoder.decode(data))
-            guard !lines.isEmpty else { return }
-            onStderr(lines)
-        }
+        // Each reader reads its pipe to the end when the process ends, so the last
+        // lines of a crash (often the stack trace) come before the termination.
+        let outputClosed = DispatchGroup()
+        outputClosed.enter()
+        outputClosed.enter()
+        let stdoutReader = PipeLineReader(
+            handle: stdoutPipe.fileHandleForReading,
+            onLines: onStdout,
+            onClose: { outputClosed.leave() }
+        )
+        let stderrReader = PipeLineReader(
+            handle: stderrPipe.fileHandleForReading,
+            onLines: onStderr,
+            onClose: { outputClosed.leave() }
+        )
 
         let stopFlag = StopFlag()
         let serviceID = service.id
 
         process.terminationHandler = { [weak self] proc in
-            stdoutHandle.readabilityHandler = nil
-            stderrHandle.readabilityHandler = nil
-            // Bytes of a character that the last chunk cut are text again here.
-            let stdoutTail = stdoutBuffer.feed(stdoutDecoder.flush())
-            let stderrTail = stderrBuffer.feed(stderrDecoder.flush())
-            if !stdoutTail.isEmpty { onStdout(stdoutTail) }
-            if !stderrTail.isEmpty { onStderr(stderrTail) }
-            if let remaining = stdoutBuffer.flush() { onStdout([remaining]) }
-            if let remaining = stderrBuffer.flush() { onStderr([remaining]) }
             let termination = Termination(
                 pid: proc.processIdentifier,
                 status: proc.terminationStatus,
                 bySignal: proc.terminationReason == .uncaughtSignal,
                 stoppedByRunner: stopFlag.isSet
             )
-            Task { await self?.recordExit(serviceID: serviceID, termination: termination) }
-            onTermination(termination)
+            stdoutReader.processEnded()
+            stderrReader.processEnded()
+            outputClosed.notify(queue: .global()) {
+                Task { await self?.recordExit(serviceID: serviceID, termination: termination) }
+                onTermination(termination)
+            }
         }
 
         try process.run()

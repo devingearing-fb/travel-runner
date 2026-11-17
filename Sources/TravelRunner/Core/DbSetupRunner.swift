@@ -124,101 +124,6 @@ private final class ExitSignal: @unchecked Sendable {
     }
 }
 
-/// Reads the pipe of a step into one stream of lines, in order. When the process
-/// ends it reads what is left in the pipe, so the last lines (often the
-/// `##db:status:failed` line) are never lost.
-private final class StepOutputReader: @unchecked Sendable {
-    private let lock = NSLock()
-    private let handle: FileHandle
-    private let decoder = UTF8ChunkDecoder()
-    private let lines = TerminalLineBuffer()
-    private let continuation: AsyncStream<OutputLine>.Continuation
-    private let onOutput: @Sendable () -> Void
-    private var finished = false
-
-    /// How long the stream waits for a child process that keeps the pipe open
-    /// after the step has ended.
-    private static let pipeGrace: DispatchTimeInterval = .seconds(1)
-
-    init(
-        handle: FileHandle, continuation: AsyncStream<OutputLine>.Continuation,
-        onOutput: @escaping @Sendable () -> Void
-    ) {
-        self.handle = handle
-        self.continuation = continuation
-        self.onOutput = onOutput
-        // A read of an empty pipe returns at once, so the end of the process can
-        // read the rest without a wait.
-        let fd = handle.fileDescriptor
-        _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK)
-        handle.readabilityHandler = { [weak self] _ in self?.readAvailable() }
-    }
-
-    func readAvailable() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !finished else { return }
-        if drain() { close() }
-    }
-
-    /// The process ended. Reads the rest of the pipe, and ends the stream at the
-    /// end of the pipe, or after a short grace.
-    func processEnded() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !finished else { return }
-        if drain() {
-            close()
-            return
-        }
-        DispatchQueue.global().asyncAfter(deadline: .now() + Self.pipeGrace) { [self] in
-            finish()
-        }
-    }
-
-    /// Ends the stream now.
-    func finish() {
-        lock.lock()
-        defer { lock.unlock() }
-        guard !finished else { return }
-        _ = drain()
-        close()
-    }
-
-    /// Reads until the pipe is empty. True at the end of the stream.
-    private func drain() -> Bool {
-        var buffer = [UInt8](repeating: 0, count: 65_536)
-        let fd = handle.fileDescriptor
-        while true {
-            let count = read(fd, &buffer, buffer.count)
-            if count > 0 {
-                onOutput()
-                emit(decoder.decode(Data(buffer[0..<count])))
-            } else if count == 0 {
-                return true
-            } else if errno != EINTR {
-                return false
-            }
-        }
-    }
-
-    private func emit(_ text: String) {
-        for line in lines.feed(text) {
-            continuation.yield(OutputLine(text: line, stream: .stdout))
-        }
-    }
-
-    private func close() {
-        finished = true
-        handle.readabilityHandler = nil
-        emit(decoder.flush())
-        if let rest = lines.flush() {
-            continuation.yield(OutputLine(text: rest, stream: .stdout))
-        }
-        continuation.finish()
-    }
-}
-
 /// The pid of the step process that runs now. The app reads it as it quits,
 /// outside the actor.
 private final class RunningProcess: @unchecked Sendable {
@@ -251,6 +156,10 @@ actor DbSetupRunner {
     private var cancelled = false
     /// The step process that runs now.
     private let running = RunningProcess()
+    /// The output of the step process that runs now. A stop holds it open.
+    private var runningOutput: PipeLineReader?
+    /// The stop that `cancel()` started. The step ends only after it.
+    private var stop: Task<Void, Never>?
     /// The health check that runs now.
     private var healthCheck: Task<CommandResult, Never>?
     /// The PATH of the step commands.
@@ -374,11 +283,18 @@ actor DbSetupRunner {
     var wasCancelled: Bool { cancelled }
 
     /// Stops the run: the step process and every process below it (SIGTERM, then
-    /// SIGKILL), and the health check. It returns when they are gone.
+    /// SIGKILL), and the health check. It returns when they are gone. The step
+    /// does not end before the stop: `runCommand` waits for it too.
     func cancel() async {
         cancelled = true
-        if let pid = running.pid {
-            await ProcessTree.terminate(ProcessTree.tree(of: pid))
+        if let stop {
+            await stop.value
+        } else if let pid = running.pid {
+            runningOutput?.hold()
+            let tree = ProcessTree.tree(of: pid)
+            let stop = Task.detached { await ProcessTree.terminate(tree) }
+            self.stop = stop
+            await stop.value
         }
         if let healthCheck {
             healthCheck.cancel()
@@ -453,6 +369,11 @@ actor DbSetupRunner {
         // Run health check if defined
         if let healthCmd = step.healthCheckCommand {
             await MainActor.run { step.status = .healthCheck }
+            // A cancel during the hop found no check to end, so the check does not start.
+            if cancelled {
+                await Self.markCancelled(step)
+                return false
+            }
 
             let health = await runHealthCheck(healthCmd, step: step)
 
@@ -515,9 +436,12 @@ actor DbSetupRunner {
         let clock = self.clock
         let watch = StepWatch(now: clock.uptime())
         let (lines, continuation) = AsyncStream<OutputLine>.makeStream()
-        let reader = StepOutputReader(handle: pipe.fileHandleForReading, continuation: continuation) {
-            watch.output(at: clock.uptime())
-        }
+        let reader = PipeLineReader(
+            handle: pipe.fileHandleForReading,
+            onData: { watch.output(at: clock.uptime()) },
+            onLines: { for line in $0 { continuation.yield(OutputLine(text: line, stream: .stdout)) } },
+            onClose: { continuation.finish() }
+        )
         let exit = ExitSignal()
         process.terminationHandler = { ended in
             reader.processEnded()
@@ -537,26 +461,40 @@ actor DbSetupRunner {
         }
         let pid = process.processIdentifier
         running.pid = pid
+        runningOutput = reader
         await logStore.markStart(serviceID: step.logKey, name: step.name, pid: pid)
 
         let logStore = self.logStore
         let consumer = Task.detached { await Self.record(lines, step: step, logStore: logStore) }
         let (idle, cap) = (step.idleTimeoutSeconds, step.hardCapSeconds)
         let watchdog = Task.detached {
-            await Self.watch(pid: pid, watch: watch, idleSeconds: idle, capSeconds: cap, clock: clock)
+            await Self.watch(
+                pid: pid, watch: watch, output: reader, idleSeconds: idle, capSeconds: cap, clock: clock
+            )
         }
 
         let code = await exit.wait()
+        // The root can end while a child still handles its SIGTERM. A stop owns the
+        // end of the step: the step ends when the stop has ended the whole tree.
         watchdog.cancel()
+        await watchdog.value
+        if let stop { await stop.value }
+        if watch.timeout != nil || stop != nil { reader.finish() }
         await consumer.value
         running.pid = nil
+        runningOutput = nil
+        // A cancel that came while the last lines were read.
+        if let stop { await stop.value }
+        stop = nil
         return (code, watch.timeout)
     }
 
     /// Stops the step tree when it prints nothing for `idleSeconds` or runs past
-    /// `capSeconds`. Ends when its task is cancelled.
+    /// `capSeconds`. Ends when its task is cancelled, but a stop that has begun
+    /// runs to its end.
     private static func watch(
-        pid: pid_t, watch: StepWatch, idleSeconds: Int, capSeconds: Int, clock: RunnerClock
+        pid: pid_t, watch: StepWatch, output: PipeLineReader, idleSeconds: Int, capSeconds: Int,
+        clock: RunnerClock
     ) async {
         while true {
             do { try await clock.wait(watchInterval) } catch { return }
@@ -565,6 +503,7 @@ actor DbSetupRunner {
                 idleSeconds: idleSeconds, capSeconds: capSeconds
             ) else { continue }
             watch.timeout = timeout
+            output.hold()
             await ProcessTree.terminate(ProcessTree.tree(of: pid))
             return
         }

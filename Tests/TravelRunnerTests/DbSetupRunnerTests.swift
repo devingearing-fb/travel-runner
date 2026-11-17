@@ -218,6 +218,64 @@ final class DbSetupRunnerTests: XCTestCase {
         XCTAssertFalse(isAlive(child))
     }
 
+    /// A child that ignores SIGTERM keeps the pipe open after the root has died.
+    /// The SIGKILL comes two seconds after the SIGTERM.
+    private var parentWithTermIgnoringChild: String { "(trap '' TERM; exec sleep 60) & echo $! > child; wait" }
+
+    /// Waits until the root of the step is gone, then past the pipe grace.
+    private func waitPastTheRootAndTheGrace(_ root: pid_t) async throws {
+        let rootGone = await waitUntil(5) { !self.isAlive(root) }
+        XCTAssertTrue(rootGone, "the root of the step did not end on SIGTERM")
+        try await Task.sleep(for: .milliseconds(1_400))
+    }
+
+    /// The step ends only when its stop has ended the whole tree, so the DB
+    /// controls do not unlock while a child of the step still runs.
+    func testACancelEndsTheStepOnlyWhenAChildThatHandlesSigtermIsGone() async throws {
+        let runner = runner()
+        let step = makeStep(parentWithTermIgnoringChild)
+        let run = Task { await runner.executeStepPublic(step) }
+        let child = try await childPid()
+        defer { reap(child) }
+        let root = try XCTUnwrap(runner.runningProcessID)
+
+        let cancel = Task { await runner.cancel() }
+        try await waitPastTheRootAndTheGrace(root)
+
+        // Negative control: the child is alive, so the stop is still on.
+        XCTAssertTrue(isAlive(child), "the child did not outlive SIGTERM")
+        XCTAssertEqual(step.status, .running, "the step ended before its tree")
+
+        await cancel.value
+        XCTAssertFalse(isAlive(child))
+        let passed = await run.value
+        XCTAssertFalse(passed)
+        XCTAssertEqual(step.status, .cancelled)
+        XCTAssertNil(runner.runningProcessID)
+    }
+
+    /// The same for a stop that the watchdog starts.
+    func testATimedOutStepEndsOnlyWhenAChildThatHandlesSigtermIsGone() async throws {
+        let gate = Gate()
+        let runner = runner(clock: heldClock(gate))
+        let step = makeStep(parentWithTermIgnoringChild, id: "verify-data", timeoutSeconds: 2)
+        let run = Task { await runner.executeStepPublic(step) }
+        let child = try await childPid()
+        defer { reap(child) }
+        let root = try XCTUnwrap(runner.runningProcessID)
+
+        await gate.open()
+        try await waitPastTheRootAndTheGrace(root)
+
+        XCTAssertTrue(isAlive(child), "the child did not outlive SIGTERM")
+        XCTAssertEqual(step.status, .running, "the step ended before its tree")
+
+        let passed = await run.value
+        XCTAssertFalse(passed)
+        XCTAssertEqual(step.status, .timedOut)
+        XCTAssertFalse(isAlive(child))
+    }
+
     func testTheLimitThatPassedFirstStopsTheStep() {
         func check(now: Int, lastOutput: Int, idle: Int = 180, cap: Int = 900) -> StepTimeout? {
             StepTimeout.check(

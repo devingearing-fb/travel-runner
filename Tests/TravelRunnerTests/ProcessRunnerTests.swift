@@ -203,6 +203,90 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertEqual(endedB?.stoppedByRunner, true)
     }
 
+    /// The lines of one launch, as the runner gave them, and a copy of them made
+    /// when the termination came.
+    private final class Lines: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stdout: [String] = []
+        private var stderr: [String] = []
+        private var atEnd: (stdout: [String], stderr: [String])?
+
+        func add(_ lines: [String], stderr isStderr: Bool) {
+            lock.lock()
+            if isStderr { stderr += lines } else { stdout += lines }
+            lock.unlock()
+        }
+
+        func ended() {
+            lock.lock()
+            atEnd = (stdout, stderr)
+            lock.unlock()
+        }
+
+        var seenAtEnd: (stdout: [String], stderr: [String])? {
+            lock.lock()
+            defer { lock.unlock() }
+            return atEnd
+        }
+    }
+
+    /// Finding "Process output lost or reordered": the termination handler dropped
+    /// what was still in the pipes, often the stack trace of a crash. Every line
+    /// now comes in order, the last one without a newline too, before the termination.
+    func testACrashKeepsEveryLineInOrder() async throws {
+        let count = 400
+        let script = """
+            i=1; while [ $i -le \(count) ]; do echo "out-$i"; echo "err-$i" >&2; i=$((i+1)); done; \
+            printf 'out-last'; printf 'err-last' >&2; exit 1
+            """
+        let expectedOut = (1...count).map { "out-\($0)" } + ["out-last"]
+        let expectedErr = (1...count).map { "err-\($0)" } + ["err-last"]
+
+        for _ in 0..<5 {
+            let runner = ProcessRunner()
+            let lines = Lines()
+            let box = Box()
+            _ = try await runner.start(
+                service: service("svc", ["sh", "-c", script]),
+                onStdout: { lines.add($0, stderr: false) },
+                onStderr: { lines.add($0, stderr: true) },
+                onTermination: { termination in
+                    lines.ended()
+                    box.set(termination)
+                }
+            )
+
+            let termination = await waitForTermination(box)
+            XCTAssertEqual(termination.map(ServiceTermination.classify), .crashed(code: 1, bySignal: false))
+            let seen = try XCTUnwrap(lines.seenAtEnd)
+            // A login shell profile can print lines of its own.
+            XCTAssertEqual(seen.stdout.filter { $0.hasPrefix("out-") }, expectedOut)
+            XCTAssertEqual(seen.stderr.filter { $0.hasPrefix("err-") }, expectedErr)
+        }
+    }
+
+    /// The pipe can still hold data when the termination comes: here a child
+    /// writes the last line after the root has ended. The old handler dropped it.
+    func testALineWrittenAfterTheRootEndedIsKept() async throws {
+        let runner = ProcessRunner()
+        let lines = Lines()
+        let box = Box()
+        _ = try await runner.start(
+            service: service("svc", ["sh", "-c", "echo out-1; (sleep 0.3; printf 'out-last') & exit 1"]),
+            onStdout: { lines.add($0, stderr: false) },
+            onStderr: { lines.add($0, stderr: true) },
+            onTermination: { termination in
+                lines.ended()
+                box.set(termination)
+            }
+        )
+
+        let termination = await waitForTermination(box)
+        XCTAssertEqual(termination.map(ServiceTermination.classify), .crashed(code: 1, bySignal: false))
+        let seen = try XCTUnwrap(lines.seenAtEnd)
+        XCTAssertEqual(seen.stdout.filter { $0.hasPrefix("out-") }, ["out-1", "out-last"])
+    }
+
     func testAStopWithNoProcessDoesNothing() async {
         let runner = ProcessRunner()
         let began = Date()

@@ -1796,12 +1796,14 @@ final class SupervisorLifecycleTests: XCTestCase {
 
     /// A DB setup whose step starts a child that writes its pid to `child` and waits.
     /// The step runs in a shell that reads no startup files.
-    private func runChildStep() async throws -> (step: DbSetupStep, child: pid_t) {
+    private func runChildStep(
+        _ command: String = "sleep 60 & echo $! > child; wait"
+    ) async throws -> (step: DbSetupStep, child: pid_t) {
         try loadSupabase()
         supervisor.shell = FakeCommandRunner()
         supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
         supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
-        let running = step("load-hotels", "sleep 60 & echo $! > child; wait")
+        let running = step("load-hotels", command)
         supervisor.dbPipelineFactory = { _, _ in self.pipeline([running, self.step("verify-data", "true")]) }
 
         supervisor.runDbSetup(profile: "reset")
@@ -1836,6 +1838,29 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(supervisor.lastError)
         let issues = await tracker.listOpenIssues()
         XCTAssertTrue(issues.isEmpty, "a cancel filed an issue")
+    }
+
+    /// The root of the step dies on SIGTERM, but its child ignores it and keeps the
+    /// pipe open until the SIGKILL two seconds later. The controls stay locked and
+    /// the pipeline runs until the child is gone.
+    func testCancelKeepsTheControlsLockedWhileAChildHandlesSigterm() async throws {
+        let (step, child) = try await runChildStep("(trap '' TERM; exec sleep 60) & echo $! > child; wait")
+        defer { if kill(child, 0) == 0 { kill(child, SIGKILL) } }
+
+        supervisor.cancelDbSetup()
+        // Past the pipe grace of 1 s, before the SIGKILL.
+        try await Task.sleep(for: .milliseconds(1_500))
+        XCTAssertEqual(kill(child, 0), 0, "the child did not outlive SIGTERM")
+        XCTAssertTrue(supervisor.dbResetRunning, "the controls unlocked while the child runs")
+        XCTAssertEqual(supervisor.dbSetupPipeline?.isRunning, true)
+        XCTAssertEqual(step.status, .running)
+
+        let unlocked = await waitUntil(10) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(unlocked)
+        XCTAssertNotEqual(kill(child, 0), 0, "the controls unlocked while the child runs")
+        let ended = await waitUntil(10) { self.supervisor.dbSetupPipeline?.isRunning == false }
+        XCTAssertTrue(ended)
+        XCTAssertEqual(step.status, .cancelled)
     }
 
     /// Stop All ends a DB step that runs, with its child processes.
