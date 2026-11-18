@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "id": "standard",
+  "name": "Standard demo data",
+  "description": "Loads local users, events, teams, contracts, room inventory, and booking examples for the ordinary booking flow.",
+  "order": 10,
+  "default": true,
+  "extends": null,
+  "settings": {
+    "variables": {
+      "game_night_name": "Game Night"
+    },
+    "dynamicVariables": {
+      "game_night_start_date": {
+        "type": "relative-date",
+        "days": 14,
+        "timeZone": "America/New_York"
+      }
+    }
+  }
+}

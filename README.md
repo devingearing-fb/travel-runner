@@ -15,6 +15,7 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 - **One-click startup**: Starts the selected profile in dependency order — `booking` (Supabase, Universal Login, Stripe, booking portal on :3002), `partner` (Supabase, Universal Login, partner portal on :3006), `both` (default), or `full` (adds cache verification, stream-services, QStash, and Sequin; experimental)
 - **Health monitoring**: Color-coded status dot in the menu bar (green/amber/red/gray)
 - **Stripe secret injection**: Captures `whsec_` from Stripe CLI stdout, writes to the runner block in `apps/booking-portal/.env.local` + serves via HTTP registry
+- **Stripe without a login**: `stripe listen` uses the `sk_test_` `STRIPE_SECRET_KEY` of `apps/booking-portal/.env` (or `.env.local`), passed as `STRIPE_API_KEY` in its environment. Without a test key it uses your own `stripe login`. The Stripe row says which. A live key is never used.
 - **Env management**: each app's shared dev values live in the monolith at `apps/<app>/.env` (a teammate's copy, brought in with **Import…** on the Environment Check step (Settings → Reconfigure Repos…), or `pnpm env:pull` with Doppler access); the runner never holds them. `pnpm env:check` in the monolith says whether a copy is complete. The runner owns a marked block at the end of each app's `.env.local` (`# >>> travel-runner: managed block, ...` to `# <<< travel-runner`) with local Supabase, URL and login overrides
 - **Migration detection**: Sets up an empty database by itself (`scripts/db/manifest.json` `reset` profile). A database with data is never reset without asking: when it lacks migrations or has versions the branch does not have, a banner offers **Apply migrations** (the `migrate` profile, which never resets; hidden when the manifest has no such profile) and **Reset and reseed…**. A failed apply changes nothing more and leaves both choices. Settings → "Reset the database when migrations change" (off by default) brings back the automatic reset, but never for a database that another checkout built
 - **Shared code**: `packages/travel-data` hot-reloads into both apps — nothing to build or link
@@ -24,6 +25,21 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 - **Database mode**: Toggle between local Supabase and hosted dev (needs each profile app's shared `.env`)
 - **Sleep/wake**: Re-probes services after macOS wake, one pass per wake
 - **Rooms tab**: For one event and hotel, shows how many rooms of each room type are booked, held and free on each night, and who holds them. A switch selects the local stack or dev. The tab is read-only. It shows the page of the monolith's holds viewer (`scripts/holds-viewer`): the copy in your checkout, or the copy of `origin/dev` when your branch does not have it. Dev needs only the shared `apps/<app>/.env`, not Doppler. The viewer runs while the tab is open and stops 10 minutes after it closes. `defaults write ai.fastbreak.travel-runner holdsViewerPath <folder>` makes the tab use a copy from another folder; `defaults delete ai.fastbreak.travel-runner holdsViewerPath` removes that
+
+## Something broke
+
+1. Read the red card on Status, or the banner at the top. A failed service shows its last log lines; a failed DB step shows its error and its log (the terminal button).
+2. Try the button on it: **Restart**, **Clear Cache**, or **Retry** on a DB step.
+3. Still broken? Press **Report**. It is on the red card, on a failed DB step, on the error banner, in an issue on the Issues tab, under Diagnostics, and in the menu bar menu (**Report a Problem…**).
+4. The runner saves `TravelRunner-report-<yyyyMMdd-HHmm>-v<version>.zip` to Downloads, shows it in Finder, and copies a three-line summary. If macOS does not let it write to Downloads, the zip goes to `~/Library/Application Support/Travel Runner/reports` instead; to use Downloads, allow it in System Settings > Privacy & Security > Files and Folders.
+5. Paste the summary in Slack, attach the zip, and send it to Devin.
+
+The report holds `diagnostics.json` (the app version, macOS, the tools and their PATH, the profile, the database mode, the start checks, the DB setup steps, the pending migrations, the repo paths and each service), the last 2000 lines of each log, the newest open issues, and `events.jsonl`. Secret values are masked (`‹redacted:kind›`). Open the zip and read it before you share it. Nothing is sent anywhere by the app.
+
+Where the files are on your Mac:
+
+- **Logs**: `~/Library/Logs/Travel Runner/<service id>.log`, with a time on each line. They are kept for 14 days.
+- **Issues**: `~/Library/Application Support/Travel Runner/issues`, one folder for each failure, with `issue.json`, `diagnostics.json` and the logs. Turn issue capture on or off in Settings. It saves failure details on this Mac only.
 
 ## Travel Runner Hackathon
 
@@ -134,6 +150,8 @@ Requires Swift 6+ (Xcode or Command Line Tools).
 ./build.sh --run        # Build + launch
 ./build.sh --install    # Build + copy to /Applications
 ```
+
+`swift test` runs the tests with fakes: no dev stack, database or network. The tests of the monolith contract (manifest, `##db:` lines, bootstrap migrations) read a pinned snapshot in `Tests/Fixtures/monolith-snapshot`. `TR_INTEGRATION=1 swift test` runs them against `../fb-travel-monolith` (or `TR_MONOLITH_DIR`) and also runs the tests that call monolith scripts.
 
 Only one copy of the app runs at a time. A second copy says where the first one runs from, and quits. A release copy outside `/Applications` (or `~/Applications`) shows a banner once for each place: move the app to `/Applications`, so that updates install and old copies do not start by mistake.
 

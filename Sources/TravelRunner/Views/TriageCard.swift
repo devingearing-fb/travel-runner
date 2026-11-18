@@ -85,43 +85,58 @@ struct TriageCard: View {
             }
 
             HStack(spacing: 6) {
-                ForEach(conditionActions, id: \.self) { action in
-                    Button(action.title(runtime: runtimeName)) {
-                        supervisor.perform(action, for: state.id)
+                HStack(spacing: 6) {
+                    ForEach(conditionActions, id: \.self) { action in
+                        Button(action.title(runtime: runtimeName)) {
+                            supervisor.perform(action, for: state.id)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .tint(action == conditionActions.first ? .accentColor : nil)
+                    }
+
+                    if !conditionActions.contains(.restart) {
+                        Button(action: onRestart) {
+                            Label("Restart", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+
+                    Button(action: onCascadeRestart) {
+                        Label("Cascade", systemImage: "arrow.clockwise.circle")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
-                    .tint(action == conditionActions.first ? .accentColor : nil)
-                }
 
-                if !conditionActions.contains(.restart) {
-                    Button(action: onRestart) {
-                        Label("Restart", systemImage: "arrow.clockwise")
+                    if let onClearCache, !conditionActions.contains(.clearCacheAndRestart) {
+                        Button(action: onClearCache) {
+                            Label("Clear Cache", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .tint(.orange)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                }
 
-                Button(action: onCascadeRestart) {
-                    Label("Cascade", systemImage: "arrow.clockwise.circle")
+                    if isActionInFlight {
+                        ProgressView().controlSize(.mini)
+                    }
+                }
+                // Report stays on while a restart hangs: that is when it is needed.
+                .disabled(isActionInFlight)
+
+                Spacer()
+
+                Button {
+                    ReportProblem.run(.service(id: state.id), supervisor: supervisor)
+                } label: {
+                    Label("Report", systemImage: "square.and.arrow.up")
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.mini)
-
-                if let onClearCache, !conditionActions.contains(.clearCacheAndRestart) {
-                    Button(action: onClearCache) {
-                        Label("Clear Cache", systemImage: "arrow.clockwise")
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                    .tint(.orange)
-                }
-
-                if isActionInFlight {
-                    ProgressView().controlSize(.mini)
-                }
+                .disabled(supervisor.reportExportRunning)
+                .help("Save a report zip to Downloads and copy a summary for Slack")
             }
-            .disabled(isActionInFlight)
         }
         .padding(10)
         .background(Color.red.opacity(0.08))

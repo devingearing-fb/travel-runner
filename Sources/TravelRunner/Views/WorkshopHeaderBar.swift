@@ -134,7 +134,8 @@ struct WorkshopHeaderBar: View {
                     color: .red,
                     text: error,
                     subtitle: supervisor.rootCauseDescription,
-                    action: headerOffersRetry ? nil : ("Retry", { supervisor.retryStartAll() })
+                    action: headerOffersRetry ? nil : ("Retry", { supervisor.retryStartAll() }),
+                    report: { ReportProblem.run(supervisor: supervisor) }
                 )
             }
             if let error = supervisor.controlAPIError {
@@ -184,6 +185,18 @@ struct WorkshopHeaderBar: View {
                         // Without the updater (a source run), the link is the only way.
                         if let updates { updates.checkForUpdates() } else { NSWorkspace.shared.open(notice.downloadURL) }
                     })
+                )
+            }
+            if let notice = updates?.behindNotice {
+                // No dismiss: an old copy can mis-handle the database. The button asks
+                // before a restart that stops the stack, like the pill.
+                alertBanner(
+                    icon: "clock.arrow.circlepath",
+                    color: .orange,
+                    text: notice,
+                    subtitle: nil,
+                    action: nil,
+                    trailing: AnyView(UpdatePill(style: .updateNowButton))
                 )
             }
             if supervisor.migrationsBannerVisible, let notice = supervisor.migrationNotice {
@@ -336,6 +349,8 @@ struct WorkshopHeaderBar: View {
         link: (label: String, url: URL)? = nil,
         action: (label: String, handler: () -> Void)?,
         secondaryAction: (label: String, handler: () -> Void)? = nil,
+        trailing: AnyView? = nil,
+        report: (() -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
     ) -> some View {
         HStack(spacing: 8) {
@@ -366,6 +381,14 @@ struct WorkshopHeaderBar: View {
                 Button(secondaryAction.label) { secondaryAction.handler() }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+            }
+            if let trailing { trailing }
+            if let report {
+                Button("Report") { report() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(supervisor.reportExportRunning)
+                    .help("Save a report zip to Downloads and copy a summary for Slack")
             }
             if let onDismiss {
                 Button {

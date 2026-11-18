@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "id": "redis-cache",
+  "name": "Redis cache integration",
+  "description": "Loads the standard data, then adds a root hotel block and exposed root inventory for cache apply, contention, block-edit, and overflow verification.",
+  "order": 40,
+  "default": false,
+  "extends": "standard",
+  "settings": {
+    "variables": {},
+    "dynamicVariables": {}
+  }
+}

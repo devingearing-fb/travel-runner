@@ -356,6 +356,21 @@ final class LogFileSinkTests: XCTestCase {
         XCTAssertEqual(names(), [])
     }
 
+    /// The lines of an earlier run, oldest first, without the lines of this run.
+    func testTheTailOfAnEarlierRunHasOnlyItsLines() {
+        let earlier = makeSink()
+        earlier.write(id: "runner", entries: [entry("one"), entry("two", .stderr), entry("three")])
+        clock.advance(days: 1.0 / 86_400)
+        let sink = makeSink()
+        sink.write(id: "runner", entries: [entry("this run")])
+
+        XCTAssertEqual(sink.earlierRunTail(id: "runner", maxLines: 10).map(\.text), ["one", "two", "three"])
+        XCTAssertEqual(sink.earlierRunTail(id: "runner", maxLines: 2).map(\.text), ["two", "three"])
+        XCTAssertEqual(sink.earlierRunTail(id: "runner", maxLines: 2).map(\.stream), [.stderr, .stdout])
+        XCTAssertEqual(sink.earlierRunTail(id: "runner", maxLines: 1).first?.timestamp, Self.start)
+        XCTAssertEqual(sink.earlierRunTail(id: "other", maxLines: 10).count, 0)
+    }
+
     func testTheDefaultFolderHasTheNameOfTheApp() {
         XCTAssertTrue(LogFileSink.defaultDirectory(flavor: .standard).path.hasSuffix("/Library/Logs/Travel Runner"))
         XCTAssertTrue(LogFileSink.defaultDirectory(flavor: .hackathon).path.hasSuffix("/Library/Logs/Travel Runner Hackathon"))

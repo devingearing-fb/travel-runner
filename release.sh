@@ -31,6 +31,11 @@ set -euo pipefail
 # After the build it runs scripts/smoke.sh on the app: a release that cannot start on
 # a clean Mac stops here, before it is notarized.
 # SKIP_TESTS=1 skips the tests, for a --draft only.
+#
+# The appcast item carries the release notes, which Sparkle shows in its update
+# window: the subjects of the commits since the last full release, or the lines of
+# RELEASE_NOTES=<file> (one change per line). It also lists the released versions,
+# so an old copy can say how many versions behind it is.
 # ────────────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -110,6 +115,12 @@ esac
 # Sparkle and the runner's own checks compare three plain numbers.
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "'$VERSION' is not a version (x.y.z)"
 
+# A rollback builds in another folder: keep the path of the notes file absolute.
+if [ -n "${RELEASE_NOTES:-}" ] && [ "$MODE" = "build" ]; then
+    [ -f "$RELEASE_NOTES" ] || fail "RELEASE_NOTES: no file at $RELEASE_NOTES"
+    RELEASE_NOTES="$(cd "$(dirname "$RELEASE_NOTES")" && pwd)/$(basename "$RELEASE_NOTES")"
+fi
+
 BUILD_NUMBER="$(date +%Y%m%d%H%M%S)"
 ZIP_NAME="${PRODUCT_NAME}-${VERSION}.zip"
 # One fixed release for each feed that is not "the latest release". It holds the newest appcast.
@@ -146,6 +157,41 @@ previous_release() {
     gh release list --repo "$GITHUB_REPO" --exclude-drafts --exclude-pre-releases --limit 100 \
         --json tagName --jq '.[].tagName' \
         | grep -E "$TAG_PATTERN" | grep -vx "$1" | sort -t. -k1,1V -k2,2n -k3,3n | tail -1 || true
+}
+
+# The versions of the full releases of this app and <version>, oldest first, on one
+# line. The app counts the versions between its own and the newest from this list.
+released_versions() {
+    {
+        gh release list --repo "$GITHUB_REPO" --exclude-drafts --exclude-pre-releases --limit 100 \
+            --json tagName --jq '.[].tagName' \
+            | grep -E "$TAG_PATTERN" | sed -E 's/^(hackathon-)?v//' || true
+        echo "$1"
+    } | sort -u -t. -k1,1n -k2,2n -k3,3n | tail -50 | tr '\n' ' ' | sed 's/ $//'
+}
+
+# The release notes of the appcast item as HTML: one list item per line of the
+# notes, escaped, and a link to the release on GitHub.
+release_notes_html() {
+    local lines=""
+    if [ -n "${RELEASE_NOTES:-}" ]; then
+        lines="$(grep -v '^[[:space:]]*$' "$RELEASE_NOTES" || true)"
+    elif [ -n "$ROLLBACK_TAG" ]; then
+        lines="The source of $ROLLBACK_TAG, released again as $VERSION."
+    else
+        local previous
+        previous="$(previous_release "$TAG")"
+        if [ -n "$previous" ] && git rev-parse --quiet --verify "refs/tags/$previous" >/dev/null; then
+            lines="$(git log --no-merges --pretty=format:%s "$previous..$RELEASE_COMMIT" | head -40)"
+        fi
+    fi
+    if [ -n "$lines" ]; then
+        echo "<ul>"
+        printf '%s\n' "$lines" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+            -e 's/^[[:space:]]*[-*][[:space:]]*//' -e 's/^/<li>/' -e 's/$/<\/li>/'
+        echo "</ul>"
+    fi
+    echo "<p><a href=\"https://github.com/$GITHUB_REPO/releases/tag/$TAG\">All changes in $TAG</a></p>"
 }
 
 # Puts the appcast of release <tag> on the fixed feed release.
@@ -443,11 +489,14 @@ fi
 
 DOWNLOAD_URL="https://github.com/$GITHUB_REPO/releases/download/${TAG}/${ZIP_NAME}"
 PUB_DATE=$(date -R)
+RELEASE_NOTES_HTML="$(release_notes_html)"
+RELEASED_VERSIONS="$(released_versions "$VERSION")"
 
 cat > appcast.xml << APPCAST
 <?xml version="1.0" encoding="utf-8"?>
 <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"
-     xmlns:dc="http://purl.org/dc/elements/1.1/">
+     xmlns:dc="http://purl.org/dc/elements/1.1/"
+     xmlns:travelrunner="https://github.com/$GITHUB_REPO">
   <channel>
     <title>$DISPLAY_NAME Updates</title>
     <link>https://github.com/$GITHUB_REPO</link>
@@ -458,6 +507,10 @@ cat > appcast.xml << APPCAST
       <sparkle:version>$BUILD_NUMBER</sparkle:version>
       <sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
       <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <description><![CDATA[
+$RELEASE_NOTES_HTML
+      ]]></description>
+      <travelrunner:releasedVersions>$RELEASED_VERSIONS</travelrunner:releasedVersions>
       <enclosure
         url="$DOWNLOAD_URL"
         length="$LENGTH"

@@ -75,6 +75,9 @@ final class EnvironmentChecker {
     /// True while the sheet that asks for the GitHub Packages token is open.
     var tokenEntryOpen = false
 
+    /// Fixes that run now, in any checker. An update does not restart the app during one.
+    private(set) static var fixesRunning = 0
+
     /// Runs the commands of the checks and the fixes.
     private let commandRunner: any CommandRunning
     private let tools: ToolEnvironment
@@ -148,7 +151,7 @@ final class EnvironmentChecker {
         case "docker": "the local database will not start"
         case "node": "the portals and the login will not run"
         case "pnpm": "installs and both portals will not run"
-        case "python-jwt": "the contract data copy of the database setup will fail"
+        case "python-jwt": "the database setup of this checkout stops at its first step"
         case "registry-auth": "pnpm install cannot download the @fastbreak-amateur packages"
         case "workspace-modules": "both portals will not run"
         case "login-modules": "the login will not run"
@@ -288,19 +291,19 @@ final class EnvironmentChecker {
             HealthCheck(id: "python-jwt", name: "Python 3 + PyJWT", section: .prerequisites,
                         isRequired: false, fixLabel: "Install PyJWT",
                         checkCommand: "python3 -c 'import jwt'",
-                        checkDescription: "Optional — this checkout is from before the .env dump scripts, and its contract data copy (copy-remote-data.py) still needs PyJWT. A newer checkout does not."),
+                        checkDescription: "Optional for the wizard, but this checkout is from before the .env dump scripts: its database setup stops at the first step without PyJWT. A newer checkout does not need it."),
             HealthCheck(id: "registry-auth", name: "GitHub Packages auth", section: .prerequisites,
                         fixLabel: "Set token",
                         checkCommand: RegistryAuth.readCommand,
                         checkDescription: "User-level token for the @fastbreak-amateur packages. The check reads the last token line of ~/.npmrc ($NPM_CONFIG_USERCONFIG when set), as pnpm does, and asks GitHub Packages for @fastbreak-amateur/fb-toolkit with it. The token needs read:packages, and SSO for the org. Set token saves it in ~/.npmrc, after a copy of the file."),
             HealthCheck(id: "stripe-cli", name: "Stripe CLI", section: .prerequisites,
-                        isRequired: false,
+                        isRequired: false, fixLabel: StripeLauncher.installCommand,
                         checkCommand: "which stripe",
-                        checkDescription: "Optional — needed only for webhook/payment testing"),
+                        checkDescription: "Optional — needed only for webhook/payment testing. Install it with: \(StripeLauncher.installCommand)"),
             HealthCheck(id: "stripe-auth", name: "Stripe CLI Auth", section: .prerequisites,
-                        isRequired: false, fixLabel: "stripe login",
-                        checkCommand: "stripe config --list",
-                        checkDescription: "Optional — Stripe CLI must be authenticated to forward webhook events"),
+                        isRequired: false, fixLabel: "Log in…",
+                        checkCommand: "stripe balance retrieve",
+                        checkDescription: "Optional — the Stripe CLI forwards webhook events. It uses the sk_test_ STRIPE_SECRET_KEY of apps/booking-portal/.env (or .env.local), so no login is needed. Without a test key it uses your own stripe login; Log in… runs stripe login in Terminal."),
 
             // Dependencies
             HealthCheck(id: "workspace-modules", name: "Monorepo dependencies", section: .dependencies,
@@ -468,6 +471,8 @@ final class EnvironmentChecker {
         guard let check = checks.first(where: { $0.id == checkID }),
               let action = fixAction(for: checkID) else { return }
         if let activeFix, activeFix.isRunning { return }
+        Self.fixesRunning += 1
+        defer { Self.fixesRunning -= 1 }
 
         switch action {
         case .guidance:
@@ -578,7 +583,7 @@ final class EnvironmentChecker {
 
         case "python-jwt":
             let ok = try await check("python3 -c 'import jwt' 2>/dev/null", label: "python3 -c 'import jwt'").succeeded
-            return ok ? .passing("Installed") : .warning("Not installed — only monolith checkouts from before the .env dump script need it")
+            return ok ? .passing("Installed") : .warning("Not installed — this checkout's database setup stops without it. Use Install PyJWT, or pull the monolith.")
 
         case "registry-auth":
             return RegistryAuth.status(await registryOutcome(token: await registryToken()))
@@ -588,8 +593,11 @@ final class EnvironmentChecker {
             return ok ? .passing("Found") : .warning("Not installed — webhooks won't work")
 
         case "stripe-auth":
-            let result = try await check("stripe balance retrieve >/dev/null 2>&1", label: "stripe balance retrieve")
-            return result.succeeded ? .passing("Authenticated") : .warning("Session invalid or expired — run: stripe login")
+            // With the test key of the portal the CLI needs no login.
+            let mode = StripeLauncher.resolve(bookingPortal: bookingPath).mode
+            if mode.isTestKey { return StripeLauncher.authStatus(mode, loggedIn: nil) }
+            let result = try await check(StripeLauncher.authCheckCommand, label: "stripe balance retrieve")
+            return StripeLauncher.authStatus(mode, loggedIn: result.succeeded)
 
         case "workspace-modules":
             let path = (monorepoPath as NSString).appendingPathComponent("node_modules/.modules.yaml")
@@ -833,6 +841,8 @@ final class EnvironmentChecker {
             return .command(Self.pnpmFixCommand(pin: Self.pnpmPin(monorepo: monorepoPath), monorepo: monorepoPath), timeout: Self.installTimeout)
         case "python-jwt":
             return .command(Self.pyJWTFixCommand, timeout: Self.installTimeout)
+        case "stripe-cli":
+            return .command(StripeLauncher.installCommand, timeout: Self.installTimeout)
         case "stripe-auth":
             return .terminal(command: "stripe login", waitFor: Self.stripeLoginWait)
         case "workspace-modules":
@@ -872,6 +882,10 @@ final class EnvironmentChecker {
                 : .failed(Self.fixFailedText(for: checkID, result: result, timeout: timeout))
 
         case .terminal(let command, let waitFor):
+            // Without the CLI, `stripe login` cannot work: Terminal is not opened.
+            if checkID == "stripe-auth", !(await runCommand(StripeLauncher.installedCommand).succeeded) {
+                return .failed(StripeLauncher.notInstalledForLoginText)
+            }
             let opened = await runCommand(Self.terminalCommand(command))
             if Task.isCancelled { return .cancelled }
             guard opened.succeeded else {

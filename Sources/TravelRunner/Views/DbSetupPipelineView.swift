@@ -11,6 +11,8 @@ struct DbSetupPipelineView: View {
     /// The text of the fix button for an action, or nil for no button.
     var actionTitle: (RecoveryAction) -> String? = { _ in nil }
     var onAction: (RecoveryAction, DbSetupStep) -> Void = { _, _ in }
+    /// "Report" on a failed step, with the step id.
+    var onReport: ((String) -> Void)? = nil
 
     private var isActivelyRunning: Bool {
         isRunning || pipeline.isRunning
@@ -156,7 +158,8 @@ struct DbSetupPipelineView: View {
                         onRetry: { onRetryFrom(step.id) },
                         onCopy: { onCopy(step) },
                         actionTitle: actionTitle,
-                        onAction: { onAction($0, step) }
+                        onAction: { onAction($0, step) },
+                        onReport: onReport.map { report in { report(step.id) } }
                     )
                 }
             }
@@ -185,6 +188,7 @@ struct DbSetupStepRow: View {
     var onCopy: () -> Void = {}
     var actionTitle: (RecoveryAction) -> String? = { _ in nil }
     var onAction: (RecoveryAction) -> Void = { _ in }
+    var onReport: (() -> Void)? = nil
 
     /// The height of the log pane. The person can drag its bottom edge.
     @State private var logHeight: CGFloat = DbSetupStepRow.logPaneHeight
@@ -265,6 +269,12 @@ struct DbSetupStepRow: View {
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
                     .tint(.orange)
+                if let onReport {
+                    Button("Report") { onReport() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help("Save a report zip to Downloads and copy a summary for Slack")
+                }
             }
 
             Button {

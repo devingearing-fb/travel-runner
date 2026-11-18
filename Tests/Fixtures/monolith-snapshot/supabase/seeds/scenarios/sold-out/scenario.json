@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "id": "sold-out",
+  "name": "Sold out",
+  "description": "Loads the standard data, then sets every contracted room night to zero exposed rooms for unavailable-inventory testing.",
+  "order": 30,
+  "default": false,
+  "extends": "standard",
+  "settings": {
+    "variables": {},
+    "dynamicVariables": {}
+  }
+}

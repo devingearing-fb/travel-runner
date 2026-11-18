@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "id": "schema-only",
+  "name": "Schema only",
+  "description": "Leaves application fixtures empty; Runner's Reset profile may still restore the shared hotel catalog in its separate Load Hotels step.",
+  "order": 20,
+  "default": false,
+  "extends": null,
+  "settings": {
+    "variables": {},
+    "dynamicVariables": {}
+  }
+}

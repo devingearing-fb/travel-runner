@@ -112,7 +112,8 @@ enum AgentEnv {
 
     private static func value(of raw: String, dialect: Dialect) -> String {
         guard let quote = raw.first, quote == "\"" || quote == "'" || quote == "`" else {
-            // Not quoted: a comment starts at " #".
+            // Not quoted: a comment starts at " #". `KEY=  # note` has no value.
+            if raw.hasPrefix("#") { return "" }
             let end = raw.range(of: " #")?.lowerBound ?? raw.endIndex
             return raw[..<end].trimmingCharacters(in: .whitespaces)
         }

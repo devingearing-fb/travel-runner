@@ -54,12 +54,26 @@ final class SharedEnvFilesTests: XCTestCase {
         XCTAssertEqual(prompt.message, "It sets 25 of the 26 shared keys. Missing: LITEAPI_API_KEY. It replaces the current apps/booking-portal/.env.")
     }
 
-    /// The real monolith script, when a checkout sits beside this repo.
+    /// The output that the monolith script gave for a file with two keys, one of them
+    /// a shared booking key. Recorded in the snapshot; the next test runs the script.
+    func testTheRecordedOutputOfTheMonolithScript() throws {
+        let output = try String(
+            contentsOf: MonolithCheckout.snapshot.appendingPathComponent("recorded/env-check-booking.json"), encoding: .utf8
+        )
+        let parsed = try XCTUnwrap(SharedEnvFiles.decode(output, app: .booking))
+        XCTAssertTrue(parsed.exists)
+        XCTAssertFalse(parsed.ok)
+        XCTAssertEqual(parsed.shared - parsed.missing.count, 1, "only LITEAPI_API_KEY is a shared booking key")
+        XCTAssertNil(SharedEnvFiles.decode(output, app: .partner))
+        let prompt = SharedEnvFiles.importPrompt(parsed, app: .booking, replacing: false)
+        XCTAssertTrue(prompt.acceptable)
+        XCTAssertTrue(prompt.message.hasPrefix("It sets 1 of the \(parsed.shared) shared keys."), prompt.message)
+    }
+
+    /// The real monolith script. It runs node in a login shell, so only with TR_INTEGRATION=1.
     func testAgainstTheMonolithScript() throws {
-        let monorepo = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
-            .deletingLastPathComponent().appendingPathComponent("fb-travel-monolith").path
-        try XCTSkipUnless(FileManager.default.fileExists(atPath: (monorepo as NSString).appendingPathComponent(SharedEnvFiles.script)))
+        try MonolithCheckout.requireIntegration()
+        let monorepo = try MonolithCheckout.root().path
         let candidate = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).env")
         try "LITEAPI_API_KEY=x\nSTATSIG_SERVER_KEY=y\n".write(to: candidate, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: candidate) }

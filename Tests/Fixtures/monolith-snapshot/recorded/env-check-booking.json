@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "ok": false,
+  "apps": [
+    {
+      "app": "booking",
+      "dir": "apps/booking-portal",
+      "envFile": "<candidate>",
+      "exists": true,
+      "shared": 21,
+      "missing": [
+        "AMATEUR_SUPABASE_URL",
+        "AMATEUR_SUPABASE_ANON_KEY",
+        "AMATEUR_SUPABASE_SIGNING_KEY",
+        "NEXT_PUBLIC_WEBAPP_URL",
+        "HOTELPLANNER_API_KEY",
+        "HOTELPLANNER_SECRET_KEY",
+        "HOTELPLANNER_ACCOUNT_ID",
+        "RESEND_API_KEY",
+        "NEXT_PUBLIC_TRAVEL_PARTNER_PORTAL_URL",
+        "NEXT_PUBLIC_MAPBOX_TOKEN",
+        "GOOGLE_PLACES_API_KEY",
+        "UPSTASH_REDIS_REST_URL",
+        "UPSTASH_REDIS_REST_TOKEN",
+        "CACHE_APPLY_SECRET_CURRENT",
+        "CACHE_APPLY_SECRET_NEXT",
+        "STRIPE_SECRET_KEY",
+        "NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY",
+        "NEXT_PUBLIC_VGS_VAULT_ID",
+        "NEXT_PUBLIC_DATADOG_APPLICATION_ID",
+        "NEXT_PUBLIC_DATADOG_CLIENT_TOKEN"
+      ],
+      "blank": [],
+      "shadowed": [],
+      "ok": false
+    }
+  ]
+}

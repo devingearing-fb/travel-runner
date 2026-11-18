@@ -61,6 +61,12 @@ final class WorkshopPanel {
         panel?.isVisible ?? false
     }
 
+    /// Visible or in the Dock: somebody may come back to work in it.
+    var isOpen: Bool {
+        guard let panel else { return false }
+        return panel.isVisible || panel.isMiniaturized
+    }
+
     func configure(supervisor: EnvironmentSupervisor, updateController: UpdateController? = nil) {
         self.supervisor = supervisor
         self.updateController = updateController

@@ -75,6 +75,10 @@ final class EnvironmentSupervisor {
     var onServiceCrash: (@MainActor (String, Int32) -> Void)? = nil
     var debugTrackingEnabled = false
     var debugOpenIssueCount = 0
+    /// True while "Report a problem" saves its zip.
+    private(set) var reportExportRunning = false
+    /// Makes the exporter of a report. Tests give one with a temporary folder and a fake zip.
+    @ObservationIgnored var makeReportExporter: () -> ReportExporter = { .live() }
     var actionsInFlight: Set<String> = []
     var onActionFeedback: ((String, Bool) -> Void)?
     /// Opens the page that shows where each tool was found (the "Open Health" button).
@@ -90,6 +94,10 @@ final class EnvironmentSupervisor {
     /// True when Settings saved new paths while the stack ran. They load at the
     /// next launch, or at the next reconfigure with the stack stopped.
     private(set) var reconfigurePending = false
+    /// Reconfigures that run now, "Stop and apply" included.
+    private var reconfiguresRunning = 0
+    /// `/api/preflight` requests that run their checks now.
+    private var preflightRequestsRunning = 0
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
@@ -167,8 +175,8 @@ final class EnvironmentSupervisor {
     @ObservationIgnored var shell: any CommandRunning
     /// The port cleanup reads listeners and kills through these tools.
     @ObservationIgnored var portTools = PortTools.live
-    /// The check that the Stripe CLI is installed and logged in. Tests set it; nil
-    /// runs the CLI.
+    /// The check that the Stripe CLI is installed and can call Stripe, with the test
+    /// key or the login. Tests set it; nil runs the CLI.
     @ObservationIgnored var stripeAvailability: (@Sendable () async -> Bool)?
     /// The time of every wait, deadline and time stamp of the supervisor. Tests
     /// set a fake.
@@ -196,7 +204,10 @@ final class EnvironmentSupervisor {
     /// The env reset of the last config load, which first asks the other runner
     /// app. Nil before the first load.
     private(set) var envResetAfterLoad: Task<Void, Never>?
-    private var phaseStartedAt: Date? = nil
+    /// Start All: the services of each startup phase that have not settled, and
+    /// when the phase began. A phase is done when all its services are.
+    private var startPhaseRemaining: [String: Int] = [:]
+    private var startPhaseBegan: [String: Date] = [:]
     private var dbSetupRunner: DbSetupRunner?
     /// Nil while issue capture is off. Tests set a tracker with a temporary folder.
     var debugTracker: DebugTracker?
@@ -209,6 +220,10 @@ final class EnvironmentSupervisor {
     var issueCapturePollInterval: Duration = .seconds(30)
     private var issueCapturePollStarted = false
     private var issueLaunchPruneDone = false
+    /// The tools of an issue's `diagnostics.json`. Tests give a fake; nil runs the
+    /// tools report in the shell of the supervisor.
+    @ObservationIgnored var diagnosticsTools: (@Sendable (_ cwd: String?) async -> [ToolReport])?
+    @ObservationIgnored private var cachedDiagnosticsTools: (at: Date, reports: [ToolReport])?
     private var gitBranchWatcher: GitBranchWatcher?
     private var gitRepoRoots: [String: String] = [:]
     private var dependencyWatcher: DependencyWatcher?
@@ -226,6 +241,10 @@ final class EnvironmentSupervisor {
     private var stripeReconnectingSince: Date? = nil
     private var localSupabaseKeys: LocalSupabaseKeys?
     private var stripeWebhookSecret: String?
+    /// The portal's log has said that it has no webhook secret, for this start.
+    private var warnedNoWebhookSecret = false
+    /// How the last start of the Stripe CLI signed in. An exit reads it for its cause.
+    private var stripeMode: StripeMode?
     /// The stop and start of one service run one at a time (see `KeyedLock`).
     private let lifecycle = KeyedLock()
     /// Services with a manual restart (or a cache clear) that waits for its turn.
@@ -404,6 +423,8 @@ final class EnvironmentSupervisor {
     /// nothing and answers `.needsStop`: a new service state knows no process, so
     /// a load now would lose the processes that run.
     func reconfigure() async -> ReconfigureResult {
+        reconfiguresRunning += 1
+        defer { reconfiguresRunning -= 1 }
         guard await !holdsLiveStack() else {
             reconfigurePending = true
             return .needsStop
@@ -425,7 +446,9 @@ final class EnvironmentSupervisor {
     @discardableResult
     func stopAndReconfigure() -> Task<ReconfigureResult, Never> {
         let stop = beginStopAll()
+        reconfiguresRunning += 1
         return Task {
+            defer { reconfiguresRunning -= 1 }
             await stop.value
             let result = await reconfigure()
             if result == .needsStop {
@@ -435,6 +458,30 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// What a restart for an update would interrupt now. The window is the app's to report.
+    func updateRestartState(panelOpen: Bool) async -> UpdatePolicy.RestartState {
+        // The process runner answers first: the other checks then see the state of this moment.
+        let processRuns = await processRunner.hasRunningProcess()
+        var state = updateRestartStateNow(panelOpen: panelOpen)
+        state.stackRunning = state.stackRunning || processRuns
+        return state
+    }
+
+    /// `updateRestartState` without the process runner, read at once. The update
+    /// controller reads it again right before the install: a click may have come
+    /// while the process runner answered.
+    func updateRestartStateNow(panelOpen: Bool) -> UpdatePolicy.RestartState {
+        UpdatePolicy.RestartState(
+            // The quit stops the holds viewer too.
+            stackRunning: holdsLiveStackNow() || holdsViewer.pid != nil,
+            panelOpen: panelOpen,
+            databaseBusy: dbResetRunning || dbSetupPipeline?.isRunning == true,
+            fixRunning: EnvironmentChecker.fixesRunning > 0,
+            reconfigureRunning: reconfiguresRunning > 0,
+            otherWorkRunning: reportExportRunning || preflightRequestsRunning > 0
+        )
+    }
+
     /// True while the runner starts, stops or holds a process of the stack, or
     /// runs a database step.
     private func holdsLiveStack() async -> Bool {
@@ -442,6 +489,11 @@ final class EnvironmentSupervisor {
         // after its process ends. The process runner knows what runs. It answers
         // first: the other checks then see the state of this moment.
         if await processRunner.hasRunningProcess() { return true }
+        return holdsLiveStackNow()
+    }
+
+    /// `holdsLiveStack` without the process runner.
+    private func holdsLiveStackNow() -> Bool {
         if startTask != nil || isShuttingDown || !actionsInFlight.isEmpty { return true }
         if dbResetRunning || dbSetupPipeline?.isRunning == true { return true }
         let livePhases: Set<ServicePhase> = [.starting, .running, .stopping]
@@ -676,57 +728,61 @@ final class EnvironmentSupervisor {
             let levels = graph.startOrder()
             var didMigrationCheck = false
 
+            // A phase is done, and timed, when all its services are, also the
+            // ones that start after the next level began.
+            self.startPhaseRemaining = [:]
+            self.startPhaseBegan = [:]
             for level in levels {
-                if Task.isCancelled { break }
+                self.startPhaseRemaining[self.resolvePhase(for: level).rawValue, default: 0] += level.count
+            }
 
-                let phase = self.resolvePhase(for: level)
-                await MainActor.run {
-                    self.currentPhase = phase
-                    self.phaseStartedAt = self.clock.date()
-                }
+            // The next level waits only for the services that a later service
+            // needs. A service that nothing needs (Stripe) starts with its level,
+            // and Start All waits for it at the end. The GROUND level waits for
+            // all its services: the database check after it can reset the database.
+            await withTaskGroup(of: Void.self) { trailing in
+                for level in levels {
+                    if Task.isCancelled { break }
 
-                await withTaskGroup(of: Void.self) { group in
-                    for serviceID in level {
-                        group.addTask { [self] in
-                            do {
-                                try await self.startService(serviceID)
-                            } catch {
-                                await MainActor.run {
-                                    self.recordFailure(serviceID, error: error, lastError: "\(error)")
-                                    self.recalculateHealth()
-                                }
+                    let phase = self.resolvePhase(for: level)
+                    await MainActor.run {
+                        self.currentPhase = phase
+                        if self.startPhaseBegan[phase.rawValue] == nil {
+                            self.startPhaseBegan[phase.rawValue] = self.clock.date()
+                        }
+                    }
+
+                    let needed = phase == .ground ? level : level.filter { !graph.dependents(of: $0).isEmpty }
+                    for serviceID in level where !needed.contains(serviceID) {
+                        trailing.addTask { await self.startForStartAll(serviceID, phase: phase) }
+                    }
+                    await withTaskGroup(of: Void.self) { group in
+                        for serviceID in needed {
+                            group.addTask { await self.startForStartAll(serviceID, phase: phase) }
+                        }
+                    }
+
+                    // After the GROUND phase (Supabase is up), the reset policy looks at the
+                    // database. An empty database is set up; changed migrations only show
+                    // the banner, unless the opt-in setting is on.
+                    if phase == .ground && !didMigrationCheck {
+                        didMigrationCheck = true
+                        // Supabase is up: write its keys before any portal starts.
+                        await self.refreshLocalSupabaseKeys()
+                        if let cwd = self.supabaseCwd {
+                            let outcome = await self.applyDbResetPolicy(cwd: cwd, checkMigrations: true, atStart: true)
+                            await self.refreshPendingMigrations(cwd: cwd)
+                            // The portals need the tables. A failed setup ends the start here.
+                            if outcome == .failed {
+                                self.dbSetupFailedAtStart = true
+                                break
                             }
+                            // An empty catalog only shows the banner: nothing loads by itself.
+                            await self.refreshHotelCatalog(cwd: cwd)
                         }
                     }
-                }
 
-                _ = await MainActor.run {
-                    if let started = self.phaseStartedAt {
-                        self.phaseTimings[phase.rawValue] = self.clock.date().timeIntervalSince(started)
-                    }
-                    self.completedPhases.insert(phase.rawValue)
                 }
-
-                // After the GROUND phase (Supabase is up), the reset policy looks at the
-                // database. An empty database is set up; changed migrations only show
-                // the banner, unless the opt-in setting is on.
-                if phase == .ground && !didMigrationCheck {
-                    didMigrationCheck = true
-                    // Supabase is up: write its keys before any portal starts.
-                    await self.refreshLocalSupabaseKeys()
-                    if let cwd = self.supabaseCwd {
-                        let outcome = await self.applyDbResetPolicy(cwd: cwd, checkMigrations: true, atStart: true)
-                        await self.refreshPendingMigrations(cwd: cwd)
-                        // The portals need the tables. A failed setup ends the start here.
-                        if outcome == .failed {
-                            self.dbSetupFailedAtStart = true
-                            break
-                        }
-                        // An empty catalog only shows the banner: nothing loads by itself.
-                        await self.refreshHotelCatalog(cwd: cwd)
-                    }
-                }
-
             }
 
             await MainActor.run {
@@ -739,6 +795,41 @@ final class EnvironmentSupervisor {
                 self.startupBeganAt = nil
             }
         }
+    }
+
+    /// One service of Start All. A failure marks the service; the start goes on.
+    private func startForStartAll(_ serviceID: String, phase: StartupPhase) async {
+        do {
+            try await startService(serviceID)
+            await awaitReplacingLaunch(serviceID)
+        } catch {
+            recordFailure(serviceID, error: error, lastError: "\(error)")
+            recalculateHealth()
+        }
+        finishStartAllService(inPhase: phase.rawValue)
+    }
+
+    /// A restart can replace the launch of Start All while it starts (a new
+    /// webhook secret restarts the portal). The services that need this one wait
+    /// until the new process is up or has failed.
+    private func awaitReplacingLaunch(_ serviceID: String) async {
+        while let state = serviceStates[serviceID], !isShuttingDown, !Task.isCancelled,
+              state.phase == .stopping || state.phase == .pending || state.phase == .starting {
+            try? await clock.sleep(for: .milliseconds(250))
+        }
+    }
+
+    private func finishStartAllService(inPhase phase: String) {
+        guard !isShuttingDown, let remaining = startPhaseRemaining[phase] else { return }
+        guard remaining <= 1 else {
+            startPhaseRemaining[phase] = remaining - 1
+            return
+        }
+        startPhaseRemaining[phase] = nil
+        if let began = startPhaseBegan[phase] {
+            phaseTimings[phase] = clock.date().timeIntervalSince(began)
+        }
+        completedPhases.insert(phase)
     }
 
     func stopAll() {
@@ -831,6 +922,8 @@ final class EnvironmentSupervisor {
     /// (Node, the ports, the folders), run now. Each check has a time limit, so
     /// the answer always comes. Without a config only the Node check runs.
     func preflightJSON() async -> String {
+        preflightRequestsRunning += 1
+        defer { preflightRequestsRunning -= 1 }
         let runner = preflightRunner
         var rows: [[String: String]] = []
         for check in runner.readOnlyChecks(for: loadedServices) {
@@ -1048,9 +1141,48 @@ final class EnvironmentSupervisor {
             guard stripeWebhookSecret != value else { return }
             stripeWebhookSecret = value
             writeAppEnv()
+            restartPortalForNewWebhookSecret()
         } else if let cwd = graph?.nodes["travel-portal"]?.resolvedCwd {
             EnvCompatLayer(envFilePaths: [cwd + "/.env.local"]).write(key: name, value: value)
         }
+    }
+
+    /// The portal does not wait for Stripe, so it can run on an old secret or on
+    /// none. Node reads `.env.local` when it boots: a running portal restarts.
+    private func restartPortalForNewWebhookSecret() {
+        guard let portal = serviceStates["travel-portal"], !isShuttingDown,
+              portal.phase == .running || (portal.phase == .starting && portal.pid != nil) else { return }
+        Task {
+            await logStore.append(serviceID: "travel-portal", entry: LogEntry(
+                stream: .stdout, text: Self.webhookSecretChangedLine
+            ))
+        }
+        restartService("travel-portal")
+    }
+
+    nonisolated static let webhookSecretChangedLine =
+        "[travel-runner] Stripe webhook secret changed — restarting Travel Portal to load it"
+    nonisolated static let noWebhookSecretLine =
+        "No Stripe webhook secret — payments will not confirm until Stripe runs."
+
+    /// Says once per portal start that payments will not confirm: the portal is
+    /// up or on its way and Stripe does not run. A secret in `.env.local` from an
+    /// earlier run does not count: without Stripe no webhook arrives.
+    private func warnIfNoWebhookSecret() async {
+        guard !warnedNoWebhookSecret,
+              let portal = serviceStates["travel-portal"],
+              portal.phase == .starting || portal.phase == .running else { return }
+        let stripeOff: Bool
+        if let stripe = serviceStates["stripe"], isInProfile("stripe") {
+            stripeOff = stripe.phase == .skipped || stripe.phase == .failed
+        } else {
+            stripeOff = true
+        }
+        guard stripeOff else { return }
+        warnedNoWebhookSecret = true
+        await logStore.append(serviceID: "travel-portal", entry: LogEntry(
+            stream: .stderr, text: "[travel-runner] " + Self.noWebhookSecretLine
+        ))
     }
 
     func clearCacheAndRestart(_ serviceID: String) {
@@ -2658,21 +2790,29 @@ final class EnvironmentSupervisor {
             }
         }
 
-        // Skip Stripe if the CLI isn't installed or authenticated
+        // Skip Stripe if the CLI isn't installed or cannot call Stripe. It uses the
+        // test key of the booking portal, or the login without one.
+        var stripeKey: StripeKeyResolution?
         if serviceID == "stripe" {
-            let available = await isStripeAvailable()
+            let resolution = stripeResolution()
+            stripeKey = resolution
+            stripeMode = resolution.mode
+            state.modeNote = resolution.mode.rowText
+            await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: resolution.mode.logLine))
+            let available = await isStripeAvailable(resolution)
             if !available {
                 state.phase = .skipped
-                noteSkip(
-                    state, .optionalOff, "Stripe CLI is not installed or not logged in — webhooks are off.",
-                    detail: "Run: stripe login, then start it from its row.", actions: [.startService]
-                )
-                let cause = "the Stripe CLI is not installed or not logged in — run: stripe login, then start it from its row"
+                let cause = StripeLauncher.unavailableCause(resolution.mode)
+                let headline = resolution.mode.isTestKey
+                    ? "Stripe CLI cannot call Stripe with the test key — webhooks are off."
+                    : "Stripe CLI is not installed or not logged in — webhooks are off."
+                noteSkip(state, .optionalOff, headline, detail: Self.capitalized(cause), actions: [.startService])
                 await logStore.append(
                     serviceID: serviceID,
                     entry: LogEntry(stream: .stderr, text: Self.stripeStoppedLine(cause))
                 )
                 await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
+                await warnIfNoWebhookSecret()
                 return nil
             }
         }
@@ -2796,24 +2936,6 @@ final class EnvironmentSupervisor {
             }
         }
 
-        // If this is the portal and Stripe is configured + available, wait for the
-        // Stripe secret before starting. This ensures .env.local has the correct
-        // STRIPE_WEBHOOK_SECRET when Node boots. Skip if Stripe isn't set up.
-        if serviceID == "travel-portal",
-           let stripeService = graph?.nodes["stripe"],
-           stripeService.probe?.artifact != nil {
-            let stripeAvailable = await isStripeAvailable()
-            if stripeAvailable {
-                state.phase = .starting
-                state.lastStarted = clock.date()
-                // Wait up to 30s for Stripe to capture its secret
-                for _ in 0..<60 {
-                    if let _ = await secretStore.get("STRIPE_WEBHOOK_SECRET") { break }
-                    try? await clock.sleep(for: .milliseconds(500))
-                }
-            }
-        }
-
         // A Node service without its packages cannot run: install them first, in its
         // log. A stale install only gets the button of its row (decision 11).
         if await dependencyState(serviceID) == .missing, let cwd = definition.resolvedCwd {
@@ -2856,6 +2978,13 @@ final class EnvironmentSupervisor {
         // No pid until the new process has one: handleTermination compares it.
         state.pid = nil
 
+        // The portal does not wait for Stripe. Without a secret it says why
+        // payments will not confirm; a secret that comes later restarts it.
+        if serviceID == "travel-portal" {
+            warnedNoWebhookSecret = false
+            await warnIfNoWebhookSecret()
+        }
+
         var stdoutProbe: StdoutProbe?
         if let probeConfig = definition.probe, probeConfig.type == .stdoutRegex {
             do {
@@ -2873,7 +3002,9 @@ final class EnvironmentSupervisor {
         let streamDefinition = streamAwareDefinition(for: definition, serviceID: serviceID)
         let lanDefinition = lanAwareDefinition(for: streamDefinition, serviceID: serviceID)
         let agentDefinition = agentLaunch.map { AgentLauncher.definition(lanDefinition, launch: $0) } ?? lanDefinition
-        let effectiveDefinition = EventDirectoryLauncher.definition(agentDefinition, env: eventDirectoryEnv)
+        let eventDefinition = EventDirectoryLauncher.definition(agentDefinition, env: eventDirectoryEnv)
+        // The key goes to the process env only: the command and the state keep no copy.
+        let effectiveDefinition = stripeKey.map { StripeLauncher.definition(eventDefinition, resolution: $0) } ?? eventDefinition
 
         let sid = serviceID
         let pid = try await processRunner.start(
@@ -3133,13 +3264,16 @@ final class EnvironmentSupervisor {
             // The log keeps the lines of earlier launches. An old 401 is not the
             // cause of this exit.
             let launched = state.lastStarted ?? .distantPast
+            let mode = stripeMode
             Task {
                 let output = await logStore.entries(for: serviceID)
                     .filter { $0.timestamp >= launched }.map(\.text)
-                let cause = if let known = CrashCause.knownCause(in: output, serviceID: serviceID) {
+                let cause = if let known = StripeLauncher.exitCause(
+                    known: CrashCause.knownCause(in: output, serviceID: serviceID), mode: mode
+                ) {
                     "\(exit) — \(known)"
                 } else {
-                    "\(exit) — see the lines above. If they show 401, run: stripe login. Then start it from its row."
+                    "\(exit) — \(StripeLauncher.unknownExitHint(mode))"
                 }
                 await logStore.append(serviceID: serviceID, entry: LogEntry(
                     stream: .stderr, text: Self.stripeStoppedLine(cause)
@@ -3149,6 +3283,7 @@ final class EnvironmentSupervisor {
                     noteSkip(state, .optionalOff, "Stripe stopped — webhooks are off.", detail: Self.capitalized(cause), actions: [.startService, .openLog])
                 }
                 await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
+                await warnIfNoWebhookSecret()
             }
             recalculateHealth()
             return
@@ -3306,6 +3441,7 @@ final class EnvironmentSupervisor {
                         stream: .stderr, text: Self.stripeStoppedLine(cause)
                     ))
                     await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
+                    await warnIfNoWebhookSecret()
                 }
                 recalculateHealth()
                 return
@@ -3575,13 +3711,62 @@ final class EnvironmentSupervisor {
     /// poll and the launch prune stay single.
     func initDebugTracking() async {
         let tracker = currentIssueTracker()
-        let prune = !issueLaunchPruneDone
+        let launch = !issueLaunchPruneDone
         issueLaunchPruneDone = true
         startIssueCapturePoll()
         await refreshIssueCapture()
-        if prune, debugTracker != nil {
+        guard launch else { return }
+        let previous = await tracker.beginRun(pid: getpid())
+        if debugTracker != nil {
             await tracker.pruneClosedIssues()
         }
+        if let previous {
+            // The new run's logs say nothing about the crash; the runner log of
+            // the last run on disk can.
+            let runnerID = LogFileSink.runnerLogID
+            let lastRun = logStore.earlierRunTail(for: runnerID, maxLines: Self.uncleanExitLogLines)
+            await captureDebugIssue(
+                trigger: "unclean_exit",
+                serviceID: nil,
+                summary: Self.uncleanExitText(
+                    previous,
+                    runnerLog: logStore.fileURL(for: runnerID).map { DiagnosticsSnapshot.tilde($0.path, home: NSHomeDirectory()) }
+                ),
+                signature: "unclean exit",
+                extraLog: lastRun.map {
+                    DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: Self.lastRunLogID, line: $0.text)
+                }
+            )
+        }
+    }
+
+    /// The id of the last run's runner log in the issue logs.
+    static let lastRunLogID = "runner-last-run"
+    /// How many lines of the last run's runner log an unclean-exit issue gets.
+    static let uncleanExitLogLines = 200
+
+    /// The issue text of a run that left its marker behind. Its start says where
+    /// to look: the issue summary keeps only the first 120 characters.
+    static func uncleanExitText(
+        _ marker: DebugTracker.RunMarker,
+        appName: String = Flavor.current.displayName,
+        runnerLog: String? = nil
+    ) -> String {
+        let version = marker.appVersion.map { "v\($0)" } ?? "version unknown"
+        var text = "The last run did not quit cleanly. Look in "
+            + (runnerLog == nil ? "" : "logs-all.txt [\(lastRunLogID)] and ")
+            + "~/Library/Logs/DiagnosticReports. "
+            + "It was \(appName) \(version), pid \(marker.pid), started \(marker.startedAt). "
+            + "It crashed, was force-quit, or the Mac lost power."
+        if let runnerLog {
+            text += " Its full runner log: \(runnerLog)"
+        }
+        return text
+    }
+
+    /// A clean quit: the next launch finds no marker of this run.
+    func markCleanExit() {
+        issueTracker?.endRun()
     }
 
     /// The one tracker of this run. It holds the rate limit.
@@ -3647,7 +3832,8 @@ final class EnvironmentSupervisor {
         errorMessage: String? = nil,
         recoveryGuidance: String? = nil,
         signature: String? = nil,
-        log: [LogEntry]? = nil
+        log: [LogEntry]? = nil,
+        extraLog: [DebugTracker.LogEntry] = []
     ) async {
         guard let tracker = debugTracker else { return }
 
@@ -3669,9 +3855,21 @@ final class EnvironmentSupervisor {
         if let sid = serviceID {
             let raw: [LogEntry] = if let log { log } else { await logStore.entries(for: sid) }
             logEntries = raw.map { DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: sid, line: $0.text) }
-            likelyCause = CrashCause.likelyCause(in: raw.map(\.text), serviceID: sid, redactor: redactor)
+            likelyCause = stripeAwareCause(
+                CrashCause.likelyCause(in: raw.map(\.text), serviceID: sid, redactor: redactor), serviceID: sid
+            )
         }
+        // The combined log has every service, the DB steps and the runner too.
+        for id in await logStore.serviceIDs() where id != serviceID {
+            logEntries += await logStore.entries(for: id).map {
+                DebugTracker.LogEntry(timestamp: $0.timestamp, serviceId: id, line: $0.text)
+            }
+        }
+        logEntries += extraLog
 
+        // The state of the failure, read now. The tools are read after the
+        // issue is filed, so the caller does not wait for them.
+        let state = diagnosticsState()
         let _ = await tracker.captureIssue(
             trigger: trigger,
             serviceId: serviceID,
@@ -3680,7 +3878,8 @@ final class EnvironmentSupervisor {
             likelyCause: likelyCause,
             logEntries: logEntries,
             stateSnapshots: snapshots,
-            redactor: redactor
+            redactor: redactor,
+            diagnostics: { [weak self] in await self?.withDiagnosticsTools(state) }
         )
 
         debugOpenIssueCount = await tracker.openIssueCount()
@@ -3694,6 +3893,96 @@ final class EnvironmentSupervisor {
             envDirectories: definitions.compactMap(\.resolvedCwd),
             environments: definitions.compactMap(\.env)
         )
+    }
+
+    /// How long the tools of the last snapshot stay good. A crash loop files many
+    /// issues; the tools are read once for them.
+    static let diagnosticsToolsMaxAge: TimeInterval = 600
+
+    /// This Mac and the stack now, for the `diagnostics.json` of an issue. The
+    /// state is read first: the tools take some seconds and the state can change
+    /// meanwhile.
+    func diagnosticsSnapshot(home: String = NSHomeDirectory()) async -> DiagnosticsSnapshot {
+        await withDiagnosticsTools(diagnosticsState(home: home), home: home)
+    }
+
+    /// The snapshot without its tools: the stack, read at once.
+    private func diagnosticsState(home: String = NSHomeDirectory()) -> DiagnosticsSnapshot {
+        let now = clock.date()
+        let services = sortedServiceIDs.compactMap { serviceStates[$0] }
+            + serviceStates.values.filter { !sortedServiceIDs.contains($0.id) }.sorted { $0.id < $1.id }
+        let pipeline = dbSetupPipeline.map { pipeline in
+            DiagnosticsSnapshot.DbPipeline(
+                profile: pipeline.profile,
+                seedScenario: pipeline.seedScenario.id,
+                running: pipeline.isRunning,
+                steps: pipeline.steps.map {
+                    DiagnosticsSnapshot.DbStep(
+                        id: $0.id, name: $0.name, status: $0.status.rawValue,
+                        optional: $0.isOptional, error: $0.errorMessage
+                    )
+                }
+            )
+        }
+        return DiagnosticsSnapshot(
+            generatedAt: ISO8601DateFormatter().string(from: now),
+            app: DiagnosticsSnapshot.App(.current),
+            machine: .current,
+            tools: [],
+            toolPath: nil,
+            profile: profile.rawValue,
+            dbMode: dbMode.rawValue,
+            health: health.rawValue,
+            lastError: lastError,
+            preflight: preflightChecks.map { DiagnosticsSnapshot.Check(id: $0.id, name: $0.name, result: $0.result) },
+            dbPipeline: pipeline,
+            pendingMigrations: pendingMigrations,
+            repoPaths: DiagnosticsSnapshot.repoPaths(config?.paths, home: home),
+            gitBranches: gitBranches,
+            services: services.map { state in
+                DiagnosticsSnapshot.Service(
+                    id: state.id,
+                    phase: state.phase.rawValue,
+                    inProfile: isInProfile(state.id),
+                    pid: state.pid,
+                    exitCode: state.exitCode,
+                    restartCount: state.restartCount,
+                    circuitBroken: state.isCircuitBroken,
+                    uptimeSeconds: state.lastStarted.map { Int(now.timeIntervalSince($0)) }
+                )
+            }
+        )
+    }
+
+    /// The snapshot with the tools of this Mac.
+    private func withDiagnosticsTools(
+        _ state: DiagnosticsSnapshot, home: String = NSHomeDirectory()
+    ) async -> DiagnosticsSnapshot {
+        var snapshot = state
+        let tools = await diagnosticsToolReports()
+        snapshot.tools = tools.map { DiagnosticsSnapshot.Tool($0, home: home) }
+        snapshot.toolPath = tools.map(\.searchedPath).first { !$0.isEmpty }
+            .map { DiagnosticsSnapshot.tilde($0, home: home) }
+        return snapshot
+    }
+
+    /// The tools report of the diagnostics, read again when it is old or has a
+    /// tool that was not read.
+    private func diagnosticsToolReports() async -> [ToolReport] {
+        if let cached = cachedDiagnosticsTools,
+           clock.date().timeIntervalSince(cached.at) < Self.diagnosticsToolsMaxAge {
+            return cached.reports
+        }
+        let cwd = monorepoPath.flatMap { FileManager.default.fileExists(atPath: $0) ? $0 : nil }
+        let reports: [ToolReport] = if let diagnosticsTools {
+            await diagnosticsTools(cwd)
+        } else {
+            await tools.report(runner: shell, cwd: cwd)
+        }
+        if !reports.contains(where: \.isUnread) {
+            cachedDiagnosticsTools = (clock.date(), reports)
+        }
+        return reports
     }
 
     func listDebugIssues(status: String = "open") async -> [DebugTracker.Issue] {
@@ -3714,6 +4003,62 @@ final class EnvironmentSupervisor {
     func debugIssueFolder(id: String, status: String = "open") async -> String? {
         guard let tracker = debugTracker else { return nil }
         return await tracker.issueFolderPath(id: id, status: status)
+    }
+
+    // MARK: - Problem report
+
+    /// Saves the problem report to Downloads (`ReportExporter`): the snapshot of
+    /// this Mac, the log files, the newest open issues and the events. Capture
+    /// can be off; the issues that exist still go in.
+    func exportReport(focus: ReportExporter.Focus = .general) async throws -> ReportExporter.Report {
+        guard !reportExportRunning else { throw ReportExporter.ExportError.alreadyRunning }
+        reportExportRunning = true
+        defer { reportExportRunning = false }
+
+        let tracker = currentIssueTracker()
+        var issueFolders: [(status: String, folder: URL)] = []
+        for issue in await tracker.listIssues(status: "open").prefix(ReportExporter.maxIssues) {
+            issueFolders.append(("open", URL(fileURLWithPath: await tracker.issueFolderPath(id: issue.id))))
+        }
+        if case .issue(let id, let status) = focus,
+           !issueFolders.contains(where: { $0.folder.lastPathComponent == id }) {
+            issueFolders.append((status, URL(fileURLWithPath: await tracker.issueFolderPath(id: id, status: status))))
+        }
+        var memoryLogs: [String: [LogEntry]] = [:]
+        for id in await logStore.serviceIDs() {
+            memoryLogs[id] = await logStore.entries(for: id)
+        }
+        let redactor = makeRedactor()
+        let input = ReportExporter.Input(
+            snapshot: await diagnosticsSnapshot(),
+            redactor: redactor,
+            focus: focus,
+            focusText: await reportFocusText(focus, redactor: redactor),
+            logDirectory: logStore.fileDirectory,
+            memoryLogs: memoryLogs,
+            issueFolders: issueFolders,
+            eventsFile: URL(fileURLWithPath: await tracker.eventsFilePath)
+        )
+        return try await makeReportExporter().export(input)
+    }
+
+    /// One line about what the report was made from.
+    private func reportFocusText(_ focus: ReportExporter.Focus, redactor: Redactor) async -> String? {
+        switch focus {
+        case .general:
+            return lastError ?? rootCauseDescription
+        case .service(let id):
+            guard let state = serviceStates[id] else { return nil }
+            let lines = await logStore.entries(for: id).map(\.text)
+            let cause = stripeAwareCause(CrashCause.likelyCause(in: lines, serviceID: id, redactor: redactor), serviceID: id)
+            let exit = state.exitCode.map { " (exit code \($0))" } ?? ""
+            return "\(state.definition.displayName) \(state.phase.rawValue)\(exit)" + (cause.map { " — \($0)" } ?? "")
+        case .dbStep(let id):
+            guard let step = dbSetupPipeline?.steps.first(where: { $0.id == id }) else { return nil }
+            return "\(step.name): \(step.errorMessage ?? step.status.rawValue)"
+        case .issue(let id, let status):
+            return await currentIssueTracker().listIssues(status: status).first { $0.id == id }?.summary
+        }
     }
 
     func closeDebugIssue(id: String, resolution: String) async -> Bool {
@@ -3798,14 +4143,27 @@ final class EnvironmentSupervisor {
         cause.prefix(1).uppercased() + cause.dropFirst()
     }
 
-    private func isStripeAvailable() async -> Bool {
+    /// The cause of a failure. In test-key mode a Stripe 401 is a rejected key, not
+    /// an expired login.
+    private func stripeAwareCause(_ cause: String?, serviceID: String) -> String? {
+        serviceID == "stripe" ? StripeLauncher.exitCause(known: cause, mode: stripeMode) : cause
+    }
+
+    /// The Stripe mode for the booking portal of this stack.
+    private func stripeResolution() -> StripeKeyResolution {
+        StripeLauncher.resolve(bookingPortal: graph?.nodes["travel-portal"]?.resolvedCwd ?? config?.paths?.bookingPortal)
+    }
+
+    private func isStripeAvailable(_ resolution: StripeKeyResolution? = nil) async -> Bool {
         if let stripeAvailability { return await stripeAvailability() }
         // `stripe config --list` only proves that a credential is stored; it
         // still exits zero for expired API keys. Exercise the authenticated API
         // so invalid sessions are skipped before `stripe listen` can crash.
-        return await runShellCommand(
-            "which stripe >/dev/null 2>&1 && stripe balance retrieve >/dev/null 2>&1", timeout: .seconds(15)
-        )
+        // The test key goes in the env of the check, as it does for the listener.
+        let resolution = resolution ?? stripeResolution()
+        return await shell.run(
+            StripeLauncher.availabilityCommand, environment: resolution.environment, timeout: .seconds(15)
+        ).succeeded
     }
 
     private func canReachHost(_ host: String) async -> Bool {
@@ -4158,7 +4516,9 @@ final class EnvironmentSupervisor {
         // Kill a Stripe listener that an earlier session left. The pattern is the
         // command of the service, so any other `stripe listen` stays alive.
         if isInProfile("stripe"), let stripe = serviceStates["stripe"]?.definition {
-            await portTools.killCommands(PortOwner.commandPattern(for: stripe.cmd))
+            for pattern in StripeLauncher.stalePatterns(for: stripe.cmd) {
+                await portTools.killCommands(pattern)
+            }
         }
 
         if didKill {

@@ -1,0 +1,103 @@
+{
+  "version": 4,
+  "steps": [
+    {
+      "id": "check-prerequisites",
+      "name": "Prerequisites",
+      "command": "node scripts/db/check-prerequisites.mjs",
+      "healthCheck": "node scripts/db/check-prerequisites.mjs --verify",
+      "timeoutMs": 60000,
+      "optional": false
+    },
+    {
+      "id": "start-supabase",
+      "name": "Start Supabase",
+      "command": "node scripts/db/start-supabase.mjs",
+      "healthCheck": "node scripts/db/start-supabase.mjs --verify",
+      "timeoutMs": 300000,
+      "optional": false
+    },
+    {
+      "id": "fetch-hotels",
+      "name": "Download Hotels",
+      "command": "node scripts/db/fetch-hotels.mjs",
+      "healthCheck": "node scripts/db/fetch-hotels.mjs --verify",
+      "timeoutMs": 1200000,
+      "optional": false
+    },
+    {
+      "id": "reset-database",
+      "name": "Reset & Seed Data",
+      "command": "node scripts/db/reset-database.mjs",
+      "healthCheck": "node scripts/db/reset-database.mjs --verify",
+      "timeoutMs": 180000,
+      "optional": false
+    },
+    {
+      "id": "apply-migrations",
+      "name": "Apply Migrations",
+      "command": "node scripts/db/apply-migrations.mjs",
+      "healthCheck": "node scripts/db/apply-migrations.mjs --verify",
+      "timeoutMs": 300000,
+      "optional": false
+    },
+    {
+      "id": "load-hotels",
+      "name": "Load Hotels",
+      "command": "node scripts/db/load-hotels.mjs",
+      "healthCheck": "node scripts/db/load-hotels.mjs --verify",
+      "timeoutMs": 600000,
+      "optional": false
+    },
+    {
+      "id": "copy-event-data",
+      "name": "Event Contracts",
+      "command": "node scripts/db/copy-event-data.mjs",
+      "healthCheck": "node scripts/db/copy-event-data.mjs --verify",
+      "timeoutMs": 90000,
+      "optional": true
+    },
+    {
+      "id": "verify-data",
+      "name": "Verify Data",
+      "command": "node scripts/db/verify-data.mjs",
+      "healthCheck": null,
+      "timeoutMs": 30000,
+      "optional": false
+    }
+  ],
+  "seedScenarios": {
+    "directory": "supabase/seeds/scenarios"
+  },
+  "profiles": {
+    "full": [
+      "check-prerequisites",
+      "start-supabase",
+      "fetch-hotels",
+      "reset-database",
+      "load-hotels",
+      "copy-event-data",
+      "verify-data"
+    ],
+    "reset": [
+      "check-prerequisites",
+      "start-supabase",
+      "fetch-hotels",
+      "reset-database",
+      "load-hotels",
+      "verify-data"
+    ],
+    "fast": [
+      "check-prerequisites",
+      "start-supabase",
+      "reset-database",
+      "verify-data"
+    ],
+    "migrate": [
+      "check-prerequisites",
+      "start-supabase",
+      "apply-migrations",
+      "verify-data"
+    ]
+  }
+}

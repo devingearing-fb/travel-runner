@@ -52,7 +52,8 @@ struct WorkshopStatusView: View {
                         isRunning: supervisor.dbResetRunning,
                         onRetryFrom: { supervisor.runDbSetup(from: $0) },
                         onCancel: { supervisor.cancelDbSetup() },
-                        onDismiss: { supervisor.dismissDbSetup() }
+                        onDismiss: { supervisor.dismissDbSetup() },
+                        onReport: { ReportProblem.run(.dbStep(id: $0), supervisor: supervisor) }
                     )
                 } else if supervisor.dbResetRunning || dbResetHasLogs {
                     dbResetConsole

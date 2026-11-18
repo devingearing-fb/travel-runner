@@ -60,6 +60,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         updateController = UpdateController()
+        let supervisor = self.supervisor!
+        updateController.restartState = {
+            await supervisor.updateRestartState(panelOpen: WorkshopPanel.shared.isOpen)
+        }
+        updateController.restartStateNow = {
+            supervisor.updateRestartStateNow(panelOpen: WorkshopPanel.shared.isOpen)
+        }
 
         WorkshopPanel.shared.configure(supervisor: supervisor, updateController: updateController)
 
@@ -122,6 +129,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Phase 4: Kill by service port as a fallback. Only the ports that Stop All
         // clears: the services of the profile and those this session started, never a
         // reuse_if_running service (Supabase persists between sessions).
+        defer { supervisor.markCleanExit() }
         guard !siblingRunsStack else { return }
         killProcessesOnPorts(supervisor.sweepPorts)
     }
@@ -176,6 +184,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showStatusMenu() {
         let menu = NSMenu()
+        // Each item sets its own enabled state; AppKit would enable every item with an action.
+        menu.autoenablesItems = false
 
         for serviceID in supervisor.sortedServiceIDs {
             guard let state = supervisor.serviceStates[serviceID] else { continue }
@@ -216,6 +226,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let terminalsItem = NSMenuItem(title: "Open Terminals", action: #selector(openTerminals), keyEquivalent: "")
         terminalsItem.target = self
         menu.addItem(terminalsItem)
+
+        let reportItem = NSMenuItem(title: "Report a Problem…", action: #selector(reportProblem), keyEquivalent: "")
+        reportItem.target = self
+        reportItem.isEnabled = !supervisor.reportExportRunning
+        menu.addItem(reportItem)
 
         let buildItem = NSMenuItem(title: BuildInfo.current.menuTitle, action: nil, keyEquivalent: "")
         buildItem.isEnabled = false
@@ -262,6 +277,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         WorkshopPanel.shared.open(section: .logs)
         NSApp.activate(ignoringOtherApps: true)
         supervisor.panelVisible = true
+    }
+
+    /// Opens the panel first, so the sheet and the toast have a window.
+    @objc private func reportProblem() {
+        openPanel()
+        ReportProblem.run(supervisor: supervisor)
     }
 
     @objc private func openIssues() {

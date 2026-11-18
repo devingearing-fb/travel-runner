@@ -249,6 +249,17 @@ private struct IssueDetailView: View {
             Spacer()
 
             Button {
+                ReportProblem.run(.issue(id: issue.id, status: status), supervisor: supervisor)
+            } label: {
+                Label("Report", systemImage: "square.and.arrow.up")
+                    .font(.caption)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(supervisor.reportExportRunning)
+            .help("Save a report zip with this issue to Downloads and copy a summary for Slack")
+
+            Button {
                 Task {
                     if let folder = await supervisor.debugIssueFolder(id: issue.id, status: status) {
                         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: folder)])

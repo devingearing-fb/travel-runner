@@ -15,6 +15,7 @@ struct ServiceRow: View {
 
     private var showSubtitle: Bool {
         state.restartCount > 0 || state.isCircuitBroken || state.capturedArtifact != nil || rowCondition != nil
+            || state.modeNote != nil
     }
 
     /// Why a skipped or failed service is in that phase. A running one has none.
@@ -166,6 +167,11 @@ struct ServiceRow: View {
                             .font(.caption2)
                             .foregroundStyle(.orange)
                             .contentTransition(.numericText())
+                    }
+                    if let mode = state.modeNote {
+                        Text(mode)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                     if let artifact = state.capturedArtifactSummary {
                         Text(artifact)

@@ -132,7 +132,8 @@ struct WorkshopDbToolsView: View {
                         onDismiss: { supervisor.dismissDbSetup() },
                         onCopy: { supervisor.copyDbStepReport($0) },
                         actionTitle: { title(for: $0) },
-                        onAction: { perform($0, step: $1) }
+                        onAction: { perform($0, step: $1) },
+                        onReport: { ReportProblem.run(.dbStep(id: $0), supervisor: supervisor) }
                     )
                 } else {
                     Text("No pipeline running")

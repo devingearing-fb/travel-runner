@@ -41,4 +41,23 @@ final class ServiceGraphTests: XCTestCase {
         XCTAssertEqual(Set(levels[1]), Set(["api", "web"]))
         XCTAssertEqual(levels[2], ["proxy"])
     }
+
+    /// S2: the portal started only after Stripe had its webhook secret, and
+    /// waited up to 30 s more for it. Stripe now needs only the database, and no
+    /// service needs Stripe, so Start All does not wait for it.
+    func testThePortalDoesNotWaitForStripe() throws {
+        let paths = RepoPaths(
+            monorepo: "/work/fb-travel-monolith", universalLogin: "/work/universal-login",
+            streamServices: "/work/stream-services", loadTest: "/work/travel-load-test"
+        )
+        let graph = try ServiceGraph(services: ServiceCatalog.services(paths: paths, flavor: .standard))
+        XCTAssertEqual(graph.nodes["stripe"]?.dependsOn, ["supabase"])
+        XCTAssertEqual(graph.nodes["travel-portal"]?.dependsOn, ["universal-login"])
+        XCTAssertEqual(graph.dependents(of: "stripe"), [])
+
+        let levels = graph.startOrder()
+        let stripeLevel = try XCTUnwrap(levels.firstIndex { $0.contains("stripe") })
+        XCTAssertEqual(levels[stripeLevel - 1], ["supabase"], "Stripe starts as soon as the database is up")
+        XCTAssertTrue(levels[stripeLevel].contains("universal-login"))
+    }
 }

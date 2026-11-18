@@ -121,6 +121,108 @@ final class DbSetupProtocolTests: XCTestCase {
         XCTAssertEqual(step.errorMessage, "Migration error")
     }
 
+    // MARK: - The contract of the monolith scripts
+
+    /// The output of a step, as the runner reads it: a `##db:` line is protocol,
+    /// any other line is log text.
+    private func read(_ output: [String], into step: DbSetupStep) {
+        for line in output where line.hasPrefix("##db:") {
+            DbSetupRunner.parseProtocolLine(String(line.dropFirst(5)), step: step)
+        }
+    }
+
+    /// One row per kind of output that the scripts print (scripts/db/README.md).
+    func testEachKindOfStepOutputGivesTheRightState() {
+        struct Row {
+            let name: String
+            let output: [String]
+            var error: String? = nil
+            var health: String? = nil
+            var progress: Double? = nil
+            var label: String? = nil
+        }
+        let rows = [
+            Row(name: "a step that passes",
+                output: ["##db:status:running", "##db:progress:0.50:Loading hotels", "plain log text", "##db:status:done"],
+                progress: 0.5, label: "Loading hotels"),
+            Row(name: "a failure names the cause and the next action",
+                output: ["##db:status:running",
+                         "##db:status:failed:No dev credentials in apps/booking-portal/.env. Import the shared .env, or reset without hotels."],
+                error: "No dev credentials in apps/booking-portal/.env. Import the shared .env, or reset without hotels."),
+            Row(name: "a message with colons is kept whole",
+                output: ["##db:status:failed:Migration 20261014000000_change.sql: column \"x\" does not exist"],
+                error: "Migration 20261014000000_change.sql: column \"x\" does not exist"),
+            Row(name: "a failure without a message",
+                output: ["##db:status:failed"],
+                error: "Unknown error"),
+            Row(name: "a count and the checks that failed",
+                output: ["##db:health:fail:Docker is not running", "##db:health:fail:node_modules missing",
+                         "##db:status:failed:2 prerequisite(s) missing"],
+                error: "2 prerequisite(s) missing: Docker is not running; node_modules missing"),
+            Row(name: "a passed check",
+                output: ["##db:health:pass:42 tables"],
+                health: "42 tables"),
+            Row(name: "the scenario line is information only",
+                output: ["##db:scenario:standard:Standard demo data"]),
+            Row(name: "a line type that this runner does not know changes nothing",
+                output: ["##db:summary:rows:12000", "##db:progress"]),
+        ]
+        for row in rows {
+            let step = makeStep()
+            read(row.output, into: step)
+            XCTAssertEqual(step.errorMessage, row.error, row.name)
+            XCTAssertEqual(step.healthResult, row.health, row.name)
+            XCTAssertEqual(step.progress, row.progress, row.name)
+            XCTAssertEqual(step.progressLabel, row.label, row.name)
+        }
+    }
+
+    /// The line types of the contract are the ones this runner was written for.
+    /// A new type fails here first, so that someone decides whether to read it.
+    func testTheContractHasTheLineTypesThatTheRunnerReads() throws {
+        let contract = try MonolithCheckout.text("scripts/db/README.md")
+        let types = contract.split(separator: "\n")
+            .filter { $0.hasPrefix("| `##db:") }
+            .compactMap { $0.dropFirst("| `##db:".count).split(separator: ":").first.map(String.init) }
+        XCTAssertEqual(Set(types), ["status", "progress", "health", "scenario"])
+        XCTAssertTrue(contract.contains("The reader splits at the first two colons only"))
+    }
+
+    /// The steps of each profile, from the manifest of the monolith.
+    func testEachProfileOfTheManifestLoadsItsSteps() throws {
+        let manifest = try MonolithCheckout.file("scripts/db/manifest.json").path
+        let reset = ["check-prerequisites", "start-supabase", "fetch-hotels", "reset-database", "load-hotels", "verify-data"]
+        let rows: [(profile: String, steps: [String])] = [
+            ("full", ["check-prerequisites", "start-supabase", "fetch-hotels", "reset-database", "load-hotels",
+                      "copy-event-data", "verify-data"]),
+            ("reset", reset),
+            ("fast", ["check-prerequisites", "start-supabase", "reset-database", "verify-data"]),
+            ("migrate", ["check-prerequisites", "start-supabase", "apply-migrations", "verify-data"]),
+        ]
+        for row in rows {
+            let steps = try DbManifestLoader.load(from: manifest, profile: row.profile)
+            XCTAssertEqual(steps.map(\.id), row.steps, row.profile)
+            XCTAssertEqual(steps.map(\.stepNumber), Array(1...steps.count), row.profile)
+            // The hotel download fails while the database still has its data.
+            if let fetch = steps.firstIndex(where: { $0.id == "fetch-hotels" }),
+               let wipe = steps.firstIndex(where: { $0.id == "reset-database" }) {
+                XCTAssertLessThan(fetch, wipe, row.profile)
+            }
+        }
+        // A profile name that the manifest does not have runs nothing.
+        XCTAssertThrowsError(try DbManifestLoader.load(from: manifest, profile: "no-such-profile")) { error in
+            XCTAssertEqual(error as? DbManifestLoader.ManifestError, .unknownProfile("no-such-profile"))
+        }
+        // Apply migrations never resets.
+        XCTAssertFalse(try DbManifestLoader.load(from: manifest, profile: "migrate").contains { $0.id == "reset-database" })
+
+        let full = Dictionary(uniqueKeysWithValues: try DbManifestLoader.load(from: manifest, profile: "full").map { ($0.id, $0) })
+        XCTAssertEqual(full["fetch-hotels"]?.timeoutSeconds, 1200)
+        XCTAssertEqual(full["check-prerequisites"]?.healthCheckCommand, "node scripts/db/check-prerequisites.mjs --verify")
+        XCTAssertNil(full["verify-data"]?.healthCheckCommand)
+        XCTAssertEqual(full.values.filter(\.isOptional).map(\.id), ["copy-event-data"])
+    }
+
     // MARK: - Environment checks
 
     func testPyJWTIsNotARequiredCheck() throws {

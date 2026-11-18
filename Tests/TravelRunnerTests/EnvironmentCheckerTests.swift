@@ -487,14 +487,16 @@ final class EnvironmentCheckerTests: XCTestCase {
         await checker.fix("stripe-auth")
 
         // A .command file that Terminal opens: no Apple event, so no Automation permission.
-        let opened = try XCTUnwrap(runner.commands.first)
+        // Before it, the fix checks that the CLI is installed.
+        XCTAssertEqual(runner.commands.first, StripeLauncher.installedCommand)
+        let opened = try XCTUnwrap(runner.commands.first { $0.contains("open -a Terminal") })
         XCTAssertEqual(opened, EnvironmentChecker.terminalCommand("stripe login"))
         XCTAssertFalse(opened.contains("osascript"), opened)
         XCTAssertTrue(opened.hasSuffix(#"open -a Terminal "$f""#), opened)
         XCTAssertTrue(opened.contains("'#!/bin/sh\nstripe login\n'"), opened)
         XCTAssertEqual(checker.activeFix?.state, .succeeded)
         XCTAssertEqual(checker.activeFix?.action.copyCommand, "stripe login")
-        XCTAssertEqual(status("stripe-auth", in: checker), .passing("Authenticated"))
+        XCTAssertEqual(status("stripe-auth", in: checker), .passing("Authenticated (your stripe login)"))
         XCTAssertEqual(fakeClock.sleeps, [.seconds(3), .seconds(3), .seconds(3)])
     }
 
@@ -943,6 +945,144 @@ final class EnvironmentCheckerTests: XCTestCase {
         XCTAssertEqual(FixRun.elapsedText(seconds: 725), "12:05")
         XCTAssertEqual(EnvironmentChecker.durationText(.seconds(180)), "3 min")
         XCTAssertEqual(EnvironmentChecker.durationText(.seconds(20)), "20 s")
+    }
+
+    // MARK: - PyJWT row
+
+    /// A monolith checkout whose `scripts/db/check-prerequisites.mjs` holds `script`.
+    /// With `script` nil the checkout has no such file.
+    private func makeCheckout(prerequisites script: String?) throws -> URL {
+        let mono = FileManager.default.temporaryDirectory.appendingPathComponent("pyjwt-row-\(UUID().uuidString)")
+        let scripts = mono.appendingPathComponent("scripts/db")
+        try FileManager.default.createDirectory(at: scripts, withIntermediateDirectories: true)
+        try script?.write(to: scripts.appendingPathComponent("check-prerequisites.mjs"), atomically: true, encoding: .utf8)
+        return mono
+    }
+
+    private func makeChecker(_ runner: FakeCommandRunner, monorepo: URL) -> EnvironmentChecker {
+        let checker = EnvironmentChecker(
+            monorepoPath: monorepo.path, loginPath: "/nonexistent/login", streamServicesPath: "/nonexistent/stream",
+            flavor: .standard, shell: runner, tools: ToolEnvironment(home: "/nonexistent/home")
+        )
+        checker.buildChecks()
+        return checker
+    }
+
+    /// The prerequisite check of a checkout from before the .env dump scripts.
+    private let oldPrerequisites = """
+        // PyJWT
+        const pyJwtOk = execQuiet('python3 -c "import jwt"') !== null;
+        if (!pyJwtOk) failures.push("PyJWT not installed");
+        """
+
+    /// The prerequisite check of a current checkout: it needs Python, and no package.
+    private let newPrerequisites = """
+        // Docker
+        const dockerOk = execQuiet("docker ps") !== null;
+        // python3 is needed for the hotel fetch.
+        const pythonOk = execQuiet("python3 --version") !== null;
+        """
+
+    /// No script of a current checkout imports jwt. The row would ask for a package
+    /// that nothing uses, so it is not shown and its command does not run.
+    func testACurrentCheckoutHasNoPyJWTRowAndRunsNoPyJWTCheck() async throws {
+        let mono = try makeCheckout(prerequisites: newPrerequisites)
+        defer { try? FileManager.default.removeItem(at: mono) }
+        let runner = FakeCommandRunner()
+        let checker = makeChecker(runner, monorepo: mono)
+
+        await checker.runAllChecks()
+
+        XCTAssertNil(checker.checks.first { $0.id == "python-jwt" })
+        XCTAssertFalse(runner.commands.contains { $0.contains("import jwt") })
+        XCTAssertFalse(EnvironmentChecker.checkoutNeedsPyJWT(monorepo: mono.path))
+
+        // Control: an old checkout has the row and runs its command.
+        let old = try makeCheckout(prerequisites: oldPrerequisites)
+        defer { try? FileManager.default.removeItem(at: old) }
+        let oldRunner = FakeCommandRunner()
+        let oldChecker = makeChecker(oldRunner, monorepo: old)
+        await oldChecker.runAllChecks()
+        XCTAssertEqual(status("python-jwt", in: oldChecker), .passing("Installed"))
+        XCTAssertTrue(oldRunner.commands.contains { $0.contains("python3 -c 'import jwt'") })
+        XCTAssertTrue(EnvironmentChecker.checkoutNeedsPyJWT(monorepo: old.path))
+    }
+
+    /// A folder that is not a monolith checkout, or one without the script, gets no row.
+    func testACheckoutWithoutThePrerequisiteScriptHasNoPyJWTRow() throws {
+        let mono = try makeCheckout(prerequisites: nil)
+        defer { try? FileManager.default.removeItem(at: mono) }
+
+        XCTAssertNil(makeChecker(FakeCommandRunner(), monorepo: mono).checks.first { $0.id == "python-jwt" })
+        XCTAssertFalse(EnvironmentChecker.checkoutNeedsPyJWT(monorepo: "/nonexistent/mono"))
+        XCTAssertFalse(EnvironmentChecker.checkoutNeedsPyJWT(monorepo: ""))
+    }
+
+    /// The row follows the checkout: after a pull that removes PyJWT from the script,
+    /// the next build of the checks drops the row.
+    func testThePyJWTRowGoesWhenTheCheckoutNoLongerAsksForIt() throws {
+        let mono = try makeCheckout(prerequisites: oldPrerequisites)
+        defer { try? FileManager.default.removeItem(at: mono) }
+        let checker = makeChecker(FakeCommandRunner(), monorepo: mono)
+        XCTAssertNotNil(checker.checks.first { $0.id == "python-jwt" })
+
+        try newPrerequisites.write(
+            to: mono.appendingPathComponent("scripts/db/check-prerequisites.mjs"), atomically: true, encoding: .utf8
+        )
+        checker.buildChecks()
+
+        XCTAssertNil(checker.checks.first { $0.id == "python-jwt" })
+        XCTAssertNotNil(checker.checks.first { $0.id == "node" })
+    }
+
+    /// On an old checkout a missing PyJWT warns that the database setup stops. It is optional,
+    /// so it does not block the wizard.
+    func testAMissingPyJWTWarnsAndDoesNotBlock() async throws {
+        let mono = try makeCheckout(prerequisites: oldPrerequisites)
+        defer { try? FileManager.default.removeItem(at: mono) }
+        let runner = FakeCommandRunner { call in
+            call.command.contains("import jwt") ? FakeCommandRunner.failed() : FakeCommandRunner.ok()
+        }
+        let checker = makeChecker(runner, monorepo: mono)
+
+        await checker.runAllChecks()
+
+        // The warning says that this checkout's database setup stops without PyJWT.
+        XCTAssertEqual(status("python-jwt", in: checker),
+                       .warning("Not installed — this checkout's database setup stops without it. Use Install PyJWT, or pull the monolith."))
+        XCTAssertFalse(checker.blockers.contains { $0.id == "python-jwt" })
+        XCTAssertFalse(checker.unresolved.contains { $0.id == "python-jwt" })
+    }
+
+    /// A Homebrew Python refuses a plain `pip install` (PEP 668). The fix tries the
+    /// user install first, then the same with the flag that a managed Python asks for.
+    func testThePyJWTFixRunsTheUserInstallThenTheManagedPythonInstall() async throws {
+        let command = "python3 -m pip install --user pyjwt || python3 -m pip install --user --break-system-packages pyjwt"
+        XCTAssertEqual(EnvironmentChecker.pyJWTFixCommand, command)
+
+        let mono = try makeCheckout(prerequisites: oldPrerequisites)
+        defer { try? FileManager.default.removeItem(at: mono) }
+        let runner = FakeCommandRunner()
+        let checker = makeChecker(runner, monorepo: mono)
+
+        await checker.fix("python-jwt")
+
+        let fix = try XCTUnwrap(runner.calls.first { $0.command == command }, "the fix ran: \(runner.commands)")
+        XCTAssertEqual(fix.timeout, EnvironmentChecker.installTimeout)
+        // The row is checked again after the fix.
+        XCTAssertTrue(try XCTUnwrap(runner.commands.last).contains("python3 -c 'import jwt'"))
+        XCTAssertEqual(status("python-jwt", in: checker), .passing("Installed"))
+    }
+
+    /// A fix that fails says so on the row, and the package is not called installed.
+    func testAFailedPyJWTFixSaysSo() async throws {
+        let mono = try makeCheckout(prerequisites: oldPrerequisites)
+        defer { try? FileManager.default.removeItem(at: mono) }
+        let checker = makeChecker(FakeCommandRunner { _ in FakeCommandRunner.failed() }, monorepo: mono)
+
+        await checker.fix("python-jwt")
+
+        XCTAssertEqual(status("python-jwt", in: checker), .failing("Fix failed (exit 1)"))
     }
 }
 

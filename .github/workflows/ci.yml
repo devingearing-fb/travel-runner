@@ -2,7 +2,8 @@ name: CI
 
 # Builds the app and runs the tests on every pull request and on every push to main.
 # The tests use fakes: they need no dev stack, no database and no sibling checkout.
-# Tests that read fb-travel-monolith skip themselves here, because it is not checked out.
+# Tests that read fb-travel-monolith read the pinned snapshot in Tests/Fixtures/monolith-snapshot.
+# The tests that run a monolith script need TR_INTEGRATION=1 and skip themselves here.
 
 on:
   pull_request:

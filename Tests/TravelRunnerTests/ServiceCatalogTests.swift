@@ -31,7 +31,7 @@ final class ServiceCatalogTests: XCTestCase {
         XCTAssertEqual(booking.cmd, ["pnpm", "dev"])
         XCTAssertEqual(booking.resolvedCwd, paths.bookingPortal)
         XCTAssertEqual(booking.probe?.url, "http://127.0.0.1:3002/api/health")
-        XCTAssertEqual(Set(booking.dependsOn), ["universal-login", "stripe"])
+        XCTAssertEqual(booking.dependsOn, ["universal-login"])
         XCTAssertEqual(partner.cmd, ["pnpm", "dev"])
         XCTAssertEqual(partner.resolvedCwd, paths.partnerPortal)
         XCTAssertEqual(partner.probe?.url, "http://127.0.0.1:3006/api/health")
@@ -66,7 +66,6 @@ final class ServiceCatalogTests: XCTestCase {
             try XCTUnwrap(levels.firstIndex(where: { $0.contains(id) }), id)
         }
         XCTAssertLessThan(try level("supabase"), try level("universal-login"))
-        XCTAssertLessThan(try level("stripe"), try level("travel-portal"))
         XCTAssertLessThan(try level("travel-portal"), try level("cache-apply-transport"))
         XCTAssertLessThan(try level("cache-apply-transport"), try level("capacity-contention"))
         XCTAssertLessThan(try level("capacity-contention"), try level("capacity-block-edit-race"))

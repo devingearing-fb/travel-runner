@@ -48,7 +48,11 @@ struct PreflightRunner: Sendable {
                 id: "node-version", name: "Node.js \u{2265} 22",
                 metadata: (nodeCwd(for: services)).map { ["cwd": $0] } ?? [:]
             ),
-            PreflightCheck(id: "stripe-auth", name: "Stripe CLI Auth"),
+            // The booking portal: the CLI uses the test key of its env.
+            PreflightCheck(
+                id: "stripe-auth", name: "Stripe CLI Auth",
+                metadata: services.first(where: { $0.id == "travel-portal" })?.resolvedCwd.map { ["cwd": $0] } ?? [:]
+            ),
         ]
 
         // `pnpm db:start` clones the backend baseline when there is no checkout of it.
@@ -127,12 +131,22 @@ struct PreflightRunner: Sendable {
                     fix: "Run node --version in a terminal to see what it waits for"
                 )
             }
-            let version = result.trimmedOutput
-            guard !version.isEmpty else {
-                return .failed(message: "Node.js not found", fix: "Install Node 22 via nvm or brew")
+            // A login profile can print lines first ("Now using node v22.3.0"): the
+            // version is the last line that is only a version.
+            guard let number = ToolVersion.parse(result.stdout) else {
+                let printed = result.trimmedOutput
+                if printed.isEmpty || result.exitCode == 127 {
+                    return .failed(message: "Node.js not found", fix: "Install Node 22 via nvm or brew")
+                }
+                // Something answered (nvm: "N/A version is not installed"): show what it said.
+                let lastLine = printed.components(separatedBy: .newlines).last ?? printed
+                return .failed(
+                    message: "node --version printed no version: \(lastLine)",
+                    fix: "Run node --version in the portal folder"
+                )
             }
-            let majorStr = version.dropFirst().split(separator: ".").first ?? ""
-            let major = Int(majorStr) ?? 0
+            let version = "v\(number)"
+            let major = EnvironmentChecker.major(of: number) ?? 0
             if major >= 22 {
                 return .passed(detail: version)
             } else if major >= 18 {
@@ -144,15 +158,25 @@ struct PreflightRunner: Sendable {
         case "stripe-auth":
             let hasStripe = await run("which stripe >/dev/null 2>&1").succeeded
             if !hasStripe { return .warning(message: "Not installed — Stripe will be skipped") }
-            let auth = await run("stripe balance retrieve >/dev/null 2>&1")
+            let key = StripeLauncher.resolve(bookingPortal: check.metadata["cwd"])
+            let auth = await shell.run(
+                StripeLauncher.authCheckCommand, environment: key.environment, timeout: Self.checkTimeout
+            )
             if auth.timedOut {
                 return .warning(
                     message: "\(Shell.timeoutText("stripe balance retrieve", after: Self.checkTimeout)) — Stripe will be skipped"
                 )
             }
-            return auth.succeeded
-                ? .passed(detail: "Authenticated")
-                : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
+            switch key.mode {
+            case .testKey(let source):
+                return auth.succeeded
+                    ? .passed(detail: "Test key from \(source)")
+                    : .warning(message: "Stripe did not accept STRIPE_SECRET_KEY from \(source), or there is no network — Stripe will be skipped; import a current .env")
+            case .login:
+                return auth.succeeded
+                    ? .passed(detail: "Authenticated")
+                    : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
+            }
 
         case "backend-baseline":
             return await backendBaseline(root: check.metadata["root"] ?? "")

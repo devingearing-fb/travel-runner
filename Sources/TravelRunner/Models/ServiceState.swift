@@ -42,6 +42,9 @@ final class ServiceState {
     var capturedArtifactSummary: String? {
         capturedArtifact.map { "Webhook secret captured (…\($0.suffix(4)))" }
     }
+    /// How the service runs, for the row: the Stripe CLI says whether it uses the
+    /// test key or the developer's login. Never a secret value.
+    var modeNote: String? = nil
     var failureTimestamps: [Date] = []
     var isCircuitBroken: Bool = false
     /// Why the service is failed or skipped, and the fix. Nil while it starts or runs.
