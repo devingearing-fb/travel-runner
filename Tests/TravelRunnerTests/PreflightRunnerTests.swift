@@ -100,16 +100,19 @@ final class PreflightRunnerTests: XCTestCase {
              "failed: node --version printed no version: nvm: N/A version is not installed | fix: \(fix)"),
             ("a Node that prints nothing", FakeCommandRunner.ok(""),
              "failed: Node.js not found | fix: \(fix)"),
+            // A hang tries once more with the limit of Health before it fails the start.
             ("a Node that hangs", FakeCommandRunner.timedOut,
-             "failed: node --version did not answer in 3 s | fix: \(fix)"),
+             "failed: node --version did not answer in 20 s | fix: \(fix)"),
         ]
         for row in rows {
             let (preflight, shell, checker) = self.preflight(["node --version": row.answer], monorepo: monorepo)
             let check = try XCTUnwrap(preflight.allChecks(for: []).first { $0.id == "node" }, row.name)
             let result = await preflight.run(check: check)
             XCTAssertEqual(describe(result), row.expected, row.name)
-            XCTAssertEqual(shell.calls.map(\.cwd), [monorepo], row.name)
-            XCTAssertEqual(shell.calls.map(\.timeout), [CheckRegistry.preflightLimit], row.name)
+            let limits = row.answer.timedOut
+                ? [CheckRegistry.preflightLimit, EnvironmentChecker.checkTimeout] : [CheckRegistry.preflightLimit]
+            XCTAssertEqual(shell.calls.map(\.cwd), limits.map { _ in monorepo }, row.name)
+            XCTAssertEqual(shell.calls.map(\.timeout), limits, row.name)
             // The Health row shows the same result.
             let health = checker.checks.first { $0.id == "node" }?.status
             XCTAssertEqual(health.map { CheckRegistry.preflightResult($0, severity: .blocksStart, fixLabel: "How to install") }.map(describe),

@@ -453,9 +453,10 @@ final class EnvironmentSupervisor {
         bootstrapOnce()
         do {
             try applyConfig()
-            // Every setup check runs once at launch, so the Status banner is current.
+            // The fast setup checks run once at launch, so the Status banner is
+            // current. The network checks wait until Health opens.
             if configHost.startsWatchers, let checker = healthChecker {
-                Task { await checker.runAllChecks() }
+                Task { await checker.runFastChecks() }
             }
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this

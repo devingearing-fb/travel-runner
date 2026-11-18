@@ -602,17 +602,17 @@ final class ToolEnvironmentTests: XCTestCase {
         XCTAssertEqual(missing.trimmingCharacters(in: .whitespacesAndNewlines), "")
     }
 
-    /// A check command that hangs held the start for ever. Now it fails by name,
-    /// after the limit of the preflight.
+    /// A check command that hangs held the start for ever. Now it fails by name:
+    /// after the limit of the preflight, and once more after the limit of Health.
     func testAPreflightCheckThatTimesOutFailsAndSaysSo() async {
         let runner = FakeCommandRunner { _ in FakeCommandRunner.timedOut }
         let preflight = await registryPreflight(runner)
 
         let node = await preflight.run(check: PreflightCheck(id: "node", name: "Node", metadata: [PreflightRunner.registryKey: "1"]))
         guard case .failed(let message, _) = node else { return XCTFail("\(node)") }
-        XCTAssertEqual(message, "node --version did not answer in 3 s")
+        XCTAssertEqual(message, "node --version did not answer in 20 s")
 
-        XCTAssertTrue(runner.calls.allSatisfy { $0.timeout == .seconds(3) }, "each check command has a timeout")
+        XCTAssertEqual(runner.calls.map(\.timeout), [.seconds(3), .seconds(20)], "each check command has a timeout")
     }
 
     /// The wait for a container runtime that does not come up (10 checks, 2 s

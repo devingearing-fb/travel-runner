@@ -399,7 +399,8 @@ final class EnvironmentCheckerTests: XCTestCase {
     }
 
     /// A check that runs for the preflight stops its commands after 3 s; the same
-    /// check in Health keeps 20 s.
+    /// check in Health keeps 20 s. A check that blocks the start and times out
+    /// tries once more with the limit of Health before it fails the start.
     func testThePreflightLimitIsOnlyForThePreflight() async {
         let runner = FakeCommandRunner { _ in FakeCommandRunner.timedOut }
         let checker = makeChecker(runner)
@@ -407,13 +408,82 @@ final class EnvironmentCheckerTests: XCTestCase {
         let result = await checker.runForPreflight("node")
 
         guard case .failed(let message, let fix) = result else { return XCTFail("\(result)") }
-        XCTAssertEqual(message, "node --version did not answer in 3 s")
+        XCTAssertEqual(message, "node --version did not answer in 20 s")
         XCTAssertEqual(fix, "Open Health → How to install")
-        XCTAssertEqual(runner.calls.map(\.timeout), [CheckRegistry.preflightLimit])
+        XCTAssertEqual(runner.calls.map(\.timeout), [CheckRegistry.preflightLimit, EnvironmentChecker.checkTimeout])
 
-        // Control: Health keeps its own limit.
+        // Control: Health keeps its own limit and runs once.
         await checker.runAllChecks()
         XCTAssertEqual(status("node", in: checker), .failing("node --version did not answer in 20 s"))
+    }
+
+    /// Finding: a cold login shell after wake took more than 3 s, and the start
+    /// failed although Node was fine. The second try with the Health limit passes.
+    func testASlowShellDoesNotFailTheNodeCheckOfAStart() async {
+        let runner = FakeCommandRunner { call in
+            call.timeout == CheckRegistry.preflightLimit ? FakeCommandRunner.timedOut : FakeCommandRunner.ok("v22.3.0\n")
+        }
+        let checker = makeChecker(runner)
+
+        let result = await checker.runForPreflight("node")
+
+        guard case .passed(let detail) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(detail, "v22.3.0")
+        XCTAssertEqual(runner.calls.map(\.timeout), [CheckRegistry.preflightLimit, EnvironmentChecker.checkTimeout])
+        XCTAssertEqual(status("node", in: checker), .passing("v22.3.0"))
+    }
+
+    /// Control: a Node that is not found or too old fails the start at once,
+    /// with no second try.
+    func testAMissingNodeFailsTheStartWithoutASecondTry() async {
+        let missing = FakeCommandRunner { _ in FakeCommandRunner.failed(127) }
+        let result = await makeChecker(missing).runForPreflight("node")
+        guard case .failed(let message, _) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(message, "Node.js not found")
+        XCTAssertEqual(missing.calls.count, 1)
+
+        let old = FakeCommandRunner { _ in FakeCommandRunner.ok("v20.11.1\n") }
+        let oldResult = await makeChecker(old).runForPreflight("node")
+        guard case .failed(let oldMessage, _) = oldResult else { return XCTFail("\(oldResult)") }
+        XCTAssertEqual(oldMessage, "v20.11.1 — need 22+")
+        XCTAssertEqual(old.calls.count, 1)
+    }
+
+    /// Control: a timeout of a check that does not block the start only warns,
+    /// so it does not try again.
+    func testATimeoutOfACheckThatDoesNotBlockTheStartIsNotRetried() async {
+        let runner = FakeCommandRunner { _ in FakeCommandRunner.timedOut }
+        let checker = makeChecker(runner)
+
+        let result = await checker.runForPreflight("stripe-cli")
+
+        guard case .warning = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(runner.calls.map(\.timeout), [CheckRegistry.preflightLimit])
+    }
+
+    /// The launch runs only the fast checks: nothing asks the network, Stripe or
+    /// pnpm. Health still runs every check when it opens.
+    func testTheLaunchRunsOnlyTheFastChecks() async {
+        let runner = FakeCommandRunner()
+        let checker = makeChecker(runner)
+
+        await checker.runFastChecks()
+
+        XCTAssertNil(checker.lastRunAt, "Health still runs every check when it opens")
+        for check in checker.checks {
+            if check.cost == .slow {
+                XCTAssertEqual(check.status, .pending, check.id)
+            } else {
+                XCTAssertNotEqual(check.status, .pending, check.id)
+            }
+        }
+        XCTAssertFalse(runner.commands.contains { $0.contains("stripe balance") }, "\(runner.commands)")
+        XCTAssertFalse(runner.commands.contains { $0.contains("pnpm") }, "\(runner.commands)")
+
+        // Control: the full run asks them.
+        await checker.runAllChecks()
+        XCTAssertNotNil(checker.lastRunAt)
+        XCTAssertFalse(checker.checks.contains { $0.status == .pending })
     }
 
     // MARK: - Commands of the checks

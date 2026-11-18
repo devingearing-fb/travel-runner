@@ -458,20 +458,37 @@ final class EnvironmentChecker {
     /// after `CheckRegistry.preflightLimit`. Its Health row shows the result too.
     func runForPreflight(_ id: String) async -> PreflightResult {
         guard let check = checks.first(where: { $0.id == id }) else { return .warning(message: "Not checked") }
-        let status = await CheckRegistry.$commandLimit.withValue(CheckRegistry.preflightLimit) {
-            await runCheck(id)
+        var outcome = await CheckRegistry.$commandLimit.withValue(CheckRegistry.preflightLimit) {
+            await checkOutcome(id)
         }
-        check.status = status
-        return CheckRegistry.preflightResult(status, severity: check.severity, fixLabel: check.fixLabel)
+        // A login shell can be slow after wake or with a heavy .zprofile. A timeout
+        // is not a missing or old tool: a check that blocks the start tries once
+        // more with the limit of Health before it fails the start.
+        if outcome.timedOut, check.severity == .blocksStart {
+            outcome = await checkOutcome(id)
+        }
+        check.status = outcome.status
+        return CheckRegistry.preflightResult(outcome.status, severity: check.severity, fixLabel: check.fixLabel)
     }
 
     func runAllChecks() async {
         lastRunAt = clock.date()
+        // Each round reads the hotel dump once, for its row and for the booking .env row.
+        hotelCache = nil
+        await run(checks)
+    }
+
+    /// The fast checks only: no network and no script that takes seconds. The
+    /// launch runs these so the Status banner is current. `lastRunAt` stays nil,
+    /// so Health runs every check when it opens.
+    func runFastChecks() async {
+        await run(checks.filter { $0.cost == .fast })
+    }
+
+    private func run(_ checks: [HealthCheck]) async {
         for check in checks {
             check.status = .pending
         }
-        // Each round reads the hotel dump once, for its row and for the booking .env row.
-        hotelCache = nil
         await withTaskGroup(of: Void.self) { group in
             for check in checks {
                 group.addTask { [self] in
@@ -571,12 +588,17 @@ final class EnvironmentChecker {
     /// not "not installed" and not "not found". A required check fails; an
     /// optional one warns.
     private func runCheck(_ id: String) async -> CheckStatus {
+        await checkOutcome(id).status
+    }
+
+    /// The status of one check, and whether a command of it timed out.
+    private func checkOutcome(_ id: String) async -> (status: CheckStatus, timedOut: Bool) {
         do {
-            return try await status(of: id)
+            return (try await status(of: id), false)
         } catch {
             let label = (error as? CheckTimedOut)?.label ?? "The check"
             let isRequired = checks.first { $0.id == id }?.isRequired ?? true
-            return Self.timedOutStatus(label: label, isRequired: isRequired)
+            return (Self.timedOutStatus(label: label, isRequired: isRequired), true)
         }
     }
 

@@ -151,7 +151,7 @@ final class StartAllTests: XCTestCase {
              "Preflight failed — Node.js 22+: Node.js not found"),
             ("a Node that hangs",
              Setup(node: FakeCommandRunner.timedOut),
-             "Preflight failed — Node.js 22+: node --version did not answer in 3 s"),
+             "Preflight failed — Node.js 22+: node --version did not answer in 20 s"),
             ("a Node that is too old",
              Setup(node: FakeCommandRunner.ok("v16.20.2\n")),
              "Preflight failed — Node.js 22+: v16.20.2 — need 22+"),

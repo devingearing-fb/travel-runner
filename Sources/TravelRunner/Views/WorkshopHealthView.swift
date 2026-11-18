@@ -10,6 +10,8 @@ struct WorkshopHealthView: View {
         VStack(alignment: .leading, spacing: 0) {
             if let checker = supervisor.healthChecker {
                 SetupStep2View(checker: checker, embedded: true, onBack: {}, onComplete: { _ in })
+                    // New paths give a new checker: its checks run when it appears.
+                    .id(ObjectIdentifier(checker))
                     .frame(maxHeight: .infinity)
             } else {
                 Text("Set up the repos in Settings first.")
