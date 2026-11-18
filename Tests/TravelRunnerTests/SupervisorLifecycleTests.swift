@@ -780,8 +780,8 @@ final class SupervisorLifecycleTests: XCTestCase {
     }
 
     /// A daemon that crashes once while it starts and then hangs has two waiters: the
-    /// one of the first launch and the one of the automatic restart. They file one
-    /// issue, and it describes the process that runs now.
+    /// one of the first launch and the one of the automatic restart. Only the
+    /// restart's waiter gives a verdict (L1): one issue, about the process that runs now.
     func testACrashThenAHangFilesOneProbeTimeoutThatSaysAlive() async throws {
         let issues = workDir.appendingPathComponent("issues")
         try FileManager.default.createDirectory(at: issues, withIntermediateDirectories: true)
@@ -794,21 +794,21 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.restartService("flaky")
         let restarted = await waitUntil(20) { self.state("flaky").restartCount == 1 && self.state("flaky").pid != nil }
         XCTAssertTrue(restarted, "restart count \(state("flaky").restartCount)")
-        // Both waiters end: the first launch's files the issue, and the restart's adds to it.
+        // The restart's waiter files the issue; the first launch's waiter files nothing.
         func probeTimeouts() async -> [DebugTracker.Issue] {
             await supervisor.listDebugIssues().filter { $0.trigger == "probe_timeout" }
         }
         let deadline = Date().addingTimeInterval(40)
-        while await probeTimeouts().first?.recurrenceCount != 1, Date() < deadline {
+        while await probeTimeouts().isEmpty, Date() < deadline {
             try await Task.sleep(for: .milliseconds(200))
         }
-        // A third capture, or a second issue, would come soon after.
+        // A second capture, or a second issue, would come soon after.
         try await Task.sleep(for: .seconds(3))
 
         let found = await probeTimeouts()
         XCTAssertEqual(found.count, 1, "\(found.map(\.errorMessage))")
         XCTAssertEqual(found.first?.errorMessage, "flaky did not pass its startup probe in 10s (process alive: yes)")
-        XCTAssertEqual(found.first?.recurrenceCount, 1, "the second waiter adds to the first issue")
+        XCTAssertEqual(found.first?.recurrenceCount, 0, "the old waiter gives no verdict")
     }
 
     /// Supabase: `supabase start` ends with code 0 when the stack is up. The stack
@@ -2111,8 +2111,9 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(calls.kills, [])
     }
 
-    /// A daemon that ends with code 0 has no process, and nothing starts it again.
-    /// The environment showed "starting" with no end.
+    /// A daemon that ends with code 0 gets one automatic restart (decision 22). When
+    /// it ends again it has no process, and nothing starts it again. The
+    /// environment showed "starting" with no end.
     func testACleanExitOfADaemonGivesDegradedNotStarting() async throws {
         let quitter = ServiceDefinition(
             id: "quitter", name: "quitter", cmd: ["sh", "-c", "echo quitter-start; sleep 2; exit 0"], cwd: workDir.path,
@@ -2124,17 +2125,19 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(ready, "quitter is \(state("quitter").phase.rawValue)")
         XCTAssertEqual(supervisor.health, .healthy)
 
-        let ended = await waitUntil(15) { self.state("quitter").phase != .running }
-        XCTAssertTrue(ended)
-        // Long enough for an automatic restart, if there was one.
+        let banner = EnvironmentSupervisor.cleanExitMessage("quitter")
+        let ended = await waitUntil(25) { self.supervisor.lastError == banner }
+        XCTAssertTrue(ended, supervisor.lastError ?? "nil")
+        // Long enough for another automatic restart, if there was one.
         try await Task.sleep(for: .seconds(4))
 
         XCTAssertEqual(supervisor.health, .degraded)
         XCTAssertEqual(state("quitter").phase, .failed)
         XCTAssertEqual(state("quitter").exitCode, 0)
         let lines = await logLines("quitter")
+        XCTAssertTrue(lines.contains("[travel-runner] quitter exited (code 0) — restarting it once"), lines.joined(separator: "\n"))
         XCTAssertTrue(lines.contains("[travel-runner] quitter exited (code 0) — not restarted"), lines.joined(separator: "\n"))
-        XCTAssertEqual(lines.filter { $0 == "quitter-start" }.count, 1, "it is not restarted")
+        XCTAssertEqual(lines.filter { $0 == "quitter-start" }.count, 2, "one automatic restart, then none")
         XCTAssertTrue(crashes.isEmpty, "a clean exit is not a crash: \(crashes)")
         // The header shows its banner only with a text.
         XCTAssertEqual(supervisor.lastError, "quitter exited (code 0) and was not restarted — restart it from its row")
@@ -2143,8 +2146,11 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// The banner of a clean exit asks for a restart from the row. The restart
     /// clears it, and it does not clear another error.
     func testARestartFromTheRowClearsTheCleanExitBanner() async throws {
-        let marker = workDir.appendingPathComponent("second-run").path
-        let script = "if [ -f '\(marker)' ]; then exec sleep 60; else touch '\(marker)'; sleep 2; exit 0; fi"
+        // The first two runs end cleanly: the start and its one automatic restart.
+        let first = workDir.appendingPathComponent("first-run").path
+        let second = workDir.appendingPathComponent("second-run").path
+        let script = "if [ -f '\(second)' ]; then exec sleep 60; elif [ -f '\(first)' ]; then touch '\(second)'; sleep 2; exit 0; "
+            + "else touch '\(first)'; sleep 2; exit 0; fi"
         let quitter = ServiceDefinition(
             id: "quitter", name: "quitter", cmd: ["sh", "-c", script], cwd: workDir.path,
             probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
@@ -2152,7 +2158,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         try load(quitter)
         supervisor.restartService("quitter")
         let banner = EnvironmentSupervisor.cleanExitMessage("quitter")
-        let ended = await waitUntil(20) { self.state("quitter").phase == .failed && self.supervisor.lastError == banner }
+        let ended = await waitUntil(30) { self.state("quitter").phase == .failed && self.supervisor.lastError == banner }
         XCTAssertTrue(ended, supervisor.lastError ?? "nil")
 
         supervisor.restartService("quitter")
@@ -2226,7 +2232,8 @@ final class SupervisorLifecycleTests: XCTestCase {
             lines.joined(separator: "\n")
         )
         XCTAssertFalse(lines.contains("stripe-start"), "the process must not start")
-        XCTAssertEqual(feedback, ["Stripe CLI skipped — see its log"])
+        // The toast says why, not only "see its log".
+        XCTAssertEqual(feedback, ["Stripe CLI skipped — " + StripeLauncher.unavailableCause(.login(reason: ""))])
         XCTAssertEqual(supervisor.health, .healthy, "Stripe is optional")
 
         let skips = await events("stripe_skip", in: tracker)
@@ -2803,6 +2810,203 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.siblingActiveServices = { [] }
         supervisor.secretRegistryPorts = 0...0
         return shell
+    }
+
+    // MARK: - L1: dependency gating, start outcomes, one serial stack operation
+
+    private func service(
+        _ id: String, _ script: String, type: ServiceType = .oneshot, dependsOn: [String] = []
+    ) -> ServiceDefinition {
+        ServiceDefinition(
+            id: id, name: id, cmd: ["sh", "-c", script], cwd: workDir.path, probe: nil, type: type,
+            restart: type == .daemon ? .onFailure : .never, dependsOn: dependsOn, env: nil, phase: nil, reuseIfRunning: nil
+        )
+    }
+
+    private func webDependingOn(_ dependencies: [String]) -> ServiceDefinition {
+        let web = daemon("web", webServer)
+        return ServiceDefinition(
+            id: web.id, name: web.name, cmd: web.cmd, cwd: web.cwd, probe: web.probe, type: .daemon,
+            restart: .onFailure, dependsOn: dependencies, env: nil, phase: nil, reuseIfRunning: nil
+        )
+    }
+
+    private func startAllEnded() async -> Bool {
+        await waitUntil(40) { self.supervisor.startupBeganAt == nil && self.supervisor.health != .starting }
+    }
+
+    /// The four gating findings: Start All went on into the services that need a
+    /// failed one, and a later failure replaced the first error. Now they wait,
+    /// and the first error is the headline.
+    func testAFailedDependencyHoldsItsDependentsWaitingAndTheFirstErrorWins() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        try supervisor.loadServices([
+            service("base", "exit 3"),
+            webDependingOn(["base"]),
+            service("next", "true", dependsOn: ["web"]),
+            service("ok", "true"),
+            service("late", "exit 4", dependsOn: ["ok"]),
+        ])
+
+        supervisor.startAll(skipPreflight: true)
+
+        let ended = await startAllEnded()
+        XCTAssertTrue(ended)
+        XCTAssertEqual(state("base").phase, .failed)
+        XCTAssertEqual(state("late").phase, .failed, "a service that needs no failed one still starts")
+        XCTAssertEqual(state("web").phase, .waiting)
+        XCTAssertNil(state("web").lastStarted, "no process starts for a waiting service")
+        XCTAssertEqual(state("web").condition?.kind, .waitingForDependency("base"))
+        XCTAssertEqual(state("web").condition?.headline, "Waiting for base (failed)")
+        XCTAssertEqual(state("next").phase, .waiting)
+        XCTAssertEqual(Self.listeners(on: port), [])
+        XCTAssertEqual(supervisor.health, .degraded)
+        XCTAssertEqual(supervisor.lastError, "base failed: base exited with non-zero status", "the first error wins")
+        XCTAssertEqual(supervisor.rootCauseServiceID, "base")
+        XCTAssertEqual(supervisor.rootCauseDescription, "2 services are waiting for it.")
+    }
+
+    /// A waiting service starts by itself when its dependency comes up.
+    func testAWaitingServiceStartsWhenItsDependencyIsUp() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        let marker = workDir.appendingPathComponent("base-ran").path
+        try supervisor.loadServices([
+            service("base", "if [ -f '\(marker)' ]; then exit 0; else touch '\(marker)'; exit 3; fi"),
+            webDependingOn(["base"]),
+        ])
+        var feedback: [String] = []
+        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+
+        supervisor.startAll(skipPreflight: true)
+        let ended = await startAllEnded()
+        XCTAssertTrue(ended)
+        XCTAssertEqual(state("web").phase, .waiting)
+
+        supervisor.restartService("base")
+
+        let up = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(up, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(state("base").phase, .completed)
+        XCTAssertNil(state("web").condition)
+        let lines = await logLines("base")
+        XCTAssertTrue(lines.contains("[travel-runner] base is up — starting web"), lines.joined(separator: "\n"))
+        XCTAssertEqual(feedback, ["base restarted"])
+        XCTAssertEqual(supervisor.health, .healthy)
+    }
+
+    /// "Retry failed" restarted the healthy services too. Now it starts only what
+    /// does not run: the port check and the port cleanup leave a running service.
+    func testRetryFailedLeavesAHealthyServiceAlone() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        let marker = workDir.appendingPathComponent("broken-ran").path
+        try supervisor.loadServices([
+            daemon("web", webServer),
+            service("broken", "if [ -f '\(marker)' ]; then exit 0; else touch '\(marker)'; exit 3; fi"),
+        ])
+
+        supervisor.startAll(skipPreflight: true)
+        var ended = await startAllEnded()
+        XCTAssertTrue(ended)
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertEqual(state("broken").phase, .failed)
+        let pid = try XCTUnwrap(state("web").pid)
+        let started = state("web").lastStarted
+
+        supervisor.retryStartAll()
+
+        ended = await waitUntil(40) { self.state("broken").phase == .completed && self.supervisor.startupBeganAt == nil }
+        XCTAssertTrue(ended, "broken is \(state("broken").phase.rawValue), error: \(supervisor.lastError ?? "none")")
+        XCTAssertEqual(state("web").pid, pid, "the healthy service keeps its process")
+        XCTAssertEqual(state("web").lastStarted, started)
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertEqual(try ownListener(), pid)
+        XCTAssertFalse(supervisor.preflightChecks.contains { $0.id == "port-\(port)" }, "its port is its own")
+        XCTAssertEqual(supervisor.health, .healthy)
+        let lines = await logLines("web")
+        XCTAssertEqual(lines.filter { $0.contains("Serving HTTP") }.count, 1, lines.joined(separator: "\n"))
+    }
+
+    /// Start pressed during a Stop was dropped. Now it runs after the stop.
+    func testAStartDuringAStopRunsAfterTheStop() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        try supervisor.loadServices([daemon("web", webServer)])
+        supervisor.startAll(skipPreflight: true)
+        let healthy = await waitUntil(40) { self.supervisor.health == .healthy }
+        XCTAssertTrue(healthy)
+        let firstPid = state("web").pid
+
+        supervisor.stopAll()
+        supervisor.startAll(skipPreflight: true)
+
+        let again = await waitUntil(40) {
+            self.supervisor.health == .healthy && self.state("web").phase == .running
+                && self.state("web").pid != firstPid && self.supervisor.startupBeganAt == nil
+        }
+        XCTAssertTrue(again, "health \(supervisor.health), web \(state("web").phase.rawValue)")
+        XCTAssertEqual(supervisor.currentPhase, .running)
+        XCTAssertEqual(Self.listeners(on: port).count, 1)
+    }
+
+    /// A restart of a stopped stack said "restarted" and started nothing. It says
+    /// what to do now.
+    func testARestartOfAStoppedStackSaysPressStart() async throws {
+        try supervisor.loadServices([daemon("web", webServer)])
+        XCTAssertEqual(supervisor.health, .stopped)
+        var feedback: [(String, Bool)] = []
+        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+
+        supervisor.restartService("web")
+
+        let done = await waitUntil(10) { !feedback.isEmpty && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(done)
+        XCTAssertEqual(feedback.map(\.0), ["Not started — the stack is stopped. Press Start."])
+        XCTAssertEqual(feedback.map(\.1), [false])
+        XCTAssertNil(state("web").lastStarted)
+        XCTAssertEqual(Self.listeners(on: port), [])
+    }
+
+    /// The waiter of a process that crashed timed out while its automatic
+    /// restart still started, and marked the new process FAILED.
+    func testAnOldWaiterDoesNotFailTheReplacement() async throws {
+        let marker = workDir.appendingPathComponent("first-run").path
+        let script = "if [ -f '\(marker)' ]; then sleep 4; exec \(webServer.joined(separator: " ")); "
+            + "else touch '\(marker)'; sleep 0.5; exit 1; fi"
+        try load(daemon("flaky", ["sh", "-c", script], probeTimeout: 8))
+        var feedback: [String] = []
+        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+
+        supervisor.restartService("flaky")
+
+        var firstPid: Int32?
+        var failedReplacement = false
+        let up = await waitUntil(40) {
+            let state = self.state("flaky")
+            if firstPid == nil { firstPid = state.pid }
+            if let pid = state.pid, pid != firstPid, state.phase == .failed { failedReplacement = true }
+            return firstPid != nil && state.pid != firstPid && self.settled("flaky")
+        }
+        XCTAssertTrue(up, "flaky is \(state("flaky").phase.rawValue), error: \(supervisor.lastError ?? "none")")
+        XCTAssertFalse(failedReplacement, "the old waiter marked the new process failed")
+        XCTAssertEqual(feedback, ["flaky restarted"])
+    }
+
+    /// A oneshot that hangs ran for ever. It is stopped at its deadline and says so.
+    func testAOneshotPastItsDeadlineIsStoppedAndSaysSo() async throws {
+        supervisor.oneshotDeadline = .seconds(1)
+        try load(service("slow", "echo slow-start; exec sleep 30"))
+
+        supervisor.restartService("slow")
+
+        let failed = await waitUntil(15) { self.state("slow").phase == .failed && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(failed, "slow is \(state("slow").phase.rawValue)")
+        let text = "slow did not finish in 1 s and was stopped. See its log."
+        XCTAssertEqual(supervisor.lastError, text)
+        let lines = await logLines("slow")
+        XCTAssertTrue(lines.contains("[travel-runner] " + text), lines.joined(separator: "\n"))
+        let pid = try XCTUnwrap(state("slow").pid)
+        let gone = await waitUntil(5) { kill(pid, 0) != 0 }
+        XCTAssertTrue(gone, "the process still runs")
+        XCTAssertEqual(EnvironmentSupervisor.durationText(.seconds(15 * 60)), "15 min")
     }
 
     /// Start All needs only a loaded graph: no services.json.
@@ -3412,7 +3616,10 @@ final class SupervisorLifecycleTests: XCTestCase {
         try Data().write(to: supabase.appendingPathComponent("seed.sql"))
 
         supervisor.runDbSetupStep("verify-data")
-        let done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        // The step is a stack operation until its last refresh ends.
+        let done = await waitUntil(30) {
+            !self.supervisor.dbResetRunning && self.supervisor.stackIsIdle
+        }
         XCTAssertTrue(done)
 
         let pipeline = try XCTUnwrap(supervisor.dbSetupPipeline, supervisor.lastError ?? "no pipeline")

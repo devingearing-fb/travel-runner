@@ -18,9 +18,9 @@ struct ServiceRow: View {
             || state.modeNote != nil
     }
 
-    /// Why a skipped or failed service is in that phase. A running one has none.
+    /// Why a skipped, failed or waiting service is in that phase. A running one has none.
     private var rowCondition: ServiceCondition? {
-        state.phase == .skipped || state.phase == .failed ? state.condition : nil
+        state.phase == .skipped || state.phase == .failed || state.phase == .waiting ? state.condition : nil
     }
 
     private var isActionInFlight: Bool {

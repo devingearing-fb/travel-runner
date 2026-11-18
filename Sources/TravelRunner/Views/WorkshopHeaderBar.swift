@@ -317,10 +317,19 @@ struct WorkshopHeaderBar: View {
             .tint(.green)
             .controlSize(.small)
         } else if supervisor.health == .degraded && supervisor.currentPhase == .idle {
-            Button("Retry") { supervisor.retryStartAll() }
-                .buttonStyle(.borderedProminent)
-                .tint(.orange)
-                .controlSize(.small)
+            // "Retry failed" starts only what does not run; the menu restarts everything.
+            Menu {
+                Button("Restart everything") { supervisor.restartEverything() }
+            } label: {
+                Text("Retry failed")
+            } primaryAction: {
+                supervisor.retryStartAll()
+            }
+            .menuStyle(.button)
+            .fixedSize()
+            .buttonStyle(.borderedProminent)
+            .tint(.orange)
+            .controlSize(.small)
         } else if supervisor.health == .starting {
             HStack(spacing: 4) {
                 ProgressView().controlSize(.small)
