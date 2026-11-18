@@ -6016,6 +6016,26 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains(EnvironmentSupervisor.branchRestartLine("feature", "web")), "\(lines)")
     }
 
+    /// A branch change on a stopped stack starts nothing, but the runner version
+    /// banner reads the new branch at once, not at the next start.
+    func testABranchChangeOnAStoppedStackRefreshesTheRunnerVersionBanner() async throws {
+        try load(daemon("supabase", ["sleep", "60"]))
+        supervisor.serviceStates["anchor"]?.phase = .stopped
+        supervisor.health = .stopped
+        supervisor.runnerVersion = "0.13.4"
+        try writeManifest(minVersion: "0.14.0")
+        XCTAssertNil(supervisor.compatibilityNotice, "negative control: nothing read the new branch yet")
+
+        await supervisor.applyBranchChanges([GitBranchWatcher.Change(
+            serviceIDs: ["supabase"], branch: "feature", changedFiles: ["package.json"]
+        )])
+
+        XCTAssertEqual(supervisor.compatibilityNotice?.text, Self.tooOldText)
+        XCTAssertNil(state("supabase").pid)
+        XCTAssertNil(state("supabase").lastStarted)
+        XCTAssertEqual(supervisor.health, .stopped)
+    }
+
     /// The DB setup runs the pipeline that the test gives: no manifest, no seed
     /// scenario. The health check of a step runs in the shell of the supervisor.
     func testADbSetupRunsThePipelineOfTheFactory() async throws {
