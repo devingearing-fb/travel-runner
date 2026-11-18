@@ -30,7 +30,7 @@ Every route answers JSON. A route never says ok when nothing ran:
 | 202 | The action runs now, or after the stack operation before it | `{"accepted":true,"ok":true}`; Start All during a stop adds `"state":"queued_after_stop"` |
 | 400 | A parameter or a body the route cannot read (`?lines=many`, a body that is not a JSON object), or an unknown profile | `{"error":"…","ok":false}`; an unknown profile adds `known_profiles` |
 | 404 | No such service, step, issue, log or route | `{"error":"unknown service 'x'","known":[…],"ok":false}`; a step has `known_steps` |
-| 409 | The action cannot run now: the stack is stopped or stopping, the same action is queued, a start runs, a DB setup runs (`"a DB setup run is in progress (step: <name>)"`), a database switch is refused, issue capture is off, or the runner is too old for the checkout (`runner_too_old`) | `{"error":"…","ok":false}` |
+| 409 | The action cannot run now: the stack is stopped or stopping, the same action is queued, a start runs, a DB setup runs (`"a DB setup run is in progress (step: <name>)"`) or already waits, a database switch is refused, issue capture is off, the runner is quitting, or the runner is too old for the checkout (`runner_too_old`) | `{"error":"…","ok":false}` |
 | 422 | A reset with no valid seed scenario | `{"error":"…","ok":false}` |
 
 Read `error` and act on it: a 409 for a stopped stack says `POST /api/start-all first`.
@@ -89,6 +89,10 @@ curl -s http://localhost:19900/api/status | python3 -m json.tool
 | `STOPPED` | All services stopped | Call start-all |
 
 `health_reason` is there when the health has a reason: the failed service and its headline, the services that are off ("OK · Stripe webhooks off"), or a refused start ("Not started — 2 checks failed").
+
+### GET /api/preflight
+
+Runs the start checks that change nothing (the fast setup checks of Health, the ports, the folders) and gives each result: `{"configured":true,"checks":[{"id":"…","name":"…","status":"passed|warning|failed|pending","detail":"…","fix":"…"}]}`. `fix` is there only for a failed check that has one. It starts nothing, so it is safe to call on a stopped stack.
 
 ### GET /api/health
 
@@ -215,6 +219,8 @@ Gracefully stops all services in reverse dependency order.
 curl -s -X POST http://localhost:19900/api/stop-all
 ```
 
+Response: 202 `{"accepted":true,"ok":true}`; the stop runs after the answer. A Start All or a DB setup that waits behind it is dropped. Poll `/api/status` until `health` is `STOPPED`.
+
 ### POST /api/toggle-lan
 
 Toggles LAN network mode. When enabled:
@@ -325,7 +331,7 @@ curl -s -X POST http://localhost:19900/api/db-setup \
 
 **Profiles:** `full` (all steps), `reset` (skip event contracts), `fast` (skip hotels + contracts), `migrate` (apply migrations only, never resets). A profile the branch's manifest does not define runs nothing and answers 400 with `known_profiles`.
 
-No body, or `{}`, runs `reset`. A body that is not a JSON object, or a `profile` that is not a string, answers 400 and runs nothing. A DB setup that already runs answers 409 (`"a DB setup run is in progress (step: <name>)"`); no valid seed scenario answers 422. Accepted runs answer 202; follow them with `GET /api/db-setup/status`.
+No body, or `{}`, runs `reset`. A body that is not a JSON object, or a `profile` that is not a string, answers 400 and runs nothing. A DB setup that already runs answers 409 (`"a DB setup run is in progress (step: <name>)"`); no valid seed scenario answers 422. Accepted runs answer 202; follow them with `GET /api/db-setup/status`. During a start or a stop the setup waits for it and still answers 202; a second setup while one waits answers 409 (`"A database setup already waits for the running start or step."`), so two resets never queue.
 
 **After a reset** a step can ask for services to restart (`##db:restart:` in `scripts/db/README.md`): when Sequin's replication slot is gone, the runner restarts `stream-db-setup`, then `stream-sequin`, if they run, once the run has passed.
 
@@ -391,9 +397,17 @@ curl -s -X POST http://localhost:19900/api/db-setup/step/verify-data
 
 **Step IDs:** `check-prerequisites`, `start-supabase`, `reset-database`, `load-hotels`, `copy-event-data` (optional), `verify-data`
 
+### GET /api/debug/status
+
+Whether issue capture is on, the open count and the issue folder:
+
+```json
+{ "enabled": true, "folder": "~/Library/Application Support/Travel Runner/issues", "open_issues": 2 }
+```
+
 ### GET /api/debug/issues
 
-List open debug-tracking issues (no query parameters; closed issues are only on disk). Returns `[]` if issue capture is off (it is on by default; Settings has the switch).
+List open debug-tracking issues (no query parameters; closed issues are only on disk). Returns `[]` if issue capture is off (it is on by default; Settings has the switch); `GET /api/debug/status` tells that apart from no open issues.
 
 ```bash
 curl -s http://localhost:19900/api/debug/issues | python3 -m json.tool
@@ -496,7 +510,7 @@ Same as above with `partner-portal` (port 3006). If it is `SKIPPED`, it is not i
 
 ### "Diagnosing with debug-tracking"
 
-1. `GET /api/debug/issues` — check for auto-captured issues first
+1. `GET /api/debug/issues` — check for auto-captured issues first (`GET /api/debug/status` says whether capture is on)
 2. If an issue exists, read it for pre-captured context (logs, state, git branches)
 3. After fixing the root cause, close it: `POST /api/debug/issues/close/{id}`
 4. Issues persist on disk if the API is unavailable: `~/Library/Application Support/Travel Runner/issues/open/`, or `~/Desktop/debug-tracking/open/` on a Mac that has a config there

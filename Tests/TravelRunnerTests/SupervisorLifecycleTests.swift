@@ -5906,6 +5906,164 @@ final class SupervisorLifecycleTests: XCTestCase {
         guard case .json = webLog else { return XCTFail("the log of a service is \(webLog)") }
     }
 
+    /// Finding diagnostics-db-step-logs-not-reachable: `/api/logs` lists each DB
+    /// step's log next to the services, and `/api/logs/<id>` reads it. The health
+    /// and services routes give the reason of a failed service.
+    func testTheReadRoutesListDbStepLogsAndGiveTheReasons() async throws {
+        try load(daemon("web", webServer))
+        await supervisor.logStore.append(
+            serviceID: "db-setup-load-hotels", entry: LogEntry(stream: .stderr, text: "COPY failed")
+        )
+
+        let idsJSON = await supervisor.logIDsJSON()
+        let ids = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(idsJSON.utf8)) as? [String: [String]]
+        )["ids"]
+        XCTAssertEqual(ids?.first, supervisor.sortedServiceIDs.first)
+        XCTAssertTrue(ids?.contains("db-setup-load-hotels") == true, "\(ids ?? [])")
+        let log = await supervisor.apiLogs("db-setup-load-hotels", lines: 5)
+        XCTAssertEqual(log, .json(#"[{"stream":"stderr","text":"COPY failed"}]"#))
+
+        state("web").phase = .failed
+        state("web").condition = ServiceCondition(kind: .failed, headline: "web exited with code 1.", since: Date())
+        supervisor.recalculateHealth()
+        let health = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(supervisor.healthJSON().utf8)) as? [String: String]
+        )
+        XCTAssertEqual(health["health"], "DEGRADED")
+        XCTAssertTrue(health["health_reason"]?.contains("web") == true, "\(health)")
+
+        let rows = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(supervisor.servicesJSON().utf8)) as? [[String: Any]]
+        )
+        let web = try XCTUnwrap(rows.first { $0["id"] as? String == "web" })
+        XCTAssertEqual(web["phase"] as? String, "FAILED")
+        XCTAssertEqual(web["in_profile"] as? Bool, true)
+        XCTAssertNotNil(web["reason"], "\(web)")
+    }
+
+    /// Decision 21: `/api/debug/issues` keeps its array, which is empty both when
+    /// capture is off and when no issue is open. `/api/debug/status` tells them apart.
+    func testTheDebugStatusTellsCaptureOffFromNoIssues() async throws {
+        supervisor.debugTracker = nil
+        var json = await supervisor.debugStatusJSON()
+        var status = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(status["enabled"] as? Bool, false)
+        XCTAssertEqual(status["open_issues"] as? Int, 0)
+
+        let tracker = captureIssues()
+        // One open issue is one folder in `open/`.
+        try FileManager.default.createDirectory(
+            atPath: (await tracker.folderPath as NSString).appendingPathComponent("open/20261118T000000_manual"),
+            withIntermediateDirectories: true
+        )
+        json = await supervisor.debugStatusJSON()
+        status = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(status["enabled"] as? Bool, true)
+        XCTAssertEqual(status["open_issues"] as? Int, 1)
+        XCTAssertEqual(status["folder"] as? String, DiagnosticsSnapshot.tilde(
+            workDir.appendingPathComponent("issues").path, home: NSHomeDirectory()
+        ))
+    }
+
+    /// Finding tests-release-stop-start-races: Start All during a stop says it waits,
+    /// and a second one says a start is already on its way.
+    func testStartAllSaysWhetherItWaitsOrIsAlreadyStarting() async throws {
+        guard case .refused = supervisor.apiStartAll() else { return XCTFail("a start with no services is not refused") }
+        try load(daemon("web", webServer))
+
+        let stop = supervisor.stopAll()
+        XCTAssertEqual(supervisor.apiStartAll(), .queuedAfterStop)
+        XCTAssertEqual(supervisor.apiStartAll(), .alreadyStarting)
+        // A second stop drops the start that waited: a new start is accepted again.
+        await supervisor.stopAll().value
+        await stop.value
+        let idle = await waitUntil(10) { self.supervisor.stackIsIdle }
+        XCTAssertTrue(idle)
+        XCTAssertEqual(supervisor.health, .stopped)
+    }
+
+    /// Finding seed-api-silent-noop: a DB setup that waits for the stack counts as a
+    /// run. A second request is refused until it ran or was dropped, so two resets
+    /// never queue behind each other.
+    func testASecondDbSetupWhileOneWaitsIsRefused() async throws {
+        try loadSupabase()
+        var runs = 0
+        supervisor.dbResetAction = { _ in
+            runs += 1
+            return true
+        }
+
+        let stop = supervisor.stopAll()
+        XCTAssertEqual(supervisor.apiRunDbSetup(profile: "reset"), .accepted)
+        XCTAssertEqual(supervisor.apiRunDbSetup(profile: "reset"), .alreadyQueued(EnvironmentSupervisor.dbSetupAlreadyWaitsText))
+        XCTAssertEqual(supervisor.apiRunDbSetupStep("verify-data"), .alreadyQueued(EnvironmentSupervisor.dbSetupAlreadyWaitsText))
+        await stop.value
+        let ran = await waitUntil(10) { runs == 1 && !self.supervisor.dbResetRunning && self.supervisor.stackIsIdle }
+        XCTAssertTrue(ran)
+        XCTAssertEqual(supervisor.dbSetupsWaiting, 0)
+
+        // A setup that a later stop drops also stops waiting.
+        let second = supervisor.stopAll()
+        XCTAssertEqual(supervisor.apiRunDbSetup(profile: "reset"), .accepted)
+        await supervisor.stopAll().value
+        await second.value
+        let dropped = await waitUntil(10) { self.supervisor.stackIsIdle }
+        XCTAssertTrue(dropped)
+        XCTAssertEqual(supervisor.dbSetupsWaiting, 0)
+        XCTAssertEqual(runs, 1)
+        XCTAssertEqual(supervisor.apiCancelDbSetup(), .refused("No database setup is running."))
+    }
+
+    /// With a manifest, an unknown profile is a 400 with the known ones, an unknown
+    /// step a 404 with the known steps, and a reset with no seed scenario a 422.
+    /// Each runs nothing.
+    func testTheDbRoutesNameWhatTheManifestKnows() async throws {
+        try loadSupabase()
+        let folder = workDir.appendingPathComponent("scripts/db")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let manifest = #"""
+        {"version":4,"steps":[
+          {"id":"reset-database","command":"echo reset"},
+          {"id":"load-hotels","command":"echo hotels"},
+          {"id":"verify-data","command":"echo '##db:status:done'"}
+        ],"profiles":{"reset":["reset-database","load-hotels","verify-data"],"fast":["reset-database","verify-data"]}}
+        """#
+        try Data(manifest.utf8).write(to: folder.appendingPathComponent("manifest.json"))
+        supervisor.dbResetAction = nil
+        supervisor.dbPipelineFactory = nil
+
+        XCTAssertEqual(supervisor.apiRunDbSetup(profile: "nonsense"), .unknownProfile("nonsense", known: ["fast", "reset"]))
+        let known = ["reset-database", "load-hotels", "verify-data"]
+        XCTAssertEqual(supervisor.apiRunDbSetupStep("nope"), .unknownStep("nope", known: known))
+        XCTAssertEqual(supervisor.apiRetryDbSetup(from: "nope"), .unknownStep("nope", known: known))
+        // No supabase/seed.sql and no scenarios in the manifest: no valid scenario.
+        guard case .invalidScenario = supervisor.apiRunDbSetup(profile: "reset") else {
+            return XCTFail("a reset with no seed scenario is not a 422")
+        }
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertNil(supervisor.dbSetupPipeline)
+    }
+
+    /// An action whose runner is gone says so; it never answers 202 for nothing.
+    func testAnActionAfterTheRunnerIsGoneIsRefused() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "SupervisorLifecycleTests-\(UUID().uuidString)"))
+        var gone: EnvironmentSupervisor? = EnvironmentSupervisor(
+            userDefaults: defaults, tools: .shared,
+            logSink: LogFileSink(directory: workDir.appendingPathComponent("gone-logs"), version: "9.9.9")
+        )
+        weak let watched = gone
+        let actions = try XCTUnwrap(gone).controlActions()
+        gone = nil
+        try XCTSkipIf(watched != nil, "the supervisor is still held elsewhere")
+        let start = await actions.startAll()
+        XCTAssertEqual(start, .runnerQuitting)
+        let restart = await actions.restartService("web", false)
+        XCTAssertEqual(restart, .runnerQuitting)
+        let stop = await actions.stopAll()
+        XCTAssertEqual(stop, .runnerQuitting)
+    }
+
     /// A DB setup that began while the stack was idle, then a Stop All in the same
     /// turn of the main actor: the stop drops the queued run, and the DB controls
     /// unlock. Before, `dbResetRunning` stayed true and every later setup was refused.

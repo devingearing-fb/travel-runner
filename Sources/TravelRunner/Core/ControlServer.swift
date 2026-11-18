@@ -76,6 +76,9 @@ actor ControlServer {
         let dbSetupStatus: @Sendable () async -> String
         let dbSetupRunStep: @Sendable (String) async -> ControlResult
         let debugListIssues: @Sendable () async -> String
+        /// Whether issue capture is on, the open count and the folder. The list
+        /// route keeps its array shape, so capture that is off shows here.
+        let debugStatus: @Sendable () async -> String
         let debugCapture: @Sendable (String) async -> ControlResult
         let debugCloseIssue: @Sendable (String, String?) async -> ControlResult
         let toggleDbMode: @Sendable () async -> ControlResult
@@ -247,6 +250,10 @@ actor ControlServer {
             return await actions.dbSetupRunStep(Self.pathValue(request, after: 3)).response
         }
 
+        await server.appendRoute("GET /api/debug/status") { _ in
+            Self.json(await actions.debugStatus())
+        }
+
         await server.appendRoute("GET /api/debug/issues") { _ in
             Self.json(await actions.debugListIssues())
         }
@@ -389,6 +396,8 @@ enum ControlResult: Error, Equatable, Sendable {
 
     static let stackStoppedText = "The stack is stopped. POST /api/start-all first."
     static let stackStoppingText = "The stack is stopping. Wait for it to stop, then POST /api/start-all."
+    /// 409: the runner quits, and nothing ran.
+    static let runnerQuitting = ControlResult.refused("The runner is quitting.")
 
     var statusCode: HTTPStatusCode {
         switch self {

@@ -21,16 +21,21 @@ After fixing something:
 ## Checking availability
 
 ```bash
-curl -sf http://localhost:19900/api/debug/issues > /dev/null 2>&1 && echo "available" || echo "not available"
+curl -s http://localhost:19900/api/debug/status
+# {"enabled":true,"folder":"~/Library/Application Support/Travel Runner/issues","open_issues":2}
 ```
 
-If not available, travel-runner may not be running. Fall back to reading on-disk files directly (see On-disk structure below). Issue capture is on by default. It is off only when `config.json` in the issue folder has `"enabled": false` (the "Issue capture" switch in Settings writes it); then the list endpoint returns `[]` and close returns `{"ok":false,"error":"debug tracking not enabled"}`.
+If nothing answers, travel-runner may not be running. Fall back to reading on-disk files directly (see On-disk structure below). Issue capture is on by default. It is off only when `config.json` in the issue folder has `"enabled": false` (the "Issue capture" switch in Settings writes it); then `enabled` is `false`, the list endpoint returns `[]`, and capture and close answer 409 `{"error":"issue capture is off","ok":false}`. An empty list with `enabled: true` means no issue is open.
 
 **The issue folder.** A Mac that has `~/Desktop/debug-tracking/config.json` (the author's Mac) keeps `~/Desktop/debug-tracking`. Every other Mac uses `~/Library/Application Support/Travel Runner/issues`. Settings → Issue capture → Show Folder opens it. The paths below say `~/Desktop/debug-tracking`; put the Application Support folder in its place when there is no Desktop config.
 
 ## Endpoints
 
-The API has exactly three debug routes: list open issues, create an issue, and close an issue. There is no detail, logs, or filter endpoint — read those from disk.
+The API has four debug routes: the capture status, list open issues, create an issue, and close an issue. There is no detail, logs, or filter endpoint — read those from disk.
+
+### GET /api/debug/status
+
+Whether issue capture is on (`enabled`), how many issues are open (`open_issues`), and the issue folder (`folder`, with `~`). Use it to tell "capture is off" from "no open issues": the list is `[]` in both cases.
 
 ### GET /api/debug/issues
 

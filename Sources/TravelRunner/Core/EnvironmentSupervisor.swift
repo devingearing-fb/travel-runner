@@ -1405,23 +1405,24 @@ final class EnvironmentSupervisor {
             getDiagnostics: { [weak self] in await self?.diagnosticsJSON() ?? "{}" },
             getEvents: { [weak self] in await self?.eventsJSON() ?? "[]" },
             listLogs: { [weak self] in await self?.logIDsJSON() ?? "{}" },
-            getLogs: { [weak self] id, lines in await self?.apiLogs(id, lines: lines) ?? .notFound("no runner") },
-            restartService: { [weak self] id, stack in await self?.apiRestart(id, stopsStack: stack) ?? .accepted },
-            clearCacheRestart: { [weak self] id in await self?.apiClearCacheRestart(id) ?? .accepted },
-            startAll: { [weak self] in await self?.apiStartAll() ?? .accepted },
+            getLogs: { [weak self] id, lines in await self?.apiLogs(id, lines: lines) ?? .runnerQuitting },
+            restartService: { [weak self] id, stack in await self?.apiRestart(id, stopsStack: stack) ?? .runnerQuitting },
+            clearCacheRestart: { [weak self] id in await self?.apiClearCacheRestart(id) ?? .runnerQuitting },
+            startAll: { [weak self] in await self?.apiStartAll() ?? .runnerQuitting },
             stopAll: { [weak self] in
-                await self?.stopAll()
+                guard let self else { return .runnerQuitting }
+                await self.stopAll()
                 return .accepted
             },
-            toggleLan: { [weak self] in await self?.apiToggleLan() ?? .accepted },
-            restartCascade: { [weak self] id in await self?.apiRestartCascade(id) ?? .accepted },
+            toggleLan: { [weak self] in await self?.apiToggleLan() ?? .runnerQuitting },
+            restartCascade: { [weak self] id in await self?.apiRestartCascade(id) ?? .runnerQuitting },
             dbResetBlock: { [weak self] in await self?.resetBlockJSON() },
-            dbReset: { [weak self] in await self?.apiRunDbSetup(profile: "reset") ?? .accepted },
-            dbSetupRun: { [weak self] profile in await self?.apiRunDbSetup(profile: profile) ?? .accepted },
-            dbSetupRetry: { [weak self] stepId in await self?.apiRetryDbSetup(from: stepId) ?? .accepted },
-            dbSetupCancel: { [weak self] in await self?.apiCancelDbSetup() ?? .accepted },
+            dbReset: { [weak self] in await self?.apiRunDbSetup(profile: "reset") ?? .runnerQuitting },
+            dbSetupRun: { [weak self] profile in await self?.apiRunDbSetup(profile: profile) ?? .runnerQuitting },
+            dbSetupRetry: { [weak self] stepId in await self?.apiRetryDbSetup(from: stepId) ?? .runnerQuitting },
+            dbSetupCancel: { [weak self] in await self?.apiCancelDbSetup() ?? .runnerQuitting },
             dbSetupStatus: { [weak self] in await self?.dbSetupStatusJSON() ?? "{}" },
-            dbSetupRunStep: { [weak self] stepId in await self?.apiRunDbSetupStep(stepId) ?? .accepted },
+            dbSetupRunStep: { [weak self] stepId in await self?.apiRunDbSetupStep(stepId) ?? .runnerQuitting },
             debugListIssues: { [weak self] in
                 guard let self, let tracker = await self.debugTracker else { return "[]" }
                 let issues: [[String: String]] = await tracker.listOpenIssues()
@@ -1429,11 +1430,12 @@ final class EnvironmentSupervisor {
                    let str = String(data: data, encoding: .utf8) { return str }
                 return "[]"
             },
-            debugCapture: { [weak self] description in await self?.apiCaptureIssue(description) ?? .accepted },
+            debugStatus: { [weak self] in await self?.debugStatusJSON() ?? "{}" },
+            debugCapture: { [weak self] description in await self?.apiCaptureIssue(description) ?? .runnerQuitting },
             debugCloseIssue: { [weak self] id, resolution in
-                await self?.apiCloseIssue(id, resolution: resolution) ?? .notFound("issue not found")
+                await self?.apiCloseIssue(id, resolution: resolution) ?? .runnerQuitting
             },
-            toggleDbMode: { [weak self] in await self?.apiToggleDbMode() ?? .accepted },
+            toggleDbMode: { [weak self] in await self?.apiToggleDbMode() ?? .runnerQuitting },
             getProfile: { [weak self] in
                 guard let self else { return "{}" }
                 let (name, members) = await (self.profile.rawValue, self.profileMembers.sorted())
@@ -1446,7 +1448,7 @@ final class EnvironmentSupervisor {
                    let str = String(data: data, encoding: .utf8) { return str }
                 return "{}"
             },
-            setProfile: { [weak self] name in await self?.apiSetProfile(name) ?? .done }
+            setProfile: { [weak self] name in await self?.apiSetProfile(name) ?? .runnerQuitting }
         )
     }
 
@@ -1493,6 +1495,21 @@ final class EnvironmentSupervisor {
         encoder.outputFormatting = [.sortedKeys]
         guard let data = try? encoder.encode(events) else { return "[]" }
         return makeRedactor().redact(String(decoding: data, as: UTF8.self))
+    }
+
+    /// `GET /api/debug/status`: whether issue capture is on, how many issues are
+    /// open, and the issue folder. `/api/debug/issues` stays an array, which is
+    /// also empty while capture is off: this route tells the two apart.
+    func debugStatusJSON() async -> String {
+        let tracker = debugTracker ?? issueTracker
+        var dict: [String: Any] = [
+            "enabled": debugTracker != nil,
+            "open_issues": await debugTracker?.openIssueCount() ?? 0,
+        ]
+        if let folder = await tracker?.folderPath {
+            dict["folder"] = DiagnosticsSnapshot.tilde(folder, home: NSHomeDirectory())
+        }
+        return Self.jsonString(dict)
     }
 
     /// The log ids: each service, then each id with lines in the store (DB steps).
@@ -1597,6 +1614,7 @@ final class EnvironmentSupervisor {
             let step: DbSetupStep? = steps.first { active.contains($0.status) }
             return .runActive(step: step?.name ?? "starting")
         }
+        if dbSetupsWaiting > 0 { return .alreadyQueued(Self.dbSetupAlreadyWaitsText) }
         if supabaseCwd == nil { return .refused("Cannot find supabase service cwd in config") }
         return nil
     }
@@ -3230,6 +3248,10 @@ final class EnvironmentSupervisor {
     nonisolated static let dbSetupWaitsText = "The database step waits for the running start or step to finish"
     nonisolated static let dbSetupDroppedText = "Stop all cancelled the database step that waited"
 
+    /// DB setups that wait for a start, a stop or another operation.
+    private(set) var dbSetupsWaiting = 0
+    nonisolated static let dbSetupAlreadyWaitsText = "A database setup already waits for the running start or step."
+
     /// What became of a DB setup that a person asked for.
     enum DbSetupQueueOutcome: Equatable, Sendable {
         /// The checks passed and the setup runs.
@@ -3247,7 +3269,17 @@ final class EnvironmentSupervisor {
     private func queueDbSetup(_ begin: @escaping @MainActor () -> DbSetupRun?) -> DbSetupQueueOutcome {
         guard stackIsIdle else {
             onActionFeedback?(Self.dbSetupWaitsText, true)
-            enqueueStackOperation(dropped: Self.dbSetupDroppedText) { [self] in
+            // The control API refuses a second setup while this one waits.
+            dbSetupsWaiting += 1
+            final class Waiting { var value = true }
+            let waiting = Waiting()
+            let stopWaiting = { [self] in
+                guard waiting.value else { return }
+                waiting.value = false
+                dbSetupsWaiting -= 1
+            }
+            enqueueStackOperation(dropped: Self.dbSetupDroppedText, finally: stopWaiting) { [self] in
+                stopWaiting()
                 guard let run = begin() else { return }
                 _ = await completeDbSetup(run)
             }

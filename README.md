@@ -125,6 +125,7 @@ When running, travel-runner exposes an HTTP API on `http://localhost:19900` (it 
 | `POST` | `/api/db-setup/step/{stepId}` | Run a single step |
 | `POST` | `/api/db-setup/cancel` | Cancel a running pipeline |
 | `GET` | `/api/db-setup/status` | Pipeline state with per-step progress (a fraction from 0 to 1) |
+| `GET` | `/api/debug/status` | Whether issue capture is on, the open count and the issue folder |
 | `GET` | `/api/debug/issues` | List open debug-tracking issues |
 | `POST` | `/api/debug/issues` | Capture an issue; body `{"description": "..."}` |
 | `POST` | `/api/debug/issues/close/{id}` | Close an issue; optional body `{"resolution": "..."}` |

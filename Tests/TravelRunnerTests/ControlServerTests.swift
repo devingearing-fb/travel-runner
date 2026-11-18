@@ -43,6 +43,7 @@ final class ControlServerTests: XCTestCase {
             dbSetupStatus: { "{}" },
             dbSetupRunStep: { _ in onDbChange("step"); return .accepted },
             debugListIssues: { "[]" },
+            debugStatus: { #"{"enabled":false,"open_issues":0}"# },
             debugCapture: { _ in .accepted },
             debugCloseIssue: { _, _ in .done },
             toggleDbMode: { .accepted },
@@ -317,6 +318,7 @@ final class ControlServerTests: XCTestCase {
             dbSetupStatus: { calls.add("db-setup-status"); return #"{"a":"db-setup-status"}"# },
             dbSetupRunStep: { act("db-setup-step \($0)") },
             debugListIssues: { calls.add("issues"); return #"{"a":"issues"}"# },
+            debugStatus: { calls.add("debug-status"); return #"{"a":"debug-status"}"# },
             debugCapture: { act("capture \($0)") },
             debugCloseIssue: { id, resolution in act("close \(id) \(resolution ?? "nil")") },
             toggleDbMode: { act("toggle-db-mode") },
@@ -377,6 +379,7 @@ final class ControlServerTests: XCTestCase {
             ("POST", "/api/db-setup/cancel", nil, 202, accepted, ["db-setup-cancel"]),
             ("GET", "/api/db-setup/status", nil, 200, #"{"a":"db-setup-status"}"#, ["db-setup-status"]),
             ("GET", "/api/debug/issues", nil, 200, #"{"a":"issues"}"#, ["issues"]),
+            ("GET", "/api/debug/status", nil, 200, #"{"a":"debug-status"}"#, ["debug-status"]),
             ("POST", "/api/debug/issues", #"{"description":"portal hangs"}"#, 202, accepted, ["capture portal hangs"]),
             ("POST", "/api/debug/issues", nil, 202, accepted, ["capture Manual capture via API"]),
             ("POST", "/api/debug/issues/close/2026/abc", #"{"resolution":"fixed"}"#, 202, accepted,
@@ -438,6 +441,8 @@ final class ControlServerTests: XCTestCase {
             "close gone nil": .notFound("issue not found"),
             "set-profile nonsense": .unknownProfile("nonsense", known: ["booking", "partner", "both", "full"]),
             "logs nope 50": .notFound("no log 'nope'"),
+            "stop-all": .runnerQuitting,
+            "db-setup-retry load-hotels": .alreadyQueued("A database setup already waits for the running start or step."),
         ]
         let (_, port) = try await startOnFreePort(actions: Self.recording(calls, answer: { answers[$0] }))
         let rows: [(method: String, path: String, body: String?, code: Int, answer: String)] = [
@@ -465,6 +470,9 @@ final class ControlServerTests: XCTestCase {
             ("POST", "/api/profile/nonsense", nil, 400,
              #"{"error":"unknown profile 'nonsense'","known_profiles":["booking","partner","both","full"],"ok":false}"#),
             ("GET", "/api/logs/nope", nil, 404, #"{"error":"no log 'nope'","ok":false}"#),
+            ("POST", "/api/stop-all", nil, 409, #"{"error":"The runner is quitting.","ok":false}"#),
+            ("POST", "/api/db-setup/retry/load-hotels", nil, 409,
+             #"{"error":"A database setup already waits for the running start or step.","ok":false}"#),
         ]
         for row in rows {
             let name = "\(row.method) \(row.path)"
