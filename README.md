@@ -2,7 +2,43 @@
 
 macOS menu bar app that orchestrates the Fastbreak travel booking local development environment.
 
-## Quick Start
+## Install (teammates)
+
+Do these in order on a new Mac. The fb-travel-monolith README ("Once per machine") has the same prerequisites.
+
+1. **Install the prerequisites.** The commands use [Homebrew](https://brew.sh):
+   ```bash
+   brew install node@22                       # Node 22; or: nvm install 22 (the monolith has .nvmrc)
+   echo 'export PATH="/opt/homebrew/opt/node@22/bin:$PATH"' >> ~/.zshrc   # node@22 is keg-only; skip with nvm
+   export PATH="/opt/homebrew/opt/node@22/bin:$PATH"                     # same, for this terminal
+   npm install -g corepack && corepack enable pnpm   # Homebrew's Node has no corepack; nvm's Node 22 does
+   brew install --cask orbstack               # Docker; or Docker Desktop. Open it once.
+   brew install python                        # Python 3 for the database setup; the Xcode python3 stub does not work
+   brew install stripe/stripe-cli/stripe      # optional, for payment webhooks
+   ```
+   Then check out `fb-travel-monolith` and `fb-amateur-universal-login`, set the GitHub Packages token (`pnpm config set --location=user "//npm.pkg.github.com/:_authToken" "$FB_TOOLKIT_TOKEN"`), and run `pnpm install` in the monolith and `npm install` in universal login. In a new terminal, `node -v` says v22 or newer, `pnpm -v` says 10.x, and `docker info` answers. Tools from nvm, fnm, Volta or mise are fine: the runner reads your `~/.zshrc` to find them.
+2. **Download Travel Runner.** Get `TravelRunner-<version>.zip` from the [latest release](https://github.com/devingearing-fb/travel-runner/releases/latest). It runs on Apple Silicon Macs.
+3. **Move it to /Applications.** Unzip it and move `TravelRunner.app` to `/Applications` before you open it. Opened from Downloads, macOS runs a read-only copy that cannot update, and the runner shows a banner that says to move it.
+4. **Find it in the menu bar.** The app has no Dock icon. Click its menu-bar icon to show or hide the window. Control-Shift-T does the same; from other apps it works only after you allow Travel Runner in System Settings > Privacy & Security > Accessibility.
+5. **Run the wizard.** It opens on the first launch. Drop your Codebases folder on it, or browse to each checkout: `fb-travel-monolith` is required, universal login too; stream-services and travel-load-test are optional. **Check Environment** then runs each check. A failed check has a fix button or a command to copy. **Re-check All** runs them again.
+6. **Bring in the two shared `.env` files.** The booking and partner apps each need `apps/<app>/.env` with the shared dev values. On the Environment Check (later: Settings → Reconfigure Repos…), use **Import…** on the booking and partner rows for a file a teammate sent you, or **Pull from Doppler** if you have Doppler access. The old file is kept as `.env.bak-<date>`. The runner never stores these values.
+7. **Press Start.** Pick a profile in Settings (`booking`, `partner` or `both`) and click **Start**. The first Start pulls the Supabase images, builds the local database and downloads the hotel catalog (about 285 MB), so it takes several minutes, more on a slow network. Later starts are much faster. The menu-bar dot turns green when every service answers.
+8. **Something failed?** See [Troubleshooting](#troubleshooting) and [Something broke](#something-broke).
+
+### Troubleshooting
+
+| What you see | What to do |
+|---|---|
+| A check says node or pnpm was not found | Open a new terminal and run `node -v` and `pnpm -v`. If they work there, press **Re-check All**: the runner reads your shell again. Diagnostics shows where each tool was found. |
+| Docker or OrbStack does not answer | Open OrbStack (or Docker Desktop) and wait until it is up, then press **Retry**. The runner waits 120 s for a runtime it opens. |
+| `pnpm install` fails with 401 for `@fastbreak-amateur/fb-toolkit` | The GitHub Packages token is missing or old. Use **Set token** on the registry check. |
+| The booking or partner `.env` check fails | Import the file a teammate sent you, or **Pull from Doppler**. `pnpm env:check` in the monolith names the missing keys. |
+| Folder access fails | macOS refused the runner a folder. Use **Grant access in System Settings**, then press **Re-check All**. |
+| "Travel Runner is already running from …" | Two copies fight over the same ports. Quit the other one, or use the one in `/Applications`. |
+| A database step fails | The step shows its error and its log. Use its button, then **Report** (below). |
+| The hotkey does nothing in other apps | Allow Travel Runner in System Settings > Privacy & Security > Accessibility. |
+
+## Developer quick start
 
 ```bash
 ./build.sh --run
@@ -162,7 +198,7 @@ No test starts two real copies. Check these by hand in a built app before a rele
 - "Quit" in the alert leaves the services and the ports of the first copy up.
 - With `TRAVEL_RUNNER_SMOKE=1`, the second copy shows no alert: it prints the message and exits with code 75.
 
-Releases: see [RELEASING.md](RELEASING.md). A release goes to the canary channel first (`./release.sh <version>`), then to everyone (`./release.sh --promote <version>`). `scripts/smoke.sh <App.app>` starts a built app with an empty home folder and checks that it answers.
+Releases: see [RELEASING.md](RELEASING.md). A release goes to the canary channel first (`./release.sh <version>`), then to everyone (`./release.sh --promote <version>`). `scripts/smoke.sh <App.app>` starts a built app with an empty home folder and checks that it answers. `scripts/clean-shell-check.sh [monolith]` runs the monolith's first database step with only the tools of the install steps above; `release.sh` refuses to publish unless it and `swift test` pass.
 
 ## Tech Stack
 

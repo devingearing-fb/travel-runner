@@ -27,10 +27,13 @@ set -euo pipefail
 # of the fixed release "hackathon-appcast", which each hackathon release replaces.
 #
 # The script first makes sure that the release can finish (signing identity, notary
-# access, GitHub access, a clean tree that is on the remote), then runs the tests.
+# access, GitHub access, a clean tree that is on the remote), then runs the tests and
+# scripts/clean-shell-check.sh: the first database step of the monolith must pass with
+# only the README's tools. The monolith is TR_MONOLITH_DIR, or fb-travel-monolith
+# (fb-travel-monolith-hackathon for the hackathon app) next to this repo.
 # After the build it runs scripts/smoke.sh on the app: a release that cannot start on
 # a clean Mac stops here, before it is notarized.
-# SKIP_TESTS=1 skips the tests, for a --draft only.
+# SKIP_TESTS=1 skips the tests and the clean-shell check, for a --draft only.
 #
 # The appcast item carries the release notes, which Sparkle shows in its update
 # window: the subjects of the commits since the last full release, or the lines of
@@ -251,6 +254,12 @@ fi
 # ── Rollback: build the source of an older tag as a new version ─────────────
 # The build runs in a separate worktree of that tag. This checkout is not changed.
 SMOKE_SCRIPT="$SCRIPT_DIR/scripts/smoke.sh"
+CLEAN_SHELL_SCRIPT="$SCRIPT_DIR/scripts/clean-shell-check.sh"
+if [ "$FLAVOR" = "hackathon" ]; then
+    MONOLITH_DIR="${TR_MONOLITH_DIR:-$SCRIPT_DIR/../fb-travel-monolith-hackathon}"
+else
+    MONOLITH_DIR="${TR_MONOLITH_DIR:-$SCRIPT_DIR/../fb-travel-monolith}"
+fi
 if [ -n "$ROLLBACK_TAG" ]; then
     git rev-parse --verify --quiet "refs/tags/$ROLLBACK_TAG" >/dev/null || fail "There is no tag $ROLLBACK_TAG."
     ROLLBACK_DIR="$(mktemp -d)/travel-runner-$ROLLBACK_TAG"
@@ -316,6 +325,12 @@ if [ "${SKIP_TESTS:-0}" != "1" ]; then
         fail "Tests failed. Fix them. (SKIP_TESTS=1 works for a --draft only.)"
     fi
     rm -f "$TEST_LOG"
+
+    # A teammate's Mac has only the README's tools. Pull dev and run pnpm install in
+    # the monolith first, so the check reads the scripts that teammates get.
+    echo "  Running the clean-shell check..."
+    "$CLEAN_SHELL_SCRIPT" "$MONOLITH_DIR" \
+        || fail "The clean-shell check failed. A teammate's first Start fails the same way. Fix it first."
 fi
 echo "  ✓ Ready to release"
 
