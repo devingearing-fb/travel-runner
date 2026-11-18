@@ -19,11 +19,12 @@ final class HealthSummaryTests: XCTestCase {
     ]
 
     private func compute(
-        _ services: [HealthSummary.Service], startInFlight: Bool = false, refusal: String? = nil,
-        dbSetupFailure: String? = nil
+        _ services: [HealthSummary.Service], startInFlight: Bool = false, restarting: Set<String> = [],
+        refusal: String? = nil, dbSetupFailure: String? = nil
     ) -> HealthSummary {
         HealthSummary.compute(HealthSummary.Input(
-            services: services, startInFlight: startInFlight, refusal: refusal, dbSetupFailure: dbSetupFailure
+            services: services, startInFlight: startInFlight, restarting: restarting, refusal: refusal,
+            dbSetupFailure: dbSetupFailure
         ))
     }
 
@@ -58,6 +59,27 @@ final class HealthSummaryTests: XCTestCase {
         XCTAssertEqual(summary.reason, "Not started — 2 checks failed")
         // The wire keeps the four strings: a refused start stays DEGRADED there.
         XCTAssertEqual(summary.status.rawValue, "DEGRADED")
+    }
+
+    /// A row restart still works after a refused start. Then the services tell the truth.
+    func testARefusalNoLongerAppliesOnceAServiceRunsOrFails() {
+        let refusal = "Not started — 2 checks failed"
+        let running = compute(
+            [service("supabase", .running), service("booking-portal", .pending)], refusal: refusal
+        )
+        XCTAssertFalse(running.notStarted)
+        XCTAssertEqual(running.status, .healthy)
+        XCTAssertEqual(running.reason, "1 stopped: Booking Portal")
+
+        let failed = compute(
+            [service("supabase", .pending),
+             service("booking-portal", .failed, headline: "Booking Portal exited with code 1.")],
+            refusal: refusal
+        )
+        XCTAssertFalse(failed.notStarted)
+        XCTAssertEqual(failed.status, .degraded)
+        XCTAssertEqual(failed.reason, "Booking Portal failed: Booking Portal exited with code 1")
+        XCTAssertEqual(failed.rootCauseID, "booking-portal")
     }
 
     // MARK: - Rule 2: degraded
@@ -115,6 +137,15 @@ final class HealthSummaryTests: XCTestCase {
             XCTAssertEqual(summary.status, .starting, phase.rawValue)
             XCTAssertNil(summary.reason)
         }
+    }
+
+    /// A restart puts its service in pending while it prepares: the stack is starting.
+    func testAPendingServiceThatARestartReplacesKeepsTheStackStarting() {
+        let services = [service("supabase", .running), service("booking-portal", .pending)]
+        XCTAssertEqual(compute(services, restarting: ["booking-portal"]).status, .starting)
+        // Negative control: a pending service that nothing restarts is off, not starting.
+        XCTAssertEqual(compute(services).status, .healthy)
+        XCTAssertEqual(compute(services, restarting: ["supabase"]).status, .healthy)
     }
 
     // MARK: - Rule 4: healthy, with a note

@@ -1693,6 +1693,13 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(failed["reason"], condition.text)
         XCTAssertEqual(failed["likely_cause"], "Error: Cannot find module 'next'")
         XCTAssertNil(failed["skip_reason"])
+        // The health names the failed service and its headline, up to /api/status.
+        XCTAssertEqual(supervisor.health, .degraded)
+        XCTAssertEqual(supervisor.rootCauseServiceID, "web")
+        XCTAssertEqual(
+            try statusObject()["health_reason"] as? String,
+            "Web App failed: A package is missing — dependencies are out of date"
+        )
 
         FileManager.default.createFile(atPath: marker, contents: nil)
         supervisor.restartService("web")
@@ -1706,6 +1713,12 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(running["reason"])
         XCTAssertNil(running["likely_cause"])
         XCTAssertEqual(running["last_probe"], "ready")
+        XCTAssertEqual(supervisor.health, .healthy)
+        XCTAssertNil(try statusObject()["health_reason"])
+    }
+
+    private func statusObject() throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: Data(supervisor.statusJSON().utf8)) as? [String: Any])
     }
 
     /// The breaker gives its own reason, and the exit of the third crash does not

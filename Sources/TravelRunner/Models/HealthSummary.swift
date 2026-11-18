@@ -20,6 +20,8 @@ struct HealthSummary: Equatable, Sendable {
         var services: [Service]
         /// A start runs now.
         var startInFlight = false
+        /// Services that a restart replaces now: their pending phase counts as starting.
+        var restarting: Set<String> = []
         /// Why the last start did not start anything (a preflight or another runner).
         var refusal: String? = nil
         /// The database setup of the start failed. The text names the step when known.
@@ -53,21 +55,20 @@ struct HealthSummary: Equatable, Sendable {
     }
 
     /// Rules, first match wins:
-    /// 0. A refused start → not started, with the refusal.
-    /// 1. All stopped, and no start runs → stopped.
+    /// 1. All stopped, and no start runs → stopped; after a refused start → not started,
+    ///    with the refusal. Once a service runs or fails, the refusal no longer applies.
     /// 2. Any failed, or the DB setup failed → degraded, with "<name> failed: <headline>".
-    /// 3. A start or a service action in flight → starting.
+    /// 3. A start, or a restart of a pending service, in flight → starting.
     /// 4. Otherwise healthy, with a note for the services that are off.
     static func compute(_ input: Input) -> HealthSummary {
         let services = input.services
         let failingCount = services.filter { $0.phase == .failed || $0.isCircuitBroken }.count
 
-        if let refusal = input.refusal {
-            return HealthSummary(status: .degraded, reason: refusal, notStarted: true)
-        }
-
         let idle: Set<ServicePhase> = [.stopped, .pending]
         if !input.startInFlight, services.allSatisfy({ idle.contains($0.phase) }) {
+            if let refusal = input.refusal {
+                return HealthSummary(status: .degraded, reason: refusal, notStarted: true)
+            }
             return .stopped
         }
 
@@ -88,7 +89,9 @@ struct HealthSummary: Equatable, Sendable {
         }
 
         let settled: Set<ServicePhase> = [.running, .completed, .skipped, .stopped, .pending, .failed]
-        let busy = services.contains { !settled.contains($0.phase) }
+        let busy = services.contains { service in
+            !settled.contains(service.phase) || (service.phase == .pending && input.restarting.contains(service.id))
+        }
         if input.startInFlight || busy {
             return HealthSummary(status: .starting, failingCount: failingCount)
         }

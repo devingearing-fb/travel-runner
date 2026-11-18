@@ -9,8 +9,12 @@ final class EnvironmentSupervisor {
     var health: HealthStatus = .stopped
     /// Why the stack has its health: the header, the menu-bar tooltip and `health_reason`.
     private(set) var healthSummary = HealthSummary.stopped
-    /// Why the last start did not start anything. Cleared by the next start or a stop.
+    /// Why the last start did not start anything. Cleared by the next start, a stop,
+    /// or once a service runs or fails.
     private var startRefusal: String?
+    /// Services that `replaceProcess` replaces now, with a count: the health counts
+    /// their pending phase as starting.
+    private var restartsInFlight: [String: Int] = [:]
     var serviceStates: [String: ServiceState] = [:]
     var preflightChecks: [PreflightCheck] = []
     var currentPhase: StartupPhase = .idle
@@ -1944,6 +1948,11 @@ final class EnvironmentSupervisor {
         prepare: (@MainActor () async -> Void)? = nil
     ) async throws -> Bool {
         var replaced = false
+        restartsInFlight[serviceID, default: 0] += 1
+        defer {
+            let remaining = (restartsInFlight[serviceID] ?? 1) - 1
+            restartsInFlight[serviceID] = remaining > 0 ? remaining : nil
+        }
         let launch = try await lifecycle.withLock(serviceID) { () -> ServiceLaunch? in
             if let condition, !condition() { return nil }
             replaced = true
@@ -3674,12 +3683,16 @@ final class EnvironmentSupervisor {
         let dbSetupFailure = dbSetupFailedAtStart
             ? "Database setup failed" + (dbSetupPipeline?.firstFailed.map { " at \($0.name)" } ?? "")
             : nil
-        applyHealth(HealthSummary.compute(HealthSummary.Input(
+        let summary = HealthSummary.compute(HealthSummary.Input(
             services: services,
             startInFlight: startInFlight ?? (startTask != nil),
+            restarting: Set(restartsInFlight.keys),
             refusal: startRefusal,
             dbSetupFailure: dbSetupFailure
-        )))
+        ))
+        // A service ran or failed after the refusal: the refusal is over.
+        if services.contains(where: { $0.phase != .stopped && $0.phase != .pending }) { startRefusal = nil }
+        applyHealth(summary)
     }
 
     private func applyHealth(_ summary: HealthSummary) {

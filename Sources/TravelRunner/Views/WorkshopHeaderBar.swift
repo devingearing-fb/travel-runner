@@ -11,6 +11,12 @@ struct WorkshopHeaderBar: View {
         return summary.status == supervisor.health ? summary.label : HealthSummary(status: supervisor.health).label
     }
 
+    /// The reason of the summary, only while the summary matches the status.
+    private var healthReason: String? {
+        let summary = supervisor.healthSummary
+        return summary.status == supervisor.health ? summary.reason : nil
+    }
+
     private var isIncident: Bool {
         let failCount = supervisor.sortedServiceIDs
             .compactMap { supervisor.serviceStates[$0] }
@@ -51,10 +57,10 @@ struct WorkshopHeaderBar: View {
                     .fontWeight(.medium)
                     .foregroundStyle(isIncident ? .red : .primary)
                     .lineLimit(1)
-                    .help(supervisor.healthSummary.reason ?? healthLabel)
+                    .help(healthReason ?? healthLabel)
 
                 // Why: the failed service, the services that are off, or the refused start.
-                if supervisor.healthSummary.status == supervisor.health, let reason = supervisor.healthSummary.reason {
+                if let reason = healthReason {
                     Text(reason)
                         .font(.caption)
                         .foregroundStyle(.secondary)
