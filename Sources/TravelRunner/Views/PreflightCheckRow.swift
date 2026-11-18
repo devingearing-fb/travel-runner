@@ -24,6 +24,11 @@ struct PreflightCheckRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(check.name)
                     .font(.caption)
+                if case .pending = check.result, let progress = check.progress {
+                    Text(progress)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 if case .warning(let message) = check.result {
                     Text(message)
                         .font(.caption2)

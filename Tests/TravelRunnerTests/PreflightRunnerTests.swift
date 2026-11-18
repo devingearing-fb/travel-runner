@@ -10,6 +10,8 @@ final class PreflightRunnerTests: XCTestCase {
     private var workDir: URL!
 
     override func setUp() async throws {
+        // A probe of another test can leave its runtime behind.
+        ContainerRuntime.forgetProbed()
         workDir = FileManager.default.temporaryDirectory.appendingPathComponent("PreflightRunnerTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
     }
@@ -130,7 +132,8 @@ final class PreflightRunnerTests: XCTestCase {
 
         let ids = preflight.allChecks(for: []).map(\.id)
 
-        XCTAssertEqual(ids, ["node", "workspace-modules", "login-modules", "login-env", "docker"])
+        // Folder access (P3) is fast and required: a start without it cannot read the checkout.
+        XCTAssertEqual(ids, ["folder-access", "node", "workspace-modules", "login-modules", "login-env", "docker"])
         for id in ["pnpm", "registry-auth", "stripe-auth", "booking-env", "partner-env", "hotel-data"] {
             XCTAssertEqual(checker.checks.first { $0.id == id }?.cost, .slow, id)
             XCTAssertFalse(ids.contains(id), id)
@@ -204,7 +207,7 @@ final class PreflightRunnerTests: XCTestCase {
             ("the runtime comes up after the runner opens it", [false, false, false, true],
              "passed: \(runtime.displayName) — auto-started", 1),
             ("the runtime never comes up", [false],
-             "failed: \(runtime.displayName) not responding | fix: Open \(runtime.appName) manually", 1),
+             "failed: \(runtime.displayName) did not answer after 120 s — open it, then press Retry | fix: Open \(runtime.appName)", 1),
         ]
         for row in rows {
             let answers = AnswerQueue(row.answers)
@@ -221,26 +224,68 @@ final class PreflightRunnerTests: XCTestCase {
 
     // MARK: - Ports and folders
 
-    func testThePortCheckForEachStateOfThePort() async throws {
-        let free = try Self.freePort()
-        let held = try Self.listen()
-        defer { close(held.socket) }
-        let rows: [(name: String, port: Int, lsof: String, ps: String, expected: String)] = [
-            ("a free port", free, "", "", "passed: Free"),
-            ("a port that a process holds", held.port, "4242\n", "/usr/local/bin/node\n",
-             "failed: Port \(held.port) in use by node (PID 4242) | fix: kill 4242"),
-            ("a held port whose owner is not found", held.port, "", "",
-             "failed: Port \(held.port) in use | fix: lsof -ti TCP:\(held.port) -sTCP:LISTEN | xargs kill"),
-            ("a number that is not a port", 70000, "", "", "passed: Free"),
+    /// Each owner of a port has its row. A port in use only warns: the start of its
+    /// service stops the runner's own processes and asks about the others.
+    func testThePortCheckForEachOwnerOfThePort() async throws {
+        let node = PortOwner.Listener(pid: 4242, command: "node")
+        let orb = PortOwner.Listener(pid: 99, command: "OrbStack Helper")
+        let otherApp = PortOwner.realPath(NSHomeDirectory()) + "/code/other-app"
+        let rows: [(name: String, occupants: [PortOwner.Occupant], reuse: Bool, expected: String)] = [
+            ("a free port", [], false, "passed: Free"),
+            ("a stranger", [PortOwner.Occupant(listener: node, owner: .foreign, cwd: otherApp)], false,
+             "warning: In use by node (PID 4242, ~/code/other-app), which Travel Runner did not start"),
+            ("a stranger whose folder is not known", [PortOwner.Occupant(listener: node, owner: .foreign)], false,
+             "warning: In use by node (PID 4242), which Travel Runner did not start"),
+            ("a process of the last session", [PortOwner.Occupant(listener: node, owner: .ownLeftover(serviceID: "web"))], false,
+             "passed: In use by Travel Runner"),
+            ("a process of this session", [PortOwner.Occupant(listener: node, owner: .ownLaunch(serviceID: "web"))], false,
+             "passed: In use by Travel Runner"),
+            ("the container of Supabase", [PortOwner.Occupant(listener: orb, owner: .containerRuntime)], true,
+             "passed: In use by OrbStack Helper (a container) — reused"),
+            ("a container on the port of a portal", [PortOwner.Occupant(listener: orb, owner: .containerRuntime)], false,
+             "warning: Published by OrbStack Helper (a container) — stop that container"),
         ]
         for row in rows {
-            let (preflight, _) = runner([
-                "lsof -ti TCP:\(row.port)": FakeCommandRunner.ok(row.lsof),
-                "ps -p": FakeCommandRunner.ok(row.ps),
-            ])
-            let result = await preflight.run(check: PreflightCheck(id: "port-\(row.port)", name: "Port \(row.port) available"))
+            var (preflight, shell) = runner([:])
+            let occupants = row.occupants
+            preflight.inspectPort = { _ in occupants }
+            let check = PreflightCheck(id: "port-3002", name: "Port 3002 available", metadata: row.reuse ? ["reuse": "true"] : [:])
+            let result = await preflight.run(check: check)
             XCTAssertEqual(describe(result), row.expected, row.name)
+            XCTAssertEqual(shell.commands, [], row.name)
         }
+
+        // A number that is not a port is not asked about.
+        var (preflight, _) = runner([:])
+        preflight.inspectPort = { _ in XCTFail("asked about 70000"); return [] }
+        let result = await preflight.run(check: PreflightCheck(id: "port-70000", name: "Port 70000 available"))
+        XCTAssertEqual(describe(result), "passed: Free")
+    }
+
+    /// The old check bound 127.0.0.1 with SO_REUSEADDR and called a port free while a
+    /// server listened on ::1 only (Node binds `localhost` there). The listeners
+    /// come from `lsof` now.
+    func testThePortCheckSeesAServerOnIPv6Loopback() async throws {
+        let held = try Self.listenOnIPv6Loopback()
+        defer { close(held.socket) }
+        let (preflight, _) = runner([:])
+
+        let result = await preflight.run(check: PreflightCheck(id: "port-\(held.port)", name: "Port \(held.port) available"))
+
+        XCTAssertTrue(describe(result).hasPrefix("warning: In use by "), describe(result))
+        XCTAssertTrue(describe(result).contains("PID \(getpid())"), describe(result))
+    }
+
+    /// The port of a reuse_if_running service (Supabase) is marked: its stack holds it.
+    func testThePortOfAReusedServiceIsMarked() {
+        let supabase = ServiceDefinition(
+            id: "supabase", name: "Supabase", cmd: ["true"], cwd: nil,
+            probe: ProbeConfig(type: .tcp, port: 54322, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5),
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: true
+        )
+        let checks = PreflightRunner().allChecks(for: [supabase, service("travel-portal", cwd: nil, port: 3002)])
+        XCTAssertEqual(checks.first { $0.id == "port-54322" }?.metadata, ["reuse": "true"])
+        XCTAssertEqual(checks.first { $0.id == "port-3002" }?.metadata, [:])
     }
 
     func testTheFolderCheck() async throws {
@@ -298,33 +343,28 @@ final class PreflightRunnerTests: XCTestCase {
 
     // MARK: - Sockets of the test
 
-    /// A port that was free a moment ago.
-    private static func freePort() throws -> Int {
-        let bound = try listen()
-        close(bound.socket)
-        return bound.port
-    }
-
-    /// A socket that listens on a port of the system's choice, on 127.0.0.1.
-    private static func listen() throws -> (socket: Int32, port: Int) {
-        let sock = socket(AF_INET, SOCK_STREAM, 0)
+    /// A socket that listens on a port of the system's choice, on ::1 only.
+    private static func listenOnIPv6Loopback() throws -> (socket: Int32, port: Int) {
+        let sock = socket(AF_INET6, SOCK_STREAM, 0)
         guard sock >= 0 else { throw XCTSkip("no socket") }
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_addr.s_addr = UInt32(INADDR_LOOPBACK).bigEndian
-        addr.sin_port = 0
+        var only: Int32 = 1
+        setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &only, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in6()
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_addr = in6addr_loopback
+        addr.sin6_port = 0
         let bound = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
         }
         guard bound == 0, Darwin.listen(sock, 1) == 0 else {
             close(sock)
-            throw XCTSkip("could not listen on 127.0.0.1")
+            throw XCTSkip("could not listen on ::1")
         }
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        var length = socklen_t(MemoryLayout<sockaddr_in6>.size)
         _ = withUnsafeMutablePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(sock, $0, &length) }
         }
-        return (sock, Int(UInt16(bigEndian: addr.sin_port)))
+        return (sock, Int(UInt16(bigEndian: addr.sin6_port)))
     }
 }
 

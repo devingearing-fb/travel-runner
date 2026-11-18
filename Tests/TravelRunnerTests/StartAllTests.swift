@@ -14,6 +14,8 @@ final class StartAllTests: XCTestCase {
     private var supervisor: EnvironmentSupervisor!
 
     override func setUp() async throws {
+        // A probe of another test can leave its runtime behind.
+        ContainerRuntime.forgetProbed()
         container = FileManager.default.temporaryDirectory.appendingPathComponent("StartAllTests-\(UUID().uuidString)")
         monorepo = container.appendingPathComponent("TRAVEL BOOKING/fb-travel-monolith")
         // The backend baseline beside the checkout, with the bootstraps under their real names.
@@ -167,7 +169,7 @@ final class StartAllTests: XCTestCase {
              one),
             ("a container runtime that does not come up",
              Setup(dockerAnswers: false),
-             "Preflight failed — \(runtime.displayName): \(runtime.displayName) not responding",
+             "Preflight failed — \(runtime.displayName): \(runtime.displayName) did not answer after 120 s — open it, then press Retry",
              one),
             ("a service folder that is not there",
              Setup(webFolder: "web-moved"),

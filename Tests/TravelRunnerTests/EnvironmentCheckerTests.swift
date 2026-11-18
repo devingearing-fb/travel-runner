@@ -4,6 +4,11 @@ import XCTest
 /// The setup checks: the pnpm pin of the monorepo, and which results block the wizard.
 @MainActor
 final class EnvironmentCheckerTests: XCTestCase {
+    override func setUp() async throws {
+        // A probe of another test can leave its runtime behind.
+        ContainerRuntime.forgetProbed()
+    }
+
     // MARK: - pnpm pin
 
     func testThePinComesFromPackageManager() {
@@ -318,12 +323,12 @@ final class EnvironmentCheckerTests: XCTestCase {
 
         for profile in RunProfile.allCases {
             XCTAssertEqual(checker.preflightSubset(profile: profile).map(\.id),
-                           ["node", "workspace-modules", "login-modules", "login-env"], profile.rawValue)
+                           ["folder-access", "node", "workspace-modules", "login-modules", "login-env"], profile.rawValue)
         }
         // A check of a folder that is not set is left out: its path is not absolute.
         let noLogin = EnvironmentChecker(monorepoPath: mono, loginPath: "", streamServicesPath: "")
         noLogin.buildChecks()
-        XCTAssertEqual(noLogin.preflightSubset(profile: .both).map(\.id), ["node", "workspace-modules"])
+        XCTAssertEqual(noLogin.preflightSubset(profile: .both).map(\.id), ["folder-access", "node", "workspace-modules"])
         // Without a checkout only the tools are checked.
         let noCheckout = EnvironmentChecker(monorepoPath: "", loginPath: "", streamServicesPath: "", flavor: .standard)
         noCheckout.buildChecks()
@@ -549,6 +554,48 @@ final class EnvironmentCheckerTests: XCTestCase {
         XCTAssertEqual(status("stripe-auth", in: checker), .warning("stripe balance retrieve did not answer in 20 s"))
         XCTAssertEqual(status("booking-env", in: checker), .warning("The check of the .env file did not answer in 20 s"))
         XCTAssertTrue(runner.calls.allSatisfy { $0.timeout == .seconds(20) }, "each check command has a timeout")
+    }
+
+    /// The docker row tells a missing CLI, a refused socket, a down daemon and a
+    /// running one apart. The runtime comes from the context, not from the apps of
+    /// this Mac. Opening the app is the fix only when waiting can help.
+    func testTheDockerRowSaysWhatTheProbeFound() async {
+        let refused = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: dial unix /var/run/docker.sock: connect: permission denied"
+        let rows: [(name: String, context: CommandResult, ps: CommandResult, expected: CheckStatus, fix: FixAction)] = [
+            ("docker is not on the PATH",
+             FakeCommandRunner.failed(127, stderr: "zsh:1: command not found: docker"), FakeCommandRunner.ok(),
+             .failing("docker was not found on Travel Runner's PATH — install OrbStack or Docker Desktop"),
+             .guidance(text: "docker was not found on Travel Runner's PATH — install OrbStack or Docker Desktop", copyCommand: nil, url: nil)),
+            ("the socket refuses the user", FakeCommandRunner.ok("desktop-linux\n"), FakeCommandRunner.failed(1, stderr: refused),
+             .failing("Docker refused the connection (permission denied on /var/run/docker.sock)"),
+             .guidance(
+                text: "Docker refused the connection (permission denied on /var/run/docker.sock) — quit and reopen Docker, then re-check",
+                copyCommand: nil, url: nil
+             )),
+            ("the daemon is down", FakeCommandRunner.ok("desktop-linux\n"),
+             FakeCommandRunner.failed(1, stderr: "Cannot connect to the Docker daemon at unix:///Users/a/.docker/run/docker.sock."),
+             .failing("Docker Desktop not responding"),
+             .navigate(app: "Docker", waitFor: .seconds(120))),
+            ("the runtime of the context runs", FakeCommandRunner.ok("desktop-linux\n"), FakeCommandRunner.ok(),
+             .passing("Docker Desktop"), .navigate(app: "Docker", waitFor: .seconds(120))),
+            ("the runtime of the context runs", FakeCommandRunner.ok("orbstack\n"), FakeCommandRunner.ok(),
+             .passing("OrbStack"), .navigate(app: "OrbStack", waitFor: .seconds(120))),
+        ]
+        for row in rows {
+            ContainerRuntime.forgetProbed()
+            let runner = FakeCommandRunner { call in
+                if call.command == "docker context show" { return row.context }
+                if call.command.hasPrefix("docker ps") { return row.ps }
+                return FakeCommandRunner.ok()
+            }
+            let checker = makeChecker(runner)
+
+            await checker.runAllChecks()
+
+            XCTAssertEqual(status("docker", in: checker), row.expected, row.name)
+            XCTAssertEqual(checker.fixAction(for: "docker"), row.fix, row.name)
+        }
+        ContainerRuntime.forgetProbed()
     }
 
     /// Control: a command that fails without a timeout keeps its own text.

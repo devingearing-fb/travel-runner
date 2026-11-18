@@ -29,6 +29,8 @@ final class HealthCheck: Identifiable {
     var requiredNow: Bool? = nil
     var isRequired: Bool { requiredNow ?? requiredByDefault }
     nonisolated let fixLabel: String?
+    /// A second fix beside the first, for example "Pull from Doppler" beside "Import…".
+    nonisolated let altFixLabel: String?
     nonisolated let checkCommand: String
     nonisolated let checkDescription: String
     nonisolated let checkPath: String?
@@ -44,7 +46,7 @@ final class HealthCheck: Identifiable {
 
     nonisolated init(
         id: String, name: String, section: CheckSection,
-        isRequired: Bool = true, fixLabel: String? = nil,
+        isRequired: Bool = true, fixLabel: String? = nil, altFixLabel: String? = nil,
         checkCommand: String = "", checkDescription: String = "",
         checkPath: String? = nil
     ) {
@@ -53,6 +55,7 @@ final class HealthCheck: Identifiable {
         self.section = section
         self.requiredByDefault = isRequired
         self.fixLabel = fixLabel
+        self.altFixLabel = altFixLabel
         self.checkCommand = checkCommand
         self.checkDescription = checkDescription
         self.checkPath = checkPath
@@ -91,6 +94,9 @@ final class EnvironmentChecker {
     /// True while the sheet that asks for the GitHub Packages token is open.
     var tokenEntryOpen = false
 
+    /// What the last check of the docker row found. Its fix depends on it.
+    @ObservationIgnored private var dockerProbe: ContainerRuntimeProbe?
+
     /// Fixes that run now, in any checker. An update does not restart the app during one.
     private(set) static var fixesRunning = 0
 
@@ -113,7 +119,7 @@ final class EnvironmentChecker {
     /// How long the runner waits for `stripe login` in Terminal.
     nonisolated static let stripeLoginWait: Duration = .seconds(3 * 60)
     /// How long the runner waits for the container app to accept connections.
-    nonisolated static let containerRuntimeWait: Duration = .seconds(60)
+    nonisolated static let containerRuntimeWait: Duration = ContainerRuntime.startTimeout
 
     init(
         monorepoPath: String, loginPath: String, streamServicesPath: String, flavor: Flavor = .current,
@@ -279,6 +285,11 @@ final class EnvironmentChecker {
             ?? "Node \(nodeMajor) or later"
         checks = [
             // Prerequisites
+            HealthCheck(id: "folder-access", name: "Folder access", section: .prerequisites,
+                        fixLabel: Self.grantAccessLabel,
+                        checkCommand: "ls \(ShellQuote.quote((monorepoPath as NSString).abbreviatingWithTildeInPath))",
+                        checkDescription: "When a checkout is in Documents, Desktop or Downloads, macOS asks once whether \(flavor.displayName) may open that folder. Allow it: the services run from there. After a denied prompt every read fails with \"Operation not permitted\" (EPERM); the row then says which folder, and the fix shows the steps and a link to the settings.",
+                        checkPath: monorepoPath),
             HealthCheck(id: "docker", name: runtime.displayName, section: .prerequisites,
                         fixLabel: "Open \(runtime.appName)",
                         checkCommand: "docker ps",
@@ -306,7 +317,7 @@ final class EnvironmentChecker {
             HealthCheck(id: "stripe-auth", name: "Stripe CLI Auth", section: .prerequisites,
                         isRequired: false, fixLabel: "Log in…",
                         checkCommand: "stripe balance retrieve",
-                        checkDescription: "Optional — the Stripe CLI forwards webhook events. It uses the sk_test_ STRIPE_SECRET_KEY of apps/booking-portal/.env (or .env.local), so no login is needed. Without a test key it uses your own stripe login; Log in… runs stripe login in Terminal."),
+                        checkDescription: "Optional — the Stripe CLI forwards webhook events. It uses the sk_test_ STRIPE_SECRET_KEY of apps/booking-portal/.env (or .env.local), so no login is needed; the check asks Stripe whether it accepts that key. Without a test key it uses your own stripe login; Log in… runs stripe login in Terminal."),
 
             // Dependencies
             HealthCheck(id: "workspace-modules", name: "Monorepo dependencies", section: .dependencies,
@@ -327,14 +338,14 @@ final class EnvironmentChecker {
 
             // Supabase & Database
             HealthCheck(id: "booking-env", name: "Booking .env (shared values)", section: .supabase,
-                        isRequired: false, fixLabel: "Import…",
+                        isRequired: false, fixLabel: "Import…", altFixLabel: Self.dopplerPullLabel,
                         checkCommand: "pnpm env:check",
-                        checkDescription: "apps/booking-portal/.env holds the shared dev values (Stripe, HotelPlanner, hosted Supabase…). Get it from a teammate and import it, or run pnpm env:pull with Doppler access. The runner writes local overrides into .env.local on top of it.",
+                        checkDescription: "apps/booking-portal/.env holds the shared dev values (Stripe, HotelPlanner, hosted Supabase…). Get it from a teammate and import it (another worktree's copy is offered first), or use Pull from Doppler (pnpm env:pull) with Doppler access. Either way the current file is kept as .env.bak-<date>, unless Doppler wrote it. The runner writes local overrides into .env.local on top of it.",
                         checkPath: (bookingPath as NSString).appendingPathComponent(".env")),
             HealthCheck(id: "partner-env", name: "Partner .env (shared values)", section: .supabase,
-                        isRequired: false, fixLabel: "Import…",
+                        isRequired: false, fixLabel: "Import…", altFixLabel: Self.dopplerPullLabel,
                         checkCommand: "pnpm env:check",
-                        checkDescription: "apps/partner-portal/.env holds the shared dev values. Get it from a teammate and import it, or run pnpm env:pull with Doppler access.",
+                        checkDescription: "apps/partner-portal/.env holds the shared dev values. Get it from a teammate and import it (another worktree's copy is offered first), or use Pull from Doppler (pnpm env:pull) with Doppler access. Either way the current file is kept as .env.bak-<date>, unless Doppler wrote it.",
                         checkPath: (partnerPath as NSString).appendingPathComponent(".env")),
             HealthCheck(id: "backend-baseline", name: "Backend migration baseline", section: .supabase,
                         isRequired: false,
@@ -473,8 +484,10 @@ final class EnvironmentChecker {
 
     func runAllChecks() async {
         lastRunAt = clock.date()
-        // Each round reads the hotel dump once, for its row and for the booking .env row.
+        // Each round reads the hotel dump once, for its row and for the booking .env row,
+        // and tests the shared keys once.
         hotelCache = nil
+        hotelKeysCache = nil
         await run(checks)
     }
 
@@ -508,13 +521,15 @@ final class EnvironmentChecker {
 
     /// Runs the fix of a check. A fix that runs something shows it in the fix sheet
     /// (`activeFix`): its output, the time, Cancel. Then the check runs again.
-    /// One fix runs at a time.
-    func fix(_ checkID: String) async {
+    /// One fix runs at a time. `alternate` runs the second fix of the row (`altFixLabel`).
+    func fix(_ checkID: String, alternate: Bool = false) async {
         guard let check = checks.first(where: { $0.id == checkID }),
-              let action = fixAction(for: checkID) else { return }
+              let action = alternate ? altFixAction(for: checkID) : fixAction(for: checkID) else { return }
         if let activeFix, activeFix.isRunning { return }
         Self.fixesRunning += 1
         defer { Self.fixesRunning -= 1 }
+        // A fix can change the shared keys: the rows test them again.
+        hotelKeysCache = nil
 
         switch action {
         case .guidance:
@@ -545,9 +560,32 @@ final class EnvironmentChecker {
         check.status = .fixing
         let run = FixRun(checkID: checkID, checkName: check.name, action: action, startedAt: clock.date())
         activeFix = run
+        // Pull from Doppler: doppler-env.sh refuses a .env it did not write, so the
+        // current file moves to a backup first, and comes back when the pull fails.
+        let pull = alternate ? Self.sharedEnvApp(of: checkID).map { SharedEnvFiles.target(monorepo: monorepoPath, app: $0) } : nil
+        var moved: String?
+        if let pull {
+            var problem = SharedEnvFiles.pullUnavailable(monorepo: monorepoPath)
+            if problem == nil {
+                do {
+                    moved = try SharedEnvFiles.moveAside(pull, now: clock.date())
+                } catch {
+                    problem = "Could not move the current .env aside: \(error.localizedDescription)"
+                }
+            }
+            if let reason = problem {
+                run.finish(.failed(reason), at: clock.date())
+                check.status = Self.statusAfterFix(recheck: await runCheck(checkID), failure: reason)
+                return
+            }
+            if let moved { run.append("Saved a copy: \((moved as NSString).lastPathComponent). Doppler writes a new .env.") }
+        }
         let task = Task { await self.perform(action, checkID: checkID, run: run) }
         run.task = task
         let outcome = await task.value
+        if let pull, let moved, outcome != .succeeded, SharedEnvFiles.restore(moved, to: pull) {
+            run.append("The pull wrote nothing. The old .env is back in place.")
+        }
         run.finish(outcome, at: clock.date())
 
         // The check runs again outside the task of the fix, so a cancel does not stop it.
@@ -563,6 +601,12 @@ final class EnvironmentChecker {
             )
         } else {
             check.status = Self.statusAfterFix(recheck: recheck, failure: failure)
+        }
+        // A new shared booking .env also changes the hotel row.
+        guard pull != nil, outcome == .succeeded else { return }
+        for other in Self.linkedChecks(of: checkID) {
+            guard let row = checks.first(where: { $0.id == other }) else { continue }
+            row.status = await runCheck(other)
         }
     }
 
@@ -609,10 +653,17 @@ final class EnvironmentChecker {
 
     private func status(of id: String) async throws -> CheckStatus {
         switch id {
+        case "folder-access":
+            let paths = [monorepoPath, loginPath, streamServicesPath].filter { !$0.isEmpty }
+            return await Task.detached { Self.folderAccessStatus(paths: paths, errorOf: Self.openError) }.value
+
         case "docker":
-            let runtime = ContainerRuntime.detect()
-            let result = try await check("docker ps >/dev/null 2>&1", label: "docker ps")
-            return result.succeeded ? .passing(runtime.displayName) : .failing("\(runtime.displayName) not responding")
+            let probe = await ContainerRuntime.probe(shell: commandRunner, timeout: Self.checkTimeout)
+            dockerProbe = probe
+            if case .daemonDown(let context) = probe, context.timedOut {
+                throw CheckTimedOut(label: "docker ps")
+            }
+            return probe.failureText(waited: nil).map(CheckStatus.failing) ?? .passing(probe.runtime.displayName)
 
         case "node":
             let result = try await check("node --version", label: "node --version")
@@ -634,9 +685,20 @@ final class EnvironmentChecker {
             return ok ? .passing("Found") : .warning("Not installed — webhooks won't work")
 
         case "stripe-auth":
-            // With the test key of the portal the CLI needs no login.
-            let mode = StripeLauncher.resolve(bookingPortal: bookingPath).mode
-            if mode.isTestKey { return StripeLauncher.authStatus(mode, loggedIn: nil) }
+            // With the test key of the portal the CLI needs no login. The row asks Stripe
+            // with that key, as `stripe listen` gets it.
+            let resolution = StripeLauncher.resolve(bookingPortal: bookingPath)
+            let mode = resolution.mode
+            if case .testKey(let source) = mode {
+                guard try await check(StripeLauncher.installedCommand, label: "which stripe").succeeded else {
+                    return StripeLauncher.testKeyStatus(source: source, result: nil)
+                }
+                let result = await commandRunner.run(
+                    StripeLauncher.keyCheckCommand, cwd: commandCwd, environment: resolution.environment, timeout: Self.checkTimeout
+                )
+                if result.timedOut { throw CheckTimedOut(label: "stripe balance retrieve") }
+                return StripeLauncher.testKeyStatus(source: source, result: result)
+            }
             let result = try await check(StripeLauncher.authCheckCommand, label: "stripe balance retrieve")
             // No network is not an expired login: `stripe login` would not help.
             switch StripeAvailability.classify(authCheck: result, mode: mode) {
@@ -668,14 +730,25 @@ final class EnvironmentChecker {
             let result = try await check(
                 SharedEnvFiles.command(monorepo: monorepoPath, app: app), label: "The check of the .env file"
             )
-            let status = SharedEnvFiles.status(SharedEnvFiles.decode(result.stdout, app: app))
+            let report = SharedEnvFiles.decode(result.stdout, app: app)
+            let failure = report == nil
+                ? SharedEnvFiles.runFailure(
+                    result, scriptExists: SharedEnvFiles.scriptExists(monorepo: monorepoPath), timeout: Self.checkTimeout
+                )
+                : nil
+            let status = SharedEnvFiles.status(report, failure: failure)
             guard app == .booking else { return status }
             // Without a valid hotel dump, the first reset downloads the hotels with its keys.
             let required = await cachedHotelDump() == nil
             checks.first { $0.id == id }?.requiredNow = required
-            return Self.bookingEnvStatus(
-                status, required: required, hotelKeysPresent: HotelCatalog.devKeysPresent(monorepo: monorepoPath)
-            )
+            let keysPresent = HotelCatalog.devKeysPresent(monorepo: monorepoPath)
+            var rejection: String?
+            // Only a refusal of the keys fails this row; other preflight failures stay on the hotel row.
+            if required, keysPresent, let tested = await testedHotelKeys(), HotelCatalog.keysRejected(tested),
+               case .failing(let reason) = HotelCatalog.preflightStatus(tested) {
+                rejection = reason
+            }
+            return Self.bookingEnvStatus(status, required: required, hotelKeysPresent: keysPresent, rejection: rejection)
 
         case "backend-baseline":
             return await backendBaselineStatus()
@@ -691,9 +764,11 @@ final class EnvironmentChecker {
             return Self.loginEnvStatus(content)
 
         case "hotel-data":
-            return HotelCatalog.sourceStatus(
-                cached: await cachedHotelDump(), keysPresent: HotelCatalog.devKeysPresent(monorepo: monorepoPath)
-            )
+            let cached = await cachedHotelDump()
+            let keysPresent = HotelCatalog.devKeysPresent(monorepo: monorepoPath)
+            // Without a dump the keys must work, not only be there.
+            if cached == nil, keysPresent, let tested = await testedHotelKeys() { return HotelCatalog.preflightStatus(tested) }
+            return HotelCatalog.sourceStatus(cached: cached, keysPresent: keysPresent)
 
         case "sb-linked":
             let path = (monorepoPath as NSString).appendingPathComponent("supabase/.temp/project-ref")
@@ -783,7 +858,7 @@ final class EnvironmentChecker {
     // MARK: - Hotel source and backend baseline
 
     nonisolated static let hotelSourceDescription =
-        "The first reset loads about 200,000 hotels. The row passes with a valid cached dump, or with the dev keys (AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY, AMATEUR_SUPABASE_SIGNING_KEY) in the shared apps/booking-portal/.env, which the download needs. Import… copies the shared .env a teammate sent you. Before a reset changes anything, it checks again that the hotels can be had."
+        "The first reset loads about 200,000 hotels. The row passes with a valid cached dump, or with the dev keys (AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY, AMATEUR_SUPABASE_SIGNING_KEY) in the shared apps/booking-portal/.env, which the download needs. Without a dump the row tests the keys: it asks dev for one row and downloads nothing. Import… copies the shared .env a teammate sent you. Before a reset changes anything, it checks again that the hotels can be had."
 
     /// The rows that a fix of this row changes too.
     nonisolated static func linkedChecks(of checkID: String) -> [String] {
@@ -796,7 +871,11 @@ final class EnvironmentChecker {
 
     /// The booking `.env` row. While no hotel dump is cached it is required, and a file
     /// that lacks the dev keys of the download fails: the first reset would stop.
-    nonisolated static func bookingEnvStatus(_ status: CheckStatus, required: Bool, hotelKeysPresent: Bool) -> CheckStatus {
+    /// `rejection` is why dev refused the keys that are there.
+    nonisolated static func bookingEnvStatus(
+        _ status: CheckStatus, required: Bool, hotelKeysPresent: Bool, rejection: String? = nil
+    ) -> CheckStatus {
+        if required, hotelKeysPresent, let rejection { return .failing(rejection) }
         guard required, !hotelKeysPresent else { return status }
         switch status {
         case .warning(let message):
@@ -816,6 +895,24 @@ final class EnvironmentChecker {
 
     /// The read of the hotel dump of this round of checks.
     private var hotelCache: Task<String?, Never>?
+    /// The test of the shared hotel keys of this round of checks.
+    private var hotelKeysCache: Task<CommandResult?, Never>?
+
+    /// The run of `fetch-hotels.mjs --preflight`, or nil when the checkout cannot ask
+    /// without a download. Asked once per round, for the hotel row and the booking .env row.
+    private func testedHotelKeys() async -> CommandResult? {
+        if let hotelKeysCache { return await hotelKeysCache.value }
+        let task = Task { () -> CommandResult? in
+            guard HotelCatalog.supportsPreflight(monorepo: self.monorepoPath) else { return nil }
+            let result = await self.commandRunner.run(
+                HotelCatalog.preflightCommand(monorepo: self.monorepoPath, dump: self.hotelDumpPath),
+                cwd: self.commandCwd, timeout: HotelCatalog.preflightTimeout
+            )
+            return result
+        }
+        hotelKeysCache = task
+        return await task.value
+    }
 
     /// "Cached — 209,823 rows, 2026-08-11" for a valid dump, or nil.
     private func cachedHotelDump() async -> String? {
@@ -873,6 +970,58 @@ final class EnvironmentChecker {
             + #" > "$f" && chmod 700 "$f" && open -a Terminal "$f""#
     }
 
+    // MARK: - Folder access
+
+    nonisolated static let grantAccessLabel = "Grant access in System Settings"
+    /// The Files and Folders pane of Privacy & Security.
+    nonisolated static let filesAndFoldersURL = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders")!
+
+    /// The errno of opening `path` as a folder, or nil when it opens. A missing folder
+    /// counts as nil: its own rows say so.
+    nonisolated static func openError(_ path: String) -> Int32? {
+        guard let dir = opendir(path) else { return errno == ENOENT ? nil : errno }
+        closedir(dir)
+        return nil
+    }
+
+    /// The row "Folder access". macOS privacy (TCC) refuses with EPERM; a folder the
+    /// user cannot read gives EACCES.
+    nonisolated static func folderAccessStatus(paths: [String], errorOf: (String) -> Int32?) -> CheckStatus {
+        let failures = paths.compactMap { path in errorOf(path).map { (path: path, code: $0) } }
+        let short = { (path: String) in (path as NSString).abbreviatingWithTildeInPath }
+        if let blocked = failures.first(where: { $0.code == EPERM }) {
+            return .failing("macOS blocks access to \(short(blocked.path)) (EPERM) — \(grantAccessLabel)")
+        }
+        if let denied = failures.first {
+            return .failing("Cannot open \(short(denied.path)): \(String(cString: strerror(denied.code)))")
+        }
+        return .passing("The checkout can be read")
+    }
+
+    nonisolated static func folderAccessGuidance(appName: String) -> String {
+        "Open System Settings › Privacy & Security › Files and Folders and turn on the folder for \(appName), "
+            + "or add \(appName) under Full Disk Access. Then quit and reopen \(appName), and re-check."
+    }
+
+    // MARK: - Pull from Doppler
+
+    nonisolated static let dopplerPullLabel = "Pull from Doppler"
+
+    /// The app of a shared .env row, or nil.
+    nonisolated static func sharedEnvApp(of checkID: String) -> SharedEnvFiles.App? {
+        switch checkID {
+        case "booking-env": .booking
+        case "partner-env": .partner
+        default: nil
+        }
+    }
+
+    /// What the second fix button of a check does. Nil when the check has none.
+    func altFixAction(for id: String) -> FixAction? {
+        guard let app = Self.sharedEnvApp(of: id) else { return nil }
+        return .command(SharedEnvFiles.pullCommand(monorepo: monorepoPath, app: app), timeout: Self.fixTimeout)
+    }
+
     nonisolated static let nodeGuidance = "Install Node 22: `brew install node@22` or `nvm install 22`"
 
     /// What the fix button of a check does. Nil when the check has no fix.
@@ -882,8 +1031,25 @@ final class EnvironmentChecker {
             "cd \(ShellQuote.quote(folder)) && \(command)"
         }
         switch id {
+        case "folder-access":
+            return .guidance(
+                text: Self.folderAccessGuidance(appName: flavor.displayName), copyCommand: nil,
+                url: Self.filesAndFoldersURL, linkTitle: "Open Files and Folders settings"
+            )
         case "docker":
-            return .navigate(app: ContainerRuntime.detect().appName, waitFor: Self.containerRuntimeWait)
+            // Opening the app and waiting does not fix a missing CLI or a refused socket.
+            switch dockerProbe {
+            case .cliMissing:
+                return .guidance(text: ContainerRuntimeProbe.cliMissingText, copyCommand: nil, url: nil)
+            case .permissionDenied(let context, _):
+                return .guidance(
+                    text: "\(dockerProbe?.failureText(waited: nil) ?? "") — quit and reopen \(context.runtime.appName), then re-check",
+                    copyCommand: nil, url: nil
+                )
+            default:
+                let runtime = dockerProbe?.runtime ?? ContainerRuntime.detect()
+                return .navigate(app: runtime.appName, waitFor: Self.containerRuntimeWait)
+            }
         case "node":
             return .guidance(
                 text: Self.nodeGuidance, copyCommand: "brew install node@22",
@@ -1090,29 +1256,54 @@ final class EnvironmentChecker {
 
     // MARK: - Helpers
 
-    /// Copies a shared `.env` the developer picks into the monolith, after the monolith's
-    /// env-check confirms it is this app's file. The runner keeps no copy.
+    /// Copies a shared `.env` into the monolith, after the monolith's env-check confirms
+    /// it is this app's file. Another worktree's copy is offered first; otherwise the
+    /// developer picks a file. A file already in place is kept as `.env.bak-<date>`.
+    /// The runner keeps no copy. Nil when the developer cancelled and nothing changed.
     func importSharedEnv(_ app: SharedEnvFiles.App) async -> Bool? {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.showsHiddenFiles = true
-        panel.message = "Choose the \(app.label.lowercased()) portal .env a teammate sent you (their \(app.directory)/.env)"
-        panel.level = .floating
-        NSApp.activate(ignoringOtherApps: true)
-        guard panel.runModal() == .OK, let source = panel.url else { return nil }
+        let target = SharedEnvFiles.target(monorepo: monorepoPath, app: app)
+        let worktrees = SharedEnvFiles.worktrees(porcelain: await runCommand(SharedEnvFiles.worktreeCommand(monorepo: monorepoPath)).stdout)
+        var source: URL?
+        if let other = SharedEnvFiles.copySources(worktrees: worktrees, current: monorepoPath, app: app).first {
+            let offer = NSAlert()
+            offer.window.level = .floating
+            offer.messageText = "Copy the \(app.label.lowercased()) .env from another worktree?"
+            offer.informativeText = "\((other as NSString).abbreviatingWithTildeInPath) has one. It is checked before it is copied."
+            offer.addButton(withTitle: "Copy")
+            offer.addButton(withTitle: "Choose a File…")
+            offer.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            switch offer.runModal() {
+            case .alertFirstButtonReturn: source = URL(fileURLWithPath: other)
+            case .alertSecondButtonReturn: break
+            default: return nil
+            }
+        }
+        if source == nil {
+            let panel = NSOpenPanel()
+            panel.canChooseFiles = true
+            panel.canChooseDirectories = false
+            panel.allowsMultipleSelection = false
+            panel.showsHiddenFiles = true
+            panel.message = "Choose the \(app.label.lowercased()) portal .env a teammate sent you (their \(app.directory)/.env)"
+            panel.level = .floating
+            NSApp.activate(ignoringOtherApps: true)
+            guard panel.runModal() == .OK, let picked = panel.url else { return nil }
+            source = picked
+        }
+        guard let source else { return nil }
 
-        let (output, _) = await shellOutput(SharedEnvFiles.command(monorepo: monorepoPath, app: app, file: source.path))
+        let result = await runCommand(SharedEnvFiles.command(monorepo: monorepoPath, app: app, file: source.path))
         let alert = NSAlert()
         alert.window.level = .floating
-        guard let report = SharedEnvFiles.decode(output, app: app) else {
+        guard let report = SharedEnvFiles.decode(result.stdout, app: app) else {
             alert.messageText = "Could not check the file"
-            alert.informativeText = "\(SharedEnvFiles.script) did not run. Pull the latest monorepo dev and try again."
+            alert.informativeText = SharedEnvFiles.runFailure(
+                result, scriptExists: SharedEnvFiles.scriptExists(monorepo: monorepoPath), timeout: Self.checkTimeout
+            ) + ". Nothing was changed."
             alert.runModal()
             return false
         }
-        let target = ((monorepoPath as NSString).appendingPathComponent(app.directory) as NSString).appendingPathComponent(".env")
         let prompt = SharedEnvFiles.importPrompt(report, app: app, replacing: exists(target))
         alert.messageText = prompt.title
         alert.informativeText = prompt.message
@@ -1124,13 +1315,33 @@ final class EnvironmentChecker {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         do {
-            let data = try Data(contentsOf: source)
-            try data.write(to: URL(fileURLWithPath: target), options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target)
+            try SharedEnvFiles.install(try Data(contentsOf: source), at: target, now: clock.date())
             return true
         } catch {
+            showImportFailure(error, source: source, target: target)
             return false
         }
+    }
+
+    /// Says why an import did not copy the file. A read that macOS refuses (EPERM) points to System Settings.
+    private func showImportFailure(_ error: Error, source: URL, target: String) {
+        let alert = NSAlert()
+        alert.window.level = .floating
+        alert.messageText = "Import failed — the file was not copied"
+        var text = error.localizedDescription
+        if Self.isPermissionDenial(error) {
+            text += " macOS blocks \(flavor.displayName) from this folder. " + Self.folderAccessGuidance(appName: flavor.displayName)
+        }
+        alert.informativeText = "\(source.path) → \((target as NSString).abbreviatingWithTildeInPath): \(text)"
+        alert.runModal()
+    }
+
+    /// True for an error that macOS privacy gives: EPERM ("Operation not permitted").
+    nonisolated static func isPermissionDenial(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain, nsError.code == Int(EPERM) { return true }
+        if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? Error { return isPermissionDenial(underlying) }
+        return false
     }
 
     /// Copies the env file of platform core that the developer picks to the file that
@@ -1195,9 +1406,12 @@ final class EnvironmentChecker {
 
         let alert = NSAlert()
         alert.window.level = .floating
-        guard let content = try? String(contentsOf: source, encoding: .utf8) else {
-            alert.messageText = "Could not read the file"
-            alert.runModal()
+        let target = (directory as NSString).appendingPathComponent(fileName)
+        let content: String
+        do {
+            content = try String(contentsOf: source, encoding: .utf8)
+        } catch {
+            showImportFailure(error, source: source, target: target)
             return false
         }
         if let problem = problem(AgentEnv.parse(content, dialect: .node)) {
@@ -1206,17 +1420,17 @@ final class EnvironmentChecker {
             alert.runModal()
             return nil
         }
-        let target = (directory as NSString).appendingPathComponent(fileName)
         alert.messageText = exists(target) ? "Replace the env of \(appName)?" : "Import the env of \(appName)?"
         alert.informativeText = "\(source.lastPathComponent) goes to \(relativeFolder)/\(fileName)."
+            + (exists(target) ? " The current file is kept as \(fileName).bak-<date>." : "")
         alert.addButton(withTitle: "Import")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return nil }
         do {
-            try Data(content.utf8).write(to: URL(fileURLWithPath: target), options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target)
+            try SharedEnvFiles.install(Data(content.utf8), at: target, now: clock.date())
             return true
         } catch {
+            showImportFailure(error, source: source, target: target)
             return false
         }
     }

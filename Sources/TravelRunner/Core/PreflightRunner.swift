@@ -7,6 +7,8 @@ final class PreflightCheck: Identifiable {
     nonisolated let name: String
     nonisolated let metadata: [String: String]
     var result: PreflightResult = .pending
+    /// A line of a check that waits, such as the wait for the container runtime.
+    var progress: String?
 
     nonisolated init(id: String, name: String, metadata: [String: String] = [:]) {
         self.id = id
@@ -44,6 +46,9 @@ struct PreflightRunner: Sendable {
     var environment: EnvironmentChecker?
     /// The profile whose checks of the registry run.
     var profile: RunProfile = .both
+    /// Who listens on a port, with the ownership of the supervisor. Nil reads the
+    /// listeners with `lsof` and knows no process of the runner.
+    var inspectPort: (@Sendable (Int) async -> [PortOwner.Occupant])? = nil
     /// A check command that hangs fails after this time and does not hold the start.
     static let checkTimeout: Duration = CheckRegistry.preflightLimit
     /// The metadata key of a check that comes from the registry.
@@ -76,8 +81,12 @@ struct PreflightRunner: Sendable {
 
         // A service of an optional repo that is not there is skipped: its port is free to be busy.
         let ports = Set(services.filter { ServiceCatalog.missingOptionalRepo($0) == nil }.compactMap { $0.probe?.port })
+        // A port of a reuse_if_running service (Supabase) is in use when its stack runs.
+        let reused = Set(services.filter(\.shouldReuseIfRunning).compactMap { $0.probe?.port })
         for port in ports.sorted() {
-            checks.append(PreflightCheck(id: "port-\(port)", name: "Port \(port) available"))
+            checks.append(PreflightCheck(
+                id: "port-\(port)", name: "Port \(port) available", metadata: reused.contains(port) ? ["reuse": "true"] : [:]
+            ))
         }
 
         // An app of the hackathon fork that an old checkout does not have is skipped
@@ -137,36 +146,38 @@ struct PreflightRunner: Sendable {
         }
         switch check.id {
         case "docker":
-            let runtime = ContainerRuntime.detect()
-            if await ContainerRuntime.isResponding(shell: shell) {
-                return .passed(detail: runtime.displayName)
+            // "Run Checks Now" changes nothing: a runtime that does not answer is not opened.
+            let probe = opensContainerRuntime
+                ? await ContainerRuntime.ensureRunning(shell: shell, clock: clock) { line in
+                    Task { @MainActor in check.progress = line }
+                }
+                : await ContainerRuntime.probe(shell: shell)
+            await MainActor.run { check.progress = nil }
+            let runtime = probe.runtime
+            switch probe {
+            case .running(let context):
+                return .passed(detail: context.opened ? "\(runtime.displayName) — auto-started" : runtime.displayName)
+            case .cliMissing:
+                return .failed(message: ContainerRuntimeProbe.cliMissingText, fix: "Install OrbStack or Docker Desktop, then press Retry")
+            case .permissionDenied:
+                return .failed(message: probe.failureText(waited: nil) ?? "", fix: "Quit and reopen \(runtime.appName)")
+            case .daemonDown:
+                // "Run Checks Now" opens nothing, so it did not wait.
+                let waited: Duration? = opensContainerRuntime ? ContainerRuntime.startTimeout : nil
+                return .failed(message: probe.failureText(waited: waited) ?? "", fix: "Open \(runtime.appName)")
             }
-            if opensContainerRuntime, await ContainerRuntime.ensureRunning(shell: shell, clock: clock) {
-                return .passed(detail: "\(runtime.displayName) — auto-started")
-            }
-            return .failed(message: "\(runtime.displayName) not responding", fix: "Open \(runtime.appName) manually")
 
         case "backend-baseline":
             return await backendBaseline(root: check.metadata["root"] ?? "")
 
         default:
             if check.id.hasPrefix("port-") {
-                let port = Int(check.id.dropFirst(5)) ?? 0
-                let available = portAvailable(port)
-                if available {
+                // A number that is not a port cannot be in use.
+                guard let port = Int(check.id.dropFirst(5)), UInt16(exactly: port) != nil else {
                     return .passed(detail: "Free")
                 }
-                let pidInfo = await shellOutput("lsof -ti TCP:\(port) -sTCP:LISTEN")
-                let pidStr = pidInfo.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let pid = Int(pidStr) {
-                    let procName = await shellOutput("ps -p \(pid) -o comm=")
-                    let name = URL(fileURLWithPath: procName.trimmingCharacters(in: .whitespacesAndNewlines)).lastPathComponent
-                    return .failed(
-                        message: "Port \(port) in use by \(name.isEmpty ? "unknown" : name) (PID \(pid))",
-                        fix: "kill \(pid)"
-                    )
-                }
-                return .failed(message: "Port \(port) in use", fix: "lsof -ti TCP:\(port) -sTCP:LISTEN | xargs kill")
+                let occupants = await occupants(of: port)
+                return Self.portResult(occupants, reused: check.metadata["reuse"] == "true")
             }
 
             if check.id.hasPrefix("dir-") {
@@ -229,26 +240,32 @@ struct PreflightRunner: Sendable {
         await run(command, cwd: cwd).stdout
     }
 
-    private func portAvailable(_ port: Int) -> Bool {
-        // A number that is not a port cannot be in use.
-        guard let portNumber = UInt16(exactly: port) else { return true }
-        let sock = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-        guard sock >= 0 else { return false }
-        defer { Darwin.close(sock) }
+    /// The listeners of the port, from `lsof`: it sees IPv4 and IPv6 on any address.
+    /// A test bind on 127.0.0.1 with SO_REUSEADDR did not see a server on `*` or `::1`.
+    private func occupants(of port: Int) async -> [PortOwner.Occupant] {
+        if let inspectPort { return await inspectPort(port) }
+        return PortOwner.classify(await PortOwner.listeners(on: port), PortOwner.Knowledge())
+    }
 
-        var reuseAddr: Int32 = 1
-        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuseAddr, socklen_t(MemoryLayout<Int32>.size))
-
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = portNumber.bigEndian
-        addr.sin_addr.s_addr = UInt32(INADDR_LOOPBACK).bigEndian
-
-        let result = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
+    /// The row of a port. A port in use only warns: the start of its service stops
+    /// the runner's own processes and refuses with a button for the others, so the
+    /// rest of the stack still starts.
+    static func portResult(_ occupants: [PortOwner.Occupant], reused: Bool) -> PreflightResult {
+        if let foreign = occupants.first(where: { $0.owner == .foreign }) {
+            var place = "PID \(foreign.listener.pid)"
+            if let cwd = foreign.cwd { place += ", \(PortOwner.displayPath(cwd))" }
+            return .warning(
+                message: "In use by \(foreign.listener.command) (\(place)), which \(Flavor.current.displayName) did not start"
+            )
         }
-        return result == 0
+        if let container = occupants.first(where: { $0.owner == .containerRuntime }) {
+            return reused
+                ? .passed(detail: "In use by \(container.listener.command) (a container) — reused")
+                : .warning(message: "Published by \(container.listener.command) (a container) — stop that container")
+        }
+        // Start stops the processes of the last session before these checks, so an
+        // own occupant here is one that the start of its service stops.
+        if !occupants.isEmpty { return .passed(detail: "In use by \(Flavor.current.displayName)") }
+        return .passed(detail: "Free")
     }
 }

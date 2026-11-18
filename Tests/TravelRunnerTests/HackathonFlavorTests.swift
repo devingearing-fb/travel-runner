@@ -974,7 +974,22 @@ final class HackathonFlavorTests: XCTestCase {
         // The hackathon app is not open during the tests: its port refuses the connection.
         let services = await SiblingRunner.activeServices(of: .hackathon, timeout: 1)
         XCTAssertEqual(services, [])
-        XCTAssertEqual(SiblingRunner.activeServicesNow(of: .hackathon, timeout: 1), [])
+    }
+
+    /// The quit waits for the other app with a hard limit. An app that takes the
+    /// connection and never answers does not hold the quit.
+    func testTheQuitStopsWaitingForTheOtherAppAtItsLimit() async {
+        let started = ContinuousClock.now
+        let services = await SiblingRunner.activeServices(within: .milliseconds(200)) {
+            try? await Task.sleep(for: .seconds(30))
+            return ["travel-portal"]
+        }
+        XCTAssertEqual(services, [])
+        XCTAssertLessThan(ContinuousClock.now - started, .seconds(5))
+
+        // Negative control: an answer within the limit is the answer.
+        let answered = await SiblingRunner.activeServices(within: .seconds(5)) { ["travel-portal"] }
+        XCTAssertEqual(answered, ["travel-portal"])
     }
 
     func testTheStatusOfARunningAppIsReadOverHTTP() async throws {
@@ -1013,10 +1028,11 @@ final class HackathonFlavorTests: XCTestCase {
             if services.isEmpty { try await Task.sleep(for: .milliseconds(100)) }
         }
         XCTAssertEqual(services, ["travel-portal"])
-        // The same from code that cannot wait in a task. Not on the main thread here:
-        // the test's own run loop is not the app's.
-        let now = await Task.detached { SiblingRunner.activeServicesNow(at: url, timeout: 1) }.value
-        XCTAssertEqual(now, ["travel-portal"])
+        // The same with the limit of the quit.
+        let atQuit = await SiblingRunner.activeServices(within: SiblingRunner.quitLimit) {
+            await SiblingRunner.activeServices(at: url, timeout: 1)
+        }
+        XCTAssertEqual(atQuit, ["travel-portal"])
     }
 
     func testTheRefusalNamesTheOtherAppAndItsServices() {

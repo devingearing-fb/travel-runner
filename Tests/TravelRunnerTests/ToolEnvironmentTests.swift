@@ -615,8 +615,8 @@ final class ToolEnvironmentTests: XCTestCase {
         XCTAssertEqual(runner.calls.map(\.timeout), [.seconds(3), .seconds(20)], "each check command has a timeout")
     }
 
-    /// The wait for a container runtime that does not come up (10 checks, 2 s
-    /// apart) runs on the clock of the preflight, so it takes no real time.
+    /// The wait for a container runtime that does not come up (120 s, a check
+    /// every 2 s) runs on the clock of the preflight, so it takes no real time.
     func testTheDockerCheckWaitsOnTheClockOfThePreflight() async {
         let runner = FakeCommandRunner { call in
             call.command.hasPrefix("docker ps") ? FakeCommandRunner.failed() : FakeCommandRunner.ok()
@@ -628,9 +628,9 @@ final class ToolEnvironmentTests: XCTestCase {
         let docker = await preflight.run(check: PreflightCheck(id: "docker", name: "Docker"))
 
         guard case .failed(let message, _) = docker else { return XCTFail("\(docker)") }
-        XCTAssertTrue(message.hasSuffix("not responding"), message)
-        XCTAssertEqual(time.sleeps, Array(repeating: .seconds(2), count: 10))
-        XCTAssertEqual(runner.commands.filter { $0.hasPrefix("docker ps") }.count, 12)
+        XCTAssertTrue(message.hasSuffix("did not answer after 120 s — open it, then press Retry"), message)
+        XCTAssertEqual(time.sleeps, Array(repeating: .seconds(2), count: 60))
+        XCTAssertEqual(runner.commands.filter { $0.hasPrefix("docker ps") }.count, 61)
         XCTAssertEqual(runner.commands.filter { $0.hasPrefix("open -a") }.count, 1)
         XCTAssertLessThan(Date().timeIntervalSince(began), 10)
     }

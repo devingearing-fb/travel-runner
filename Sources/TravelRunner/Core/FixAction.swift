@@ -13,8 +13,9 @@ enum FixAction: Equatable, Sendable {
     case inApp
     /// Opens another app, then runs the check again until it passes or `waitFor` is over.
     case navigate(app: String, waitFor: Duration)
-    /// Says what to do. The runner runs nothing.
-    case guidance(text: String, copyCommand: String?, url: URL?)
+    /// Says what to do. The runner runs nothing. `linkTitle` names the link to `url`;
+    /// without one the link shows the URL.
+    case guidance(text: String, copyCommand: String?, url: URL?, linkTitle: String? = nil)
     /// Asks for the GitHub Packages token in a secure field, tests it, and saves it.
     case enterToken
 
@@ -24,7 +25,7 @@ enum FixAction: Equatable, Sendable {
         case .command(let command, _): command
         case .terminal(let command, _): command
         case .navigate(let app, _): "open -a \(ShellQuote.quote(app))"
-        case .guidance(_, let command, _): command
+        case .guidance(_, let command, _, _): command
         case .importFile, .inApp, .enterToken: nil
         }
     }
@@ -69,7 +70,7 @@ final class FixRun: Identifiable {
         self.action = action
         self.startedAt = startedAt
         self.state = state
-        if state == .guidance, case .guidance(let text, _, _) = action { lines = [text] }
+        if state == .guidance, case .guidance(let text, _, _, _) = action { lines = [text] }
     }
 
     var isRunning: Bool { state == .running }

@@ -16,6 +16,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Another copy of the app ran first. This copy only says so and quits: it has no
     /// supervisor, and it must not touch the env, the processes or the ports of the other.
     private var yieldsToRunningCopy = false
+    /// The answer of the other runner app, read before the quit (`applicationShouldTerminate`).
+    private var siblingRunsStackAtQuit = false
+    private var quitPrepared = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.accessory)
@@ -48,6 +51,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ToolEnvironment.shared.beginResolve(runner: LoginShell())
 
         supervisor = EnvironmentSupervisor(logSink: .live())
+        // Before the config load: the load reports what the last session left running.
+        supervisor.ledger = .live()
         supervisor.misplacedCopyNotice = InstanceGuard.misplacedNotice(
             bundlePath: Bundle.main.bundlePath,
             build: .current,
@@ -98,9 +103,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return false
     }
 
+    /// The quit asks the other runner app whether it runs a stack. The answer comes
+    /// over HTTP, so the quit waits for it here, with a limit, and the main thread
+    /// keeps running. Before, `applicationWillTerminate` blocked it for up to a second.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !yieldsToRunningCopy, supervisor != nil, !quitPrepared else { return .terminateNow }
+        // The stop takes some seconds. A launch in that time waits for this copy.
+        InstanceGuard.markQuitting()
+        Task { @MainActor in
+            let services = await SiblingRunner.activeServices(within: SiblingRunner.quitLimit)
+            self.siblingRunsStackAtQuit = !services.isEmpty
+            self.quitPrepared = true
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         guard !yieldsToRunningCopy else { return }
-        // The stop below takes some seconds. A launch in that time waits for this copy.
         InstanceGuard.markQuitting()
         if let monitor = rightClickMonitor { NSEvent.removeMonitor(monitor) }
         if let monitor = globalHotkeyMonitor { NSEvent.removeMonitor(monitor) }
@@ -108,19 +128,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         iconTimer?.invalidate()
         // While the other runner app runs a stack, the login's env and the ports are its.
         // An idle restart for an update leaves them alone too: see `quitCleanup`.
-        let siblingRunsStack = !SiblingRunner.activeServicesNow().isEmpty
         let cleanup = UpdatePolicy.quitCleanup(
             unattendedUpdate: updateController?.quitsForUnattendedUpdate == true,
-            siblingRunsStack: siblingRunsStack
+            siblingRunsStack: siblingRunsStackAtQuit
         )
         if cleanup.resetsEnv { supervisor.resetEnvToLocalhost() }
 
         // Phase 1: Collect the full process tree BEFORE sending signals.
-        // Killing a parent reparents its children to launchd.
-        var allPids: [pid_t] = []
-        for (_, state) in supervisor.serviceStates {
-            if let pid = state.pid { allPids += ProcessTree.tree(of: pid) }
-        }
+        // Killing a parent reparents its children to launchd. The ledger holds each
+        // process that the runner started, also one that an earlier session left.
+        var allPids = supervisor.ledgerTreesForQuit()
 
         // A teardown (Sequin's `compose down`) takes longer than the quit waits.
         // Its stop command runs on after the app has ended.
@@ -133,30 +150,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ProcessRunner.startStopCommandDetached(of: supabase)
         }
 
-        // The holds viewer of the Rooms tab is not a service, so it is not in the loop above.
+        // The holds viewer of the Rooms tab is not a service, so it is not in the ledger.
         if let pid = supervisor.holdsViewer.pid { allPids += ProcessTree.tree(of: pid) }
 
         // A DB step that runs (a reset, a hotel load) is not a service either.
         if let pid = supervisor.dbStepProcessID { allPids += ProcessTree.tree(of: pid) }
 
+        // A listener of the runner whose parent is already gone. Only the ports that
+        // Stop All clears, and only a process of the runner: never a stranger's, never
+        // a container runtime's.
+        if cleanup.sweepsPorts { allPids += supervisor.ownListenersNow(on: supervisor.sweepPorts) }
+
         // Phase 2 and 3: SIGTERM, then SIGKILL to what is still alive after a second.
         ProcessTree.terminateNow(Array(Set(allPids)))
-
-        // Phase 4: Kill by service port as a fallback. Only the ports that Stop All
-        // clears: the services of the profile and those this session started, never a
-        // reuse_if_running service (Supabase persists between sessions).
-        defer { supervisor.markCleanExit() }
-        guard cleanup.sweepsPorts else { return }
-        killProcessesOnPorts(supervisor.sweepPorts)
-    }
-
-    /// A container runtime is never killed: its port helper serves every container.
-    private func killProcessesOnPorts(_ ports: [Int]) {
-        for port in ports {
-            for listener in PortOwner.killable(PortOwner.listenersNow(on: port)) {
-                kill(listener.pid, SIGKILL)
-            }
-        }
+        supervisor.forgetLaunches()
+        supervisor.markCleanExit()
     }
 
     // MARK: - Status Item

@@ -212,6 +212,16 @@ struct SetupStep2View: View {
                 // Status result text
                 statusBadge(check.status)
 
+                // Second fix button, beside the first
+                if let altFixLabel = check.altFixLabel, shouldShowFix(check.status) {
+                    Button(altFixLabel) {
+                        Task { await checker.fix(check.id, alternate: true) }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .disabled(checker.activeFix?.isRunning == true)
+                }
+
                 // Fix button
                 if let fixLabel = check.fixLabel, shouldShowFix(check.status) {
                     Button(fixLabel) {

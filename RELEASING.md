@@ -22,7 +22,7 @@ The script, in order:
 1. Checks that the release can finish: signing identity, notary access, GitHub access,
    a clean tree whose commit is on the remote, a version number that is not used, and
    that the latest release on GitHub is a standard release.
-2. Runs `swift test`.
+2. Runs `swift test`, then `scripts/clean-shell-check.sh` on the monolith (see below).
 3. Builds, packages and signs the app.
 4. Runs `scripts/smoke.sh` on the signed app (see below). A failure stops the release
    before the notarization, so the version number is still free.
@@ -149,6 +149,36 @@ a check with no result, or no answer, is not.
 
 It runs on a dev build too (`./build.sh && scripts/smoke.sh TravelRunner.app`).
 
+## The clean-shell check
+
+```bash
+scripts/clean-shell-check.sh [monolith-dir]
+```
+
+It runs the first database step of the monolith (`check-prerequisites.mjs --verify`,
+which sends no request) the way a teammate's Mac that followed the README would: a PATH
+with only node (and npm, npx, corepack), pnpm, docker, python3 and stripe (when installed), an empty
+home folder, and a python3 that has only its standard library. It also checks that
+node is at least the major of `.nvmrc` and that pnpm has the major of `packageManager`.
+`--verify` runs no Python, so the check then reads the imports of each Python script in
+`scripts/setup` and `scripts/db` (not the tests) with that python3: each module must be
+in the standard library or beside the script. It runs no script code. A step that needs
+a tool or a Python package that no README names fails here. The PyJWT break of the
+hotel step (`import jwt` in `remote_supabase.py`) would have failed here.
+
+The monolith is the folder given, or `TR_MONOLITH_DIR`, or `fb-travel-monolith` next to
+this repo (`fb-travel-monolith-hackathon` for `FLAVOR=hackathon`). Run `pnpm install`
+there first. Docker must run: the check uses the socket of your current docker context.
+When the check fails because a step needs a new tool, add the tool to the install steps
+of both READMEs, or remove the need from the script.
+
+`release.sh` runs the check only on the scripts that teammates get. Before the tests it
+fetches the monolith and stops unless its HEAD is `origin/dev` (`origin/main` for
+`FLAVOR=hackathon`; `TR_MONOLITH_BRANCH` overrides) with no local change. It prints the
+branch and commit that it checks.
+
+`SKIP_TESTS=1` skips it with the tests, for a `--draft` only.
+
 ## Travel Runner Hackathon
 
 ```bash
@@ -171,3 +201,5 @@ open decision.
 | The notarization times out | Run the script again with the same version: nothing was published. |
 | "GitHub marks … as the latest release" | Open the releases page and set the newest promoted `v…` release as the latest. Installed apps read their updates from it. |
 | `gh` cannot release | `gh auth switch --user <owner>`. |
+| "The monolith at … is on …, not origin/dev" | Pull dev in that checkout, or set `TR_MONOLITH_DIR` to a checkout of dev. |
+| "The clean-shell check failed" | Read the lines above it. "no node_modules": run `pnpm install` in the monolith. A failed check-prerequisites or a Python import: a teammate's first Start fails the same way; fix the monolith script or the READMEs first. |

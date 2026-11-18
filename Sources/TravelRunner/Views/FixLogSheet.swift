@@ -60,7 +60,7 @@ struct FixLogSheet: View {
         case .succeeded: "Done. The check runs again."
         case .failed(let text): text
         case .cancelled: "Cancelled."
-        case .guidance: "Travel Runner does not install this for you."
+        case .guidance: "Travel Runner cannot do this step for you."
         }
     }
 
@@ -68,11 +68,11 @@ struct FixLogSheet: View {
 
     @ViewBuilder
     private var content: some View {
-        if case .guidance(let text, _, let url) = run.action {
+        if case .guidance(let text, _, let url, let linkTitle) = run.action {
             VStack(alignment: .leading, spacing: 10) {
                 Text(text).textSelection(.enabled)
                 if let url {
-                    Link(url.absoluteString, destination: url).font(.caption)
+                    Link(linkTitle ?? url.absoluteString, destination: url).font(.caption)
                 }
                 Spacer()
             }

@@ -120,6 +120,8 @@ enum HaltReason: Equatable, Sendable {
     case runtimeDown(runtime: String, waiting: Bool)
     /// Something outside the runner stopped it `times` times in a minute.
     case killedRepeatedly(signal: Int32, times: Int)
+    /// The container runtime cannot be used (no docker CLI, a refused socket). The text says why.
+    case runtimeUnusable(String)
 
     /// The short form for the triage card and a row with no condition.
     var label: String {
@@ -130,6 +132,7 @@ enum HaltReason: Equatable, Sendable {
         case .runtimeDown(let runtime, false): "\(runtime) is not running"
         case .killedRepeatedly(let signal, let times):
             "stopped from outside (\(ServiceTermination.signalName(signal)) \(times) times)"
+        case .runtimeUnusable(let reason): reason
         }
     }
 }

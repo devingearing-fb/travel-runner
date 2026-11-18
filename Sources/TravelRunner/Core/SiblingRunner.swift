@@ -43,43 +43,31 @@ enum SiblingRunner {
         return activeServices(statusJSON: data)
     }
 
-    /// The same for code that cannot wait in a task (app quit).
-    static func activeServicesNow(of flavor: Flavor = Flavor.current.sibling, timeout: TimeInterval = 1.0) -> [String] {
-        activeServicesNow(at: statusURL(of: flavor), timeout: timeout)
-    }
+    /// The longest wait of the quit for the other app.
+    static let quitLimit: Duration = .milliseconds(1500)
 
-    static func activeServicesNow(at url: URL, timeout: TimeInterval) -> [String] {
-        let done = DispatchSemaphore(value: 0)
-        let box = ResultBox()
-        let task = URLSession.shared.dataTask(with: request(url, timeout: timeout)) { data, _, _ in
-            if let data { box.set(activeServices(statusJSON: data)) }
-            done.signal()
+    /// The answer of `query`, or none after `limit`. The URL timeout is an idle
+    /// limit: an app that takes the connection and never answers would hold the
+    /// quit. No answer counts as no stack.
+    static func activeServices(
+        within limit: Duration,
+        query: @escaping @Sendable () async -> [String] = { await activeServices(timeout: 1) }
+    ) async -> [String] {
+        await withTaskGroup(of: [String]?.self) { group in
+            group.addTask { await query() }
+            group.addTask {
+                try? await Task.sleep(for: limit)
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first ?? []
         }
-        task.resume()
-        if done.wait(timeout: .now() + timeout + 0.5) == .timedOut { task.cancel() }
-        return box.value
     }
 
     /// What the person reads when this app refuses to start.
     static func refusal(activeServices: [String], sibling: Flavor = Flavor.current.sibling) -> String {
         "\(sibling.displayName) runs a stack now (\(activeServices.joined(separator: ", "))). "
             + "The two apps use the same ports. Stop the stack there, then start again."
-    }
-
-    private final class ResultBox: @unchecked Sendable {
-        private let lock = NSLock()
-        private var stored: [String] = []
-
-        func set(_ value: [String]) {
-            lock.lock()
-            stored = value
-            lock.unlock()
-        }
-
-        var value: [String] {
-            lock.lock()
-            defer { lock.unlock() }
-            return stored
-        }
     }
 }

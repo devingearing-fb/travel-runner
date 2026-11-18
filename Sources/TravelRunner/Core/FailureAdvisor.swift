@@ -30,6 +30,9 @@ enum FailureAdvisor {
         case message(String)
         /// The missing packages could not be installed before the start.
         case installFailed(String)
+        /// The start did not run: something that the runner did not start is in the
+        /// way. The action stops it and starts again.
+        case blocked(String, action: RecoveryAction)
     }
 
     struct Context: Sendable {
@@ -97,6 +100,8 @@ enum FailureAdvisor {
             return condition(text, nil, [.openLog, .restart])
         case .installFailed(let text):
             return condition(text, nil, [.installDependencies, .openLog])
+        case .blocked(let text, let action):
+            return condition(text, nil, [action, .openLog])
         case .cleanExit:
             return condition("\(name) exited (code 0) — not restarted.", nil, [.restart, .openLog])
         // A kill or a failed wake check has its own cause. A line of the log from

@@ -6,6 +6,12 @@ import XCTest
 final class FailureAdvisorTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
 
+    override func setUp() {
+        super.setUp()
+        // A probe of another test can leave its runtime behind.
+        ContainerRuntime.forgetProbed()
+    }
+
     private func portal(
         log: [String] = [], likelyCause: String? = nil, canClearCache: Bool = true
     ) -> FailureAdvisor.Context {

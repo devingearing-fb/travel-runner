@@ -78,6 +78,7 @@ enum CheckRegistry {
     static func impact(of id: String) -> String? {
         switch id {
         case "docker": "the local database will not start"
+        case "folder-access": "the runner cannot read the checkout, so nothing will start"
         case "node": "the portals and the login will not run"
         case "pnpm": "installs and both portals will not run"
         case "python-jwt": "the database setup of this checkout stops at its first step"

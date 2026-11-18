@@ -167,6 +167,61 @@ enum HotelCatalog {
         return keysPresent ? .passing(keysOnlyText) : .failing(noSourceText)
     }
 
+    // MARK: - The keys, tested
+
+    /// True when the checkout's `fetch-hotels.mjs` has `--preflight`. An older script
+    /// ignores the flag and downloads, so the runner never passes it to one.
+    static func supportsPreflight(monorepo: String) -> Bool {
+        let path = (monorepo as NSString).appendingPathComponent("scripts/db/fetch-hotels.mjs")
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
+        return content.contains("--preflight")
+    }
+
+    /// `fetch-hotels.mjs --preflight`: reads the keys and asks dev for one row. Downloads nothing.
+    static func preflightCommand(monorepo: String, dump: String) -> String {
+        "TRAVEL_HOTEL_DUMP=\(ShellQuote.quote(dump)) "
+            + ShellQuote.join(["node", (monorepo as NSString).appendingPathComponent("scripts/db/fetch-hotels.mjs"), "--preflight"])
+    }
+
+    /// The script gives up after 25 s; this is the limit for a script that hangs.
+    static let preflightTimeout: Duration = .seconds(30)
+
+    static let keysAcceptedText =
+        "Not cached — dev Supabase accepts the shared keys; the first reset downloads the hotels (3–5 min)"
+
+    /// The hotel row when the shared keys were tested. Dev refusing them fails the row.
+    /// No network only warns: the keys may be fine. A pass shows what the script found:
+    /// a dump in the checkout or a published dump passes without a test of the keys.
+    static func preflightStatus(_ result: CommandResult) -> CheckStatus {
+        if result.timedOut {
+            return .warning("\(Shell.timeoutText("The test of the hotel keys", after: preflightTimeout)) — the keys are not checked")
+        }
+        if result.succeeded {
+            guard let detail = healthDetail(result, "pass") else { return .passing("fetch-hotels.mjs --preflight passed") }
+            return .passing(detail.contains("dev Supabase") ? keysAcceptedText : detail)
+        }
+        let reason = healthDetail(result, "fail") ?? "fetch-hotels.mjs --preflight failed (exit \(result.exitCode))"
+        if result.exitCode == 12 {
+            return .warning("\(reason) — the keys are not checked")
+        }
+        return .failing(reason)
+    }
+
+    /// True when the preflight failed because of the shared keys: exit 10 (no
+    /// credentials) or 11 (HTTP 401/403). Only then does the booking .env row fail too.
+    static func keysRejected(_ result: CommandResult) -> Bool {
+        !result.timedOut && (result.exitCode == 10 || result.exitCode == 11)
+    }
+
+    /// The text of the last `##db:health:<kind>:` line, or nil.
+    private static func healthDetail(_ result: CommandResult, _ kind: String) -> String? {
+        let prefix = "##db:health:\(kind):"
+        return result.stdout.split(whereSeparator: \.isNewline)
+            .last { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+    }
+
     // MARK: - The catalog, after Start
 
     /// Fewer hotels than this is an empty catalog: dev has about 200,000.

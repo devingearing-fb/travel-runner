@@ -38,6 +38,9 @@ final class EnvironmentSupervisor {
     /// Set while the checkout needs a newer runner. No reset and no DB step runs
     /// while it is set; the services still start.
     var compatibilityNotice: Compatibility.Notice? = nil
+    /// Set at launch while processes of the last session still run, until they are
+    /// stopped or Start stops them.
+    var leftoverNotice: String? = nil
     var startupBeganAt: Date? = nil
     /// Migrations the local database has not applied (from the last check).
     var pendingMigrations: [String] = []
@@ -241,6 +244,12 @@ final class EnvironmentSupervisor {
     @ObservationIgnored var shell: any CommandRunning
     /// The port cleanup reads listeners and kills through these tools.
     @ObservationIgnored var portTools = PortTools.live
+    /// The processes that the runner started. The app gives it the file; without
+    /// one it stays in memory.
+    @ObservationIgnored var ledger = LaunchLedger(path: nil)
+    /// Per service, the start time of its earliest launch in this session that has
+    /// ended (`checkOtherNextDev`).
+    @ObservationIgnored private var endedLaunchStarts: [String: Int64] = [:]
     /// The check that the Stripe CLI is installed and can call Stripe, with the test
     /// key or the login. Tests set a fake; nil runs the CLI in `shell`.
     @ObservationIgnored var stripeTooling: (any StripeTooling)?
@@ -265,9 +274,13 @@ final class EnvironmentSupervisor {
     /// Where the config and the control server come from.
     @ObservationIgnored var configHost = ConfigHost()
     /// The preflight checks run their commands in the shell of the supervisor and
-    /// wait on its clock. The checks of the registry come from Health.
+    /// wait on its clock. The checks of the registry come from Health, and the port
+    /// checks know which processes are the runner's own.
     private var preflightRunner: PreflightRunner {
-        PreflightRunner(shell: shell, clock: clock, environment: resolvedHealthChecker(), profile: profile)
+        PreflightRunner(
+            shell: shell, clock: clock, environment: resolvedHealthChecker(), profile: profile,
+            inspectPort: { [weak self] port in await self?.portOccupants(port) ?? [] }
+        )
     }
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
@@ -502,6 +515,10 @@ final class EnvironmentSupervisor {
         case oneshotTimedOut(name: String, limit: String)
         /// A daemon did not answer by the hard cap of its start and was stopped.
         case startTimedOut(name: String, limit: Duration)
+        /// A process that the runner did not start listens on the port of the service.
+        case portHeldByProcess(name: String, port: Int, occupant: PortOwner.Occupant)
+        /// A `next dev` that the runner did not start runs in the folder of the service.
+        case otherNextDev(pid: pid_t, port: Int?, folder: String, startTime: Int64)
 
         var description: String {
             switch self {
@@ -530,6 +547,10 @@ final class EnvironmentSupervisor {
                 "\(name) did not finish in \(limit) and was stopped. See its log."
             case .startTimedOut(let name, let limit):
                 HealthMonitor.hardCapText(name: name, limit: limit)
+            case .portHeldByProcess(let name, let port, let occupant):
+                PortOwner.foreignText(port: port, occupant: occupant, service: name)
+            case .otherNextDev(let pid, let port, let folder, _):
+                PortOwner.otherNextDevText(pid: pid, port: port, folder: folder)
             }
         }
     }
@@ -577,6 +598,7 @@ final class EnvironmentSupervisor {
             postNotice(.config, "Config load failed: \(error)")
             print("[Supervisor] Config load failed: \(error)")
         }
+        reconcileLeftovers()
     }
 
     /// Loads the config that Settings saved. While the stack runs it changes
@@ -943,12 +965,20 @@ final class EnvironmentSupervisor {
                 return
             }
 
+            // The processes of the last session hold the ports and the folders. They
+            // are the runner's own: stop them before the checks look at the ports.
+            await self.stopLeftovers()
+
             // "Retry failed" leaves the services that run. The checks and the
             // cleanup skip them: their ports are in use by their own process.
             var kept: Set<String> = []
             if mode == .missingOnly {
                 for serviceID in self.sortedServiceIDs where await self.isUp(serviceID) { kept.insert(serviceID) }
             }
+
+            // Stale processes of the runner on the ports of the stack. "Retry failed"
+            // spares the services that run: their ports are in use by their own process.
+            await self.cleanupStaleProcesses(sparing: kept)
 
             // Preflight
             if !skipPreflight {
@@ -987,9 +1017,6 @@ final class EnvironmentSupervisor {
                     return
                 }
             }
-
-            // Cleanup stale processes from previous sessions
-            await self.cleanupStaleProcesses(sparing: kept)
 
             // Start registry. One registry runs: a retry replaces the one before.
             await self.registry?.stop()
@@ -2147,7 +2174,7 @@ final class EnvironmentSupervisor {
     /// steps and the checks.
     func canPerform(_ action: RecoveryAction, for serviceID: String) -> Bool {
         switch action {
-        case .restart, .startService, .stopForeignAndRetry, .openContainerRuntime: true
+        case .restart, .startService, .stopForeignAndRetry, .stopProcessAndRetry, .openContainerRuntime: true
         case .keepWaiting: serviceStates[serviceID]?.phase == .starting && slowStartDeadlines[serviceID] != nil
         case .clearCacheAndRestart: Self.cacheClearingServices.contains(serviceID)
         case .installDependencies: serviceCwd(serviceID) != nil
@@ -2176,14 +2203,27 @@ final class EnvironmentSupervisor {
             keepWaiting(serviceID)
         case .startService:
             restartService(serviceID)
-        case .stopForeignAndRetry(nil):
-            // The start stops the stale process that holds the port of the probe.
-            restartService(serviceID)
-        case .stopForeignAndRetry(let port?):
-            // The port can be another port of the app (the HMR port); the start
-            // frees only the port of the probe.
+        case .stopForeignAndRetry(let port):
+            // The port can be another port of the app (the HMR port). With no port in
+            // the line, the button frees the port of the probe: the start alone
+            // would refuse a process that the runner did not start.
+            let target = port ?? serviceStates[serviceID]?.definition.probe?.port
             Task {
-                await freePort(port)
+                if let target { await freePort(target, includingForeign: true) }
+                restartService(serviceID)
+            }
+        case .stopProcessAndRetry(let pid, let startTime, let port, _):
+            // The person pressed the button: the process need not be the runner's.
+            // It must still be the process that the row named; the start checks again.
+            let tools = portTools
+            Task {
+                if await Self.isSameProcess(pid, startTime: startTime, port: port, tools: tools) {
+                    await tools.stopTree(pid)
+                } else {
+                    await logStore.append(serviceID: serviceID, entry: LogEntry(
+                        stream: .stderr, text: "[travel-runner] PID \(pid) is no longer the process that blocked the start. Not stopped."
+                    ))
+                }
                 restartService(serviceID)
             }
         case .clearCacheAndRestart:
@@ -2511,6 +2551,15 @@ final class EnvironmentSupervisor {
             return .cannotRun(finding)
         case .installFailed:
             return .installFailed(serviceError.description)
+        case .portHeldByProcess(_, let port, let occupant):
+            let pid = occupant.listener.pid
+            return .blocked(serviceError.description, action: .stopProcessAndRetry(
+                pid: pid, startTime: portTools.facts(pid)?.startTime, port: port
+            ))
+        case .otherNextDev(let pid, _, _, let startTime):
+            return .blocked(serviceError.description, action: .stopProcessAndRetry(
+                pid: pid, startTime: startTime, sameFolder: true
+            ))
         default:
             return .message(serviceError.description)
         }
@@ -4055,16 +4104,23 @@ final class EnvironmentSupervisor {
             // new one for the port. Callers stop it first; this covers one that did not.
             await processRunner.stop(serviceID: serviceID)
 
-            // Kill any stale occupant on the port
+            // A stale process of the runner on the port is stopped. A process that
+            // the runner did not start is not: the row asks first.
             if let port = definition.probe?.port, definition.resolvedType == .daemon, isPortBound(port) {
+                if let foreign = await portOccupants(port).first(where: { $0.owner == .foreign }) {
+                    throw ServiceError.portHeldByProcess(name: definition.displayName, port: port, occupant: foreign)
+                }
                 await freePort(port)
                 // A container still has the port: the service would fail with
                 // EADDRINUSE while its TCP probe passes against the container.
                 if isPortBound(port),
-                   let owner = await portTools.listeners(port).first(where: { PortOwner.isContainerRuntime($0.command) }) {
-                    throw ServiceError.portHeldByContainer(name: definition.displayName, port: port, owner: owner.command)
+                   let owner = await portOccupants(port).first(where: { $0.owner == .containerRuntime }) {
+                    throw ServiceError.portHeldByContainer(
+                        name: definition.displayName, port: port, owner: owner.listener.command
+                    )
                 }
             }
+            try await checkOtherNextDev(definition)
         }
 
         // A Node service without its packages cannot run: install them first, in its
@@ -4182,11 +4238,17 @@ final class EnvironmentSupervisor {
                     }
                 }
             },
-            onTermination: { [weak self] termination in
-                Task { @MainActor in self?.handleTermination(serviceID: sid, termination: termination) }
+            onTermination: { [weak self, ledger = self.ledger] termination in
+                let ended = ledger.entries.first { $0.pid == termination.pid }
+                ledger.remove(pids: [termination.pid])
+                Task { @MainActor in
+                    if let ended { self?.noteEndedLaunch(ended) }
+                    self?.handleTermination(serviceID: sid, termination: termination)
+                }
             }
         )
 
+        recordLaunch(sid, pid: pid, definition: definition)
         state.pid = pid
         await logStore.markStart(serviceID: sid, name: definition.displayName, pid: pid)
         return .launched(ServiceLaunch(
@@ -4725,13 +4787,27 @@ final class EnvironmentSupervisor {
             // A service that failed because the container runtime is down fails again
             // at once. Start the runtime first; if it does not come up, say so and stop.
             let recentLines = await logStore.entries(for: serviceID).map(\.text)
-            if CrashCause.showsContainerRuntimeDown(recentLines), !(await ContainerRuntime.isResponding(shell: shell)) {
-                let runtime = ContainerRuntime.detect()
-                await logStore.append(serviceID: serviceID, entry: LogEntry(
-                    stream: .stdout,
-                    text: "[travel-runner] \(runtime.displayName) is not running — starting it before the restart of \(name)"
-                ))
-                guard await ContainerRuntime.ensureRunning(shell: shell, clock: clock) else {
+            if CrashCause.showsContainerRuntimeDown(recentLines) {
+                let logStore = logStore
+                let probe = await ContainerRuntime.ensureRunning(shell: shell, clock: clock) { line in
+                    Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
+                        stream: .stdout, text: "[travel-runner] \(line) before the restart of \(name)"
+                    )) }
+                }
+                // The user can stop or restart the service during the wait.
+                guard serviceStates[serviceID]?.phase == .failed else { return }
+                if let reason = probe.failureText(waited: ContainerRuntime.startTimeout) {
+                    let runtime = probe.runtime
+                    guard case .daemonDown = probe else {
+                        // No docker CLI, or a socket that refuses: a wait does not fix it.
+                        state.haltReason = .runtimeUnusable(reason)
+                        postNotice(.service(serviceID), reason)
+                        recordFailure(serviceID, kind: .message(reason))
+                        await recordDebugEvent(
+                            kind: "breaker_trip", serviceID: serviceID, message: "\(reason) — the restart of \(name) stopped"
+                        )
+                        return
+                    }
                     state.haltReason = .runtimeDown(runtime: runtime.displayName, waiting: true)
                     postNotice(.service(serviceID), Self.runtimeWaitText(runtime, name))
                     recordFailure(serviceID, kind: .runtimeDown(waiting: true))
@@ -4742,7 +4818,6 @@ final class EnvironmentSupervisor {
                     waitForContainerRuntime(serviceID, runtime: runtime)
                     return
                 }
-                guard serviceStates[serviceID]?.phase == .failed else { return }
             }
 
             // The restart releases it once the phase has changed.
@@ -4771,7 +4846,7 @@ final class EnvironmentSupervisor {
             for _ in 0..<AutoRestart.runtimeChecks {
                 try? await clock.sleep(for: AutoRestart.runtimeCheckInterval)
                 guard waiting() else { return }
-                guard await ContainerRuntime.isResponding(shell: shell) else {
+                guard await ContainerRuntime.probe(shell: shell).isRunning else {
                     if clock.uptime() >= deadline { break }
                     continue
                 }
@@ -6047,7 +6122,26 @@ final class EnvironmentSupervisor {
     /// the LAN address is not used: after a network change that address is gone,
     /// and the connect blocks the main actor for the TCP timeout.
     private func isPortBound(_ port: Int) -> Bool {
-        isPortBoundOnAddress(port, address: UInt32(INADDR_LOOPBACK).bigEndian)
+        if isPortBoundOnAddress(port, address: UInt32(INADDR_LOOPBACK).bigEndian) { return true }
+        // Node binds `localhost` to ::1 only: an IPv4 connect does not see it.
+        return isPortBoundOnIPv6Loopback(port)
+    }
+
+    private func isPortBoundOnIPv6Loopback(_ port: Int) -> Bool {
+        guard let portNumber = UInt16(exactly: port) else { return false }
+        let sock = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { Darwin.close(sock) }
+        var addr = sockaddr_in6()
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = portNumber.bigEndian
+        addr.sin6_addr = in6addr_loopback
+        let result = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+        return result == 0
     }
 
     private func isPortBoundOnAddress(_ port: Int, address: UInt32) -> Bool {
@@ -6072,9 +6166,10 @@ final class EnvironmentSupervisor {
 
     /// Kills the listeners of the port and waits up to five seconds for it to free.
     /// The port frees only when a listener was killed. With none killed (a container
-    /// holds it) there is nothing to wait for.
-    private func freePort(_ port: Int) async {
-        guard await killPortOccupants(port) else { return }
+    /// holds it) there is nothing to wait for. `includingForeign` is for a button
+    /// that the person pressed.
+    private func freePort(_ port: Int, includingForeign: Bool = false) async {
+        guard await killPortOccupants(port, includingForeign: includingForeign) else { return }
         for _ in 0..<10 {
             try? await clock.sleep(for: .milliseconds(500))
             if !isPortBound(port) { break }
@@ -6085,24 +6180,179 @@ final class EnvironmentSupervisor {
     /// the clients of the port (a browser tab, the Stripe CLI that forwards to the
     /// portal, another dev server), and those must stay alive.
     /// A container runtime is never killed: its port helper serves every container.
+    /// A process that the runner did not start is killed only with `includingForeign`.
     /// True when it killed a listener.
     @discardableResult
-    private func killPortOccupants(_ port: Int) async -> Bool {
+    private func killPortOccupants(_ port: Int, includingForeign: Bool = false) async -> Bool {
         var killed = false
-        for listener in await portTools.listeners(port) {
-            if PortOwner.isContainerRuntime(listener.command) {
-                if let serviceID = sortedServiceIDs.first(where: { serviceStates[$0]?.definition.probe?.port == port }) {
-                    await logStore.append(
-                        serviceID: serviceID,
-                        entry: LogEntry(stream: .stderr, text: "[travel-runner] Port \(port) is published by \(listener.command) (a container). Not killed.")
-                    )
-                }
+        for occupant in await portOccupants(port) {
+            let listener = occupant.listener
+            switch occupant.owner {
+            case .containerRuntime:
+                await logPortLine(port, "Port \(port) is published by \(listener.command) (a container). Not killed.")
                 continue
+            case .foreign where !includingForeign:
+                await logPortLine(
+                    port, "Port \(port) is in use by \(listener.command) (PID \(listener.pid)), which \(Flavor.current.displayName) did not start. Not killed."
+                )
+                continue
+            case .ownLaunch, .ownLeftover, .foreign:
+                break
             }
             portTools.kill(listener.pid)
             killed = true
         }
         return killed
+    }
+
+    /// A line in the log of the service of the port.
+    private func logPortLine(_ port: Int, _ text: String) async {
+        guard let serviceID = sortedServiceIDs.first(where: { serviceStates[$0]?.definition.probe?.port == port }) else { return }
+        await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(text)"))
+    }
+
+    // MARK: - Process ownership
+
+    /// What the ownership rules know now: the live ledger entries, and the folders
+    /// of the services (decision 15).
+    private func ownershipKnowledge() -> PortOwner.Knowledge {
+        let tools = portTools
+        return PortOwner.Knowledge(
+            ledger: ledger.live(facts: tools.facts),
+            sessionPIDs: ledger.sessionPIDs,
+            roots: PortOwner.roots(serviceStates.values.compactMap { $0.definition.resolvedCwd }),
+            facts: tools.facts,
+            ancestors: tools.ancestors
+        )
+    }
+
+    /// Who listens on the port. Empty: the port is free.
+    func portOccupants(_ port: Int) async -> [PortOwner.Occupant] {
+        let listeners = await portTools.listeners(port)
+        return PortOwner.classify(listeners, ownershipKnowledge())
+    }
+
+    /// Records a process that this run started.
+    private func recordLaunch(_ serviceID: String, pid: pid_t, definition: ServiceDefinition) {
+        // The command of the service, never its environment.
+        ledger.record(
+            serviceID: serviceID, pid: pid, cwd: definition.resolvedCwd, command: definition.cmd, facts: portTools.facts
+        )
+    }
+
+    /// At launch, also after a relaunch for an update: the processes of the last
+    /// session that still run. The ledger forgets the ones that are gone.
+    func reconcileLeftovers() {
+        let facts = portTools.facts
+        ledger.prune(facts: facts)
+        leftoverNotice = Self.leftoverText(ledger.leftovers(facts: facts).map(\.serviceID), states: serviceStates)
+    }
+
+    /// "3 services from the last session are still running (Travel Portal :3002, …)."
+    static func leftoverText(_ serviceIDs: [String], states: [String: ServiceState]) -> String? {
+        var ids: [String] = []
+        for id in serviceIDs where !ids.contains(id) { ids.append(id) }
+        guard !ids.isEmpty else { return nil }
+        let names = ids.map { id -> String in
+            let definition = states[id]?.definition
+            let name = definition?.displayName ?? id
+            return definition?.probe?.port.map { "\(name) :\($0)" } ?? name
+        }
+        let one = ids.count == 1
+        return "\(ids.count) service\(one ? "" : "s") from the last session \(one ? "is" : "are") still running (\(names.joined(separator: ", ")))."
+    }
+
+    /// Stops the processes of the last session with their children. Start does it
+    /// first, without asking: they are the runner's own.
+    func stopLeftovers() async {
+        let leftovers = ledger.leftovers(facts: portTools.facts)
+        for entry in leftovers {
+            await portTools.stopTree(entry.pid)
+            let name = serviceStates[entry.serviceID]?.definition.displayName ?? entry.serviceID
+            await logStore.append(serviceID: entry.serviceID, entry: LogEntry(
+                stream: .stdout, text: "[travel-runner] Stopped \(name) (PID \(entry.pid)) from the last session."
+            ))
+        }
+        ledger.remove(pids: leftovers.map(\.pid))
+        leftoverNotice = nil
+    }
+
+    /// The "Stop them" button of the banner.
+    func stopLeftoversFromBanner() {
+        Task {
+            await stopLeftovers()
+            onActionFeedback?("Stopped the services of the last session", true)
+        }
+    }
+
+    /// The processes that the quit stops: each live ledger entry with its children.
+    /// The tree is read before the first signal.
+    func ledgerTreesForQuit() -> [pid_t] {
+        let tools = portTools
+        return ledger.live(facts: tools.facts).flatMap { tools.tree($0.pid) }
+    }
+
+    /// The listeners of the ports that the runner owns, for the quit. A process of
+    /// a stranger and a container runtime stay alive.
+    func ownListenersNow(on ports: [Int]) -> [pid_t] {
+        let knowledge = ownershipKnowledge()
+        let tools = portTools
+        return ports.flatMap { port in
+            PortOwner.classify(tools.listenersNow(port), knowledge)
+                .filter { $0.owner.isOwn }.map(\.listener.pid)
+        }
+    }
+
+    /// True while the pid names the process that a button names: the same start
+    /// time, and a listener of the port when the button has one. Without a start
+    /// time the process is not known, and nothing is stopped.
+    static func isSameProcess(_ pid: pid_t, startTime: Int64?, port: Int?, tools: PortTools) async -> Bool {
+        guard let startTime, tools.facts(pid)?.startTime == startTime else { return false }
+        guard let port else { return true }
+        return await tools.listeners(port).contains { $0.pid == pid }
+    }
+
+    /// A launch of this session ended: its root left the ledger. A `next dev` that
+    /// it started can outlive it, with no parent in the ledger.
+    private func noteEndedLaunch(_ entry: LaunchLedger.Entry) {
+        let earliest = endedLaunchStarts[entry.serviceID].map { min($0, entry.startTime) } ?? entry.startTime
+        endedLaunchStarts[entry.serviceID] = earliest
+    }
+
+    /// The quit stopped the processes of the ledger: the next launch has nothing to report.
+    func forgetLaunches() {
+        ledger.remove(pids: ledger.entries.map(\.pid))
+    }
+
+    /// A `next dev` of the person in the folder of the service. Next allows one dev
+    /// server per folder, so the start would fail in a loop. The runner's own (in
+    /// the ledger) do not count: the port cleanup and Start stop those.
+    ///
+    /// A `next dev` that started after a launch of this service that has ended is
+    /// the runner's own too: a crash of the root (pnpm) left it. It is stopped
+    /// without a question. Decision 15 (a folder of the repos is the runner's) does
+    /// not apply here: the folder of the service always is, and the plan asks
+    /// before it stops a `next dev` that the person started there.
+    private func checkOtherNextDev(_ definition: ServiceDefinition) async throws {
+        guard definition.resolvedType == .daemon, let cwd = definition.resolvedCwd, !cwd.isEmpty else { return }
+        let tools = portTools
+        let processes = await Task.detached { tools.processesIn(cwd) }.value
+        guard !processes.isEmpty else { return }
+        let knowledge = ownershipKnowledge()
+        let others = PortOwner.otherNextDevs(processes, knowledge)
+        let endedSince = endedLaunchStarts[definition.id]
+        for orphan in others {
+            guard let endedSince, orphan.startTime >= endedSince else { continue }
+            await tools.stopTree(orphan.pid)
+            await logStore.append(serviceID: definition.id, entry: LogEntry(
+                stream: .stdout,
+                text: "[travel-runner] Stopped a next dev (PID \(orphan.pid)) that an earlier start of \(definition.displayName) left."
+            ))
+        }
+        guard let other = others.first(where: { process in endedSince.map { process.startTime < $0 } ?? true }) else { return }
+        let port = await tools.listeningPorts(other.pid).first
+        let folder = PortOwner.folderName(cwd, roots: knowledge.roots)
+        throw ServiceError.otherNextDev(pid: other.pid, port: port, folder: folder, startTime: other.startTime)
     }
 
     /// Services whose port the cleanup may clear: in the profile, and not a
