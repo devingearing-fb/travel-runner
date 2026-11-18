@@ -127,6 +127,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for (_, state) in supervisor.serviceStates where state.pid != nil {
             ProcessRunner.startStopCommandDetached(of: state.definition)
         }
+        // Supabase keeps running between sessions, unless Settings says to stop it at
+        // quit. An update restart, or a stack of the other runner app, leaves it.
+        if cleanup.resetsEnv, let supabase = supervisor.supabaseStopAtQuit {
+            ProcessRunner.startStopCommandDetached(of: supabase)
+        }
 
         // The holds viewer of the Rooms tab is not a service, so it is not in the loop above.
         if let pid = supervisor.holdsViewer.pid { allPids += ProcessTree.tree(of: pid) }
@@ -238,6 +243,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminalsItem.target = self
         menu.addItem(terminalsItem)
 
+        if supervisor.hasSupabaseStack {
+            let stopSupabaseItem = NSMenuItem(title: "Stop Supabase", action: #selector(stopSupabase), keyEquivalent: "")
+            stopSupabaseItem.target = self
+            stopSupabaseItem.isEnabled = supervisor.canStopSupabase
+            stopSupabaseItem.toolTip = supervisor.canStopSupabase
+                ? "Stops the local containers. Data is kept."
+                : "Stop the stack first."
+            menu.addItem(stopSupabaseItem)
+
+            let quitStopItem = NSMenuItem(
+                title: "Stop Supabase when I quit", action: #selector(toggleStopSupabaseOnQuit), keyEquivalent: ""
+            )
+            quitStopItem.target = self
+            quitStopItem.state = supervisor.stopSupabaseOnQuit ? .on : .off
+            menu.addItem(quitStopItem)
+        }
+
         let reportItem = NSMenuItem(title: "Report a Problem…", action: #selector(reportProblem), keyEquivalent: "")
         reportItem.target = self
         reportItem.isEnabled = !supervisor.reportExportRunning
@@ -278,6 +300,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitApp() {
         NSApplication.shared.terminate(nil)
+    }
+
+    @objc private func stopSupabase() {
+        supervisor.stopSupabase()
+    }
+
+    @objc private func toggleStopSupabaseOnQuit() {
+        supervisor.stopSupabaseOnQuit.toggle()
     }
 
     @objc private func checkForUpdates() {

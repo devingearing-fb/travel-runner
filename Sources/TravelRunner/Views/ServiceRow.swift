@@ -18,9 +18,14 @@ struct ServiceRow: View {
             || state.modeNote != nil || stoppingText != nil
     }
 
-    /// What a stop with a teardown command does, while it runs.
+    /// What a stop with a teardown command does, while it runs. The Supabase
+    /// stack says what its start or stop prints.
     private var stoppingText: String? {
-        state.phase == .stopping ? state.definition.stoppingText : nil
+        switch state.phase {
+        case .starting: state.progressNote
+        case .stopping: state.progressNote ?? state.definition.stoppingText
+        default: nil
+        }
     }
 
     /// Why a skipped, failed or waiting service is in that phase. A running one has none.

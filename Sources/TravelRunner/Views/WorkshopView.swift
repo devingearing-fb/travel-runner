@@ -84,6 +84,19 @@ struct WorkshopView: View {
         } message: { request in
             Text(request.message)
         }
+        // A restart of Supabase stops its containers: it asks first.
+        .alert(
+            SupabaseStackHealth.restartConfirmationTitle,
+            isPresented: Binding(
+                get: { supervisor.supabaseRestartConfirmation != nil },
+                set: { if !$0 { supervisor.cancelSupabaseRestart() } }
+            )
+        ) {
+            Button("Restart") { supervisor.confirmSupabaseRestart() }
+            Button("Cancel", role: .cancel) { supervisor.cancelSupabaseRestart() }
+        } message: {
+            Text(SupabaseStackHealth.restartConfirmationMessage)
+        }
     }
 }
 

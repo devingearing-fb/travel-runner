@@ -134,6 +134,26 @@ struct SettingsPageView: View {
                 Divider().padding(.leading, 32)
 
                 settingsRow {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle(isOn: Binding(
+                            get: { supervisor.stopSupabaseOnQuit },
+                            set: { supervisor.stopSupabaseOnQuit = $0 }
+                        )) {
+                            Label("Stop Supabase when I quit", systemImage: "stop.circle")
+                                .font(.system(.caption, design: .monospaced))
+                        }
+                        .toggleStyle(.switch)
+                        .controlSize(.small)
+                        Text("Off: Supabase keeps running after you quit, and the next start is fast. On: quitting stops the local containers. Data is kept either way.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                Divider().padding(.leading, 32)
+
+                settingsRow {
                     HStack {
                         Toggle(isOn: Binding(
                             get: { supervisor.networkMode },

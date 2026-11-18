@@ -47,6 +47,9 @@ final class ServiceState {
     /// How the service runs, for the row: the Stripe CLI says whether it uses the
     /// test key or the developer's login. Never a secret value.
     var modeNote: String? = nil
+    /// What the service does now, while it starts or stops: the last line of
+    /// `supabase start` during a cold image pull, or the stop of the stack.
+    var progressNote: String? = nil
     var failureTimestamps: [Date] = []
     var isCircuitBroken: Bool = false
     /// The daemon ended with code 0 and got its one automatic restart.

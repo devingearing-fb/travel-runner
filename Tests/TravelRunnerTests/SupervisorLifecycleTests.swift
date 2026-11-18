@@ -4440,6 +4440,293 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(supervisor.dbMode, .remote)
         await loads.stopControlServers()
     }
+
+    // MARK: - L4: the Supabase stack
+
+    /// The Supabase service of the catalog: its launcher ends, its containers run on.
+    private func supabaseStack(_ cmd: [String], probeTimeout: Int = 30) -> ServiceDefinition {
+        daemon("supabase", cmd, probeTimeout: probeTimeout, reuse: true)
+    }
+
+    /// Listens on the test's port in this process, as a running database would.
+    private func holdPort() throws -> Int32 {
+        let sock = socket(AF_INET, SOCK_STREAM, 0)
+        XCTAssertGreaterThanOrEqual(sock, 0)
+        var yes: Int32 = 1
+        setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_addr.s_addr = UInt32(INADDR_LOOPBACK).bigEndian
+        addr.sin_port = UInt16(port).bigEndian
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+        }
+        guard bound == 0, listen(sock, 16) == 0 else {
+            close(sock)
+            throw XCTSkip("the test's port was taken")
+        }
+        return sock
+    }
+
+    /// The health that the fake check gives, and how often it was asked.
+    private func fakeStackHealth(_ health: SupabaseStackHealth) -> OSAllocatedUnfairLock<(health: SupabaseStackHealth, asks: Int)> {
+        let box = OSAllocatedUnfairLock(initialState: (health: health, asks: 0))
+        supervisor.supabaseHealthCheck = { _, _ in
+            box.withLock { value in
+                value.asks += 1
+                return value.health
+            }
+        }
+        return box
+    }
+
+    private func stackStops(_ shell: FakeCommandRunner) -> Int {
+        shell.commands.filter { $0 == "pnpm db:stop" }.count
+    }
+
+    /// health-supabase-ready-is-db-port-only: an open database port with Kong and auth
+    /// down was reused as a running stack. A start now stops it and runs db:start.
+    func testAPartlyUpSupabaseIsStoppedAndStartedAgain() async throws {
+        let held = try holdPort()
+        defer { close(held) }
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        let health = fakeStackHealth(.partial(missing: ["kong", "auth"]))
+        // db:stop brings the stack down; db:start makes it whole.
+        shell.respond { call in
+            if call.command == "pnpm db:stop" { health.withLock { $0.health = .healthy } }
+            return FakeCommandRunner.ok()
+        }
+        try load(supabaseStack(["sh", "-c", "echo db-start; exit 0"]))
+
+        supervisor.restartService("supabase")
+
+        let up = await waitUntil(20) { self.settled("supabase") }
+        XCTAssertTrue(up, "supabase is \(state("supabase").phase.rawValue)")
+        let lines = await logLines("supabase")
+        XCTAssertTrue(lines.contains(SupabaseStackHealth.partialRepairLine(["kong", "auth"])), lines.joined(separator: "\n"))
+        XCTAssertTrue(lines.contains("db-start"), "db:start must run")
+        XCTAssertEqual(stackStops(shell), 1)
+    }
+
+    /// A healthy stack is reused: no db:stop and no db:start. A negative control for
+    /// the test above.
+    func testAHealthySupabaseIsReusedWithoutAStart() async throws {
+        let held = try holdPort()
+        defer { close(held) }
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        let health = fakeStackHealth(.healthy)
+        try load(supabaseStack(["sh", "-c", "echo db-start; exit 0"]))
+
+        supervisor.restartService("supabase")
+
+        let up = await waitUntil(20) { self.settled("supabase") }
+        XCTAssertTrue(up, "supabase is \(state("supabase").phase.rawValue)")
+        let lines = await logLines("supabase")
+        XCTAssertFalse(lines.contains("db-start"))
+        XCTAssertEqual(stackStops(shell), 0)
+        XCTAssertEqual(health.withLock { $0.asks }, 1)
+    }
+
+    /// lifecycle-supabase-restart-is-noop: a restart from the row or the API reused the
+    /// running containers. It now stops them and starts them again.
+    func testARestartOfSupabaseStopsAndStartsItsContainers() async throws {
+        let held = try holdPort()
+        defer { close(held) }
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        let health = fakeStackHealth(.healthy)
+        try load(supabaseStack(["sh", "-c", "echo db-start; exit 0"]))
+        // After db:stop the first check finds the stack down; db:start makes it whole.
+        shell.respond { call in
+            if call.command == "pnpm db:stop" { health.withLock { $0.health = .down } }
+            return FakeCommandRunner.ok()
+        }
+        supervisor.supabaseHealthCheck = { _, _ in
+            health.withLock { value in
+                let answer = value.health
+                if answer == .down { value.health = .healthy }
+                return answer
+            }
+        }
+
+        supervisor.restartService("supabase", stopsStack: true)
+
+        let lines = await waitForLog("supabase", containing: "db-start")
+        XCTAssertTrue(lines.contains("db-start"), lines.joined(separator: "\n"))
+        XCTAssertEqual(stackStops(shell), 1)
+        XCTAssertTrue(lines.contains { $0.contains("Stopping the Supabase containers (pnpm db:stop). Data is kept.") })
+    }
+
+    /// A restart from the panel asks first; the confirmation restarts the stack.
+    func testARestartOfSupabaseFromThePanelAsksFirst() async throws {
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        _ = fakeStackHealth(.healthy)
+        try load(supabaseStack(["sh", "-c", "exit 0"]))
+        state("supabase").phase = .running
+
+        supervisor.requestRestart("supabase")
+        XCTAssertEqual(supervisor.supabaseRestartConfirmation, .service)
+        supervisor.cancelSupabaseRestart()
+        XCTAssertNil(supervisor.supabaseRestartConfirmation)
+        try await Task.sleep(for: .seconds(2))
+        XCTAssertEqual(stackStops(shell), 0, "a cancelled question stops nothing")
+        XCTAssertEqual(state("supabase").phase, .running)
+
+        // Another service restarts without a question.
+        supervisor.requestRestart("anchor")
+        XCTAssertNil(supervisor.supabaseRestartConfirmation)
+
+        supervisor.requestCascadeRestart("supabase")
+        XCTAssertEqual(supervisor.supabaseRestartConfirmation, .withDependents)
+        supervisor.cancelSupabaseRestart()
+        XCTAssertEqual(SupabaseStackHealth.restartConfirmationTitle + " " + SupabaseStackHealth.restartConfirmationMessage,
+                       "Restart Supabase? This stops and starts the local containers (about 1 min). Data is kept.")
+    }
+
+    /// Ready means the whole stack answers, not only the database port.
+    func testSupabaseIsNotRunningUntilItsWholeStackAnswers() async throws {
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        let health = fakeStackHealth(.partial(missing: ["auth"]))
+        try load(supabaseStack(webServer))
+
+        supervisor.restartService("supabase")
+
+        // The port opens; the stack is still partly up.
+        let portOpen = await waitUntil(20) { !Self.listeners(on: self.port).isEmpty }
+        XCTAssertTrue(portOpen)
+        try await Task.sleep(for: .seconds(3))
+        XCTAssertEqual(state("supabase").phase, .starting)
+        XCTAssertEqual(state("supabase").lastProbe, .other("the database port is open; auth not answering"))
+
+        health.withLock { $0.health = .healthy }
+        let up = await waitUntil(20) { self.settled("supabase") }
+        XCTAssertTrue(up, "supabase is \(state("supabase").phase.rawValue)")
+        XCTAssertEqual(stackStops(shell), 0, "the port was free: a plain db:start")
+    }
+
+    /// One repair for each start: a stack that stays partly up fails with the reason,
+    /// and the automatic restart does not stop the containers again.
+    func testAStackThatStaysPartlyUpFailsAfterOneRepair() async throws {
+        let held = try holdPort()
+        defer { close(held) }
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        _ = fakeStackHealth(.partial(missing: ["rest"]))
+        // db:start fails; the automatic restart finds the stack partly up again.
+        try load(supabaseStack(["sh", "-c", "echo db-start; exit 3"]))
+
+        supervisor.restartService("supabase")
+
+        let failed = await waitUntil(30) {
+            self.state("supabase").phase == .failed && self.supervisor.lastError?.contains("still only partly up") == true
+        }
+        XCTAssertTrue(failed, "supabase is \(state("supabase").phase.rawValue), error: \(supervisor.lastError ?? "none")")
+        try await Task.sleep(for: .seconds(4))
+        XCTAssertEqual(stackStops(shell), 1)
+        XCTAssertEqual(
+            supervisor.lastError,
+            "Supabase is still only partly up (rest not answering) after db:stop and db:start — restart Supabase, and see its log"
+        )
+    }
+
+    /// Another project's database on the port is never reused or stopped.
+    func testAnotherProjectsStackOnThePortStopsTheStart() async throws {
+        let held = try holdPort()
+        defer { close(held) }
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        _ = fakeStackHealth(.foreign(container: "supabase_db_fb-travel-data"))
+        try load(supabaseStack(["sh", "-c", "echo db-start; exit 0"]))
+
+        supervisor.restartService("supabase")
+
+        let failed = await waitUntil(20) { self.state("supabase").phase == .failed && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(failed, "supabase is \(state("supabase").phase.rawValue)")
+        XCTAssertTrue(supervisor.lastError?.contains("held by another Supabase stack (supabase_db_fb-travel-data)") == true,
+                      supervisor.lastError ?? "nil")
+        let lines = await logLines("supabase")
+        XCTAssertFalse(lines.contains("db-start"))
+        XCTAssertEqual(stackStops(shell), 0)
+    }
+
+    /// The liveness loop never restarts Supabase by itself: a restart stops its
+    /// containers. The row offers Restart instead.
+    func testAWakeCheckNeverRestartsSupabaseByItself() async throws {
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        let health = fakeStackHealth(.healthy)
+        try load(supabaseStack(["sh", "-c", "echo db-start; exit 0"], probeTimeout: 5))
+        // "Running" for the supervisor, but nothing listens: the probe after wake fails.
+        state("supabase").phase = .running
+        state("supabase").lastStarted = Date().addingTimeInterval(-3600)
+
+        supervisor.handleWake()
+
+        let failed = await waitUntil(30) { self.state("supabase").phase == .failed }
+        XCTAssertTrue(failed, "supabase is \(state("supabase").phase.rawValue)")
+        try await Task.sleep(for: .seconds(5))
+        XCTAssertEqual(state("supabase").phase, .failed)
+        XCTAssertEqual(state("supabase").restartCount, 0)
+        XCTAssertEqual(state("supabase").condition?.actions.first, .restart)
+        let lines = await logLines("supabase")
+        XCTAssertFalse(lines.contains("db-start"))
+        XCTAssertEqual(stackStops(shell), 0)
+        XCTAssertEqual(health.withLock { $0.asks }, 0)
+    }
+
+    /// "Stop Supabase" runs db:stop, and only while the stack is stopped.
+    func testStopSupabaseRunsDbStopOnlyWhileTheStackIsStopped() async throws {
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        var feedback: [(String, Bool)] = []
+        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        try load(supabaseStack(["sh", "-c", "exit 0"]))
+        XCTAssertTrue(supervisor.hasSupabaseStack)
+
+        // The stack runs: the portals would lose their database.
+        XCTAssertFalse(supervisor.canStopSupabase)
+        supervisor.stopSupabase()
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(stackStops(shell), 0)
+
+        supervisor.health = .stopped
+        XCTAssertTrue(supervisor.canStopSupabase)
+        supervisor.stopSupabase()
+        let done = await waitUntil(10) { !feedback.isEmpty }
+        XCTAssertTrue(done)
+        XCTAssertEqual(stackStops(shell), 1)
+        XCTAssertEqual(feedback.first?.0, "Supabase stopped")
+        XCTAssertEqual(state("supabase").phase, .stopped)
+        XCTAssertEqual(shell.calls.first { $0.command == "pnpm db:stop" }?.cwd, workDir.path)
+    }
+
+    /// Supabase keeps running after quit unless the setting is on.
+    func testQuittingStopsSupabaseOnlyWhenTheSettingIsOn() throws {
+        try load(supabaseStack(["sh", "-c", "exit 0"]))
+        XCTAssertFalse(supervisor.stopSupabaseOnQuit)
+        XCTAssertNil(supervisor.supabaseStopAtQuit)
+
+        supervisor.stopSupabaseOnQuit = true
+        let stop = try XCTUnwrap(supervisor.supabaseStopAtQuit)
+        XCTAssertEqual(stop.resolvedStopCmd, ["pnpm", "db:stop"])
+        XCTAssertEqual(stop.resolvedCwd, workDir.path)
+    }
+
+    /// Waits for a line with `text` in the log of the service, and returns the log.
+    private func waitForLog(_ id: String, containing text: String, seconds: Double = 20) async -> [String] {
+        let deadline = Date().addingTimeInterval(seconds)
+        var lines: [String] = []
+        repeat {
+            lines = await logLines(id)
+            if lines.contains(where: { $0.contains(text) }) { return lines }
+            try? await Task.sleep(for: .milliseconds(100))
+        } while Date() < deadline
+        return lines
+    }
 }
 
 /// The database mode at each ask of the other app.

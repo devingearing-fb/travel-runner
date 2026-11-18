@@ -23,8 +23,8 @@ struct WorkshopStatusView: View {
                     TriageCard(
                         state: state,
                         logStore: supervisor.logStore,
-                        onRestart: { supervisor.restartService(state.id) },
-                        onCascadeRestart: { supervisor.restartCascade(state.id) },
+                        onRestart: { supervisor.requestRestart(state.id) },
+                        onCascadeRestart: { supervisor.requestCascadeRestart(state.id) },
                         onClearCache: ["travel-portal", "partner-portal"].contains(state.id)
                             ? { supervisor.clearCacheAndRestart(state.id) } : nil
                     )
@@ -68,8 +68,8 @@ struct WorkshopStatusView: View {
                             phase: group.phase,
                             services: healthyServices,
                             logStore: supervisor.logStore,
-                            onRestart: { supervisor.restartService($0) },
-                            onCascadeRestart: { supervisor.restartCascade($0) },
+                            onRestart: { supervisor.requestRestart($0) },
+                            onCascadeRestart: { supervisor.requestCascadeRestart($0) },
                             dbResetRunning: supervisor.dbResetRunning,
                             serviceBehindCount: { supervisor.gitBehindCounts[$0] ?? 0 },
                             isServiceDepsStale: { supervisor.npmStaleServices.contains($0) }

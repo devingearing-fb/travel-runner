@@ -58,6 +58,14 @@ final class EnvironmentSupervisor {
     var dbSeedScenarioNotice: String?
     /// The reset that waits for the person to confirm it, or nil.
     var resetConfirmation: DbResetPolicy.ResetRequest? = nil
+    /// The Supabase restart that waits for the person to confirm it, or nil.
+    var supabaseRestartConfirmation: SupabaseRestartRequest? = nil
+    /// Off: Supabase keeps running when the app quits. Saved in UserDefaults.
+    var stopSupabaseOnQuit = false {
+        didSet { userDefaults.set(stopSupabaseOnQuit, forKey: SupabaseStackHealth.stopOnQuitSettingKey) }
+    }
+    /// True while "Stop Supabase" runs.
+    private(set) var supabaseStopping = false
     /// The cached hotel dump, as `fetch-hotels.mjs --verify` sees it.
     var hotelDump: HotelCatalog.DumpState = .unknown
     /// Set after a reset passed while portals ran, until a restart or a dismiss.
@@ -285,6 +293,11 @@ final class EnvironmentSupervisor {
     /// The port of Supabase opens before Postgres takes queries.
     var databaseProbeRetry: (interval: Duration, timeout: Duration) = (.seconds(2), .seconds(60))
     var dbResetAction: ((_ cwd: String) async -> Bool)?
+    /// Tests give the health of the Supabase stack; nil checks its containers.
+    @ObservationIgnored var supabaseHealthCheck: ((_ root: String, _ dbPort: Int) async -> SupabaseStackHealth)?
+    /// A start repairs a Supabase stack that is only partly up once. Start All and
+    /// a restart that a person asks for allow one more.
+    private var supabaseRepairUsed = false
     /// Tests give the pipeline of a DB setup, so no manifest and no seed scenario
     /// is read. Nil from the closure starts nothing and sets `lastError`, like a
     /// missing scenario.
@@ -312,6 +325,7 @@ final class EnvironmentSupervisor {
         self.userDefaults = userDefaults
         self.selectedDbSeedScenarioID = userDefaults.string(forKey: "dbSeedScenarioID")
         self.autoResetOnMigrations = userDefaults.bool(forKey: DbResetPolicy.autoResetSettingKey)
+        self.stopSupabaseOnQuit = userDefaults.bool(forKey: SupabaseStackHealth.stopOnQuitSettingKey)
         if holdsViewer == nil {
             self.holdsViewer.monorepo = { [weak self] in self?.monorepoPath }
         }
@@ -368,6 +382,8 @@ final class EnvironmentSupervisor {
         case commandNotRunnable(name: String, finding: CommandDiagnosis.Finding)
         case localKeysMissing(name: String, envFile: String)
         case portHeldByOtherStack(port: Int, container: String)
+        /// The Supabase stack stayed partly up after its one repair of this start.
+        case supabasePartlyUp(missing: [String])
         /// `owner` is the process name of the container runtime that listens on the port.
         case portHeldByContainer(name: String, port: Int, owner: String)
         /// `reason` is `ProbeConfig.problem`.
@@ -392,6 +408,8 @@ final class EnvironmentSupervisor {
                 "\(name) was not started: the keys of the local Supabase stack could not be read (scripts/local-db.sh status -o env). Without them it would use the hosted dev values in \(envFile). Restart Supabase, then restart \(name)."
             case .portHeldByOtherStack(let port, let container):
                 "Port \(port) is held by another Supabase stack (\(container)) — stop it, then start again"
+            case .supabasePartlyUp(let missing):
+                "Supabase is still only partly up (\(SupabaseStackHealth.missingText(missing))) after db:stop and db:start — restart Supabase, and see its log"
             case .badProbe(let name, let reason):
                 "\(name) cannot start: \(reason). Correct its probe in services.json, then quit \(Flavor.current.displayName) and open it again."
             case .portHeldByContainer(let name, let port, let owner):
@@ -708,6 +726,7 @@ final class EnvironmentSupervisor {
         health = .starting
         lastError = nil
         startFailure = nil
+        supabaseRepairUsed = false
         dbSetupFailedAtStart = false
         startupBeganAt = clock.date()
         phaseTimings = [:]
@@ -1113,7 +1132,7 @@ final class EnvironmentSupervisor {
                         return "[]"
                     },
                     restartService: { [weak self] serviceId in
-                        await MainActor.run { self?.restartService(serviceId) }
+                        await MainActor.run { self?.restartService(serviceId, stopsStack: true) }
                     },
                     clearCacheRestart: { [weak self] serviceId in
                         await MainActor.run { self?.clearCacheAndRestart(serviceId) }
@@ -1547,9 +1566,12 @@ final class EnvironmentSupervisor {
     }
 
     /// A restart that a person or the API asks for. It clears the failure history:
-    /// the circuit breaker and the backoff start again.
-    func restartService(_ serviceID: String) {
+    /// the circuit breaker and the backoff start again. With `stopsStack`, a restart
+    /// of Supabase stops its containers first; without it, it only starts what is down.
+    func restartService(_ serviceID: String, stopsStack: Bool = false) {
         if serviceID == "stripe" { stripeReconnectingSince = nil }
+        let stopsStack = stopsStack && isSupabaseStack(serviceID)
+        if isSupabaseStack(serviceID) { supabaseRepairUsed = false }
         guard queuedRestarts.insert(serviceID).inserted else { return }
         let name = serviceStates[serviceID]?.definition.displayName ?? serviceID
         Task {
@@ -1564,6 +1586,13 @@ final class EnvironmentSupervisor {
                     return heldBy == nil
                 }, prepare: {
                     self.queuedRestarts.remove(serviceID)
+                    // A stopped stack refuses the start: its containers stay as they are.
+                    if stopsStack, !self.isShuttingDown, self.health != .stopped,
+                       let definition = self.graph?.nodes[serviceID] {
+                        self.serviceStates[serviceID]?.phase = .stopping
+                        await self.stopSupabaseStack(definition)
+                        self.serviceStates[serviceID]?.phase = .pending
+                    }
                     try? await self.clock.sleep(for: .seconds(1))
                 })
                 if let heldBy {
@@ -1618,6 +1647,145 @@ final class EnvironmentSupervisor {
         }
     }
 
+    // MARK: - Supabase stack
+
+    /// What the Supabase confirmation restarts.
+    enum SupabaseRestartRequest: Equatable, Sendable {
+        case service
+        case withDependents
+    }
+
+    /// True for the container-managed Supabase service: its launcher ends, and its
+    /// containers run on.
+    func isSupabaseStack(_ serviceID: String) -> Bool {
+        serviceID == "supabase" && graph?.nodes[serviceID]?.shouldReuseIfRunning == true
+    }
+
+    /// The health of the local Supabase stack at `root`.
+    private func supabaseStackHealth(root: String, dbPort: Int) async -> SupabaseStackHealth {
+        if let supabaseHealthCheck { return await supabaseHealthCheck(root, dbPort) }
+        return await SupabaseStackHealth.check(
+            root: root, dbPort: dbPort, shell: shell, environment: graph?.nodes["supabase"]?.env ?? [:]
+        )
+    }
+
+    /// Why the launched Supabase stack is not ready although its database port is
+    /// open, or nil when it is ready (or the service is not Supabase).
+    private func supabaseStackNotReady(_ serviceID: String, _ launch: ServiceLaunch) async -> String? {
+        guard serviceID == "supabase", launch.definition.shouldReuseIfRunning,
+              let root = launch.definition.resolvedCwd, let port = launch.definition.probe?.port else { return nil }
+        switch await supabaseStackHealth(root: root, dbPort: port) {
+        case .healthy: return nil
+        case .partial(let missing): return "the database port is open; \(SupabaseStackHealth.missingText(missing))"
+        case .down: return "the database port is open; no container of the stack runs"
+        case .foreign(let container): return "the database port is held by \(container)"
+        }
+    }
+
+    /// Runs `pnpm db:stop` in the stack's folder, with its output in the Supabase log.
+    /// The data stays in the Docker volumes. True when it passed.
+    @discardableResult
+    private func stopSupabaseStack(_ definition: ServiceDefinition) async -> Bool {
+        guard let root = definition.resolvedCwd else { return false }
+        let id = definition.id
+        let logStore = logStore
+        serviceStates[id]?.progressNote = SupabaseStackHealth.stoppingText
+        defer { serviceStates[id]?.progressNote = nil }
+        let command = ShellQuote.join(SupabaseStackHealth.stopCommand)
+        await logStore.append(serviceID: id, entry: LogEntry(
+            stream: .stdout, text: "[travel-runner] Stopping the Supabase containers (\(command)). Data is kept."
+        ))
+        // One reader appends the lines, so the log keeps their order.
+        let (lines, sink) = AsyncStream<LogEntry>.makeStream()
+        let writer = Task {
+            for await entry in lines { await logStore.append(serviceID: id, entry: entry) }
+        }
+        let result = await shell.run(
+            command, cwd: root, environment: definition.env ?? [:], timeout: Self.supabaseStopTimeout,
+            onLine: { line, stream in sink.yield(LogEntry(stream: stream, text: line)) }
+        )
+        sink.finish()
+        await writer.value
+        if !result.succeeded {
+            let why = result.timedOut
+                ? "did not finish in \(Self.supabaseStopTimeout.components.seconds) s"
+                : "failed (exit \(result.exitCode))"
+            await logStore.append(serviceID: id, entry: LogEntry(
+                stream: .stderr, text: "[travel-runner] \(command) \(why) — see the lines above"
+            ))
+        }
+        return result.succeeded
+    }
+
+    nonisolated static let supabaseStopTimeout: Duration = .seconds(120)
+
+    /// The last line that `supabase start` printed, for the row while it starts.
+    private func noteStartProgress(_ serviceID: String, _ lines: [String]) {
+        guard let state = serviceStates[serviceID], state.phase == .starting,
+              let line = lines.last(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) else { return }
+        state.progressNote = String(line.trimmingCharacters(in: .whitespaces).prefix(160))
+    }
+
+    /// A restart from the panel. Supabase asks first: its restart stops the containers.
+    func requestRestart(_ serviceID: String) {
+        guard isSupabaseStack(serviceID), health != .stopped else {
+            restartService(serviceID)
+            return
+        }
+        supabaseRestartConfirmation = .service
+    }
+
+    /// A restart with dependents from the panel. Supabase asks first.
+    func requestCascadeRestart(_ serviceID: String) {
+        guard isSupabaseStack(serviceID), health != .stopped else {
+            restartCascade(serviceID)
+            return
+        }
+        supabaseRestartConfirmation = .withDependents
+    }
+
+    func confirmSupabaseRestart() {
+        guard let request = supabaseRestartConfirmation else { return }
+        supabaseRestartConfirmation = nil
+        switch request {
+        case .service: restartService("supabase", stopsStack: true)
+        case .withDependents: restartCascade("supabase")
+        }
+    }
+
+    func cancelSupabaseRestart() {
+        supabaseRestartConfirmation = nil
+    }
+
+    /// The menu offers "Stop Supabase" for a config with the Supabase stack.
+    var hasSupabaseStack: Bool { isSupabaseStack("supabase") }
+
+    /// "Stop Supabase" works while the stack is stopped, so no portal loses its database.
+    var canStopSupabase: Bool {
+        hasSupabaseStack && health == .stopped && stackIsIdle && !supabaseStopping
+    }
+
+    /// Stops the Supabase containers. The data is kept.
+    func stopSupabase() {
+        guard canStopSupabase, let definition = graph?.nodes["supabase"] else { return }
+        supabaseStopping = true
+        enqueueStackOperation(finally: { [weak self] in self?.supabaseStopping = false }) { [weak self] in
+            guard let self else { return }
+            self.serviceStates["supabase"]?.phase = .stopping
+            let ok = await self.stopSupabaseStack(definition)
+            self.serviceStates["supabase"]?.phase = .stopped
+            self.onActionFeedback?(ok ? "Supabase stopped" : "Supabase did not stop — see its log", ok)
+        }
+    }
+
+    /// The stop that quitting runs for Supabase, or nil. Supabase keeps running
+    /// between sessions unless Settings says to stop it.
+    var supabaseStopAtQuit: ServiceDefinition? {
+        guard stopSupabaseOnQuit, isSupabaseStack("supabase"), var definition = graph?.nodes["supabase"] else { return nil }
+        definition.stopCmd = SupabaseStackHealth.stopCommand
+        return definition
+    }
+
     // MARK: - Recovery actions
 
     /// The actions that a service row can run now. The others belong to the DB
@@ -1637,7 +1805,9 @@ final class EnvironmentSupervisor {
     func perform(_ action: RecoveryAction, for serviceID: String) {
         guard canPerform(action, for: serviceID) else { return }
         switch action {
-        case .restart, .startService:
+        case .restart:
+            requestRestart(serviceID)
+        case .startService:
             restartService(serviceID)
         case .stopForeignAndRetry(nil):
             // The start stops the stale process that holds the port of the probe.
@@ -2022,6 +2192,11 @@ final class EnvironmentSupervisor {
                 await lifecycle.withLock(id) {
                     serviceStates[id]?.phase = .stopping
                     await processRunner.stop(serviceID: id)
+                    // Supabase's launcher has ended: a restart stops its containers.
+                    if isSupabaseStack(id), !isShuttingDown, health != .stopped, let definition = graph.nodes[id] {
+                        supabaseRepairUsed = false
+                        await stopSupabaseStack(definition)
+                    }
                     serviceStates[id]?.phase = .stopped
                 }
             }
@@ -3181,21 +3356,43 @@ final class EnvironmentSupervisor {
         // Reuse-if-running: Docker-managed services (Supabase) persist between sessions.
         // If the port is already bound, skip starting and mark as running.
         if definition.shouldReuseIfRunning, let port = definition.probe?.port {
-            if isPortBound(port) {
-                // Only reuse the monorepo's own database. Another checkout's stack (the
-                // old travel-booking-portal one, say) on the same port is a different DB.
-                if serviceID == "supabase", let root = definition.resolvedCwd {
+            var reuses = isPortBound(port)
+            // The database port alone is not a working stack. Only the monorepo's own
+            // healthy stack is reused. Another checkout's stack (the old
+            // travel-booking-portal one, say) on the same port is a different DB.
+            if reuses, serviceID == "supabase", let root = definition.resolvedCwd {
+                switch await supabaseStackHealth(root: root, dbPort: port) {
+                case .healthy:
+                    break
+                case .down:
+                    reuses = false
+                case .foreign(let occupant):
                     let expected = SupabaseProject.dbContainerName(root: root)
-                    if let occupant = await Self.containerPublishing(port: port, shell: shell), occupant != expected {
-                        await logStore.append(serviceID: serviceID, entry: LogEntry(
-                            stream: .stderr,
-                            text: "[travel-runner] Port \(port) is held by \(occupant), not \(expected). Stop that stack (npx supabase stop in its checkout, or: docker stop $(docker ps -q --filter name=_\(occupant.replacingOccurrences(of: "supabase_db_", with: ""))$)) and start again."
-                        ))
-                        throw ServiceError.portHeldByOtherStack(port: port, container: occupant)
+                    await logStore.append(serviceID: serviceID, entry: LogEntry(
+                        stream: .stderr,
+                        text: "[travel-runner] Port \(port) is held by \(occupant), not \(expected). Stop that stack (npx supabase stop in its checkout, or: docker stop $(docker ps -q --filter name=_\(occupant.replacingOccurrences(of: "supabase_db_", with: ""))$)) and start again."
+                    ))
+                    throw ServiceError.portHeldByOtherStack(port: port, container: occupant)
+                case .partial(let missing):
+                    // db:start keeps a stack whose database runs as it is, so the
+                    // repair stops the stack first. One repair for each start: a stack
+                    // that stays partly up fails with the reason.
+                    guard !supabaseRepairUsed else {
+                        throw ServiceError.supabasePartlyUp(missing: missing)
                     }
+                    supabaseRepairUsed = true
+                    await logStore.append(serviceID: serviceID, entry: LogEntry(
+                        stream: .stderr, text: SupabaseStackHealth.partialRepairLine(missing)
+                    ))
+                    state.phase = .starting
+                    await stopSupabaseStack(definition)
+                    reuses = false
                 }
+            }
+            if reuses {
                 state.phase = .running
                 state.clearCondition()
+                state.progressNote = nil
                 state.lastStarted = clock.date()
                 state.readyAt = clock.date()
                 startBlockedDependents(of: serviceID)
@@ -3384,6 +3581,7 @@ final class EnvironmentSupervisor {
 
         state.phase = .starting
         state.clearCondition()
+        state.progressNote = nil
         state.lastProbe = nil
         state.lastStarted = clock.date()
         state.readyAt = nil
@@ -3420,9 +3618,12 @@ final class EnvironmentSupervisor {
         let effectiveDefinition = stripeKey.map { StripeLauncher.definition(eventDefinition, resolution: $0) } ?? eventDefinition
 
         let sid = serviceID
+        // A cold start of Supabase pulls images for minutes: the row shows its output.
+        let showsProgress = serviceID == "supabase" && definition.shouldReuseIfRunning
         let pid = try await processRunner.start(
             service: effectiveDefinition,
             onStdout: { [weak self] lines in
+                if showsProgress { Task { @MainActor in self?.noteStartProgress(sid, lines) } }
                 Task {
                     let entries = lines.map { LogEntry(stream: .stdout, text: $0) }
                     await logStore.appendBatch(serviceID: sid, entries: entries)
@@ -3454,7 +3655,8 @@ final class EnvironmentSupervisor {
                     }
                 }
             },
-            onStderr: { lines in
+            onStderr: { [weak self] lines in
+                if showsProgress { Task { @MainActor in self?.noteStartProgress(sid, lines) } }
                 Task {
                     let entries = lines.map { LogEntry(stream: .stderr, text: $0) }
                     await logStore.appendBatch(serviceID: sid, entries: entries)
@@ -3515,8 +3717,12 @@ final class EnvironmentSupervisor {
                 // The newest process of the service owns the field.
                 if state.pid == launch.pid, state.lastProbe != outcome { state.lastProbe = outcome }
                 if outcome.isReady {
-                    ready = true
-                    break
+                    // The database port of Supabase opens before the rest of its stack answers.
+                    guard let waiting = await supabaseStackNotReady(serviceID, launch) else {
+                        ready = true
+                        break
+                    }
+                    if state.pid == launch.pid { state.lastProbe = .other(waiting) }
                 }
                 if let exit = await processRunner.exit(of: launch.pid) {
                     // The automatic restart gives the verdict, not this waiter.
@@ -3584,6 +3790,7 @@ final class EnvironmentSupervisor {
 
         state.phase = .running
         state.clearCondition()
+        state.progressNote = nil
         if state.readyAt == nil { state.readyAt = clock.date() }
         startBlockedDependents(of: serviceID)
     }
@@ -4132,7 +4339,8 @@ final class EnvironmentSupervisor {
                 state.lastProbe = outcome
                 recordFailure(serviceID, kind: .wakeCheck(lastProbe: outcome))
                 recalculateHealth()
-                scheduleRestart(serviceID: serviceID)
+                // A restart of Supabase stops its containers: only a person starts one.
+                if !isSupabaseStack(serviceID) { scheduleRestart(serviceID: serviceID) }
                 Task { await self.captureDebugIssue(
                     trigger: "probe_timeout",
                     serviceID: serviceID,
