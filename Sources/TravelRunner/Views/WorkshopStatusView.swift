@@ -19,6 +19,11 @@ struct WorkshopStatusView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
+                // The header shows the newest few; this lists them all.
+                if supervisor.notices.header.more > 0 {
+                    noticesSection
+                }
+
                 ForEach(failedServices) { state in
                     TriageCard(
                         state: state,
@@ -91,6 +96,48 @@ struct WorkshopStatusView: View {
                 try? await Task.sleep(for: .milliseconds(1000))
             }
         }
+    }
+
+    private var noticesSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Notices")
+                .font(.caption)
+                .fontWeight(.medium)
+            ForEach(supervisor.notices.all) { notice in
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: notice.severity == .error ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                        .foregroundStyle(notice.severity == .error ? .red : .blue)
+                        .frame(width: 16)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(notice.text)
+                            .font(.caption)
+                            .textSelection(.enabled)
+                        Text(notice.since, style: .relative)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(notice.text, forType: .string)
+                    } label: {
+                        Image(systemName: "doc.on.doc").font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Copy the text")
+                    Button {
+                        supervisor.dismissNotice(notice.key)
+                    } label: {
+                        Image(systemName: "xmark").font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .padding(10)
+        .background(Color.secondary.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     private var preflightSection: some View {

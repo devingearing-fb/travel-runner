@@ -1041,7 +1041,7 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         // Control: a database that answers with no tables is reset, as before.
         state("supabase").phase = .running
-        supervisor.lastError = nil
+        supervisor.notices = NoticeCenter()
         let emptyDatabase = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
         XCTAssertTrue(emptyDatabase)
         XCTAssertEqual(resets, 1)
@@ -1079,7 +1079,7 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         // Control: the same path with a database that answers "no tables" is reset.
         docker.respond { _ in FakeCommandRunner.ok("0\n") }
-        supervisor.lastError = nil
+        supervisor.notices = NoticeCenter()
         let emptyDatabase = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
         XCTAssertTrue(emptyDatabase)
         XCTAssertEqual(resets, 1)
@@ -1289,7 +1289,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             resets += 1
             // The same request while this one runs.
             second = await supervisor?.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: false)
-            supervisor?.lastError = "DB reset failed at Load hotels: HTTP 401"
+            supervisor?.notices.post(.dbSetup, "DB reset failed at Load hotels: HTTP 401")
             return false
         }
 
@@ -1701,6 +1701,68 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(running["reason"])
         XCTAssertNil(running["likely_cause"])
         XCTAssertEqual(running["last_probe"], "ready")
+    }
+
+    /// Finding ux-global-lasterror-slot: one global banner that stayed after the
+    /// service ran again. The notice of a service resolves when it runs; the notice
+    /// of another key stays.
+    func testTheNoticeOfAServiceResolvesWhenItRunsAndOtherNoticesStay() async throws {
+        let marker = workDir.appendingPathComponent("fixed").path
+        let script = "if [ -f '\(marker)' ]; then exec \(webServer.joined(separator: " ")); else exit 1; fi"
+        try load(ServiceDefinition(
+            id: "web", name: "Web App", cmd: ["sh", "-c", script], cwd: workDir.path,
+            probe: ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30),
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        ))
+
+        supervisor.restartService("web")
+        let failed = await waitUntil(20) {
+            self.state("web").phase == .failed && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(failed, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(supervisor.notices.text(.service("web")), "Web App exited before it was ready — see its log")
+        supervisor.notices.post(.profile, "Could not save profile: disk full")
+        XCTAssertEqual(supervisor.lastError, "Could not save profile: disk full", "the newest error")
+        XCTAssertEqual(supervisor.notices.all.count, 2, "one notice per key; the newer one hides no other")
+
+        FileManager.default.createFile(atPath: marker, contents: nil)
+        supervisor.restartService("web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+
+        XCTAssertNil(supervisor.notices.notice(.service("web")), "the service runs: its notice resolved itself")
+        XCTAssertEqual(supervisor.notices.all.map(\.key), [.profile])
+        XCTAssertEqual(supervisor.lastError, "Could not save profile: disk full")
+
+        // A start makes the notices of the stack stale; the profile's stays.
+        supervisor.notices.post(.preflight, "Preflight failed — Docker: not running")
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(supervisor.notices.all.map(\.key), [.profile])
+    }
+
+    /// The setup of an empty database shows its progress as an info notice. It is
+    /// no error, and it goes when the setup ends.
+    func testTheProgressOfAnEmptyDatabaseSetupIsInfoAndGoesWhenItEnds() async throws {
+        try loadSupabase()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "0", stderr: "") }
+        var during: Notice?
+        var errorDuring: String?
+        supervisor.dbResetAction = { [supervisor] _ in
+            during = supervisor?.notices.notice(.dbProgress)
+            errorDuring = supervisor?.lastError
+            return true
+        }
+
+        let didReset = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
+
+        XCTAssertTrue(didReset)
+        XCTAssertEqual(during?.severity, .info)
+        XCTAssertEqual(during?.text.hasPrefix("Empty database — running the reset now"), true, during?.text ?? "nil")
+        XCTAssertNil(errorDuring, "progress is no error")
+        XCTAssertNil(supervisor.notices.notice(.dbProgress))
+        XCTAssertTrue(supervisor.notices.all.isEmpty)
     }
 
     /// The breaker gives its own reason, and the exit of the third crash does not
@@ -2160,7 +2222,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(cleared, supervisor.lastError ?? "nil")
 
         // An error that is not the banner of this service stays.
-        supervisor.lastError = "Could not save profile: disk full"
+        supervisor.notices.post(.profile, "Could not save profile: disk full")
         supervisor.restartService("quitter")
         let started = await waitUntil(5) { !self.supervisor.actionsInFlight.isEmpty }
         XCTAssertTrue(started)
@@ -3113,7 +3175,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         // has no seed scenario, so the next guard stops it.
         _ = try checkoutLackingAMigration(profiles: ["reset", HotelCatalog.withoutHotelsProfile])
         supervisor.dbResetAction = nil
-        supervisor.lastError = nil
+        supervisor.notices = NoticeCenter()
         supervisor.resetWithoutHotels()
         XCTAssertNotNil(supervisor.lastError)
         XCTAssertNotEqual(supervisor.lastError, HotelCatalog.noWithoutHotelsProfileText)

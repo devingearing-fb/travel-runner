@@ -125,18 +125,17 @@ struct WorkshopHeaderBar: View {
             }
 
             // Banners
-            if let error = supervisor.lastError {
-                // When the primary header button is already Retry, the banner
-                // shows context only — one Retry affordance, not two.
-                let headerOffersRetry = supervisor.health == .degraded && supervisor.currentPhase == .idle
-                alertBanner(
-                    icon: "exclamationmark.triangle.fill",
-                    color: .red,
-                    text: error,
-                    subtitle: supervisor.rootCauseDescription,
-                    action: headerOffersRetry ? nil : ("Retry", { supervisor.retryStartAll() }),
-                    report: { ReportProblem.run(supervisor: supervisor) }
-                )
+            let header = supervisor.notices.header
+            ForEach(header.shown) { notice in
+                noticeBanner(notice, isNewestError: notice.id == supervisor.notices.newestError?.id)
+            }
+            if header.more > 0 {
+                Button(NoticeCenter.moreText(header.more)) { WorkshopPanel.shared.open(section: .status) }
+                    .buttonStyle(.link)
+                    .font(.caption)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
             }
             if let error = supervisor.controlAPIError {
                 alertBanner(
@@ -339,6 +338,31 @@ struct WorkshopHeaderBar: View {
         }
     }
 
+    // MARK: - Notices
+
+    /// One notice: selectable text, copy and dismiss. The newest error also says
+    /// the root cause and offers Retry and Report, as the single banner did.
+    private func noticeBanner(_ notice: Notice, isNewestError: Bool) -> some View {
+        // When the primary header button is already Retry, the notice shows
+        // context only — one Retry affordance, not two.
+        let headerOffersRetry = supervisor.health == .degraded && supervisor.currentPhase == .idle
+        let offersRetry = isNewestError && notice.key.endsWithStack && notice.key != .dbMode && !headerOffersRetry
+        return alertBanner(
+            icon: notice.severity == .error ? "exclamationmark.triangle.fill" : "info.circle.fill",
+            color: notice.severity == .error ? .red : .blue,
+            text: notice.text,
+            subtitle: isNewestError ? supervisor.rootCauseDescription : nil,
+            longText: true,
+            action: offersRetry ? ("Retry", { supervisor.retryStartAll() }) : nil,
+            report: notice.severity == .error ? { ReportProblem.run(supervisor: supervisor) } : nil,
+            onCopy: {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(notice.text, forType: .string)
+            },
+            onDismiss: { supervisor.dismissNotice(notice.key) }
+        )
+    }
+
     // MARK: - Alert banner
 
     private func alertBanner(
@@ -347,10 +371,13 @@ struct WorkshopHeaderBar: View {
         text: String,
         subtitle: String?,
         link: (label: String, url: URL)? = nil,
+        // A notice may be long: it shows more lines.
+        longText: Bool = false,
         action: (label: String, handler: () -> Void)?,
         secondaryAction: (label: String, handler: () -> Void)? = nil,
         trailing: AnyView? = nil,
         report: (() -> Void)? = nil,
+        onCopy: (() -> Void)? = nil,
         onDismiss: (() -> Void)? = nil
     ) -> some View {
         HStack(spacing: 8) {
@@ -359,7 +386,8 @@ struct WorkshopHeaderBar: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(text)
                     .font(.caption)
-                    .lineLimit(link == nil ? 2 : 3)
+                    .lineLimit(longText ? 4 : link == nil ? 2 : 3)
+                    .textSelection(.enabled)
                 if let subtitle {
                     Text(subtitle)
                         .font(.caption2)
@@ -389,6 +417,17 @@ struct WorkshopHeaderBar: View {
                     .controlSize(.small)
                     .disabled(supervisor.reportExportRunning)
                     .help("Save a report zip to Downloads and copy a summary for Slack")
+            }
+            if let onCopy {
+                Button {
+                    onCopy()
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Copy the text")
             }
             if let onDismiss {
                 Button {

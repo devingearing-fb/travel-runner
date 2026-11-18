@@ -159,7 +159,7 @@ final class DiagnosticsSnapshotTests: XCTestCase {
         }
         supervisor.dbMode = .local
         supervisor.pendingMigrations = ["20261101000000_add_holds"]
-        supervisor.lastError = "DB setup failed at Seed"
+        supervisor.notices.post(.dbSetup, "DB setup failed at Seed")
         let check = PreflightCheck(id: "docker", name: "Docker")
         check.result = .failed(message: "Docker is not running", fix: "Open OrbStack")
         supervisor.preflightChecks = [check]
