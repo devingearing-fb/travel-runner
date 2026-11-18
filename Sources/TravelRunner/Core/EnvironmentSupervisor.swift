@@ -181,6 +181,9 @@ final class EnvironmentSupervisor {
     /// The processes that the runner started. The app gives it the file; without
     /// one it stays in memory.
     @ObservationIgnored var ledger = LaunchLedger(path: nil)
+    /// Per service, the start time of its earliest launch in this session that has
+    /// ended (`checkOtherNextDev`).
+    @ObservationIgnored private var endedLaunchStarts: [String: Int64] = [:]
     /// The check that the Stripe CLI is installed and can call Stripe, with the test
     /// key or the login. Tests set it; nil runs the CLI.
     @ObservationIgnored var stripeAvailability: (@Sendable () async -> Bool)?
@@ -369,7 +372,7 @@ final class EnvironmentSupervisor {
         /// A process that the runner did not start listens on the port of the service.
         case portHeldByProcess(name: String, port: Int, occupant: PortOwner.Occupant)
         /// A `next dev` that the runner did not start runs in the folder of the service.
-        case otherNextDev(pid: pid_t, port: Int?, folder: String)
+        case otherNextDev(pid: pid_t, port: Int?, folder: String, startTime: Int64)
 
         var description: String {
             switch self {
@@ -394,7 +397,7 @@ final class EnvironmentSupervisor {
                 "\(name) cannot start: its packages are not installed and \(command) \(why)"
             case .portHeldByProcess(let name, let port, let occupant):
                 PortOwner.foreignText(port: port, occupant: occupant, service: name)
-            case .otherNextDev(let pid, let port, let folder):
+            case .otherNextDev(let pid, let port, let folder, _):
                 PortOwner.otherNextDevText(pid: pid, port: port, folder: folder)
             }
         }
@@ -1455,21 +1458,27 @@ final class EnvironmentSupervisor {
         switch action {
         case .restart, .startService:
             restartService(serviceID)
-        case .stopForeignAndRetry(nil):
-            // The start stops the stale process that holds the port of the probe.
-            restartService(serviceID)
-        case .stopForeignAndRetry(let port?):
-            // The port can be another port of the app (the HMR port); the start
-            // frees only the port of the probe.
+        case .stopForeignAndRetry(let port):
+            // The port can be another port of the app (the HMR port). With no port in
+            // the line, the button frees the port of the probe: the start alone
+            // would refuse a process that the runner did not start.
+            let target = port ?? serviceStates[serviceID]?.definition.probe?.port
             Task {
-                await freePort(port, includingForeign: true)
+                if let target { await freePort(target, includingForeign: true) }
                 restartService(serviceID)
             }
-        case .stopProcessAndRetry(let pid, _):
+        case .stopProcessAndRetry(let pid, let startTime, let port, _):
             // The person pressed the button: the process need not be the runner's.
+            // It must still be the process that the row named; the start checks again.
             let tools = portTools
             Task {
-                await tools.stopTree(pid)
+                if await Self.isSameProcess(pid, startTime: startTime, port: port, tools: tools) {
+                    await tools.stopTree(pid)
+                } else {
+                    await logStore.append(serviceID: serviceID, entry: LogEntry(
+                        stream: .stderr, text: "[travel-runner] PID \(pid) is no longer the process that blocked the start. Not stopped."
+                    ))
+                }
                 restartService(serviceID)
             }
         case .clearCacheAndRestart:
@@ -1710,10 +1719,15 @@ final class EnvironmentSupervisor {
             return .cannotRun(finding)
         case .installFailed:
             return .installFailed(serviceError.description)
-        case .portHeldByProcess(_, _, let occupant):
-            return .blocked(serviceError.description, action: .stopProcessAndRetry(pid: occupant.listener.pid))
-        case .otherNextDev(let pid, _, _):
-            return .blocked(serviceError.description, action: .stopProcessAndRetry(pid: pid, sameFolder: true))
+        case .portHeldByProcess(_, let port, let occupant):
+            let pid = occupant.listener.pid
+            return .blocked(serviceError.description, action: .stopProcessAndRetry(
+                pid: pid, startTime: portTools.facts(pid)?.startTime, port: port
+            ))
+        case .otherNextDev(let pid, _, _, let startTime):
+            return .blocked(serviceError.description, action: .stopProcessAndRetry(
+                pid: pid, startTime: startTime, sameFolder: true
+            ))
         default:
             return .message(serviceError.description)
         }
@@ -3109,8 +3123,12 @@ final class EnvironmentSupervisor {
                 }
             },
             onTermination: { [weak self, ledger = self.ledger] termination in
+                let ended = ledger.entries.first { $0.pid == termination.pid }
                 ledger.remove(pids: [termination.pid])
-                Task { @MainActor in self?.handleTermination(serviceID: sid, termination: termination) }
+                Task { @MainActor in
+                    if let ended { self?.noteEndedLaunch(ended) }
+                    self?.handleTermination(serviceID: sid, termination: termination)
+                }
             }
         )
 
@@ -4605,17 +4623,35 @@ final class EnvironmentSupervisor {
     /// The processes that the quit stops: each live ledger entry with its children.
     /// The tree is read before the first signal.
     func ledgerTreesForQuit() -> [pid_t] {
-        ledger.live(facts: portTools.facts).flatMap { ProcessTree.tree(of: $0.pid) }
+        let tools = portTools
+        return ledger.live(facts: tools.facts).flatMap { tools.tree($0.pid) }
     }
 
     /// The listeners of the ports that the runner owns, for the quit. A process of
     /// a stranger and a container runtime stay alive.
     func ownListenersNow(on ports: [Int]) -> [pid_t] {
         let knowledge = ownershipKnowledge()
+        let tools = portTools
         return ports.flatMap { port in
-            PortOwner.classify(PortOwner.listenersNow(on: port), knowledge)
+            PortOwner.classify(tools.listenersNow(port), knowledge)
                 .filter { $0.owner.isOwn }.map(\.listener.pid)
         }
+    }
+
+    /// True while the pid names the process that a button names: the same start
+    /// time, and a listener of the port when the button has one. Without a start
+    /// time the process is not known, and nothing is stopped.
+    static func isSameProcess(_ pid: pid_t, startTime: Int64?, port: Int?, tools: PortTools) async -> Bool {
+        guard let startTime, tools.facts(pid)?.startTime == startTime else { return false }
+        guard let port else { return true }
+        return await tools.listeners(port).contains { $0.pid == pid }
+    }
+
+    /// A launch of this session ended: its root left the ledger. A `next dev` that
+    /// it started can outlive it, with no parent in the ledger.
+    private func noteEndedLaunch(_ entry: LaunchLedger.Entry) {
+        let earliest = endedLaunchStarts[entry.serviceID].map { min($0, entry.startTime) } ?? entry.startTime
+        endedLaunchStarts[entry.serviceID] = earliest
     }
 
     /// The quit stopped the processes of the ledger: the next launch has nothing to report.
@@ -4626,16 +4662,32 @@ final class EnvironmentSupervisor {
     /// A `next dev` of the person in the folder of the service. Next allows one dev
     /// server per folder, so the start would fail in a loop. The runner's own (in
     /// the ledger) do not count: the port cleanup and Start stop those.
+    ///
+    /// A `next dev` that started after a launch of this service that has ended is
+    /// the runner's own too: a crash of the root (pnpm) left it. It is stopped
+    /// without a question. Decision 15 (a folder of the repos is the runner's) does
+    /// not apply here: the folder of the service always is, and the plan asks
+    /// before it stops a `next dev` that the person started there.
     private func checkOtherNextDev(_ definition: ServiceDefinition) async throws {
         guard definition.resolvedType == .daemon, let cwd = definition.resolvedCwd, !cwd.isEmpty else { return }
         let tools = portTools
         let processes = await Task.detached { tools.processesIn(cwd) }.value
         guard !processes.isEmpty else { return }
         let knowledge = ownershipKnowledge()
-        guard let other = PortOwner.otherNextDevs(processes, knowledge).first else { return }
+        let others = PortOwner.otherNextDevs(processes, knowledge)
+        let endedSince = endedLaunchStarts[definition.id]
+        for orphan in others {
+            guard let endedSince, orphan.startTime >= endedSince else { continue }
+            await tools.stopTree(orphan.pid)
+            await logStore.append(serviceID: definition.id, entry: LogEntry(
+                stream: .stdout,
+                text: "[travel-runner] Stopped a next dev (PID \(orphan.pid)) that an earlier start of \(definition.displayName) left."
+            ))
+        }
+        guard let other = others.first(where: { process in endedSince.map { process.startTime < $0 } ?? true }) else { return }
         let port = await tools.listeningPorts(other.pid).first
         let folder = PortOwner.folderName(cwd, roots: knowledge.roots)
-        throw ServiceError.otherNextDev(pid: other.pid, port: port, folder: folder)
+        throw ServiceError.otherNextDev(pid: other.pid, port: port, folder: folder, startTime: other.startTime)
     }
 
     /// Services whose port the cleanup may clear: in the profile, and not a

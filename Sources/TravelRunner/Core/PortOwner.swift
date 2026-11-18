@@ -285,6 +285,10 @@ struct PortTools: Sendable {
     var listeningPorts: @Sendable (pid_t) async -> [Int] = { _ in [] }
     /// Stops a process and its children: SIGTERM, then SIGKILL after the grace.
     var stopTree: @Sendable (pid_t) async -> Void = { _ in }
+    /// The listeners of a port without `await`, for the quit of the app.
+    var listenersNow: @Sendable (Int) -> [PortOwner.Listener] = { _ in [] }
+    /// A process and its children (`ProcessTree.tree`), read before a signal.
+    var tree: @Sendable (pid_t) -> [pid_t] = { [$0] }
 
     static let live = PortTools(
         listeners: { await PortOwner.listeners(on: $0) },
@@ -294,6 +298,8 @@ struct PortTools: Sendable {
         ancestors: { ProcessTree.ancestors(of: $0) },
         processesIn: { ProcessTree.processes(in: $0) },
         listeningPorts: { await PortOwner.listeningPorts(of: ProcessTree.tree(of: $0)) },
-        stopTree: { await ProcessTree.terminate(ProcessTree.tree(of: $0)) }
+        stopTree: { await ProcessTree.terminate(ProcessTree.tree(of: $0)) },
+        listenersNow: { PortOwner.listenersNow(on: $0) },
+        tree: { ProcessTree.tree(of: $0) }
     )
 }

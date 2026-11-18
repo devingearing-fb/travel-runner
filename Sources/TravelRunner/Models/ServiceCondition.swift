@@ -44,8 +44,10 @@ enum RecoveryAction: Equatable, Hashable, Sendable {
     case stopForeignAndRetry(port: Int?)
     /// Stop this process and its children, then start again. The runner did not
     /// start it, so only a button does this. `sameFolder`: a `next dev` in the
-    /// folder of the service, not on its port.
-    case stopProcessAndRetry(pid: Int32, sameFolder: Bool = false)
+    /// folder of the service, not on its port. The button can stay for hours and
+    /// the system gives a dead pid to a new process: the stop runs only while the
+    /// pid has `startTime`, and still listens on `port` when one is given.
+    case stopProcessAndRetry(pid: Int32, startTime: Int64? = nil, port: Int? = nil, sameFolder: Bool = false)
     case openContainerRuntime
     case installDependencies
     case clearCacheAndRestart
@@ -66,7 +68,7 @@ enum RecoveryAction: Equatable, Hashable, Sendable {
         case .restart: "Restart"
         case .startService: "Start"
         case .stopForeignAndRetry: "Free port and restart"
-        case .stopProcessAndRetry(let pid, let sameFolder): sameFolder ? "Stop it and retry" : "Stop PID \(pid) and retry"
+        case .stopProcessAndRetry(let pid, _, _, let sameFolder): sameFolder ? "Stop it and retry" : "Stop PID \(pid) and retry"
         case .openContainerRuntime: "Open \(runtime)"
         case .installDependencies: "Install dependencies"
         case .clearCacheAndRestart: "Clear cache and restart"

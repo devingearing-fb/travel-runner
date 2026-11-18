@@ -2812,7 +2812,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             "Port \(port) is in use by node (PID 4242, ~/code/other-app), which Travel Runner did not start. web was not started."
         )
         let action = try XCTUnwrap(state("web").condition?.action)
-        XCTAssertEqual(action, .stopProcessAndRetry(pid: 4242))
+        XCTAssertEqual(action, .stopProcessAndRetry(pid: 4242, startTime: 1, port: port))
         XCTAssertEqual(action.title(), "Stop PID 4242 and retry")
         XCTAssertEqual(calls.kills, [], "a stranger is not killed without a click")
         XCTAssertNil(state("web").pid, "the process must not start")
@@ -2891,6 +2891,12 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.perform(.stopForeignAndRetry(port: stranger.port), for: "partner-portal")
         let clicked = await waitUntil(10) { calls.kills.contains(pid_t(stranger.port)) }
         XCTAssertTrue(clicked, "\(calls.kills)")
+
+        // The same button for a line with no port frees the port of the probe.
+        calls.reset()
+        supervisor.perform(.stopForeignAndRetry(port: nil), for: "partner-portal")
+        let freed = await waitUntil(10) { calls.kills.contains(pid_t(stranger.port)) }
+        XCTAssertTrue(freed, "\(calls.kills)")
     }
 
     /// At launch the runner says what the last session left running. Start stops
@@ -3022,7 +3028,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             "Another next dev (PID 57752, port 3006) is running in \(workDir.lastPathComponent). Next allows one dev server per folder."
         )
         let action = try XCTUnwrap(state("web").condition?.action)
-        XCTAssertEqual(action, .stopProcessAndRetry(pid: 57752, sameFolder: true))
+        XCTAssertEqual(action, .stopProcessAndRetry(pid: 57752, startTime: 1, sameFolder: true))
         XCTAssertEqual(action.title(), "Stop it and retry")
         XCTAssertTrue(Self.listeners(on: port).isEmpty, "the process must not start")
 
@@ -3031,6 +3037,157 @@ final class SupervisorLifecycleTests: XCTestCase {
         let ready = await waitUntil(30) { self.settled("web") }
         XCTAssertTrue(ready, "web is \(state("web").phase.rawValue): \(supervisor.lastError ?? "")")
         XCTAssertEqual(stopped.entries, ["stop 57752"])
+    }
+
+    /// The button of a refusal can stay for hours, and the system gives a dead pid
+    /// to a new process. A click stops nothing when the pid has another start time:
+    /// the start checks again and names the new process.
+    func testTheStopButtonDoesNotStopAProcessThatTookThePidSince() async throws {
+        let held = try Self.listeningSocket()
+        XCTAssertEqual(listen(held.fd, 128), 0)
+        port = held.port
+        let socket = OwnedSocket(held.fd)
+        defer { socket.close() }
+        let startTime = Locked<Int64>(1)
+        let stopped = OrderLog()
+        supervisor.portTools = PortTools(
+            listeners: { _ in socket.isOpen ? [PortOwner.Listener(pid: 4242, command: "node")] : [] },
+            kill: { _ in }, killCommands: { _ in },
+            facts: { pid in pid == 4242 ? ProcessFacts(pid: pid, startTime: startTime.value) : nil },
+            stopTree: { pid in
+                stopped.add("stop \(pid)")
+                socket.close()
+            }
+        )
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let failed = await waitUntil(30) { self.state("web").phase == .failed && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(failed, "web is \(state("web").phase.rawValue)")
+        let action = try XCTUnwrap(state("web").condition?.action)
+        XCTAssertEqual(action, .stopProcessAndRetry(pid: 4242, startTime: 1, port: port))
+
+        // The stranger ended, and the system gave its pid to another process.
+        startTime.value = 2
+        supervisor.perform(action, for: "web")
+
+        let refusedAgain = await waitUntil(30) {
+            self.state("web").condition?.action == .stopProcessAndRetry(pid: 4242, startTime: 2, port: self.port)
+                && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(refusedAgain, "\(String(describing: state("web").condition?.action))")
+        XCTAssertEqual(stopped.entries, [], "the process with the reused pid is not stopped")
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains(
+            "[travel-runner] PID 4242 is no longer the process that blocked the start. Not stopped."
+        ), lines.joined(separator: "\n"))
+
+        // Negative control: the button of the new refusal names the process that runs now.
+        supervisor.perform(try XCTUnwrap(state("web").condition?.action), for: "web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue): \(supervisor.lastError ?? "")")
+        XCTAssertEqual(stopped.entries, ["stop 4242"])
+    }
+
+    /// A crash of the root (pnpm) can leave its `next dev` running, with no parent in
+    /// the ledger. That one started after the launch, so the restart stops it
+    /// without a question.
+    func testARestartAfterACrashStopsTheNextDevThatTheCrashLeft() async throws {
+        let (stopped, lines) = try await crashBesideNextDev(startedAfterTheLaunch: true)
+        XCTAssertTrue(settled("web"), "web is \(state("web").phase.rawValue): \(supervisor.lastError ?? "")")
+        XCTAssertEqual(stopped, ["stop 57752"])
+        XCTAssertTrue(lines.contains(
+            "[travel-runner] Stopped a next dev (PID 57752) that an earlier start of web left."
+        ), lines.joined(separator: "\n"))
+    }
+
+    /// Negative control: a `next dev` that ran before the launch is the person's.
+    /// The restart asks first.
+    func testARestartAfterACrashAsksAboutANextDevThatRanBefore() async throws {
+        let (stopped, _) = try await crashBesideNextDev(startedAfterTheLaunch: false)
+        XCTAssertEqual(stopped, [])
+        XCTAssertEqual(state("web").phase, .failed)
+        XCTAssertEqual(state("web").condition?.action, .stopProcessAndRetry(pid: 57752, startTime: 1, sameFolder: true))
+    }
+
+    /// Starts web, then kills it from outside while a `next dev` (PID 57752) runs in
+    /// its folder. Returns what the fake tools stopped and the log of web.
+    private func crashBesideNextDev(startedAfterTheLaunch: Bool) async throws -> (stopped: [String], lines: [String]) {
+        let folder = PortOwner.realPath(workDir.path)
+        let nextDev = Locked<ProcessFacts?>(nil)
+        let stopped = OrderLog()
+        supervisor.portTools = PortTools(
+            listeners: PortTools.live.listeners, kill: { _ in }, killCommands: { _ in },
+            facts: { pid in pid == 57752 ? nextDev.value : PortTools.live.facts(pid) },
+            processesIn: { _ in [nextDev.value].compactMap { $0 } },
+            stopTree: { pid in
+                stopped.add("stop \(pid)")
+                nextDev.value = nil
+            }
+        )
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let pid = try ownListener()
+        let launchStart = try XCTUnwrap(supervisor.ledger.entries.first { $0.pid == pid }?.startTime)
+        nextDev.value = ProcessFacts(
+            pid: 57752, startTime: startedAfterTheLaunch ? launchStart + 1 : 1, cwd: folder,
+            arguments: ["node", "/x/node_modules/next/dist/bin/next", "dev"]
+        )
+
+        Darwin.kill(pid, SIGTERM)
+
+        let done = await waitUntil(40) {
+            guard self.supervisor.actionsInFlight.isEmpty else { return false }
+            if self.settled("web"), let now = self.state("web").pid, now != pid { return true }
+            if case .stopProcessAndRetry = self.state("web").condition?.action { return true }
+            return false
+        }
+        XCTAssertTrue(done, "web is \(state("web").phase.rawValue): \(supervisor.lastError ?? "")")
+        return (stopped.entries, await logLines("web"))
+    }
+
+    /// The quit stops each live entry of the ledger with its children, and the
+    /// listeners of the swept ports that are the runner's own. A stranger and a
+    /// container runtime stay alive.
+    func testTheQuitStopsOnlyTheRunnersOwnProcesses() async throws {
+        let folder = PortOwner.realPath(workDir.path)
+        let starts: [pid_t: Int64] = [500: 5, 501: 5, 600: 6, 700: 7, 4242: 9, 99: 9]
+        let cwds: [pid_t: String] = [500: folder, 501: folder + "/apps/booking-portal", 600: folder, 4242: "/Users/someone/elsewhere"]
+        let facts: @Sendable (pid_t) -> ProcessFacts? = { pid in
+            starts[pid].map { ProcessFacts(pid: pid, startTime: $0, cwd: cwds[pid]) }
+        }
+        let parents: [pid_t: pid_t] = [501: 500, 500: 1, 600: 1, 4242: 1, 99: 1]
+        let listeners: [Int: PortOwner.Listener] = [
+            3000: .init(pid: 501, command: "node"),
+            3002: .init(pid: 4242, command: "node"),
+            3006: .init(pid: 99, command: "OrbStack Helper"),
+        ]
+        supervisor.portTools = PortTools(
+            listeners: { _ in [] }, kill: { _ in }, killCommands: { _ in },
+            facts: facts,
+            ancestors: { ProcessTree.ancestors(of: $0, parents: parents) },
+            listenersNow: { port in listeners[port].map { [$0] } ?? [] },
+            tree: { pid in [pid] + parents.filter { $0.value == pid }.map(\.key) }
+        )
+        let path = workDir.appendingPathComponent("config/launches.json").path
+        let earlier = LaunchLedger(path: path)
+        earlier.record(serviceID: "partner-portal", pid: 600, cwd: folder, command: ["pnpm", "dev"], facts: facts)
+        // The system gave pid 700 to another process since.
+        earlier.record(serviceID: "web", pid: 700, cwd: folder, command: ["pnpm", "dev"], facts: { ProcessFacts(pid: $0, startTime: 1) })
+        supervisor.ledger = LaunchLedger(path: path)
+        supervisor.ledger.record(serviceID: "travel-portal", pid: 500, cwd: folder, command: ["pnpm", "dev"], facts: facts)
+        try load(daemon("web", webServer))
+
+        XCTAssertEqual(supervisor.ledgerTreesForQuit().sorted(), [500, 501, 600])
+        XCTAssertEqual(supervisor.ownListenersNow(on: [3000, 3002, 3006]), [501])
+
+        // Negative control: a stranger in the ledger is the runner's own.
+        supervisor.ledger.record(serviceID: "partner-portal", pid: 4242, cwd: nil, command: ["node"], facts: facts)
+        XCTAssertEqual(supervisor.ownListenersNow(on: [3000, 3002, 3006]), [501, 4242])
+
+        supervisor.forgetLaunches()
+        XCTAssertEqual(LaunchLedger(path: path).entries, [])
     }
 
     /// A socket of the test that listens on a free loopback port.
@@ -4348,7 +4505,6 @@ private final class ConfigLoads {
     }
 }
 
-/// What the fake port tools were asked to kill.
 /// Events of a test in the order they came.
 private final class OrderLog: @unchecked Sendable {
     private let lock = NSLock()
@@ -4375,6 +4531,20 @@ private final class OwnedSocket: @unchecked Sendable {
     }
 }
 
+/// A value that a fake tool reads while the test changes it.
+private final class Locked<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value
+
+    init(_ value: Value) { stored = value }
+
+    var value: Value {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
+}
+
+/// What the fake port tools were asked to kill.
 private final class PortToolCalls: @unchecked Sendable {
     private let lock = NSLock()
     private var killed: [pid_t] = []

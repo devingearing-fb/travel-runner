@@ -295,11 +295,8 @@ struct PreflightRunner: Sendable {
                 ? .passed(detail: "In use by \(container.listener.command) (a container) — reused")
                 : .warning(message: "Published by \(container.listener.command) (a container) — stop that container")
         }
-        let leftover = occupants.contains { occupant in
-            if case .ownLeftover = occupant.owner { return true }
-            return false
-        }
-        if leftover { return .passed(detail: "Held by a process from the last session — Start stops it") }
+        // Start stops the processes of the last session before these checks, so an
+        // own occupant here is one that the start of its service stops.
         if !occupants.isEmpty { return .passed(detail: "In use by \(Flavor.current.displayName)") }
         return .passed(detail: "Free")
     }

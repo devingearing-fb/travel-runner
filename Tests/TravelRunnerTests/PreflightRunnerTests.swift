@@ -210,7 +210,7 @@ final class PreflightRunnerTests: XCTestCase {
             ("a stranger whose folder is not known", [PortOwner.Occupant(listener: node, owner: .foreign)], false,
              "warning: In use by node (PID 4242), which Travel Runner did not start"),
             ("a process of the last session", [PortOwner.Occupant(listener: node, owner: .ownLeftover(serviceID: "web"))], false,
-             "passed: Held by a process from the last session — Start stops it"),
+             "passed: In use by Travel Runner"),
             ("a process of this session", [PortOwner.Occupant(listener: node, owner: .ownLaunch(serviceID: "web"))], false,
              "passed: In use by Travel Runner"),
             ("the container of Supabase", [PortOwner.Occupant(listener: orb, owner: .containerRuntime)], true,
