@@ -3,8 +3,8 @@ import Foundation
 /// The state of the local Supabase stack of a checkout. An open database port is not
 /// enough: Postgres opens it before Kong, auth and PostgREST answer.
 enum SupabaseStackHealth: Equatable, Sendable {
-    /// The containers run, the database answers `select 1`, the auth health URL
-    /// answers, and `local-db.sh status -o env` gives the keys.
+    /// The containers are up, the database answers `select 1`, `local-db.sh status
+    /// -o env` gives the keys, and auth and rest answer through Kong with the anon key.
     case healthy
     /// Some parts of the stack run. `missing` names those that do not answer.
     case partial(missing: [String])
@@ -21,6 +21,9 @@ enum SupabaseStackHealth: Equatable, Sendable {
 
     /// Stops the containers of the stack and keeps their data.
     static let stopCommand = ["pnpm", "db:stop"]
+
+    /// The toast when `pnpm db:stop` fails or times out: the stack runs on.
+    static let didNotStopText = "Supabase did not stop — see its log"
 
     /// The row text while the stack stops.
     static let stoppingText = "Stopping Supabase (pnpm db:stop)…"
@@ -82,22 +85,36 @@ enum SupabaseStackHealth: Equatable, Sendable {
         return (try? String(contentsOfFile: path, encoding: .utf8)).map(apiPort(inConfig:)) ?? 54321
     }
 
-    /// One GET with a 5 s limit that follows no redirect: the status, or nil without an answer.
-    static let liveHTTPStatus: @Sendable (URL) async -> Int? = { url in
+    /// One request with a 5 s limit that follows no redirect: the status, or nil without an answer.
+    static let liveHTTPStatus: @Sendable (URLRequest) async -> Int? = { request in
+        try? await HttpProbe.sendWithoutRedirects(request).statusCode
+    }
+
+    /// A GET through Kong. With the anon key Kong passes it on to the service;
+    /// without one Kong answers 401 itself.
+    static func apiRequest(_ url: URL, apiKey: String?) -> URLRequest {
         var request = URLRequest(url: url)
         request.timeoutInterval = 5
         request.cachePolicy = .reloadIgnoringLocalCacheData
-        return try? await HttpProbe.sendWithoutRedirects(request).statusCode
+        if let apiKey { request.setValue(apiKey, forHTTPHeaderField: "apikey") }
+        return request
+    }
+
+    /// True when `docker ps` shows the container up and ready: not restarting, not
+    /// paused, and with no health check that fails or still starts.
+    static func isUp(status: String) -> Bool {
+        status.hasPrefix("Up")
+            && !["(unhealthy)", "(health: starting)", "(Paused)"].contains(where: status.contains)
     }
 
     /// Checks the stack of the checkout at `root`. The cheap checks run first;
-    /// `local-db.sh status` runs only when all the others pass.
+    /// `local-db.sh status` runs only when the containers and the database pass.
     static func check(
         root: String,
         dbPort: Int,
         shell: any CommandRunning,
         environment: [String: String] = [:],
-        httpStatus: @Sendable (URL) async -> Int? = liveHTTPStatus
+        httpStatus: @Sendable (URLRequest) async -> Int? = liveHTTPStatus
     ) async -> SupabaseStackHealth {
         let project = SupabaseProject.projectName(root: root)
         let list = await shell.run("docker ps --format '{{.Names}}\t{{.Status}}'", timeout: .seconds(10))
@@ -122,7 +139,7 @@ enum SupabaseStackHealth: Equatable, Sendable {
 
         var missing = requiredServices.filter { service in
             guard let status = containers[container(service, project: project)] else { return true }
-            return status.contains("(unhealthy)")
+            return !isUp(status: status)
         }
 
         if !missing.contains("db") {
@@ -133,22 +150,33 @@ enum SupabaseStackHealth: Equatable, Sendable {
             if !(query.succeeded && query.trimmedOutput == "1") { missing.append("db") }
         }
 
-        // Kong answers 401 without an API key: it is up and routes. A 5xx means it
-        // cannot reach auth.
-        if !missing.contains("kong"), let url = URL(string: "http://127.0.0.1:\(apiPort(root: root))/auth/v1/health") {
-            switch await httpStatus(url) {
-            case nil: missing.append("kong")
-            case let status? where status >= 500: if !missing.contains("auth") { missing.append("auth") }
-            default: break
-            }
-        }
-
+        // The keys come before the requests: without the anon key Kong answers 401
+        // itself, and the request never reaches auth or rest.
+        var keys: LocalSupabaseKeys?
         if missing.isEmpty {
             let status = await shell.run(
                 "scripts/local-db.sh status -o env", cwd: root, environment: environment, timeout: .seconds(60)
             )
-            if !(status.succeeded && LocalSupabaseKeys.parse(statusEnv: status.stdout) != nil) {
-                missing.append(statusPart)
+            keys = status.succeeded ? LocalSupabaseKeys.parse(statusEnv: status.stdout) : nil
+            if keys == nil { missing.append(statusPart) }
+        }
+
+        if !missing.contains("kong") {
+            let base = "http://127.0.0.1:\(apiPort(root: root))"
+            // A 5xx means Kong cannot reach the service. Without the key only auth is
+            // asked: Kong's 401 shows that Kong itself is up.
+            let paths = keys == nil ? [("auth", "/auth/v1/health")] : [("auth", "/auth/v1/health"), ("rest", "/rest/v1/")]
+            for (service, path) in paths {
+                guard let url = URL(string: base + path) else { continue }
+                switch await httpStatus(apiRequest(url, apiKey: keys?.anonKey)) {
+                case nil:
+                    if !missing.contains("kong") { missing.append("kong") }
+                case let code? where code >= 500:
+                    if !missing.contains(service) { missing.append(service) }
+                default:
+                    break
+                }
+                if missing.contains("kong") { break }
             }
         }
         return missing.isEmpty ? .healthy : .partial(missing: missing)

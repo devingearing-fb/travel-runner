@@ -1580,6 +1580,7 @@ final class EnvironmentSupervisor {
             await waitForEnvResetOfLoad()
             do {
                 var heldBy: String?
+                var stackDidNotStop = false
                 let outcome = try await replaceProcess(serviceID, stoppedPhase: .pending, onlyIf: {
                     heldBy = self.dependencyHolding(serviceID)
                     if heldBy != nil { self.queuedRestarts.remove(serviceID) }
@@ -1590,7 +1591,7 @@ final class EnvironmentSupervisor {
                     if stopsStack, !self.isShuttingDown, self.health != .stopped,
                        let definition = self.graph?.nodes[serviceID] {
                         self.serviceStates[serviceID]?.phase = .stopping
-                        await self.stopSupabaseStack(definition)
+                        stackDidNotStop = !(await self.stopSupabaseStack(definition))
                         self.serviceStates[serviceID]?.phase = .pending
                     }
                     try? await self.clock.sleep(for: .seconds(1))
@@ -1603,7 +1604,12 @@ final class EnvironmentSupervisor {
                 if case .launched = outcome { await awaitReplacingLaunch(serviceID) }
                 let (text, ok) = restartFeedback(serviceID, outcome)
                 if ok { clearCleanExitError(serviceID) }
-                onActionFeedback?(text, ok)
+                // The containers ran on, so the start only reused them: nothing restarted.
+                if stackDidNotStop {
+                    onActionFeedback?(SupabaseStackHealth.didNotStopText, false)
+                } else {
+                    onActionFeedback?(text, ok)
+                }
             } catch {
                 recordFailure(serviceID, error: error, lastError: "\(error)")
                 onActionFeedback?("\(name) restart failed", false)
@@ -1670,16 +1676,27 @@ final class EnvironmentSupervisor {
     }
 
     /// Why the launched Supabase stack is not ready although its database port is
-    /// open, or nil when it is ready (or the service is not Supabase).
-    private func supabaseStackNotReady(_ serviceID: String, _ launch: ServiceLaunch) async -> String? {
+    /// open, or nil when it is ready (or the service is not Supabase). It throws when
+    /// another project's database holds the port: this start cannot succeed.
+    private func supabaseStackNotReady(_ serviceID: String, _ launch: ServiceLaunch) async throws -> String? {
         guard serviceID == "supabase", launch.definition.shouldReuseIfRunning,
               let root = launch.definition.resolvedCwd, let port = launch.definition.probe?.port else { return nil }
         switch await supabaseStackHealth(root: root, dbPort: port) {
         case .healthy: return nil
         case .partial(let missing): return "the database port is open; \(SupabaseStackHealth.missingText(missing))"
         case .down: return "the database port is open; no container of the stack runs"
-        case .foreign(let container): return "the database port is held by \(container)"
+        case .foreign(let occupant): throw await otherStackHoldsPort(port, occupant: occupant, root: root)
         }
+    }
+
+    /// Logs how to stop the other project's stack on the database port, and gives the error.
+    private func otherStackHoldsPort(_ port: Int, occupant: String, root: String) async -> ServiceError {
+        let expected = SupabaseProject.dbContainerName(root: root)
+        await logStore.append(serviceID: "supabase", entry: LogEntry(
+            stream: .stderr,
+            text: "[travel-runner] Port \(port) is held by \(occupant), not \(expected). Stop that stack (npx supabase stop in its checkout, or: docker stop $(docker ps -q --filter name=_\(occupant.replacingOccurrences(of: "supabase_db_", with: ""))$)) and start again."
+        ))
+        return ServiceError.portHeldByOtherStack(port: port, container: occupant)
     }
 
     /// Runs `pnpm db:stop` in the stack's folder, with its output in the Supabase log.
@@ -1774,7 +1791,7 @@ final class EnvironmentSupervisor {
             self.serviceStates["supabase"]?.phase = .stopping
             let ok = await self.stopSupabaseStack(definition)
             self.serviceStates["supabase"]?.phase = .stopped
-            self.onActionFeedback?(ok ? "Supabase stopped" : "Supabase did not stop — see its log", ok)
+            self.onActionFeedback?(ok ? "Supabase stopped" : SupabaseStackHealth.didNotStopText, ok)
         }
     }
 
@@ -2188,6 +2205,7 @@ final class EnvironmentSupervisor {
         Task {
             for id in topoOrder { beginAction(id) }
             defer { for id in topoOrder { endAction(id) } }
+            var stackDidNotStop = false
             for id in topoOrder.reversed() {
                 await lifecycle.withLock(id) {
                     serviceStates[id]?.phase = .stopping
@@ -2195,7 +2213,7 @@ final class EnvironmentSupervisor {
                     // Supabase's launcher has ended: a restart stops its containers.
                     if isSupabaseStack(id), !isShuttingDown, health != .stopped, let definition = graph.nodes[id] {
                         supabaseRepairUsed = false
-                        await stopSupabaseStack(definition)
+                        stackDidNotStop = !(await stopSupabaseStack(definition))
                     }
                     serviceStates[id]?.phase = .stopped
                 }
@@ -2236,7 +2254,12 @@ final class EnvironmentSupervisor {
                 }
             }
             recalculateHealth()
-            onActionFeedback?("\(name) restarted with dependents", true)
+            // The containers ran on, so the start only reused them.
+            if stackDidNotStop {
+                onActionFeedback?(SupabaseStackHealth.didNotStopText, false)
+            } else {
+                onActionFeedback?("\(name) restarted with dependents", true)
+            }
         }
     }
 
@@ -3367,12 +3390,7 @@ final class EnvironmentSupervisor {
                 case .down:
                     reuses = false
                 case .foreign(let occupant):
-                    let expected = SupabaseProject.dbContainerName(root: root)
-                    await logStore.append(serviceID: serviceID, entry: LogEntry(
-                        stream: .stderr,
-                        text: "[travel-runner] Port \(port) is held by \(occupant), not \(expected). Stop that stack (npx supabase stop in its checkout, or: docker stop $(docker ps -q --filter name=_\(occupant.replacingOccurrences(of: "supabase_db_", with: ""))$)) and start again."
-                    ))
-                    throw ServiceError.portHeldByOtherStack(port: port, container: occupant)
+                    throw await otherStackHoldsPort(port, occupant: occupant, root: root)
                 case .partial(let missing):
                     // db:start keeps a stack whose database runs as it is, so the
                     // repair stops the stack first. One repair for each start: a stack
@@ -3718,7 +3736,7 @@ final class EnvironmentSupervisor {
                 if state.pid == launch.pid, state.lastProbe != outcome { state.lastProbe = outcome }
                 if outcome.isReady {
                     // The database port of Supabase opens before the rest of its stack answers.
-                    guard let waiting = await supabaseStackNotReady(serviceID, launch) else {
+                    guard let waiting = try await supabaseStackNotReady(serviceID, launch) else {
                         ready = true
                         break
                     }
@@ -4339,7 +4357,8 @@ final class EnvironmentSupervisor {
                 state.lastProbe = outcome
                 recordFailure(serviceID, kind: .wakeCheck(lastProbe: outcome))
                 recalculateHealth()
-                // A restart of Supabase stops its containers: only a person starts one.
+                // The liveness loop never restarts Supabase by itself (plan rule L4):
+                // the row offers Restart, and a person decides.
                 if !isSupabaseStack(serviceID) { scheduleRestart(serviceID: serviceID) }
                 Task { await self.captureDebugIssue(
                     trigger: "probe_timeout",
@@ -5071,15 +5090,6 @@ final class EnvironmentSupervisor {
             profile: pipeline.profile, tools: tools, shell: shell, launcher: dbStepLauncher,
             killGrace: dbStepKillGrace
         )
-    }
-
-    /// Name of the Docker container that publishes this host port, if any.
-    nonisolated static func containerPublishing(port: Int, shell: any CommandRunning = LoginShell()) async -> String? {
-        let result = await shell.run(
-            "docker ps --filter publish=\(port) --format '{{.Names}}' 2>/dev/null", timeout: .seconds(10)
-        )
-        guard result.succeeded else { return nil }
-        return result.stdout.split(separator: "\n").first.map(String.init)
     }
 
     private func isPortBound(_ port: Int) -> Bool {

@@ -4503,7 +4503,8 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         let up = await waitUntil(20) { self.settled("supabase") }
         XCTAssertTrue(up, "supabase is \(state("supabase").phase.rawValue)")
-        let lines = await logLines("supabase")
+        // The service can be running before the output of db:start reaches the log.
+        let lines = await waitForLog("supabase", containing: "db-start")
         XCTAssertTrue(lines.contains(SupabaseStackHealth.partialRepairLine(["kong", "auth"])), lines.joined(separator: "\n"))
         XCTAssertTrue(lines.contains("db-start"), "db:start must run")
         XCTAssertEqual(stackStops(shell), 1)
@@ -4557,6 +4558,70 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains("db-start"), lines.joined(separator: "\n"))
         XCTAssertEqual(stackStops(shell), 1)
         XCTAssertTrue(lines.contains { $0.contains("Stopping the Supabase containers (pnpm db:stop). Data is kept.") })
+    }
+
+    /// A db:stop that fails leaves the stack running: the toast says so, not "restarted".
+    func testARestartWhoseDbStopFailsSaysSupabaseDidNotStop() async throws {
+        let held = try holdPort()
+        defer { close(held) }
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        _ = fakeStackHealth(.healthy)
+        shell.respond { call in
+            call.command == "pnpm db:stop" ? FakeCommandRunner.failed(1, stderr: "stop failed") : FakeCommandRunner.ok()
+        }
+        var feedback: [(String, Bool)] = []
+        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        try load(supabaseStack(["sh", "-c", "echo db-start; exit 0"]))
+
+        supervisor.restartService("supabase", stopsStack: true)
+
+        let done = await waitUntil(20) { !feedback.isEmpty }
+        XCTAssertTrue(done)
+        XCTAssertEqual(stackStops(shell), 1)
+        XCTAssertEqual(feedback.first?.0, "Supabase did not stop — see its log")
+        XCTAssertEqual(feedback.first?.1, false)
+    }
+
+    /// The same for a restart with dependents.
+    func testACascadeRestartWhoseDbStopFailsSaysSupabaseDidNotStop() async throws {
+        let held = try holdPort()
+        defer { close(held) }
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        _ = fakeStackHealth(.healthy)
+        shell.respond { call in
+            call.command == "pnpm db:stop" ? FakeCommandRunner.failed(1, stderr: "stop failed") : FakeCommandRunner.ok()
+        }
+        var feedback: [(String, Bool)] = []
+        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        try load(supabaseStack(["sh", "-c", "echo db-start; exit 0"]))
+        // The reset check after Supabase asks the database once.
+        supervisor.databaseProbeRetry = (.milliseconds(10), .zero)
+
+        supervisor.restartCascade("supabase")
+
+        let done = await waitUntil(20) { !feedback.isEmpty }
+        XCTAssertTrue(done)
+        XCTAssertEqual(stackStops(shell), 1)
+        XCTAssertEqual(feedback.first?.0, "Supabase did not stop — see its log")
+    }
+
+    /// Another project's database that takes the port during the start stops the
+    /// wait at once with the reason, not at the probe timeout.
+    func testAnotherProjectsStackFoundWhileStartingFailsAtOnce() async throws {
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        _ = fakeStackHealth(.foreign(container: "supabase_db_fb-travel-data"))
+        try load(supabaseStack(webServer, probeTimeout: 120))
+
+        supervisor.restartService("supabase")
+
+        let failed = await waitUntil(20) {
+            self.supervisor.lastError?.contains("held by another Supabase stack (supabase_db_fb-travel-data)") == true
+        }
+        XCTAssertTrue(failed, "supabase is \(state("supabase").phase.rawValue), error: \(supervisor.lastError ?? "nil")")
+        XCTAssertEqual(stackStops(shell), 0)
     }
 
     /// A restart from the panel asks first; the confirmation restarts the stack.

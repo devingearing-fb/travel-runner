@@ -57,21 +57,51 @@ final class SupabaseStackHealthTests: XCTestCase {
         }
     }
 
-    private func check(_ shell: FakeCommandRunner, http: Int? = 401) async -> SupabaseStackHealth {
+    private func check(_ shell: FakeCommandRunner, http: Int? = 200) async -> SupabaseStackHealth {
         await SupabaseStackHealth.check(root: root.path, dbPort: 54322, shell: shell, httpStatus: { _ in http })
     }
 
     func testAWholeStackThatAnswersIsHealthy() async {
         let fake = shell()
-        let urls = URLRecorder()
+        let requests = RequestRecorder()
         let health = await SupabaseStackHealth.check(
-            root: root.path, dbPort: 54322, shell: fake, httpStatus: { url in urls.add(url); return 401 }
+            root: root.path, dbPort: 54322, shell: fake, httpStatus: { request in requests.add(request); return 200 }
         )
         XCTAssertEqual(health, .healthy)
-        // Kong answers 401 without a key: up. The URL takes the port of config.toml.
-        XCTAssertEqual(urls.all.map(\.absoluteString), ["http://127.0.0.1:55521/auth/v1/health"])
+        // The requests carry the anon key, so Kong passes them on to auth and rest.
+        // The URL takes the port of config.toml.
+        XCTAssertEqual(requests.all.map { $0.url?.absoluteString },
+                       ["http://127.0.0.1:55521/auth/v1/health", "http://127.0.0.1:55521/rest/v1/"])
+        XCTAssertEqual(requests.all.map { $0.value(forHTTPHeaderField: "apikey") }, ["anon", "anon"])
         let status = fake.calls.first { $0.command.contains("local-db.sh status") }
         XCTAssertEqual(status?.cwd, root.path)
+    }
+
+    /// A crash-looping auth container is listed by `docker ps`, but it is not up.
+    func testARestartingAuthContainerIsPartlyUp() async {
+        let containers = Self.allUp.replacingOccurrences(
+            of: "supabase_auth_fb-travel\tUp 2 hours (healthy)", with: "supabase_auth_fb-travel\tRestarting (1) 4 seconds ago"
+        )
+        let health = await check(shell(containers: containers), http: 200)
+        XCTAssertEqual(health, .partial(missing: ["auth"]))
+    }
+
+    /// A container whose health check still starts is not ready yet.
+    func testARestContainerWhoseHealthCheckStartsIsPartlyUp() async {
+        let containers = Self.allUp.replacingOccurrences(
+            of: "supabase_rest_fb-travel\tUp 2 hours", with: "supabase_rest_fb-travel\tUp 3 seconds (health: starting)"
+        )
+        let health = await check(shell(containers: containers), http: 200)
+        XCTAssertEqual(health, .partial(missing: ["rest"]))
+    }
+
+    /// Rest behind Kong that does not answer: Kong gives a 5xx with the key.
+    func testRestBehindKongAnswering502IsPartlyUp() async {
+        let health = await SupabaseStackHealth.check(
+            root: root.path, dbPort: 54322, shell: shell(),
+            httpStatus: { request in request.url?.path.hasPrefix("/rest/") == true ? 502 : 200 }
+        )
+        XCTAssertEqual(health, .partial(missing: ["rest"]))
     }
 
     /// The finding: an open database port counted as a running stack.
@@ -91,7 +121,10 @@ final class SupabaseStackHealthTests: XCTestCase {
     }
 
     func testAuthBehindKongAnswering500IsPartlyUp() async {
-        let health = await check(shell(), http: 502)
+        let health = await SupabaseStackHealth.check(
+            root: root.path, dbPort: 54322, shell: shell(),
+            httpStatus: { request in request.url?.path.hasPrefix("/auth/") == true ? 502 : 200 }
+        )
         XCTAssertEqual(health, .partial(missing: ["auth"]))
     }
 
@@ -101,7 +134,8 @@ final class SupabaseStackHealthTests: XCTestCase {
     }
 
     func testAStackWithoutKeysIsPartlyUp() async {
-        let health = await check(shell(status: FakeCommandRunner.failed(1)))
+        // Without the key only Kong's own 401 can come back.
+        let health = await check(shell(status: FakeCommandRunner.failed(1)), http: 401)
         XCTAssertEqual(health, .partial(missing: [SupabaseStackHealth.statusPart]))
     }
 
@@ -128,20 +162,20 @@ final class SupabaseStackHealthTests: XCTestCase {
     }
 }
 
-/// Collects the URLs of the fake HTTP check.
-private final class URLRecorder: @unchecked Sendable {
+/// Collects the requests of the fake HTTP check.
+private final class RequestRecorder: @unchecked Sendable {
     private let lock = NSLock()
-    private var urls: [URL] = []
+    private var requests: [URLRequest] = []
 
-    func add(_ url: URL) {
+    func add(_ request: URLRequest) {
         lock.lock()
-        urls.append(url)
+        requests.append(request)
         lock.unlock()
     }
 
-    var all: [URL] {
+    var all: [URLRequest] {
         lock.lock()
         defer { lock.unlock() }
-        return urls
+        return requests
     }
 }
