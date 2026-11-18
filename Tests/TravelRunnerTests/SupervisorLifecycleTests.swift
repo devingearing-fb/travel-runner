@@ -6135,6 +6135,52 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("cdc-next").lastStarted, nextStarted, "a Retry restarted the services again")
     }
 
+    /// A run that fails keeps the restart requests of its passed steps. A Retry of
+    /// the failed step that passes acts on them, once: the reset dropped Sequin's
+    /// slot, and the Retry does not run the reset again.
+    func testARetryThatPassesRestartsWhatTheFailedRunAskedFor() async throws {
+        supervisor.shell = FakeCommandRunner()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        try supervisor.loadServices([
+            daemon("supabase", ["sleep", "60"]),
+            service("cdc", "true", type: .oneshot),
+        ])
+        state("supabase").phase = .running
+        state("cdc").phase = .completed
+        supervisor.health = .healthy
+
+        // The second step passes once this file is there.
+        let flag = workDir.appendingPathComponent("verify-passes").path
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([
+                self.step("reset-database", "echo '##db:restart:cdc:R'"),
+                self.step("verify-data", "test -f '\(flag)'"),
+            ], profile: profile)
+        }
+
+        supervisor.runDbSetup()
+        let failed = await waitUntil(20) {
+            !self.supervisor.dbResetRunning && self.supervisor.dbSetupPipeline?.steps.last?.status == .failed
+        }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(supervisor.dbSetupPipeline?.steps.first?.status, .passed)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertNil(state("cdc").lastStarted, "a failed run restarted a service")
+
+        FileManager.default.createFile(atPath: flag, contents: nil)
+        supervisor.runDbSetup(from: "verify-data")
+        let restarted = await waitUntil(20) {
+            !self.supervisor.dbResetRunning && self.state("cdc").lastStarted != nil
+                && self.state("cdc").phase == .completed && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(restarted, "cdc is \(state("cdc").phase.rawValue)")
+        XCTAssertEqual(supervisor.dbSetupPipeline?.steps.map(\.status), [.passed, .passed])
+        try await Task.sleep(for: .seconds(1))
+        let log = await logLines("cdc")
+        XCTAssertEqual(log.filter { $0 == EnvironmentSupervisor.restartAfterResetLine("cdc", reason: "R") }.count, 1, "\(log)")
+    }
+
     /// A branch change restarts a running service only when it changed the packages,
     /// the lockfile, the Next config or an env file. Other files hot-reload.
     func testABranchChangeRestartsOnlyForPackageConfigOrEnvFiles() async throws {
