@@ -71,6 +71,8 @@ struct WorkshopHeaderBar: View {
 
                 UpdatePill()
 
+                DevDatabaseChip()
+
                 if supervisor.networkMode, let ip = supervisor.localIP {
                     HStack(spacing: 4) {
                         Image(systemName: "wifi")

@@ -1063,7 +1063,10 @@ final class EnvironmentSupervisor {
                         return ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"issue not found\"}"
                     },
                     toggleDbMode: { [weak self] in
-                        await MainActor.run { self?.toggleDatabaseMode() }
+                        await MainActor.run {
+                            guard let self else { return }
+                            self.setDatabaseMode(self.dbMode == .local ? .remote : .local)
+                        }
                     },
                     getProfile: { [weak self] in
                         guard let self else { return "{}" }
@@ -1262,13 +1265,47 @@ final class EnvironmentSupervisor {
         }
     }
 
-    func toggleDatabaseMode() {
-        guard health == .healthy || health == .stopped else {
-            postNotice(.dbMode, "Cannot switch database while services are starting")
+    static let dbModeStartingRefusal =
+        "A start is in progress — wait for it to finish, or stop the stack, then switch."
+    static let dbModeSwitchingRefusal = "A database switch is in progress — wait for it to finish."
+    static let devDatabaseConfirmationTitle = "Use the shared dev database?"
+    static let switchToDevTitle = "Switch to Dev"
+    static let dbToolsDevCaption = "Acts on the local database only. The portals currently use dev."
+
+    /// The apps that read the database mode from their env, in the loaded profile.
+    private var databaseModeServices: [String] {
+        ["travel-portal", "partner-portal", "universal-login"].filter { graph?.nodes[$0] != nil && isInProfile($0) }
+    }
+
+    /// Why the database mode cannot change now, or nil when it can. A switch is
+    /// allowed when the stack is stopped, healthy or degraded.
+    var databaseModeRefusal: String? {
+        if startTask != nil || health == .starting { return Self.dbModeStartingRefusal }
+        if actionsInFlight.contains("db-mode") { return Self.dbModeSwitchingRefusal }
+        return nil
+    }
+
+    /// The text under "Use the shared dev database?": which apps restart and use the dev data.
+    var devDatabaseConfirmation: String {
+        let names = databaseModeServices.map(displayName)
+        let list = names.count > 1
+            ? names.dropLast().joined(separator: ", ") + " and " + names[names.count - 1]
+            : names.first ?? "The portals"
+        return health == .stopped
+            ? "\(list) will read and write the shared hosted dev data at the next start."
+            : "\(list) will restart and will read and write the shared hosted dev data."
+    }
+
+    /// Switches the database of the apps. A running stack restarts the apps that
+    /// read it. Ask the person before a switch to dev: the dev data is shared.
+    func setDatabaseMode(_ target: DatabaseMode) {
+        guard target != dbMode else { return }
+        if let refusal = databaseModeRefusal {
+            postNotice(.dbMode, refusal)
             return
         }
 
-        if dbMode == .local {
+        if target == .remote {
             // Hosted dev comes from each app's shared .env; the runner block then stops
             // overriding Supabase.
             let apps = ["travel-portal"] + (isInProfile("partner-portal") ? ["partner-portal"] : [])
@@ -1294,12 +1331,14 @@ final class EnvironmentSupervisor {
 
         guard health != .stopped else { return }
 
-        var servicesToRestart = ["travel-portal", "universal-login"]
-        if isInProfile("partner-portal") {
-            servicesToRestart.append("partner-portal")
+        // A degraded stack switches too. A service that the person stopped, or that
+        // was skipped, stays as it is; a failed one starts with the new env.
+        let servicesToRestart = databaseModeServices.filter { serviceID in
+            guard let phase = serviceStates[serviceID]?.phase else { return false }
+            return phase != .stopped && phase != .pending && phase != .skipped
         }
+        beginAction("db-mode")
         Task {
-            beginAction("db-mode")
             defer { endAction("db-mode") }
             var switchFailed = false
             for serviceID in servicesToRestart {

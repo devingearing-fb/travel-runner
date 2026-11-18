@@ -4140,13 +4140,123 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.loadConfig()
         let reset = try XCTUnwrap(supervisor.envResetAfterLoad)
 
-        supervisor.toggleDatabaseMode()
+        supervisor.setDatabaseMode(.remote)
         XCTAssertEqual(supervisor.dbMode, .remote, "error: \(supervisor.lastError ?? "none")")
 
         await gate.open()
         await reset.value
         XCTAssertEqual(supervisor.dbMode, .remote)
         await loads.stopControlServers()
+    }
+
+    // MARK: - Database mode
+
+    /// The apps of a database switch. The booking portal is stopped and holds the
+    /// shared .env with the hosted values; the login runs a small server.
+    private func loadDatabaseModeApps() throws {
+        try "AMATEUR_SUPABASE_URL=https://hosted.example.test\n"
+            .write(to: workDir.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+        try supervisor.loadServices([
+            daemon("travel-portal", ["sleep", "30"]),
+            daemon("universal-login", webServer),
+            ServiceDefinition(
+                id: "broken", name: nil, cmd: ["sleep", "1"], cwd: nil, probe: nil, type: .daemon, restart: .never,
+                dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+            ),
+        ])
+    }
+
+    /// Finding "DB switch: wrong refusal": a degraded stack refused the switch with
+    /// "while services are starting". Now it switches and restarts the apps that run.
+    func testADegradedStackSwitchesTheDatabaseAndRestartsTheRunningApps() async throws {
+        try loadDatabaseModeApps()
+        supervisor.health = .healthy
+        supervisor.restartService("universal-login")
+        let up = await waitUntil(20) { self.settled("universal-login") }
+        XCTAssertTrue(up, "universal-login is \(state("universal-login").phase.rawValue)")
+        let firstPid = try XCTUnwrap(state("universal-login").pid)
+        supervisor.serviceStates["broken"]?.phase = .failed
+        // The person stopped the booking portal.
+        supervisor.serviceStates["travel-portal"]?.phase = .stopped
+        supervisor.recalculateHealth()
+        XCTAssertEqual(supervisor.health, .degraded)
+        XCTAssertNil(supervisor.databaseModeRefusal)
+        XCTAssertEqual(
+            supervisor.devDatabaseConfirmation,
+            "travel-portal and universal-login will restart and will read and write the shared hosted dev data."
+        )
+
+        supervisor.setDatabaseMode(.remote)
+
+        XCTAssertEqual(supervisor.dbMode, .remote, "error: \(supervisor.lastError ?? "none")")
+        XCTAssertNil(supervisor.notices.notice(.dbMode))
+        // A second switch while the first restarts the apps waits for it.
+        supervisor.setDatabaseMode(.local)
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        XCTAssertEqual(supervisor.notices.text(.dbMode), EnvironmentSupervisor.dbModeSwitchingRefusal)
+
+        let restarted = await waitUntil(20) {
+            self.settled("universal-login") && self.state("universal-login").pid != firstPid
+        }
+        XCTAssertTrue(restarted, "universal-login is \(state("universal-login").phase.rawValue)")
+        XCTAssertEqual(state("travel-portal").phase, .stopped, "a stopped app stays stopped")
+        let loginEnv = try String(contentsOf: workDir.appendingPathComponent(".env.local"), encoding: .utf8)
+        XCTAssertTrue(loginEnv.contains("AMATEUR_SUPABASE_URL=https://hosted.example.test"), loginEnv)
+    }
+
+    /// The only refusal is a start in progress, with the text that says what to do.
+    func testTheDatabaseSwitchIsRefusedOnlyWhileTheStackStarts() async throws {
+        try loadDatabaseModeApps()
+        supervisor.health = .starting
+
+        supervisor.setDatabaseMode(.remote)
+
+        XCTAssertEqual(supervisor.dbMode, .local)
+        XCTAssertEqual(
+            supervisor.notices.text(.dbMode),
+            "A start is in progress — wait for it to finish, or stop the stack, then switch."
+        )
+
+        // Negative control: the same switch on a healthy stack goes through.
+        supervisor.health = .healthy
+        supervisor.setDatabaseMode(.remote)
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        XCTAssertNil(supervisor.notices.notice(.dbMode), "the switch resolves the refusal")
+    }
+
+    /// A stopped stack switches and restarts nothing; the apps use the mode at the
+    /// next start, and the question says so.
+    func testAStoppedStackSwitchesTheDatabaseWithoutARestart() async throws {
+        try loadDatabaseModeApps()
+        XCTAssertEqual(supervisor.health, .stopped)
+        XCTAssertEqual(
+            supervisor.devDatabaseConfirmation,
+            "travel-portal and universal-login will read and write the shared hosted dev data at the next start."
+        )
+
+        supervisor.setDatabaseMode(.remote)
+
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        XCTAssertFalse(supervisor.actionsInFlight.contains("db-mode"))
+        XCTAssertNil(state("universal-login").lastStarted)
+        // The same mode again changes nothing.
+        supervisor.setDatabaseMode(.remote)
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        supervisor.setDatabaseMode(.local)
+        XCTAssertEqual(supervisor.dbMode, .local)
+        XCTAssertNil(state("universal-login").lastStarted)
+    }
+
+    /// Without hosted values in the shared .env the switch to dev stays local and says why.
+    func testASwitchToDevWithoutHostedValuesStaysLocal() async throws {
+        try loadDatabaseModeApps()
+        try FileManager.default.removeItem(at: workDir.appendingPathComponent(".env"))
+        supervisor.health = .healthy
+
+        supervisor.setDatabaseMode(.remote)
+
+        XCTAssertEqual(supervisor.dbMode, .local)
+        XCTAssertEqual(supervisor.notices.text(.dbMode)?.hasPrefix("Hosted dev values are missing from apps/booking-portal/.env"), true)
     }
 }
 
