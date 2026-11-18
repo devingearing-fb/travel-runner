@@ -3579,6 +3579,8 @@ final class EnvironmentSupervisor {
                         stream: .stdout, text: "[travel-runner] \(line) before the restart of \(name)"
                     )) }
                 }
+                // The user can stop or restart the service during the wait.
+                guard serviceStates[serviceID]?.phase == .failed else { return }
                 if let reason = probe.failureText(waited: ContainerRuntime.startTimeout) {
                     state.isCircuitBroken = true
                     lastError = reason
@@ -3593,7 +3595,6 @@ final class EnvironmentSupervisor {
                     )
                     return
                 }
-                guard serviceStates[serviceID]?.phase == .failed else { return }
             }
 
             await autoRestart(serviceID)

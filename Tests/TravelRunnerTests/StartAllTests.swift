@@ -14,6 +14,8 @@ final class StartAllTests: XCTestCase {
     private var supervisor: EnvironmentSupervisor!
 
     override func setUp() async throws {
+        // A probe of another test can leave its runtime behind.
+        ContainerRuntime.forgetProbed()
         container = FileManager.default.temporaryDirectory.appendingPathComponent("StartAllTests-\(UUID().uuidString)")
         monorepo = container.appendingPathComponent("TRAVEL BOOKING/fb-travel-monolith")
         // The backend baseline beside the checkout, with the bootstraps under their real names.

@@ -51,6 +51,23 @@ enum ContainerRuntime: Sendable, Equatable {
         return nil
     }
 
+    /// The socket of docker's `default` context when DOCKER_HOST is not set.
+    static let defaultSocket = "/var/run/docker.sock"
+
+    /// The target of a symlink, or nil. OrbStack and Docker Desktop link the
+    /// default socket into their own folder (~/.orbstack/run, ~/.docker/run).
+    static let readLink: @Sendable (String) -> String? = { path in
+        try? FileManager.default.destinationOfSymbolicLink(atPath: path)
+    }
+
+    /// The runtime of a probe. For the `default` context with no socket or the
+    /// default socket, the runtime is read from where the default socket links to.
+    static func runtime(context: String?, socket: String?, readLink: (String) -> String?) -> ContainerRuntime? {
+        if let found = runtime(context: context, socket: socket) { return found }
+        guard context == "default", socket == nil || socket == defaultSocket else { return nil }
+        return readLink(defaultSocket).flatMap { runtime(context: context, socket: $0) }
+    }
+
     /// The socket that a docker error names (`unix:///var/run/docker.sock`), as a path.
     static func socket(in text: String) -> String? {
         guard let start = text.range(of: "unix://") else { return nil }
@@ -63,7 +80,10 @@ enum ContainerRuntime: Sendable, Equatable {
     }
 
     /// Asks docker which context it uses and whether its daemon answers.
-    static func probe(shell: any CommandRunning = LoginShell(), timeout: Duration = commandTimeout) async -> ContainerRuntimeProbe {
+    static func probe(
+        shell: any CommandRunning = LoginShell(), timeout: Duration = commandTimeout,
+        readLink: @Sendable (String) -> String? = readLink
+    ) async -> ContainerRuntimeProbe {
         let shown = await shell.run("docker context show", timeout: timeout)
         if shown.exitCode == 127 || shown.stderr.contains("command not found") {
             return .cliMissing
@@ -73,19 +93,20 @@ enum ContainerRuntime: Sendable, Equatable {
             ? shown.trimmedOutput.components(separatedBy: .newlines).last.map { $0.trimmingCharacters(in: .whitespaces) }
                 .flatMap { $0.isEmpty ? nil : $0 }
             : nil
-        return await probeDaemon(contextName: name, shell: shell, timeout: timeout)
+        return await probeDaemon(contextName: name, shell: shell, timeout: timeout, readLink: readLink)
     }
 
     /// Asks the daemon of a known context.
     private static func probeDaemon(
-        contextName: String?, shell: any CommandRunning, timeout: Duration, opened: Bool = false
+        contextName: String?, shell: any CommandRunning, timeout: Duration, opened: Bool = false,
+        readLink: (String) -> String?
     ) async -> ContainerRuntimeProbe {
         let ps = await shell.run("docker ps -q >/dev/null", timeout: timeout)
         if ps.exitCode == 127 || ps.stderr.contains("command not found") {
             return .cliMissing
         }
         let socket = socket(in: ps.stderr)
-        let found = runtime(context: contextName, socket: socket)
+        let found = runtime(context: contextName, socket: socket, readLink: readLink)
         if let found { Probed.shared.runtime = found }
         let context = ContainerRuntimeContext(
             name: contextName, runtime: found ?? detect(), timedOut: ps.timedOut, opened: opened
@@ -106,9 +127,10 @@ enum ContainerRuntime: Sendable, Equatable {
         timeout: Duration = startTimeout,
         shell: any CommandRunning = LoginShell(),
         clock: RunnerClock = .live,
+        readLink: @Sendable (String) -> String? = readLink,
         onProgress: (@Sendable (String) -> Void)? = nil
     ) async -> ContainerRuntimeProbe {
-        let first = await probe(shell: shell)
+        let first = await probe(shell: shell, readLink: readLink)
         guard case .daemonDown(let context) = first else { return first }
         let runtime = context.runtime
         await open(runtime, shell: shell)
@@ -122,7 +144,7 @@ enum ContainerRuntime: Sendable, Equatable {
             } catch {
                 return last
             }
-            last = await probeDaemon(contextName: context.name, shell: shell, timeout: commandTimeout, opened: true)
+            last = await probeDaemon(contextName: context.name, shell: shell, timeout: commandTimeout, opened: true, readLink: readLink)
             if case .daemonDown = last {
                 let waited = clock.uptime() - start
                 if waited - reported >= progressInterval, waited < timeout {
@@ -146,6 +168,8 @@ enum ContainerRuntime: Sendable, Equatable {
     }
 
     /// The runtime that the last probe found. The views read it without a command.
+    /// Any probe writes it, a probe of a test too: a suite that probes or reads
+    /// `detect()` clears it in setUp, and the tests must not run in parallel.
     private final class Probed: @unchecked Sendable {
         static let shared = Probed()
         private let lock = NSLock()

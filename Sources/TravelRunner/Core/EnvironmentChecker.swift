@@ -75,6 +75,9 @@ final class EnvironmentChecker {
     /// True while the sheet that asks for the GitHub Packages token is open.
     var tokenEntryOpen = false
 
+    /// What the last check of the docker row found. Its fix depends on it.
+    @ObservationIgnored private var dockerProbe: ContainerRuntimeProbe?
+
     /// Fixes that run now, in any checker. An update does not restart the app during one.
     private(set) static var fixesRunning = 0
 
@@ -564,6 +567,7 @@ final class EnvironmentChecker {
         switch id {
         case "docker":
             let probe = await ContainerRuntime.probe(shell: commandRunner, timeout: Self.checkTimeout)
+            dockerProbe = probe
             if case .daemonDown(let context) = probe, context.timedOut {
                 throw CheckTimedOut(label: "docker ps")
             }
@@ -833,7 +837,19 @@ final class EnvironmentChecker {
         }
         switch id {
         case "docker":
-            return .navigate(app: ContainerRuntime.detect().appName, waitFor: Self.containerRuntimeWait)
+            // Opening the app and waiting does not fix a missing CLI or a refused socket.
+            switch dockerProbe {
+            case .cliMissing:
+                return .guidance(text: ContainerRuntimeProbe.cliMissingText, copyCommand: nil, url: nil)
+            case .permissionDenied(let context, _):
+                return .guidance(
+                    text: "\(dockerProbe?.failureText(waited: nil) ?? "") — quit and reopen \(context.runtime.appName), then re-check",
+                    copyCommand: nil, url: nil
+                )
+            default:
+                let runtime = dockerProbe?.runtime ?? ContainerRuntime.detect()
+                return .navigate(app: runtime.appName, waitFor: Self.containerRuntimeWait)
+            }
         case "node":
             return .guidance(
                 text: Self.nodeGuidance, copyCommand: "brew install node@22",

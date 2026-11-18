@@ -8,6 +8,11 @@ final class ContainerRuntimeTests: XCTestCase {
     private let orbstackDown = "Cannot connect to the Docker daemon at unix:///Users/a/.orbstack/run/docker.sock. Is the docker daemon running?"
     private let desktopDown = "Cannot connect to the Docker daemon at unix:///Users/a/.docker/run/docker.sock. Is the docker daemon running?"
 
+    override func setUp() {
+        super.setUp()
+        ContainerRuntime.forgetProbed()
+    }
+
     override func tearDown() {
         ContainerRuntime.forgetProbed()
         super.tearDown()
@@ -46,6 +51,59 @@ final class ContainerRuntimeTests: XCTestCase {
                 "\(row.context ?? "nil") \(row.socket ?? "nil")"
             )
         }
+    }
+
+    /// The `default` context with the default socket: the runtime is where the
+    /// socket links to. The link is read by a fake, never on this Mac.
+    func testTheDefaultContextReadsWhereTheDefaultSocketLinks() {
+        let orbstackLink: (String) -> String? = { $0 == "/var/run/docker.sock" ? "/Users/a/.orbstack/run/docker.sock" : nil }
+        let desktopLink: (String) -> String? = { $0 == "/var/run/docker.sock" ? "/Users/a/.docker/run/docker.sock" : nil }
+        let noLink: (String) -> String? = { _ in nil }
+        let rows: [(context: String?, socket: String?, link: (String) -> String?, expected: ContainerRuntime?)] = [
+            ("default", nil, orbstackLink, .orbstack),
+            ("default", nil, desktopLink, .docker),
+            ("default", "/var/run/docker.sock", desktopLink, .docker),
+            ("default", "/var/run/docker.sock", noLink, nil),
+            // A socket that names its runtime wins over the link.
+            ("default", "/Users/a/.orbstack/run/docker.sock", desktopLink, .orbstack),
+            // The context wins over the link.
+            ("desktop-linux", nil, orbstackLink, .docker),
+            // The link of the default socket says nothing about another context or another socket.
+            ("colima", nil, orbstackLink, nil),
+            (nil, nil, orbstackLink, nil),
+            ("default", "/Users/a/.colima/docker.sock", orbstackLink, nil),
+        ]
+        for row in rows {
+            XCTAssertEqual(
+                ContainerRuntime.runtime(context: row.context, socket: row.socket, readLink: row.link), row.expected,
+                "\(row.context ?? "nil") \(row.socket ?? "nil")"
+            )
+        }
+    }
+
+    /// Docker Desktop owns the default socket and OrbStack is installed too: the
+    /// runner opens Docker, not OrbStack.
+    func testADownDaemonOfTheDefaultContextOpensTheAppThatOwnsTheSocket() async {
+        let down = FakeCommandRunner.failed(1, stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?")
+        let runner = shell(context: FakeCommandRunner.ok("default\n"), ps: [down, FakeCommandRunner.ok()])
+        let time = FakeClock()
+
+        let probe = await ContainerRuntime.ensureRunning(shell: runner, clock: time.clock, readLink: {
+            $0 == "/var/run/docker.sock" ? "/Users/a/.docker/run/docker.sock" : nil
+        })
+
+        XCTAssertEqual(probe, .running(ContainerRuntimeContext(name: "default", runtime: .docker, opened: true)))
+        XCTAssertEqual(runner.commands.filter { $0.hasPrefix("open") }, ["open -a Docker"])
+        XCTAssertEqual(ContainerRuntime.detect(), .docker)
+    }
+
+    /// A running daemon prints no socket: the link still names the runtime.
+    func testARunningDaemonOfTheDefaultContextIsNamedFromTheLink() async {
+        let runner = shell(context: FakeCommandRunner.ok("default\n"), ps: [FakeCommandRunner.ok()])
+        let probe = await ContainerRuntime.probe(shell: runner, readLink: {
+            $0 == "/var/run/docker.sock" ? "/Users/a/.orbstack/run/docker.sock" : nil
+        })
+        XCTAssertEqual(probe, .running(ContainerRuntimeContext(name: "default", runtime: .orbstack)))
     }
 
     func testTheSocketIsReadFromDockersError() {

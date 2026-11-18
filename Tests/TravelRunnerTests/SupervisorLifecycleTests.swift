@@ -13,6 +13,8 @@ final class SupervisorLifecycleTests: XCTestCase {
     private var crashes: [(name: String, code: Int32)] = []
 
     override func setUp() async throws {
+        // A probe of another test can leave its runtime behind.
+        ContainerRuntime.forgetProbed()
         port = Self.freePort()
         workDir = FileManager.default.temporaryDirectory.appendingPathComponent("SupervisorLifecycleTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
@@ -4071,6 +4073,127 @@ final class SupervisorLifecycleTests: XCTestCase {
         let stopped = await waitUntil(15) { self.supervisor.health == .stopped && step.status == .cancelled }
         XCTAssertTrue(stopped, "step is \(step.status.rawValue)")
         XCTAssertNotEqual(kill(child, 0), 0, "the child of the step still runs")
+    }
+
+    // MARK: - Container runtime down
+
+    private static let daemonDown = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+
+    /// A service that runs a while, then fails because the container runtime is
+    /// down. It has no probe, so its start does not wait on the fake clock.
+    private func loadDockerService() throws {
+        let service = ServiceDefinition(
+            id: "db", name: nil, cmd: ["sh", "-c", "sleep 0.5; echo '\(Self.daemonDown)'; exit 1"], cwd: workDir.path,
+            probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try load(service)
+    }
+
+    /// A shell whose context is OrbStack and whose `docker ps` gives `ps`.
+    /// Each `docker ps` after the first waits for `gate` when there is one.
+    private func dockerShell(ps: CommandResult, gate: Gate? = nil) -> FakeCommandRunner {
+        let asked = OSAllocatedUnfairLock(initialState: 0)
+        let shell = FakeCommandRunner { call in
+            if call.command == "docker context show" { return FakeCommandRunner.ok("orbstack\n") }
+            if call.command.hasPrefix("docker ps") {
+                let count = asked.withLock { $0 += 1; return $0 }
+                if count > 1, let gate { await gate.wait() }
+                return ps
+            }
+            return FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        return shell
+    }
+
+    private func dockerPsCount(_ shell: FakeCommandRunner) -> Int {
+        shell.commands.filter { $0.hasPrefix("docker ps") }.count
+    }
+
+    /// The crash restart opens the runtime and waits 120 s for it (no real time
+    /// with the clock of the test). When it stays down, the service halts with
+    /// the plan's text and the button that opens the runtime.
+    func testACrashWithTheRuntimeDownWaitsForItThenHalts() async throws {
+        let tracker = captureIssues()
+        let shell = dockerShell(ps: FakeCommandRunner.failed(1, stderr: Self.daemonDown))
+        supervisor.clock = FakeClock().clock
+        try loadDockerService()
+
+        supervisor.restartService("db")
+
+        let halted = await waitUntil(30) {
+            self.state("db").isCircuitBroken && self.state("db").condition?.actions == [.openContainerRuntime]
+        }
+        XCTAssertTrue(halted, state("db").condition?.text ?? "no condition")
+        XCTAssertEqual(supervisor.lastError, "OrbStack did not answer after 120 s — open it, then press Retry")
+        XCTAssertEqual(state("db").condition?.kind, .halted(reason: "runtime down"))
+        XCTAssertEqual(shell.commands.filter { $0.hasPrefix("open") }, ["open -a OrbStack"])
+        // One probe, then one each 2 s for 120 s.
+        XCTAssertEqual(dockerPsCount(shell), 61)
+        let trips = await events("breaker_trip", in: tracker)
+        XCTAssertEqual(
+            trips.map(\.message), ["OrbStack did not answer after 120 s — open it, then press Retry — the restart of db stopped"]
+        )
+        // The wait writes its progress to the log of the service.
+        var lines: [String] = []
+        for _ in 0..<40 {
+            lines = await logLines("db")
+            if lines.contains("[travel-runner] Waiting for OrbStack — 110 s of 120 s before the restart of db") { break }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTAssertTrue(lines.contains(
+            "[travel-runner] OrbStack is not running — opening it and waiting up to 120 s before the restart of db"
+        ), "\(lines)")
+        XCTAssertTrue(lines.contains("[travel-runner] Waiting for OrbStack — 10 s of 120 s before the restart of db"), "\(lines)")
+        XCTAssertTrue(lines.contains("[travel-runner] Waiting for OrbStack — 110 s of 120 s before the restart of db"), "\(lines)")
+    }
+
+    /// A refused socket does not get better with time: no app is opened, the
+    /// runner does not wait, and the service says why.
+    func testACrashWithARefusedSocketHaltsAtOnce() async throws {
+        let refused = "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock: dial unix /var/run/docker.sock: connect: permission denied"
+        let shell = dockerShell(ps: FakeCommandRunner.failed(1, stderr: refused))
+        supervisor.clock = FakeClock().clock
+        try loadDockerService()
+
+        supervisor.restartService("db")
+
+        let text = "Docker refused the connection (permission denied on /var/run/docker.sock)"
+        let halted = await waitUntil(30) {
+            self.state("db").isCircuitBroken && self.state("db").condition?.headline == text
+        }
+        XCTAssertTrue(halted, state("db").condition?.text ?? "no condition")
+        XCTAssertEqual(supervisor.lastError, text)
+        XCTAssertFalse(shell.commands.contains { $0.hasPrefix("open") }, "\(shell.commands)")
+        XCTAssertEqual(dockerPsCount(shell), 1)
+    }
+
+    /// A stop during the wait wins: the end of the wait trips no breaker and
+    /// leaves the banner alone.
+    func testAStopDuringTheWaitForTheRuntimeLeavesTheServiceAlone() async throws {
+        let tracker = captureIssues()
+        let gate = Gate()
+        let shell = dockerShell(ps: FakeCommandRunner.failed(1, stderr: Self.daemonDown), gate: gate)
+        supervisor.clock = FakeClock().clock
+        try loadDockerService()
+        supervisor.restartService("db")
+        let waiting = await waitUntil(30) { self.dockerPsCount(shell) >= 2 }
+        XCTAssertTrue(waiting, "\(shell.commands)")
+
+        supervisor.stopAll()
+        let stopped = await waitUntil(15) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        let before = supervisor.lastError
+        await gate.open()
+
+        let ended = await waitUntil(15) { self.dockerPsCount(shell) == 61 }
+        XCTAssertTrue(ended, "\(dockerPsCount(shell))")
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(supervisor.lastError, before)
+        XCTAssertFalse(state("db").isCircuitBroken)
+        XCTAssertNotEqual(state("db").phase, .failed)
+        let trips = await tracker.listEvents().filter { $0.kind == "breaker_trip" }
+        XCTAssertEqual(trips.map(\.message), [])
     }
 
     // MARK: - Time from the clock of the test
