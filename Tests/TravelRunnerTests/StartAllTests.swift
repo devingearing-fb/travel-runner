@@ -170,6 +170,19 @@ final class StartAllTests: XCTestCase {
 
             XCTAssertEqual(supervisor.health, .degraded, row.name)
             XCTAssertEqual(supervisor.lastError, row.error, row.name)
+            // The header says "Not started", and the reason reaches the tooltip and the API.
+            let checks = row.error.components(separatedBy: " · ").count
+            let reason = row.setup.siblingServices.isEmpty
+                ? "Not started — \(checks) check\(checks == 1 ? "" : "s") failed"
+                : "Not started — \(Flavor.current.sibling.displayName) runs a stack now"
+            XCTAssertTrue(supervisor.healthSummary.notStarted, row.name)
+            XCTAssertEqual(supervisor.healthSummary.label, "Not started", row.name)
+            XCTAssertEqual(supervisor.healthSummary.reason, reason, row.name)
+            let status = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(supervisor.statusJSON().utf8)) as? [String: Any]
+            )
+            XCTAssertEqual(status["health"] as? String, "DEGRADED", row.name)
+            XCTAssertEqual(status["health_reason"] as? String, reason, row.name)
             XCTAssertEqual(started, [], row.name)
             XCTAssertEqual(run.queries, [], row.name)
             XCTAssertEqual(run.resets, 0, row.name)

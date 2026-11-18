@@ -2233,6 +2233,14 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertFalse(lines.contains("stripe-start"), "the process must not start")
         XCTAssertEqual(feedback, ["Stripe CLI skipped — see its log"])
         XCTAssertEqual(supervisor.health, .healthy, "Stripe is optional")
+        // Healthy, but the header, the tooltip and the API say what is off.
+        XCTAssertEqual(supervisor.healthSummary.label, "OK · Stripe webhooks off")
+        let reason = "1 skipped: Stripe CLI (Stripe CLI login expired — webhooks are off)"
+        XCTAssertEqual(supervisor.healthSummary.reason, reason)
+        let status = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(supervisor.statusJSON().utf8)) as? [String: Any]
+        )
+        XCTAssertEqual(status["health_reason"] as? String, reason)
 
         let skips = await events("stripe_skip", in: tracker)
         XCTAssertEqual(skips.count, 1)

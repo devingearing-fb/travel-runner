@@ -7,6 +7,10 @@ final class EnvironmentSupervisor {
     // MARK: - Published State
 
     var health: HealthStatus = .stopped
+    /// Why the stack has its health: the header, the menu-bar tooltip and `health_reason`.
+    private(set) var healthSummary = HealthSummary.stopped
+    /// Why the last start did not start anything. Cleared by the next start or a stop.
+    private var startRefusal: String?
     var serviceStates: [String: ServiceState] = [:]
     var preflightChecks: [PreflightCheck] = []
     var currentPhase: StartupPhase = .idle
@@ -687,7 +691,8 @@ final class EnvironmentSupervisor {
         for serviceID in serviceStates.keys { clearFailureHistory(serviceID) }
         // Stripe keeps its own retry counts. The preflight fills the probe cache after this.
         resetStripeRetries(keepingAvailability: true)
-        health = .starting
+        startRefusal = nil
+        applyHealth(HealthSummary(status: .starting))
         lastError = nil
         dbSetupFailedAtStart = false
         startupBeganAt = clock.date()
@@ -699,6 +704,8 @@ final class EnvironmentSupervisor {
             defer {
                 Task { @MainActor in
                     self.startTask = nil
+                    // The start is over: a health of "starting" ends here.
+                    self.recalculateHealth()
                 }
             }
 
@@ -709,7 +716,8 @@ final class EnvironmentSupervisor {
             let siblingServices = await self.siblingActiveServices()
             if !siblingServices.isEmpty {
                 await MainActor.run {
-                    self.health = .degraded
+                    self.startRefusal = "Not started — \(Flavor.current.sibling.displayName) runs a stack now"
+                    self.recalculateHealth(startInFlight: false)
                     self.lastError = SiblingRunner.refusal(activeServices: siblingServices)
                     self.currentPhase = .idle
                 }
@@ -739,7 +747,9 @@ final class EnvironmentSupervisor {
                 if !allPassed {
                     let summary = failedDetails.joined(separator: " · ")
                     await MainActor.run {
-                        self.health = .degraded
+                        let count = failedDetails.count
+                        self.startRefusal = "Not started — \(count) check\(count == 1 ? "" : "s") failed"
+                        self.recalculateHealth(startInFlight: false)
                         self.lastError = "Preflight failed — \(summary)"
                         self.currentPhase = .idle
                     }
@@ -827,7 +837,7 @@ final class EnvironmentSupervisor {
             }
 
             await MainActor.run {
-                self.recalculateHealth()
+                self.recalculateHealth(startInFlight: false)
                 if self.dbSetupFailedAtStart {
                     self.currentPhase = .idle
                 } else if self.health == .healthy {
@@ -911,7 +921,8 @@ final class EnvironmentSupervisor {
 
             await registry?.stop()
             dbSetupFailedAtStart = false
-            health = .stopped
+            startRefusal = nil
+            applyHealth(.stopped)
             currentPhase = .idle
             completedPhases = []
             phaseTimings = [:]
@@ -938,6 +949,8 @@ final class EnvironmentSupervisor {
             "gitBehind": gitBehindCounts,
             "npmStale": Array(npmStaleServices)
         ]
+        // Why the stack has its health: a failed service, the services that are off, a refused start.
+        if let reason = healthSummary.reason { dict["health_reason"] = reason }
         // Present only while this runner is too old to reset the checkout.
         if let compatibilityNotice { dict["reset_blocked"] = compatibilityNotice.text }
         // version, build, commit, build_kind
@@ -3643,32 +3656,36 @@ final class EnvironmentSupervisor {
 
     // MARK: - Private: Health
 
-    func recalculateHealth() {
-        let daemonStates = serviceStates.values
+    /// Recomputes the health and its reason. `startInFlight` defaults to whether a
+    /// start runs; the end of a start passes false before its task is cleared.
+    func recalculateHealth(startInFlight: Bool? = nil) {
+        // The order of the rows; a state outside the graph comes last.
+        let ordered = sortedServiceIDs + serviceStates.keys.filter { !sortedServiceIDs.contains($0) }.sorted()
+        let services = ordered.compactMap { serviceStates[$0] }
             .filter { $0.definition.resolvedType != .oneshot }
-            .map(\.phase)
-
-        if daemonStates.allSatisfy({ $0 == .stopped || $0 == .pending }) {
-            health = .stopped
-        } else if daemonStates.contains(.failed) || dbSetupFailedAtStart {
-            health = .degraded
-        } else if daemonStates.allSatisfy({ $0 == .running || $0 == .completed || $0 == .skipped }) {
-            health = .healthy
-        } else {
-            health = .starting
-        }
-
-        if health == .degraded {
-            let failedIDs = serviceStates.filter { $0.value.phase == .failed }.map(\.key)
-            rootCauseServiceID = failedIDs.first { serviceID in
-                let deps = graph?.nodes[serviceID]?.dependsOn ?? []
-                return deps.allSatisfy { depID in
-                    serviceStates[depID]?.phase != .failed
-                }
+            .map { state in
+                HealthSummary.Service(
+                    id: state.id, name: state.definition.displayName, phase: state.phase,
+                    conditionKind: state.condition?.kind, headline: state.condition?.headline,
+                    dependsOn: graph?.nodes[state.id]?.dependsOn ?? state.definition.dependsOn,
+                    isCircuitBroken: state.isCircuitBroken
+                )
             }
-        } else {
-            rootCauseServiceID = nil
-        }
+        let dbSetupFailure = dbSetupFailedAtStart
+            ? "Database setup failed" + (dbSetupPipeline?.firstFailed.map { " at \($0.name)" } ?? "")
+            : nil
+        applyHealth(HealthSummary.compute(HealthSummary.Input(
+            services: services,
+            startInFlight: startInFlight ?? (startTask != nil),
+            refusal: startRefusal,
+            dbSetupFailure: dbSetupFailure
+        )))
+    }
+
+    private func applyHealth(_ summary: HealthSummary) {
+        health = summary.status
+        healthSummary = summary
+        rootCauseServiceID = summary.rootCauseID
     }
 
     func handleWake() {
