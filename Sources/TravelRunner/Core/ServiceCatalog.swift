@@ -146,7 +146,8 @@ enum ServiceCatalog {
             service("stripe", "Stripe CLI",
                     StripeLauncher.command,
                     probe: ProbeConfig(type: .stdoutRegex, port: nil, host: nil, url: nil,
-                                       pattern: "whsec_[A-Za-z0-9]+", artifact: "STRIPE_WEBHOOK_SECRET", timeout: nil),
+                                       pattern: "whsec_[A-Za-z0-9]+", artifact: "STRIPE_WEBHOOK_SECRET",
+                                       timeout: StripeLauncher.connectTimeout),
                     restart: .onFailure, phase: "gateway", dependsOn: ["supabase"]),
             // The portal does not wait for Stripe. A new webhook secret restarts it.
             service("travel-portal", "Travel Portal", ["pnpm", "dev"], cwd: booking,

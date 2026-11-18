@@ -44,6 +44,11 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.dependencyRecord = DependencyRecord(path: workDir.appendingPathComponent("config/deps.json").path)
         // The diagnostics of an issue read no tool of this Mac.
         supervisor.diagnosticsTools = { _ in [] }
+        // Stripe's network check never goes on the network, and its retries are short.
+        supervisor.stripeNetworkUp = { true }
+        supervisor.stripeRetryPolicy = StripeRetryPolicy(
+            networkBase: .milliseconds(200), networkCap: .seconds(1), crashRestarts: 2, crashDelay: .milliseconds(200)
+        )
     }
 
     /// Gives the supervisor a shell that holds each "where is the tool" question
@@ -2209,10 +2214,10 @@ final class SupervisorLifecycleTests: XCTestCase {
 
     /// 105 tickets: Stripe ended as "skipped" with no line that says why. The CLI
     /// check is a fake; the test does not run the Stripe CLI.
-    func testStripeWithoutItsCliIsSkippedWithTheCauseInItsLog() async throws {
+    func testStripeWithAnExpiredLoginIsSkippedWithTheCauseInItsLog() async throws {
         let tracker = captureIssues()
         try load(stripe("echo stripe-start; sleep 30"))
-        supervisor.stripeAvailability = { false }
+        supervisor.stripeTooling = FakeStripeTooling.answering(.notAuthenticated)
         var feedback: [String] = []
         supervisor.onActionFeedback = { message, _ in feedback.append(message) }
 
@@ -2222,7 +2227,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
         let lines = await logLines("stripe")
         XCTAssertTrue(
-            lines.contains { $0.hasPrefix("[travel-runner] Stripe stopped: ") && $0.contains("stripe login") },
+            lines.contains("[travel-runner] Stripe stopped: Stripe CLI login expired — webhooks are off."),
             lines.joined(separator: "\n")
         )
         XCTAssertFalse(lines.contains("stripe-start"), "the process must not start")
@@ -2232,32 +2237,40 @@ final class SupervisorLifecycleTests: XCTestCase {
         let skips = await events("stripe_skip", in: tracker)
         XCTAssertEqual(skips.count, 1)
         XCTAssertEqual(skips.first?.serviceId, "stripe")
-        XCTAssertTrue(skips.first?.message.contains("stripe login") == true, "\(skips)")
+        XCTAssertEqual(skips.first?.message, "Stripe CLI login expired — webhooks are off.")
 
         // F4: a skip has a reason on the row and in the status API.
         let condition = try XCTUnwrap(state("stripe").condition)
         XCTAssertEqual(condition.kind, .optionalOff)
-        XCTAssertEqual(condition.headline, "Stripe CLI is not installed or not logged in — webhooks are off.")
+        XCTAssertEqual(condition.headline, "Stripe CLI login expired — webhooks are off.")
+        XCTAssertEqual(condition.actions, [.stripeLogin])
+        XCTAssertTrue(supervisor.canPerform(.stripeLogin, for: "stripe"))
+        XCTAssertFalse(supervisor.canPerform(.stripeLogin, for: "anchor"), "only the Stripe row logs in")
         let fields = EnvironmentSupervisor.statusFields(state("stripe"))
         XCTAssertEqual(fields["skip_reason"], condition.text)
         XCTAssertNil(fields["reason"])
     }
 
-    /// A Stripe CLI that fails (an expired session, say) is skipped, not restarted in
-    /// a loop. Its log says so, with the exit code.
-    func testAStripeCrashIsSkippedWithTheCauseInItsLog() async throws {
-        try load(stripe("echo stripe-start; sleep 2; exit 1"))
-        supervisor.stripeAvailability = { true }
+    /// S3: a Stripe CLI that exits with no known cause gets two restarts, then
+    /// Stripe is off and one issue is filed. The stack stays green, and there is no
+    /// crash notification.
+    func testAStripeCrashRestartsTwiceThenTurnsStripeOffWithOneIssue() async throws {
+        let tracker = captureIssues()
+        try load(stripe("echo stripe-start; sleep 1; exit 1"))
+        supervisor.stripeTooling = FakeStripeTooling.available
 
         supervisor.restartService("stripe")
 
-        let started = await waitUntil(15) { self.settled("stripe") }
-        XCTAssertTrue(started, "stripe is \(state("stripe").phase.rawValue)")
-        let skipped = await waitUntil(15) { self.state("stripe").phase == .skipped }
-        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
-        try await Task.sleep(for: .seconds(3))
+        let off = await waitUntil(30) { self.state("stripe").condition?.headline == StripeOffReason.crashedTwice.headline }
+        XCTAssertTrue(off, "stripe: \(state("stripe").condition?.text ?? "no condition")")
+        XCTAssertEqual(state("stripe").condition?.headline, "Stripe CLI crashed twice (see log) — webhooks are off.")
+        XCTAssertEqual(state("stripe").condition?.actions, [.startService, .openLog])
+        try await Task.sleep(for: .seconds(2))
 
         let lines = await logLines("stripe")
+        XCTAssertEqual(lines.filter { $0 == "stripe-start" }.count, 3, "the first run and two restarts")
+        XCTAssertTrue(lines.contains("[travel-runner] Stripe: the Stripe CLI exited with code 1 — restarting it (1 of 2)"))
+        XCTAssertTrue(lines.contains("[travel-runner] Stripe: the Stripe CLI exited with code 1 — restarting it (2 of 2)"))
         XCTAssertTrue(
             lines.contains(
                 "[travel-runner] Stripe stopped: the Stripe CLI exited with code 1 — see the lines above. "
@@ -2265,16 +2278,18 @@ final class SupervisorLifecycleTests: XCTestCase {
             ),
             lines.joined(separator: "\n")
         )
-        XCTAssertEqual(lines.filter { $0 == "stripe-start" }.count, 1, "it is not restarted")
         XCTAssertEqual(state("stripe").phase, .skipped)
         XCTAssertEqual(supervisor.health, .healthy, "Stripe is optional")
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+        let issues = await tracker.listIssues(status: "open")
+        XCTAssertEqual(issues.map(\.trigger), ["service_crash"], "one issue for the series")
+        XCTAssertEqual(issues.first?.serviceId, "stripe")
     }
 
     /// The Stripe line said "see the lines above". Now it names the cause it finds there.
     func testAStripeCrashWithA401SaysThatTheSessionExpired() async throws {
         try load(stripe("echo 'Authorization failed, status=401'; sleep 2; exit 1"))
-        supervisor.stripeAvailability = { true }
+        supervisor.stripeTooling = FakeStripeTooling.available
 
         supervisor.restartService("stripe")
 
@@ -2288,21 +2303,29 @@ final class SupervisorLifecycleTests: XCTestCase {
             lines = await logLines("stripe")
         }
         XCTAssertTrue(lines.contains(expected), lines.joined(separator: "\n"))
+
+        // S3: a rejected login never retries.
+        try await Task.sleep(for: .seconds(1))
+        lines = await logLines("stripe")
+        XCTAssertEqual(lines.filter { $0 == "Authorization failed, status=401" }.count, 1, "it is not restarted")
+        XCTAssertEqual(state("stripe").condition?.headline, "Stripe CLI login expired — webhooks are off.")
+        XCTAssertEqual(state("stripe").condition?.actions, [.stripeLogin])
     }
 
     /// The Stripe log is not cleared on a restart. A 401 from an earlier launch
     /// labelled a later exit as an expired session.
     func testAnOld401InTheStripeLogIsNotTheCauseOfALaterExit() async throws {
-        try load(stripe("echo stripe-start; sleep 2; exit 1"))
-        supervisor.stripeAvailability = { true }
+        try load(stripe("echo stripe-start; sleep 1; exit 1"))
+        supervisor.stripeTooling = FakeStripeTooling.available
         await supervisor.logStore.append(serviceID: "stripe", entry: LogEntry(
             timestamp: Date().addingTimeInterval(-600), stream: .stderr, text: "Authorization failed, status=401"
         ))
 
         supervisor.restartService("stripe")
 
-        let skipped = await waitUntil(20) { self.state("stripe").phase == .skipped }
-        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        // An exit with no known cause restarts twice before Stripe is off.
+        let off = await waitUntil(30) { self.state("stripe").condition?.headline == StripeOffReason.crashedTwice.headline }
+        XCTAssertTrue(off, "stripe: \(state("stripe").condition?.text ?? "no condition")")
         let prefix = "[travel-runner] Stripe stopped: the Stripe CLI exited with code 1"
         var lines: [String] = []
         for _ in 0..<100 where !lines.contains(where: { $0.hasPrefix(prefix) }) {
@@ -2312,6 +2335,192 @@ final class SupervisorLifecycleTests: XCTestCase {
         let stopped = lines.first { $0.hasPrefix(prefix) }
         XCTAssertNotNil(stopped, lines.joined(separator: "\n"))
         XCTAssertEqual(stopped?.contains("Stripe session expired"), false, stopped ?? "")
+    }
+
+    // MARK: - S3: the Stripe state machine
+
+    /// A Stripe script that runs only while the file `online` is in its folder.
+    /// Without it, it fails as the CLI does with no DNS.
+    private var stripeThatNeedsTheNetwork: ServiceDefinition {
+        stripe("if [ -f online ]; then echo stripe-online; sleep 30; else echo 'dial tcp: lookup api.stripe.com: no such host'; exit 1; fi")
+    }
+
+    private func setOnline(_ online: Bool, _ flag: OSAllocatedUnfairLock<Bool>) throws {
+        let file = workDir.appendingPathComponent("online")
+        if online {
+            try Data().write(to: file)
+        } else {
+            try? FileManager.default.removeItem(at: file)
+        }
+        flag.withLock { $0 = online }
+    }
+
+    /// 33 tickets: Stripe ended after a DNS failure. Now it waits for the network,
+    /// with no issue and no red state, and comes back by itself.
+    func testStripeWithoutNetworkWaitsAndReconnectsWithNoIssue() async throws {
+        let tracker = captureIssues()
+        let online = OSAllocatedUnfairLock(initialState: false)
+        supervisor.stripeNetworkUp = { online.withLock { $0 } }
+        supervisor.stripeTooling = FakeStripeTooling.available
+        try load(stripeThatNeedsTheNetwork)
+
+        supervisor.restartService("stripe")
+
+        let waiting = await waitUntil(15) { self.state("stripe").condition?.headline == StripeOffReason.offline.headline }
+        XCTAssertTrue(waiting, "stripe: \(state("stripe").condition?.text ?? "no condition")")
+        XCTAssertEqual(state("stripe").condition?.headline, "No network — Stripe reconnects when the network is back.")
+        XCTAssertEqual(state("stripe").condition?.kind, .retrying)
+        XCTAssertEqual(state("stripe").condition?.actions, [])
+        XCTAssertEqual(state("stripe").phase, .skipped)
+        XCTAssertEqual(supervisor.health, .healthy, "no red state")
+        // The runner asks for the network a few times, and starts nothing while it is down.
+        try await Task.sleep(for: .seconds(2))
+        var lines = await logLines("stripe")
+        XCTAssertEqual(lines.filter { $0.contains("no such host") }.count, 1, "no start without the network")
+
+        try setOnline(true, online)
+
+        let back = await waitUntil(15) { self.state("stripe").phase == .running }
+        XCTAssertTrue(back, "stripe is \(state("stripe").phase.rawValue)")
+        for _ in 0..<100 where !lines.contains("stripe-online") {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines("stripe")
+        }
+        XCTAssertTrue(lines.contains("stripe-online"), lines.joined(separator: "\n"))
+        let issues = await tracker.listIssues(status: "open")
+        XCTAssertTrue(issues.isEmpty, "\(issues.map(\.summary))")
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+        let skips = await events("stripe_skip", in: tracker)
+        XCTAssertEqual(skips.count, 1, "the wait is said once: \(skips.map(\.message))")
+    }
+
+    /// The network check can pass while the CLI still cannot resolve Stripe. The
+    /// retries go on with a longer wait each time, and the log says it once.
+    func testStripeRetriesANetworkFailureWithBackoffAndSaysItOnce() async throws {
+        let tracker = captureIssues()
+        supervisor.stripeTooling = FakeStripeTooling.available
+        try load(stripeThatNeedsTheNetwork)
+
+        supervisor.restartService("stripe")
+
+        // 200 ms, 400 ms, 800 ms, then 1 s each: at least four tries in 4 s.
+        try await Task.sleep(for: .seconds(4))
+        var lines = await logLines("stripe")
+        let tries = lines.filter { $0.contains("no such host") }.count
+        XCTAssertGreaterThanOrEqual(tries, 4, lines.joined(separator: "\n"))
+        XCTAssertLessThanOrEqual(tries, 8, "the wait grows: \(tries) tries")
+        XCTAssertEqual(lines.filter { $0.hasPrefix("[travel-runner] Stripe stopped:") }.count, 1, lines.joined(separator: "\n"))
+        XCTAssertEqual(state("stripe").condition?.headline, StripeOffReason.offline.headline)
+        XCTAssertEqual(supervisor.health, .healthy)
+
+        try Data().write(to: workDir.appendingPathComponent("online"))
+        let back = await waitUntil(15) { self.state("stripe").phase == .running }
+        XCTAssertTrue(back, "stripe is \(state("stripe").phase.rawValue)")
+        lines = await logLines("stripe")
+        let issues = await tracker.listIssues(status: "open")
+        XCTAssertTrue(issues.isEmpty, "\(issues.map(\.summary))")
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
+    /// Six probe-timeout tickets came from the wake path: it waited 30 s for the
+    /// network, then marked Stripe failed and filed an issue. Now Stripe is stopped
+    /// by the runner and waits for the network, with no issue.
+    func testAWakeWithoutNetworkReconnectsStripeWithoutAnIssue() async throws {
+        let tracker = captureIssues()
+        let online = OSAllocatedUnfairLock(initialState: true)
+        supervisor.stripeNetworkUp = { online.withLock { $0 } }
+        supervisor.stripeTooling = FakeStripeTooling { resolution in online.withLock { $0 } ? .ok(resolution.mode) : .offline }
+        try setOnline(true, online)
+        try load(stripeThatNeedsTheNetwork)
+        supervisor.restartService("stripe")
+        let up = await waitUntil(15) { self.settled("stripe") }
+        XCTAssertTrue(up, "stripe is \(state("stripe").phase.rawValue)")
+        let before = try XCTUnwrap(state("stripe").pid)
+
+        try setOnline(false, online)
+        supervisor.handleWake()
+
+        let waiting = await waitUntil(20) { self.state("stripe").condition?.headline == StripeOffReason.afterWake.headline && self.state("stripe").phase == .skipped }
+        XCTAssertTrue(waiting, "stripe: \(state("stripe").phase.rawValue) \(state("stripe").condition?.text ?? "no condition")")
+        XCTAssertEqual(state("stripe").condition?.headline, "Reconnecting Stripe after wake…")
+        XCTAssertEqual(state("stripe").condition?.kind, .retrying)
+        XCTAssertNil(state("stripe").pid)
+        XCTAssertEqual(supervisor.health, .healthy)
+
+        try setOnline(true, online)
+        let back = await waitUntil(15) { self.state("stripe").phase == .running && self.state("stripe").pid != nil }
+        XCTAssertTrue(back, "stripe is \(state("stripe").phase.rawValue)")
+        XCTAssertNotEqual(state("stripe").pid, before)
+        let issues = await tracker.listIssues(status: "open")
+        XCTAssertTrue(issues.isEmpty, "\(issues.map(\.summary))")
+        XCTAssertTrue(crashes.isEmpty, "a stop by the runner is no crash: \(crashes)")
+    }
+
+    /// A wake leaves alone a Stripe that is off for a cause that needs a person.
+    func testAWakeDoesNotStartAStripeThatIsOffForALogin() async throws {
+        supervisor.stripeTooling = FakeStripeTooling.answering(.notAuthenticated)
+        try load(stripe("echo stripe-start; sleep 30"))
+        supervisor.restartService("stripe")
+        let off = await waitUntil(15) { self.state("stripe").condition?.headline == StripeOffReason.loginExpired.headline }
+        XCTAssertTrue(off)
+        let asked = (supervisor.stripeTooling as? FakeStripeTooling)?.calls
+
+        supervisor.handleWake()
+        try await Task.sleep(for: .seconds(5))
+
+        XCTAssertEqual((supervisor.stripeTooling as? FakeStripeTooling)?.calls, asked, "the wake asks nothing")
+        XCTAssertEqual(state("stripe").condition?.headline, StripeOffReason.loginExpired.headline)
+    }
+
+    /// A slow `stripe listen` ended FAILED and made the stack red. Now Stripe is
+    /// stopped and off, with a Start button and no issue.
+    func testASlowStripeListenTurnsStripeOffNotFailed() async throws {
+        let tracker = captureIssues()
+        supervisor.stripeTooling = FakeStripeTooling.available
+        try load(ServiceDefinition(
+            id: "stripe", name: "Stripe CLI", cmd: ["sh", "-c", "echo stripe-start; sleep 30"], cwd: workDir.path,
+            probe: ProbeConfig(type: .stdoutRegex, port: nil, host: nil, url: nil,
+                               pattern: "whsec_[A-Za-z0-9]+", artifact: "STRIPE_WEBHOOK_SECRET", timeout: 2),
+            type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        ))
+
+        supervisor.restartService("stripe")
+
+        let off = await waitUntil(20) {
+            self.state("stripe").condition?.headline == "Stripe did not connect within 2s — webhooks are off."
+                && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(off, "stripe: \(state("stripe").phase.rawValue) \(state("stripe").condition?.text ?? "no condition")")
+        XCTAssertEqual(state("stripe").phase, .skipped)
+        XCTAssertEqual(state("stripe").condition?.actions, [.startService])
+        XCTAssertNil(state("stripe").pid)
+        XCTAssertEqual(supervisor.health, .healthy)
+        XCTAssertNil(supervisor.lastError)
+        try await Task.sleep(for: .seconds(1))
+        let lines = await logLines("stripe")
+        XCTAssertEqual(lines.filter { $0 == "stripe-start" }.count, 1, "not restarted")
+        let issues = await tracker.listIssues(status: "open")
+        XCTAssertTrue(issues.isEmpty, "\(issues.map(\.summary))")
+    }
+
+    /// The probe ran three times for one start. Within 60 s the answer is reused;
+    /// a start by a person asks again.
+    func testTheStripeProbeAnswerIsReusedFor60sAndAStartAsksAgain() async throws {
+        let tooling = FakeStripeTooling.answering(.notInstalled)
+        supervisor.stripeTooling = tooling
+        try load(stripe("echo stripe-start; sleep 30"))
+        let resolution = StripeLauncher.resolve(bookingPortal: nil)
+
+        _ = await supervisor.stripeAvailability(resolution)
+        _ = await supervisor.stripeAvailability(resolution)
+        XCTAssertEqual(tooling.calls, 1)
+
+        supervisor.restartService("stripe")
+        let off = await waitUntil(15) { self.state("stripe").phase == .skipped && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(off)
+        XCTAssertEqual(tooling.calls, 2, "a start by a person asks again")
+        XCTAssertEqual(state("stripe").condition?.headline, "Stripe CLI not installed — webhooks are off. Run: brew install stripe/stripe-cli/stripe")
+        XCTAssertEqual(state("stripe").condition?.actions, [.installStripe])
     }
 
     // MARK: - S2: the portal does not wait for Stripe
@@ -2339,7 +2548,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         // Remote mode: the portal starts without the keys of a local stack.
         supervisor.dbMode = .remote
         _ = fakeTheOutsideOfStartAll()
-        supervisor.stripeAvailability = { true }
+        supervisor.stripeTooling = FakeStripeTooling.available
         let web = daemon("travel-portal", webServer)
         let portal = ServiceDefinition(
             id: web.id, name: web.name, cmd: web.cmd, cwd: web.cwd, probe: web.probe, type: .daemon,
@@ -2372,7 +2581,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     func testANewWebhookSecretRestartsTheRunningPortal() async throws {
         // Remote mode: the portal starts without the keys of a local stack.
         supervisor.dbMode = .remote
-        supervisor.stripeAvailability = { true }
+        supervisor.stripeTooling = FakeStripeTooling.available
         try supervisor.loadServices([
             stripeWithSecretProbe("echo whsec_madeUpForTheLifecycle1; sleep 30"),
             daemon("travel-portal", webServer),
@@ -2410,7 +2619,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     func testThePortalSaysPaymentsWillNotConfirmWhenStripeIsOff() async throws {
         // Remote mode: the portal starts without the keys of a local stack.
         supervisor.dbMode = .remote
-        supervisor.stripeAvailability = { false }
+        supervisor.stripeTooling = FakeStripeTooling.answering(.notAuthenticated)
         try supervisor.loadServices([
             stripeWithSecretProbe("echo stripe-start; sleep 30"),
             daemon("travel-portal", webServer),
@@ -2442,7 +2651,9 @@ final class SupervisorLifecycleTests: XCTestCase {
         // Remote mode: the portal starts without the keys of a local stack.
         supervisor.dbMode = .remote
         let stripeOn = OSAllocatedUnfairLock(initialState: true)
-        supervisor.stripeAvailability = { stripeOn.withLock { $0 } }
+        supervisor.stripeTooling = FakeStripeTooling { resolution in
+            stripeOn.withLock { $0 } ? .ok(resolution.mode) : .notAuthenticated
+        }
         try supervisor.loadServices([
             stripeWithSecretProbe("echo whsec_madeUpOldSecret1; sleep 30"),
             daemon("travel-portal", webServer),
@@ -2473,7 +2684,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         // Remote mode: the portal starts without the keys of a local stack.
         supervisor.dbMode = .remote
         _ = fakeTheOutsideOfStartAll()
-        supervisor.stripeAvailability = { true }
+        supervisor.stripeTooling = FakeStripeTooling.available
         // The portal takes 3 s to listen; the secret comes after 2 s.
         let web = daemon("travel-portal", ["sh", "-c", "sleep 3; exec \(webServer.joined(separator: " "))"])
         let portal = ServiceDefinition(
@@ -2566,7 +2777,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains(StripeMode.testKey(source: "apps/booking-portal/.env").logLine), lines.joined(separator: "\n"))
         XCTAssertEqual(state("stripe").modeNote, "Test key from apps/booking-portal/.env")
 
-        let check = try XCTUnwrap(shell.calls.first { $0.command == StripeLauncher.availabilityCommand })
+        let check = try XCTUnwrap(shell.calls.first { $0.command == StripeLauncher.authCheckCommand })
         XCTAssertEqual(check.environment, ["STRIPE_API_KEY": key])
         XCTAssertFalse(shell.calls.contains { $0.command.contains(key) }, "the key is never in a command")
         XCTAssertNil(state("stripe").definition.env, "the state keeps no key")
@@ -2584,7 +2795,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         let running = await waitUntil(15) { self.state("stripe").phase == .running }
         XCTAssertTrue(running, "stripe is \(state("stripe").phase.rawValue)")
         XCTAssertEqual(state("stripe").modeNote, "Your stripe login")
-        XCTAssertEqual(shell.calls.first { $0.command == StripeLauncher.availabilityCommand }?.environment, [:])
+        XCTAssertEqual(shell.calls.first { $0.command == StripeLauncher.authCheckCommand }?.environment, [:])
     }
 
     /// In test-key mode a 401 means the key is wrong; `stripe login` does not fix that.
@@ -2818,11 +3029,12 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(supervisor.currentPhase, .running)
         XCTAssertNil(supervisor.lastError)
         XCTAssertEqual(Self.listeners(on: port).count, 1)
-        // The preflight ran, with the shell of the supervisor.
+        // The preflight ran, with the shell of the supervisor. Without Stripe in
+        // the graph it does not ask Stripe.
         XCTAssertTrue(supervisor.completedPhases.contains("PREFLIGHT"))
         XCTAssertEqual(
             supervisor.preflightChecks.map(\.id),
-            ["docker", "node-version", "stripe-auth", "port-\(port)", "dir-\(workDir.lastPathComponent)"]
+            ["docker", "node-version", "port-\(port)", "dir-\(workDir.lastPathComponent)"]
         )
         XCTAssertFalse(supervisor.preflightChecks.contains { $0.result.isFailed })
         XCTAssertTrue(shell.commands.contains("node --version"), "\(shell.commands)")

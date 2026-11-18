@@ -135,18 +135,21 @@ final class PreflightRunnerTests: XCTestCase {
         let skipped = "Stripe will be skipped"
 
         let rows: [(name: String, portal: String, installed: Bool, auth: CommandResult, expected: String)] = [
-            ("no Stripe CLI", withKey, false, FakeCommandRunner.ok(), "warning: Not installed — \(skipped)"),
+            ("no Stripe CLI", withKey, false, FakeCommandRunner.ok(),
+             "warning: Not installed — \(skipped); run: brew install stripe/stripe-cli/stripe"),
             ("the test key works", withKey, true, FakeCommandRunner.ok(), "passed: Test key from apps/booking-portal/.env"),
-            ("Stripe rejects the test key", withKey, true, FakeCommandRunner.failed(1),
-             "warning: Stripe did not accept STRIPE_SECRET_KEY from apps/booking-portal/.env, or there is no network — \(skipped); import a current .env"),
+            ("Stripe rejects the test key", withKey, true, FakeCommandRunner.failed(1, stderr: "Request failed, status=401"),
+             "warning: Stripe rejected STRIPE_SECRET_KEY from apps/booking-portal/.env — \(skipped); import a current .env"),
+            ("no network", withKey, true, FakeCommandRunner.failed(1, stderr: "dial tcp: lookup api.stripe.com: no such host"),
+             "warning: No network, or Stripe did not answer — Stripe reconnects when the network is back"),
             ("no key, and the login works", withoutKey, true, FakeCommandRunner.ok(), "passed: Authenticated"),
             ("no key, and the login expired", withoutKey, true, FakeCommandRunner.failed(1),
              "warning: Session invalid or expired — \(skipped); run: stripe login"),
             ("Stripe does not answer", withKey, true, FakeCommandRunner.timedOut,
-             "warning: stripe balance retrieve did not answer in 15 s — \(skipped)"),
+             "warning: No network, or Stripe did not answer — Stripe reconnects when the network is back"),
         ]
         for row in rows {
-            let check = PreflightRunner().allChecks(for: [service("travel-portal", cwd: row.portal)])
+            let check = PreflightRunner().allChecks(for: [service("travel-portal", cwd: row.portal), service("stripe", cwd: row.portal)])
                 .first { $0.id == "stripe-auth" }!
             let (preflight, shell) = runner([
                 "which stripe": row.installed ? FakeCommandRunner.ok() : FakeCommandRunner.failed(1),
@@ -245,6 +248,7 @@ final class PreflightRunnerTests: XCTestCase {
             service("supabase", cwd: monorepo, port: 54322),
             service("travel-portal", cwd: booking, port: 3002),
             service("partner-portal", cwd: partner, port: 3003),
+            service("stripe", cwd: monorepo),
             // An app of the fork that an old checkout lacks is skipped at its start.
             service(forkApp, cwd: workDir.appendingPathComponent("mono/apps/not-in-this-checkout").path, port: 3010),
         ]

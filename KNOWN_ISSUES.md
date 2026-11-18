@@ -100,11 +100,11 @@ Moving the machine between networks (e.g., office → home WiFi) while LAN mode 
 
 ### Stripe restart permanently abandoned when network not ready
 
-**Resolved:** 2026-06-10
+**Resolved:** 2026-06-10. **Replaced:** S3, 2026-11.
 
 Both `handleWake()` (30s wait) and `scheduleRestart()` (15s wait) gave up permanently if the network wasn't ready, leaving Stripe FAILED until a manual restart.
 
-**Fix:** Both paths now schedule a retry with exponential backoff (capped by the existing restartCount < 5 guard) instead of abandoning.
+**Fix now (S3):** Stripe has its own state machine (see "Stripe CLI crash-loops after macOS sleep/wake"). `scheduleRestart()` has no Stripe path any more.
 
 ### Watcher tasks leaked on config reload
 
@@ -124,14 +124,16 @@ The timeout watchdog task slept for the full step timeout even after the process
 
 ### Stripe CLI crash-loops after macOS sleep/wake
 
-**Resolved:** 2026-06-02
+**Resolved:** 2026-06-02. **Replaced:** S3, 2026-11.
 
-Stripe's WebSocket to api.stripe.com dies during macOS sleep. On wake, the CLI enters a "Session expired, reconnecting..." loop that eventually fails with a DNS resolution error and exits code 1. The `handleWake()` method skipped stdout_regex services, so Stripe was never health-checked after wake.
+Stripe's WebSocket to api.stripe.com dies during macOS sleep. On wake, the CLI enters a "Session expired, reconnecting..." loop that eventually fails with a DNS resolution error and exits code 1.
 
-**Fix:**
-- `handleWake()` now proactively restarts Stripe after wake with a network readiness check (`waitForNetwork()` polls DNS for up to 30s)
-- `scheduleRestart()` checks network availability before restarting Stripe, preventing the circuit breaker from tripping on transient DNS failures
-- Added WebSocket degradation early warning: if "Session expired, reconnecting..." messages persist for >2 minutes without successful webhook forwarding, Stripe is automatically restarted
+**Fix now (S3, `StripeSupport.swift`):**
+- One probe, `StripeCLI`, says `ok`, `notInstalled`, `offline`, `notAuthenticated` or `outdated`. Each command has a timeout, and Start All's preflight and the start of Stripe share one answer for 60 s.
+- `StripeExitClassifier` reads the log of each exit: a 401 never retries; `no such host` or `dial tcp` waits for the network and retries after 5 s, doubling up to 60 s, with no issue and no red state; a crash or an unknown exit gets 2 restarts, then Stripe is off and one issue is filed.
+- On wake the runner stops Stripe itself and starts it again while the portals are probed. With no network the row says "Reconnecting Stripe after wake…" and no issue is filed.
+- `stripe listen` that prints no webhook secret in 25 s turns Stripe off ("Stripe did not connect within 25s — webhooks are off."), not FAILED.
+- The 2-minute "Session expired, reconnecting" watchdog is gone.
 
 ### Travel Portal EADDRINUSE on rapid LAN mode toggle
 

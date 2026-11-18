@@ -597,6 +597,10 @@ final class EnvironmentChecker {
             let mode = StripeLauncher.resolve(bookingPortal: bookingPath).mode
             if mode.isTestKey { return StripeLauncher.authStatus(mode, loggedIn: nil) }
             let result = try await check(StripeLauncher.authCheckCommand, label: "stripe balance retrieve")
+            // No network is not an expired login: `stripe login` would not help.
+            if StripeAvailability.classify(authCheck: result, mode: mode) == .offline {
+                return .warning("No network — cannot ask Stripe whether you are logged in")
+            }
             return StripeLauncher.authStatus(mode, loggedIn: result.succeeded)
 
         case "workspace-modules":

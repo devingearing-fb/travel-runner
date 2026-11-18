@@ -176,8 +176,12 @@ final class EnvironmentSupervisor {
     /// The port cleanup reads listeners and kills through these tools.
     @ObservationIgnored var portTools = PortTools.live
     /// The check that the Stripe CLI is installed and can call Stripe, with the test
-    /// key or the login. Tests set it; nil runs the CLI.
-    @ObservationIgnored var stripeAvailability: (@Sendable () async -> Bool)?
+    /// key or the login. Tests set a fake; nil runs the CLI in `shell`.
+    @ObservationIgnored var stripeTooling: (any StripeTooling)?
+    /// Whether the network reaches Stripe. Tests set a fake; nil asks with `nc`.
+    @ObservationIgnored var stripeNetworkUp: (@Sendable () async -> Bool)?
+    /// The waits of the Stripe retries. Tests make them short.
+    @ObservationIgnored var stripeRetryPolicy = StripeRetryPolicy()
     /// The time of every wait, deadline and time stamp of the supervisor. Tests
     /// set a fake.
     @ObservationIgnored var clock = RunnerClock.live
@@ -191,7 +195,12 @@ final class EnvironmentSupervisor {
     @ObservationIgnored var configHost = ConfigHost()
     /// The preflight checks run their commands in the shell of the supervisor and
     /// wait on its clock.
-    private var preflightRunner: PreflightRunner { PreflightRunner(shell: shell, clock: clock) }
+    /// Its Stripe check fills the 60 s cache that the start of Stripe reads.
+    private var preflightRunner: PreflightRunner {
+        PreflightRunner(shell: shell, clock: clock, stripe: { [weak self] resolution in
+            await self?.stripeAvailability(resolution) ?? .offline
+        })
+    }
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
     private var sleepWakeObserver: SleepWakeObserver?
@@ -238,13 +247,25 @@ final class EnvironmentSupervisor {
     private var gitWatcherTask: Task<Void, Never>?
     private var depsWatcherTask: Task<Void, Never>?
     private var isTogglingNetwork = false
-    private var stripeReconnectingSince: Date? = nil
     private var localSupabaseKeys: LocalSupabaseKeys?
     private var stripeWebhookSecret: String?
     /// The portal's log has said that it has no webhook secret, for this start.
     private var warnedNoWebhookSecret = false
     /// How the last start of the Stripe CLI signed in. An exit reads it for its cause.
     private var stripeMode: StripeMode?
+    /// The last answer of the Stripe probe, for 60 s.
+    private var stripeAvailabilityCache = StripeAvailabilityCache()
+    /// Counts the changes of Stripe's state. A retry that waits runs only when no
+    /// newer change (a start, a stop, another retry) came first.
+    private var stripeGeneration = 0
+    /// The tries since the network went away, and the restarts since the CLI
+    /// began to crash. A start by a person sets both to 0.
+    private var stripeNetworkAttempts = 0
+    private var stripeCrashRestarts = 0
+    /// The reconnect after a wake runs. A wait for the network says so on the row.
+    private var stripeReconnectingAfterWake = false
+    /// Why Stripe waits, as the log last said it. The retries do not say it again.
+    private var stripeWaitAnnounced: String?
     /// The stop and start of one service run one at a time (see `KeyedLock`).
     private let lifecycle = KeyedLock()
     /// Services with a manual restart (or a cache clear) that waits for its turn.
@@ -1387,7 +1408,7 @@ final class EnvironmentSupervisor {
     /// A restart that a person or the API asks for. It clears the failure history:
     /// the circuit breaker and the backoff start again.
     func restartService(_ serviceID: String) {
-        if serviceID == "stripe" { stripeReconnectingSince = nil }
+        if serviceID == "stripe" { resetStripeRetries() }
         guard queuedRestarts.insert(serviceID).inserted else { return }
         let name = serviceStates[serviceID]?.definition.displayName ?? serviceID
         Task {
@@ -1424,6 +1445,7 @@ final class EnvironmentSupervisor {
         case .installDependencies: serviceCwd(serviceID) != nil
         case .openLog: logStore.revealTarget(for: serviceID) != nil
         case .openHealth: onOpenHealth != nil
+        case .installStripe, .updateStripe, .stripeLogin, .importSharedEnv: serviceID == "stripe"
         default: false
         }
     }
@@ -1459,6 +1481,14 @@ final class EnvironmentSupervisor {
             case .folder(let folder): NSWorkspace.shared.open(folder)
             case nil: break
             }
+        case .installStripe:
+            runStripeSetup(StripeLauncher.installCommand)
+        case .updateStripe:
+            runStripeSetup(StripeLauncher.updateCommand)
+        case .stripeLogin:
+            openStripeLogin()
+        case .importSharedEnv:
+            importSharedEnvForStripe()
         default:
             break
         }
@@ -2814,20 +2844,10 @@ final class EnvironmentSupervisor {
             stripeMode = resolution.mode
             state.modeNote = resolution.mode.rowText
             await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: resolution.mode.logLine))
-            let available = await isStripeAvailable(resolution)
-            if !available {
-                state.phase = .skipped
-                let cause = StripeLauncher.unavailableCause(resolution.mode)
-                let headline = resolution.mode.isTestKey
-                    ? "Stripe CLI cannot call Stripe with the test key — webhooks are off."
-                    : "Stripe CLI is not installed or not logged in — webhooks are off."
-                noteSkip(state, .optionalOff, headline, detail: Self.capitalized(cause), actions: [.startService])
-                await logStore.append(
-                    serviceID: serviceID,
-                    entry: LogEntry(stream: .stderr, text: Self.stripeStoppedLine(cause))
-                )
-                await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
-                await warnIfNoWebhookSecret()
+            let availability = await stripeAvailability(resolution)
+            if let reason = StripeOffReason.unavailable(availability, mode: resolution.mode) {
+                state.pid = nil
+                await stripeOff(state, reason, cause: reason.headline)
                 return nil
             }
         }
@@ -3024,7 +3044,7 @@ final class EnvironmentSupervisor {
         let sid = serviceID
         let pid = try await processRunner.start(
             service: effectiveDefinition,
-            onStdout: { [weak self] lines in
+            onStdout: { lines in
                 Task {
                     let entries = lines.map { LogEntry(stream: .stdout, text: $0) }
                     await logStore.appendBatch(serviceID: sid, entries: entries)
@@ -3032,25 +3052,6 @@ final class EnvironmentSupervisor {
                         for line in lines {
                             if let captured = probe.feed(line: line), let name = artifactName {
                                 await secretStore.set(name, value: captured)
-                            }
-                        }
-                    }
-                    if sid == "stripe" {
-                        for line in lines {
-                            if line.contains("Session expired, reconnecting") {
-                                await MainActor.run {
-                                    guard let now = self?.clock.date() else { return }
-                                    if self?.stripeReconnectingSince == nil {
-                                        self?.stripeReconnectingSince = now
-                                    }
-                                    if let since = self?.stripeReconnectingSince,
-                                       now.timeIntervalSince(since) > 120 {
-                                        self?.stripeReconnectingSince = nil
-                                        self?.restartService("stripe")
-                                    }
-                                }
-                            } else if line.contains("-->") {
-                                await MainActor.run { self?.stripeReconnectingSince = nil }
                             }
                         }
                     }
@@ -3119,6 +3120,11 @@ final class EnvironmentSupervisor {
                 }
                 try await clock.sleep(for: .seconds(2))
             }
+            if !ready, serviceID == "stripe" {
+                // Stripe is optional: a slow `stripe listen` turns it off, not red.
+                await stripeDidNotConnect(state, launch: launch, seconds: probeConfig.timeout ?? 120)
+                return
+            }
             if !ready {
                 let seconds = probeConfig.timeout ?? 120
                 // Every start path throws from here, so one capture covers them all.
@@ -3180,6 +3186,8 @@ final class EnvironmentSupervisor {
     /// The process of a launch ended before its probe passed. Returns true to keep
     /// waiting and false to stop without an error. Throws when the start failed.
     private func shouldKeepWaiting(for state: ServiceState, after exit: ProcessRunner.Termination) async throws -> Bool {
+        // Each exit of Stripe is for handleTermination: it retries, or turns Stripe off.
+        if state.id == "stripe" { return false }
         switch ServiceTermination.classify(exit) {
         case .stoppedByRunner:
             // Stop-all, or another operation replaced this process and owns the state.
@@ -3187,8 +3195,6 @@ final class EnvironmentSupervisor {
         case .cleanExit:
             // The launcher of a container-managed service ends while the stack still starts.
             if state.definition.shouldReuseIfRunning { return true }
-            // Stripe degrades to skipped; handleTermination owns its state.
-            if state.id == "stripe" { return false }
             throw ServiceError.exitedDuringStartup(name: state.definition.displayName)
         case .commandNotRunnable(let code):
             let finding = await commandFinding(forExit: code, pid: exit.pid, of: state)
@@ -3197,8 +3203,6 @@ final class EnvironmentSupervisor {
             if let current = state.pid, current != exit.pid { return false }
             throw ServiceError.commandNotRunnable(name: state.definition.displayName, finding: finding)
         case .killedExternally, .crashed:
-            // Stripe degrades to skipped when its CLI fails.
-            if state.phase == .skipped { return false }
             // A stop-all or another operation took over after the failure.
             if isShuttingDown || health == .stopped || state.phase == .stopped { return false }
             if state.isCircuitBroken {
@@ -3264,43 +3268,10 @@ final class EnvironmentSupervisor {
 
         let name = state.definition.displayName
 
-        // Stripe is an optional local gateway. A stale/expired CLI session must
-        // degrade to "skipped", not enter the daemon crash loop (and emit a
-        // notification on every retry). The next manual/full start re-runs the
-        // credential probe and will enable Stripe again once `stripe login`
-        // succeeds.
+        // Stripe is optional: an exit never makes the stack red. Its cause decides
+        // between a retry and off (see `handleStripeExit`).
         if serviceID == "stripe" {
-            state.phase = .skipped
-            state.exitCode = termination.status
-            state.pid = nil
-            state.lastStopped = clock.date()
-            state.failureTimestamps.removeAll()
-            let exit = "the Stripe CLI \(ServiceTermination.describe(termination))"
-            // The log keeps the lines of earlier launches. An old 401 is not the
-            // cause of this exit.
-            let launched = state.lastStarted ?? .distantPast
-            let mode = stripeMode
-            Task {
-                let output = await logStore.entries(for: serviceID)
-                    .filter { $0.timestamp >= launched }.map(\.text)
-                let cause = if let known = StripeLauncher.exitCause(
-                    known: CrashCause.knownCause(in: output, serviceID: serviceID), mode: mode
-                ) {
-                    "\(exit) — \(known)"
-                } else {
-                    "\(exit) — \(StripeLauncher.unknownExitHint(mode))"
-                }
-                await logStore.append(serviceID: serviceID, entry: LogEntry(
-                    stream: .stderr, text: Self.stripeStoppedLine(cause)
-                ))
-                // A new start can begin while the log is read; it owns the row then.
-                if state.phase == .skipped, state.pid == nil {
-                    noteSkip(state, .optionalOff, "Stripe stopped — webhooks are off.", detail: Self.capitalized(cause), actions: [.startService, .openLog])
-                }
-                await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
-                await warnIfNoWebhookSecret()
-            }
-            recalculateHealth()
+            handleStripeExit(state, termination)
             return
         }
 
@@ -3312,7 +3283,6 @@ final class EnvironmentSupervisor {
         }
 
         state.exitCode = termination.status
-        let uptime = state.lastStarted.map { clock.date().timeIntervalSince($0) }
         // Time in the ready state. A service that never became ready has none, so a
         // slow failure (two minutes to give up) does not start a new series each time.
         let stableFor = state.readyAt.map { clock.date().timeIntervalSince($0) }
@@ -3359,7 +3329,7 @@ final class EnvironmentSupervisor {
                 await recordDebugEvent(kind: "outside_kill", serviceID: serviceID, message: killed)
             }
             if restarts {
-                scheduleRestart(serviceID: serviceID, wasEarlyExit: (uptime ?? 0) < 10)
+                scheduleRestart(serviceID: serviceID)
             }
 
         case .commandNotRunnable(let code):
@@ -3403,7 +3373,7 @@ final class EnvironmentSupervisor {
                 )}
             }
             if restarts {
-                scheduleRestart(serviceID: serviceID, wasEarlyExit: (uptime ?? 0) < 10)
+                scheduleRestart(serviceID: serviceID)
             }
             // A tripped breaker recorded its own reason.
             if state.phase == .failed, !state.isCircuitBroken {
@@ -3424,7 +3394,7 @@ final class EnvironmentSupervisor {
         }
     }
 
-    private func scheduleRestart(serviceID: String, wasEarlyExit: Bool = false) {
+    private func scheduleRestart(serviceID: String) {
         guard let state = serviceStates[serviceID] else { return }
         let name = state.definition.displayName
 
@@ -3445,22 +3415,6 @@ final class EnvironmentSupervisor {
             )}
             return
         case .exhausted:
-            if serviceID == "stripe" {
-                // The network stayed down. Stripe is optional: it degrades to skipped,
-                // and the next start (manual, start-all, or a wake) tries it again.
-                state.phase = .skipped
-                let cause = "no network after \(AutoRestart.maxRestarts) tries — start it from its row when the network is back"
-                noteSkip(state, .optionalOff, "Stripe stopped — webhooks are off.", detail: Self.capitalized(cause), actions: [.startService])
-                Task {
-                    await logStore.append(serviceID: serviceID, entry: LogEntry(
-                        stream: .stderr, text: Self.stripeStoppedLine(cause)
-                    ))
-                    await recordDebugEvent(kind: "stripe_skip", serviceID: serviceID, message: cause)
-                    await warnIfNoWebhookSecret()
-                }
-                recalculateHealth()
-                return
-            }
             state.isCircuitBroken = true
             lastError = "\(name) did not come back after \(AutoRestart.maxRestarts) restarts — auto-restart stopped"
             recordFailure(serviceID, kind: .exhausted(restarts: AutoRestart.maxRestarts))
@@ -3478,21 +3432,9 @@ final class EnvironmentSupervisor {
             baseDelay = after
         }
 
-        let delay = (serviceID == "stripe" && wasEarlyExit) ? max(baseDelay, 15.0) : baseDelay
         Task {
-            try? await clock.sleep(for: .seconds(delay))
+            try? await clock.sleep(for: .seconds(baseDelay))
             guard serviceStates[serviceID]?.phase == .failed else { return }
-
-            if serviceID == "stripe" {
-                let networkReady = await waitForNetwork(timeout: .seconds(15))
-                guard networkReady else {
-                    // Network still down — count the attempt and reschedule with
-                    // backoff instead of abandoning the restart permanently.
-                    state.restartCount += 1
-                    scheduleRestart(serviceID: serviceID)
-                    return
-                }
-            }
 
             // LAN services: if the machine moved networks, restarting with the
             // stale IP fails with EADDRNOTAVAIL. Re-detect and re-apply instead.
@@ -3585,7 +3527,10 @@ final class EnvironmentSupervisor {
             repeat {
                 wakePending = false
                 wakePassStartedAt = clock.date()
+                // Stripe reconnects while the portals are probed.
+                async let stripe: Void = reconnectStripeAfterWake()
                 await runWakeChecks()
+                await stripe
             } while wakePending && (health == .healthy || health == .degraded)
             isHandlingWake = false
             wakePassStartedAt = nil
@@ -3685,37 +3630,6 @@ final class EnvironmentSupervisor {
                         summary: "\(state.definition.displayName) served HTTP errors after wake (zombie server) — restarted"
                     )}
                 }
-            }
-        }
-
-        // Stripe's WebSocket is guaranteed stale after sleep — proactively restart
-        // rather than waiting for the CLI to detect the failure and crash.
-        if let stripeState = serviceStates["stripe"],
-           stripeState.phase == .running || stripeState.phase == .failed {
-            await logStore.append(
-                serviceID: "stripe",
-                entry: LogEntry(stream: .stdout, text: "[travel-runner] Restarting Stripe after wake — waiting for network...")
-            )
-
-            let networkReady = await waitForNetwork(timeout: .seconds(30))
-            if networkReady {
-                stripeState.restartCount = 0
-                stripeState.isCircuitBroken = false
-                stripeState.failureTimestamps = []
-                restartService("stripe")
-            } else {
-                // Network still down — mark failed and let scheduleRestart
-                // keep retrying with backoff instead of abandoning.
-                stripeState.phase = .failed
-                lastError = "Stripe: network not available after wake — will retry"
-                recordFailure("stripe", kind: .message("No network after wake — Stripe retries when it is back."))
-                recalculateHealth()
-                scheduleRestart(serviceID: "stripe")
-                Task { await self.captureDebugIssue(
-                    trigger: "probe_timeout",
-                    serviceID: "stripe",
-                    summary: "Network not available 30s after wake — Stripe restart deferred"
-                )}
             }
         }
     }
@@ -4169,29 +4083,238 @@ final class EnvironmentSupervisor {
         StripeLauncher.resolve(bookingPortal: graph?.nodes["travel-portal"]?.resolvedCwd ?? config?.paths?.bookingPortal)
     }
 
-    private func isStripeAvailable(_ resolution: StripeKeyResolution? = nil) async -> Bool {
-        if let stripeAvailability { return await stripeAvailability() }
-        // `stripe config --list` only proves that a credential is stored; it
-        // still exits zero for expired API keys. Exercise the authenticated API
-        // so invalid sessions are skipped before `stripe listen` can crash.
-        // The test key goes in the env of the check, as it does for the listener.
-        let resolution = resolution ?? stripeResolution()
-        return await shell.run(
-            StripeLauncher.availabilityCommand, environment: resolution.environment, timeout: .seconds(15)
-        ).succeeded
+    // MARK: - Stripe state machine (S3)
+
+    /// What the Stripe CLI can do now. The preflight of Start All and the start of
+    /// Stripe share one answer for 60 s; a start by a person or a retry asks again.
+    func stripeAvailability(_ resolution: StripeKeyResolution) async -> StripeAvailability {
+        if let cached = stripeAvailabilityCache.value(for: resolution, now: clock.date()) { return cached }
+        let value = await (stripeTooling ?? StripeCLI(shell: shell)).availability(resolution)
+        stripeAvailabilityCache.store(value, for: resolution, at: clock.date())
+        return value
+    }
+
+    private func isStripeNetworkUp() async -> Bool {
+        if let stripeNetworkUp { return await stripeNetworkUp() }
+        return await canReachHost("api.stripe.com")
+    }
+
+    /// A start by a person: the probe asks again, and the retries start over.
+    private func resetStripeRetries() {
+        stripeGeneration += 1
+        stripeNetworkAttempts = 0
+        stripeCrashRestarts = 0
+        stripeReconnectingAfterWake = false
+        stripeWaitAnnounced = nil
+        stripeAvailabilityCache.invalidate()
+    }
+
+    /// Stripe is off, or waits for the network. The row, the log and `events.jsonl`
+    /// say why; no issue is filed. A wait for the network tries again by itself.
+    private func stripeOff(_ state: ServiceState, _ reason: StripeOffReason, cause: String) async {
+        stripeGeneration += 1
+        let generation = stripeGeneration
+        let waitsForNetwork = reason == .offline
+        let shown = waitsForNetwork && stripeReconnectingAfterWake ? StripeOffReason.afterWake : reason
+        // A retry that finds the same cause again says nothing new.
+        let repeated = shown.retries && stripeWaitAnnounced == shown.headline
+        stripeWaitAnnounced = shown.retries ? shown.headline : nil
+        state.phase = .skipped
+        noteSkip(
+            state, shown.kind, shown.headline,
+            detail: cause == shown.headline ? nil : Self.capitalized(cause), actions: shown.actions
+        )
+        recalculateHealth()
+        if !repeated {
+            await logStore.append(serviceID: "stripe", entry: LogEntry(stream: .stderr, text: Self.stripeStoppedLine(cause)))
+            await recordDebugEvent(kind: "stripe_skip", serviceID: "stripe", message: cause)
+        }
+        if waitsForNetwork {
+            scheduleStripeReconnect(generation)
+        } else {
+            stripeReconnectingAfterWake = false
+            await warnIfNoWebhookSecret()
+        }
+    }
+
+    /// An exit of `stripe listen`. Its log decides: a rejected key or login turns
+    /// Stripe off; no network waits for the network; a crash gets two restarts,
+    /// then Stripe is off and one issue is filed.
+    private func handleStripeExit(_ state: ServiceState, _ termination: ProcessRunner.Termination) {
+        let stableFor = state.readyAt.map { clock.date().timeIntervalSince($0) }
+        if AutoRestart.startsNewSeries(uptime: stableFor) {
+            stripeCrashRestarts = 0
+            stripeNetworkAttempts = 0
+            stripeWaitAnnounced = nil
+        }
+        state.phase = .skipped
+        state.exitCode = termination.status
+        state.pid = nil
+        state.lastStopped = clock.date()
+        state.failureTimestamps.removeAll()
+        stripeGeneration += 1
+        let generation = stripeGeneration
+        let exit = "the Stripe CLI \(ServiceTermination.describe(termination))"
+        // The log keeps the lines of earlier launches. An old 401 is not the cause of this exit.
+        let launched = state.lastStarted ?? .distantPast
+        let mode = stripeMode
+        Task {
+            let output = await logStore.entries(for: "stripe").filter { $0.timestamp >= launched }.map(\.text)
+            // A new start can begin while the log is read; it owns the row then.
+            guard stripeGeneration == generation, state.phase == .skipped, state.pid == nil else { return }
+            switch StripeExitClassifier.classify(logTail: output) {
+            case .auth:
+                let known = StripeLauncher.exitCause(known: CrashCause.stripeSessionExpired, mode: mode)
+                    ?? CrashCause.stripeSessionExpired
+                await stripeOff(state, .notAuthenticated(mode), cause: "\(exit) — \(known)")
+            case .network:
+                await stripeOff(state, .offline, cause: "\(exit) — no network; Stripe reconnects when the network is back")
+            case .cliCrash, .unknown:
+                let total = stripeRetryPolicy.crashRestarts
+                if stripeCrashRestarts < total {
+                    stripeCrashRestarts += 1
+                    let reason = StripeOffReason.restarting(stripeCrashRestarts, of: total)
+                    noteSkip(state, reason.kind, reason.headline, actions: [])
+                    await logStore.append(serviceID: "stripe", entry: LogEntry(
+                        stream: .stderr, text: "[travel-runner] Stripe: \(exit) — restarting it (\(stripeCrashRestarts) of \(total))"
+                    ))
+                    let delay = stripeRetryPolicy.crashDelay
+                    Task {
+                        try? await clock.sleep(for: delay)
+                        await retryStripe(generation)
+                    }
+                } else {
+                    await stripeOff(state, .crashedTwice, cause: "\(exit) — \(StripeLauncher.unknownExitHint(mode))")
+                    await captureDebugIssue(
+                        trigger: "service_crash",
+                        serviceID: "stripe",
+                        summary: "Stripe CLI \(ServiceTermination.describe(termination)) after \(total) restarts — webhooks are off"
+                    )
+                }
+            }
+        }
+        recalculateHealth()
+    }
+
+    /// Starts Stripe again for a retry, unless something newer happened to it.
+    private func retryStripe(_ generation: Int) async {
+        guard stripeGeneration == generation else { return }
+        stripeAvailabilityCache.invalidate()
+        do {
+            try await replaceProcess("stripe", stoppedPhase: .pending, keepsFailureHistory: true, onlyIf: {
+                guard self.stripeGeneration == generation, !self.isShuttingDown, self.health != .stopped,
+                      let state = self.serviceStates["stripe"] else { return false }
+                return state.phase == .skipped && state.pid == nil
+            })
+        } catch {
+            recordFailure("stripe", error: error, lastError: "\(error)")
+        }
+        if serviceStates["stripe"]?.phase == .running { stripeReconnectingAfterWake = false }
+        recalculateHealth()
+    }
+
+    /// No network: try again after 5 s, then twice as long each time, up to 60 s.
+    /// A try starts Stripe only when the network is back.
+    private func scheduleStripeReconnect(_ generation: Int) {
+        let delay = stripeRetryPolicy.networkDelay(attempt: stripeNetworkAttempts)
+        stripeNetworkAttempts += 1
+        Task {
+            try? await clock.sleep(for: delay)
+            guard stripeGeneration == generation, !isShuttingDown, health != .stopped else { return }
+            if await isStripeNetworkUp() {
+                await retryStripe(generation)
+            } else if stripeGeneration == generation {
+                scheduleStripeReconnect(generation)
+            }
+        }
+    }
+
+    /// `stripe listen` gave no webhook secret in time. Stripe is optional: it is
+    /// stopped and off, not failed. Without a network it waits for the network.
+    private func stripeDidNotConnect(_ state: ServiceState, launch: ServiceLaunch, seconds: Int) async {
+        // A stop, or a newer launch, owns the state.
+        guard state.pid == launch.pid, state.phase == .starting, !isShuttingDown else { return }
+        let generation = stripeGeneration
+        await lifecycle.withLock("stripe") { await processRunner.stop(serviceID: "stripe") }
+        let online = await isStripeNetworkUp()
+        guard stripeGeneration == generation, state.pid == launch.pid, !isShuttingDown else { return }
+        state.pid = nil
+        if online {
+            await stripeOff(state, .didNotConnect(seconds: seconds), cause: "stripe listen did not connect within \(seconds)s")
+        } else {
+            await stripeOff(state, .offline, cause: "stripe listen did not connect — no network; Stripe reconnects when the network is back")
+        }
+    }
+
+    /// After a wake the CLI's connection is stale. The runner stops it (its own
+    /// stop, so no crash) and starts it again while the portals are probed. With no
+    /// network it waits for the network: no issue, and the stack stays green.
+    private func reconnectStripeAfterWake() async {
+        guard isInProfile("stripe"), let state = serviceStates["stripe"] else { return }
+        let waits = state.phase == .skipped && state.condition?.kind == .retrying
+        guard state.phase == .running || state.phase == .starting || state.phase == .failed || waits else { return }
+        stripeGeneration += 1
+        let generation = stripeGeneration
+        stripeNetworkAttempts = 0
+        stripeReconnectingAfterWake = true
+        stripeAvailabilityCache.invalidate()
+        noteSkip(state, StripeOffReason.afterWake.kind, StripeOffReason.afterWake.headline)
+        await logStore.append(serviceID: "stripe", entry: LogEntry(stream: .stdout, text: "[travel-runner] Reconnecting Stripe after wake"))
+        do {
+            try await replaceProcess("stripe", stoppedPhase: .pending, keepsFailureHistory: true, onlyIf: {
+                self.stripeGeneration == generation && !self.isShuttingDown && self.health != .stopped
+            })
+        } catch {
+            recordFailure("stripe", error: error, lastError: "\(error)")
+        }
+        if state.phase == .running { stripeReconnectingAfterWake = false }
+        recalculateHealth()
+    }
+
+    /// The Install and Update buttons of the Stripe row: Homebrew, then a start.
+    private func runStripeSetup(_ command: String) {
+        Task {
+            beginAction("stripe")
+            defer { endAction("stripe") }
+            await logStore.append(serviceID: "stripe", entry: LogEntry(stream: .stdout, text: "[travel-runner] Running: \(command)"))
+            let result = await shell.run(command, timeout: EnvironmentChecker.installTimeout)
+            let output = (result.stdout + "\n" + result.stderr).split(whereSeparator: \.isNewline).suffix(20)
+            await logStore.appendBatch(serviceID: "stripe", entries: output.map { LogEntry(stream: .stdout, text: String($0)) })
+            if result.succeeded {
+                restartService("stripe")
+            } else {
+                onActionFeedback?("\(command) failed — see the Stripe log", false)
+            }
+        }
+    }
+
+    /// The "Log in…" button of the Stripe row: `stripe login` in Terminal.
+    private func openStripeLogin() {
+        let shell = shell
+        Task {
+            let opened = await shell.run(EnvironmentChecker.terminalCommand("stripe login")).succeeded
+            onActionFeedback?(
+                opened ? "Finish stripe login in Terminal, then start Stripe from its row" : "Could not open Terminal — run: stripe login",
+                opened
+            )
+        }
+    }
+
+    /// The "Import…" button of the Stripe row: the shared `.env` of the booking
+    /// portal, then a start of Stripe on its key.
+    func importSharedEnvForStripe() {
+        guard let monorepo = supabaseCwd ?? monorepoPath else { return }
+        let checker = EnvironmentChecker(
+            monorepoPath: monorepo, loginPath: "", streamServicesPath: "", shell: shell, tools: tools
+        )
+        Task {
+            guard await checker.importSharedEnv(.booking) == true else { return }
+            restartService("stripe")
+        }
     }
 
     private func canReachHost(_ host: String) async -> Bool {
         await runShellCommand("nc -z -w 2 \(host) 443 >/dev/null 2>&1", timeout: .seconds(10))
-    }
-
-    private func waitForNetwork(timeout: Duration = .seconds(30)) async -> Bool {
-        let deadline = clock.uptime() + timeout
-        while clock.uptime() < deadline {
-            if await canReachHost("api.stripe.com") { return true }
-            try? await clock.sleep(for: .seconds(2))
-        }
-        return false
     }
 
     /// Whether the local database has the travel tables. A fresh Docker volume has

@@ -39,6 +39,9 @@ struct PreflightRunner: Sendable {
     var clock = RunnerClock.live
     /// A check command that hangs fails after this time and does not hold the start.
     static let checkTimeout: Duration = .seconds(15)
+    /// Asks the Stripe CLI. The supervisor gives its own, so the start of Stripe
+    /// reuses the answer; nil runs the CLI in `shell`.
+    var stripe: (@Sendable (StripeKeyResolution) async -> StripeAvailability)? = nil
 
     func allChecks(for services: [ServiceDefinition]) -> [PreflightCheck] {
         var checks: [PreflightCheck] = [
@@ -48,12 +51,15 @@ struct PreflightRunner: Sendable {
                 id: "node-version", name: "Node.js \u{2265} 22",
                 metadata: (nodeCwd(for: services)).map { ["cwd": $0] } ?? [:]
             ),
-            // The booking portal: the CLI uses the test key of its env.
-            PreflightCheck(
+        ]
+        // Only a profile with Stripe asks Stripe. The cwd is the booking portal's:
+        // the CLI uses the test key of its env.
+        if services.contains(where: { $0.id == "stripe" }) {
+            checks.append(PreflightCheck(
                 id: "stripe-auth", name: "Stripe CLI Auth",
                 metadata: services.first(where: { $0.id == "travel-portal" })?.resolvedCwd.map { ["cwd": $0] } ?? [:]
-            ),
-        ]
+            ))
+        }
 
         // `pnpm db:start` clones the backend baseline when there is no checkout of it.
         if let root = services.first(where: { $0.id == "supabase" })?.resolvedCwd, BackendBaseline.applies(root: root) {
@@ -156,27 +162,13 @@ struct PreflightRunner: Sendable {
             }
 
         case "stripe-auth":
-            let hasStripe = await run("which stripe >/dev/null 2>&1").succeeded
-            if !hasStripe { return .warning(message: "Not installed — Stripe will be skipped") }
             let key = StripeLauncher.resolve(bookingPortal: check.metadata["cwd"])
-            let auth = await shell.run(
-                StripeLauncher.authCheckCommand, environment: key.environment, timeout: Self.checkTimeout
-            )
-            if auth.timedOut {
-                return .warning(
-                    message: "\(Shell.timeoutText("stripe balance retrieve", after: Self.checkTimeout)) — Stripe will be skipped"
-                )
+            let availability = if let stripe {
+                await stripe(key)
+            } else {
+                await StripeCLI(shell: shell, timeout: Self.checkTimeout).availability(key)
             }
-            switch key.mode {
-            case .testKey(let source):
-                return auth.succeeded
-                    ? .passed(detail: "Test key from \(source)")
-                    : .warning(message: "Stripe did not accept STRIPE_SECRET_KEY from \(source), or there is no network — Stripe will be skipped; import a current .env")
-            case .login:
-                return auth.succeeded
-                    ? .passed(detail: "Authenticated")
-                    : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
-            }
+            return Self.stripeResult(availability, mode: key.mode)
 
         case "backend-baseline":
             return await backendBaseline(root: check.metadata["root"] ?? "")
@@ -262,6 +254,28 @@ struct PreflightRunner: Sendable {
 
     /// One check command. A cwd that does not exist is left out: the check of
     /// the folders reports it.
+    /// The row of the Stripe check. Stripe is optional: it never fails the start.
+    static func stripeResult(_ availability: StripeAvailability, mode: StripeMode) -> PreflightResult {
+        let skipped = "Stripe will be skipped"
+        switch availability {
+        case .ok(.testKey(let source)):
+            return .passed(detail: "Test key from \(source)")
+        case .ok(.login):
+            return .passed(detail: "Authenticated")
+        case .notInstalled:
+            return .warning(message: "Not installed — \(skipped); run: \(StripeLauncher.installCommand)")
+        case .offline:
+            return .warning(message: "No network, or Stripe did not answer — Stripe reconnects when the network is back")
+        case .notAuthenticated:
+            if case .testKey(let source) = mode {
+                return .warning(message: "Stripe rejected STRIPE_SECRET_KEY from \(source) — \(skipped); import a current .env")
+            }
+            return .warning(message: "Session invalid or expired — \(skipped); run: stripe login")
+        case .outdated(let version):
+            return .warning(message: "Stripe CLI \(version) is too old — \(skipped); run: \(StripeLauncher.updateCommand)")
+        }
+    }
+
     private func run(_ command: String, cwd: String? = nil) async -> CommandResult {
         var isDirectory: ObjCBool = false
         let folder = cwd.flatMap {
