@@ -6200,6 +6200,198 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(supervisor.lastError)
     }
 
+    /// A service of a test with its own command and type.
+    private func service(_ id: String, _ script: String, type: ServiceType, restart: RestartPolicy = .never,
+                         probe: ProbeConfig? = nil, phase: String? = nil) -> ServiceDefinition {
+        ServiceDefinition(
+            id: id, name: id, cmd: ["sh", "-c", script], cwd: workDir.path, probe: probe, type: type,
+            restart: restart, dependsOn: [], env: nil, phase: phase, reuseIfRunning: nil
+        )
+    }
+
+    /// `##db:restart:` lines of every step count, each id once. The list is decided
+    /// before the first restart: the CDC setup stops Sequin, and Sequin still
+    /// restarts after it, with no crash. Each service is ready, or its oneshot is
+    /// done, before the next one starts.
+    func testARestartAfterResetCollectsEveryStepAndWaitsForEachService() async throws {
+        supervisor.shell = FakeCommandRunner()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let probe = ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30)
+        // The web server is ready a second after it starts.
+        let web = service("web", "sleep 1; exec python3 -u -m http.server \(port) --bind 127.0.0.1",
+                          type: .daemon, restart: .onFailure, probe: probe)
+        // Like runner-db-setup.sh, the setup stops a Sequin that still runs: here it
+        // ends the process of the pid file, when that is still this test's Sequin.
+        let setup = service("stream-db-setup", """
+            sleep 1; p=$(cat sequin.pid 2>/dev/null); \
+            if [ -n "$p" ] && [ "$(ps -o command= -p "$p")" = "sleep 61.5" ]; then kill "$p"; fi; true
+            """, type: .oneshot)
+        let sequin = service("stream-sequin", "echo $$ > sequin.pid; exec sleep 61.5", type: .daemon, restart: .onFailure)
+        try supervisor.loadServices([daemon("supabase", ["sleep", "60"]), web, setup, sequin])
+        state("supabase").phase = .running
+        supervisor.health = .healthy
+        state("stream-db-setup").phase = .completed
+        supervisor.restartService("web")
+        supervisor.restartService("stream-sequin")
+        let up = await waitUntil(20) { self.settled("web") && self.settled("stream-sequin") }
+        XCTAssertTrue(up, "web is \(state("web").phase.rawValue), stream-sequin is \(state("stream-sequin").phase.rawValue)")
+        let webPid = try XCTUnwrap(state("web").pid)
+        let sequinPid = try XCTUnwrap(state("stream-sequin").pid)
+
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([
+                self.step("reset-database", "echo '##db:restart:web,stream-db-setup:First'"),
+                self.step("refresh-after-reset", "echo '##db:restart:stream-sequin,web:Second'"),
+            ], profile: profile)
+        }
+        supervisor.runDbSetup()
+        let restarted = await waitUntil(40) {
+            !self.supervisor.dbResetRunning && self.settled("web") && self.settled("stream-sequin")
+                && self.state("stream-sequin").pid != sequinPid && self.state("stream-db-setup").phase == .completed
+        }
+        XCTAssertTrue(restarted, "stream-sequin is \(state("stream-sequin").phase.rawValue)")
+
+        XCTAssertNotEqual(state("web").pid, webPid)
+        let webReady = try XCTUnwrap(state("web").readyAt)
+        let setupStarted = try XCTUnwrap(state("stream-db-setup").lastStarted)
+        let sequinStarted = try XCTUnwrap(state("stream-sequin").lastStarted)
+        XCTAssertGreaterThanOrEqual(setupStarted, webReady, "the setup starts once the web server is ready")
+        XCTAssertGreaterThanOrEqual(sequinStarted.timeIntervalSince(setupStarted), 1, "Sequin starts once the setup is done")
+        XCTAssertTrue(crashes.isEmpty, "the setup's stop of Sequin counts as a crash: \(crashes)")
+        XCTAssertEqual(state("stream-sequin").restartCount, 0)
+
+        let webLog = await logLines("web")
+        XCTAssertEqual(webLog.filter { $0 == EnvironmentSupervisor.restartAfterResetLine("web", reason: "First") }.count, 1, "\(webLog)")
+        let sequinLog = await logLines("stream-sequin")
+        XCTAssertTrue(sequinLog.contains(EnvironmentSupervisor.restartAfterResetLine("stream-sequin", reason: "Second")), "\(sequinLog)")
+        XCTAssertFalse(sequinLog.contains { $0.contains("stopped from outside") }, "\(sequinLog)")
+        XCTAssertNil(supervisor.lastError)
+    }
+
+    /// The other rules of `##db:restart:`: a run that passed but was cancelled
+    /// restarts nothing; a service out of the profile is left alone; a failed restart
+    /// is a failure of that service, the DB setup stays passed and the next id still
+    /// restarts; the "restart portals" notice stays apart; and a Retry of a later
+    /// step does not restart the services again.
+    func testARestartAfterResetSkipsCancelledRunsOtherProfilesAndKeepsTheSetupPassed() async throws {
+        supervisor.shell = FakeCommandRunner()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        try supervisor.loadServices([
+            daemon("supabase", ["sleep", "60"]),
+            service("stream-sequin", "exec sleep 60", type: .daemon),
+            service("travel-portal", "exec sleep 60", type: .daemon, phase: "portal"),
+            service("cdc-fails", "exit 1", type: .oneshot),
+            service("cdc-next", "true", type: .oneshot),
+        ], profile: .booking)
+        XCTAssertFalse(supervisor.isInProfile("stream-sequin"))
+        XCTAssertTrue(supervisor.isInProfile("cdc-fails"))
+        // They count as running; the test starts none of them first.
+        for id in ["supabase", "stream-sequin", "travel-portal"] { state(id).phase = .running }
+        state("cdc-fails").phase = .completed
+        state("cdc-next").phase = .completed
+        supervisor.health = .healthy
+
+        let line = "echo '##db:restart:cdc-fails,stream-sequin,cdc-next,travel-portal-x:Reset'"
+        var slow = true
+        supervisor.dbPipelineFactory = { _, profile in
+            let last = slow
+                ? DbSetupStep(id: "slow", name: "slow", command: "sleep 30", healthCheckCommand: nil,
+                              timeoutSeconds: 60, isOptional: true, stepNumber: 2)
+                : self.step("verify-data", "exit 0")
+            return self.pipeline([self.step("reset-database", line), last], profile: profile)
+        }
+
+        // Cancelled in its optional last step: the profile passed, but it was cancelled.
+        supervisor.runDbSetup()
+        let slowRuns = await waitUntil(20) { self.supervisor.dbSetupPipeline?.steps.last?.status == .running }
+        XCTAssertTrue(slowRuns)
+        supervisor.cancelDbSetup()
+        let ended = await waitUntil(20) { self.supervisor.dbSetupPipeline?.isRunning == false && !self.supervisor.dbResetRunning }
+        XCTAssertTrue(ended)
+        XCTAssertEqual(supervisor.dbSetupPipeline?.allRequiredPassed, true, "control: the cancelled run passed")
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertNil(state("cdc-next").lastStarted, "a cancelled run restarted a service")
+        XCTAssertNil(state("cdc-fails").lastStarted)
+
+        slow = false
+        supervisor.runDbSetup()
+        let restarted = await waitUntil(30) {
+            !self.supervisor.dbResetRunning && self.state("cdc-next").lastStarted != nil
+                && self.state("cdc-next").phase == .completed && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(restarted, "cdc-next is \(state("cdc-next").phase.rawValue)")
+        // A failed restart fails the service, not the DB setup.
+        XCTAssertEqual(state("cdc-fails").phase, .failed)
+        XCTAssertNotNil(supervisor.notices.notice(.service("cdc-fails")))
+        XCTAssertNil(supervisor.notices.notice(.dbSetup))
+        XCTAssertEqual(supervisor.dbSetupPipeline?.steps.map(\.status), [.passed, .passed])
+        // Out of the profile: left alone. The portal was not listed, so the
+        // "restart portals" notice says to restart it.
+        XCTAssertNil(state("stream-sequin").lastStarted)
+        XCTAssertNil(state("travel-portal").lastStarted)
+        XCTAssertEqual(supervisor.portalRestartNotice, EnvironmentSupervisor.portalRestartText)
+        let runnerLog = await logLines(LogFileSink.runnerLogID)
+        XCTAssertTrue(runnerLog.contains(EnvironmentSupervisor.unknownRestartLine("travel-portal-x")), "\(runnerLog)")
+
+        // A Retry of the last step keeps the passed reset, and restarts nothing again.
+        let nextStarted = try XCTUnwrap(state("cdc-next").lastStarted)
+        supervisor.runDbSetup(from: "verify-data")
+        let retried = await waitUntil(20) {
+            !self.supervisor.dbResetRunning && self.supervisor.dbSetupPipeline?.isRunning == false
+        }
+        XCTAssertTrue(retried)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(state("cdc-next").lastStarted, nextStarted, "a Retry restarted the services again")
+    }
+
+    /// A run that fails keeps the restart requests of its passed steps. A Retry of
+    /// the failed step that passes acts on them, once: the reset dropped Sequin's
+    /// slot, and the Retry does not run the reset again.
+    func testARetryThatPassesRestartsWhatTheFailedRunAskedFor() async throws {
+        supervisor.shell = FakeCommandRunner()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        try supervisor.loadServices([
+            daemon("supabase", ["sleep", "60"]),
+            service("cdc", "true", type: .oneshot),
+        ])
+        state("supabase").phase = .running
+        state("cdc").phase = .completed
+        supervisor.health = .healthy
+
+        // The second step passes once this file is there.
+        let flag = workDir.appendingPathComponent("verify-passes").path
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([
+                self.step("reset-database", "echo '##db:restart:cdc:R'"),
+                self.step("verify-data", "test -f '\(flag)'"),
+            ], profile: profile)
+        }
+
+        supervisor.runDbSetup()
+        let failed = await waitUntil(20) {
+            !self.supervisor.dbResetRunning && self.supervisor.dbSetupPipeline?.steps.last?.status == .failed
+        }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(supervisor.dbSetupPipeline?.steps.first?.status, .passed)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertNil(state("cdc").lastStarted, "a failed run restarted a service")
+
+        FileManager.default.createFile(atPath: flag, contents: nil)
+        supervisor.runDbSetup(from: "verify-data")
+        let restarted = await waitUntil(20) {
+            !self.supervisor.dbResetRunning && self.state("cdc").lastStarted != nil
+                && self.state("cdc").phase == .completed && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(restarted, "cdc is \(state("cdc").phase.rawValue)")
+        XCTAssertEqual(supervisor.dbSetupPipeline?.steps.map(\.status), [.passed, .passed])
+        try await Task.sleep(for: .seconds(1))
+        let log = await logLines("cdc")
+        XCTAssertEqual(log.filter { $0 == EnvironmentSupervisor.restartAfterResetLine("cdc", reason: "R") }.count, 1, "\(log)")
+    }
+
     /// A branch change restarts a running service only when it changed the packages,
     /// the lockfile, the Next config or an env file. Other files hot-reload.
     func testABranchChangeRestartsOnlyForPackageConfigOrEnvFiles() async throws {
