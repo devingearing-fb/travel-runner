@@ -29,19 +29,32 @@ final class NoticeCenterTests: XCTestCase {
         XCTAssertEqual(center.newestError?.key, .service("web"))
     }
 
-    func testTheSameTextAgainKeepsTheNoticeAndItsTime() {
+    func testTheSameErrorAgainKeepsItsTimeAndBecomesTheNewest() {
         var center = NoticeCenter()
         center.post(.preflight, "Preflight failed", now: start)
         center.post(.profile, "Could not save profile", now: start.addingTimeInterval(1))
+        XCTAssertEqual(center.newestError?.key, .profile, "control: the profile error came last")
         center.post(.preflight, "Preflight failed", now: start.addingTimeInterval(5))
 
-        XCTAssertEqual(center.notice(.preflight)?.since, start)
-        XCTAssertEqual(center.all.map(\.key), [.profile, .preflight], "the order stays")
+        XCTAssertEqual(center.notice(.preflight)?.since, start, "the first time stays")
+        XCTAssertEqual(center.all.map(\.key), [.preflight, .profile], "it happened again: it is the newest")
+        XCTAssertEqual(center.newestError?.key, .preflight)
+        XCTAssertEqual(center.all.count, 2)
 
         // Negative control: a new text is a new notice.
         center.post(.preflight, "Preflight failed again", now: start.addingTimeInterval(6))
         XCTAssertEqual(center.notice(.preflight)?.since, start.addingTimeInterval(6))
         XCTAssertEqual(center.all.first?.key, .preflight)
+    }
+
+    func testTheSameProgressAgainKeepsItsPlace() {
+        var center = NoticeCenter()
+        center.post(.dbProgress, "Empty database — running the reset now", severity: .info, now: start)
+        center.post(.dbSetup, "DB setup failed at Seed", now: start.addingTimeInterval(1))
+        center.post(.dbProgress, "Empty database — running the reset now", severity: .info, now: start.addingTimeInterval(2))
+
+        XCTAssertEqual(center.all.map(\.key), [.dbSetup, .dbProgress], "progress does not jump over an error")
+        XCTAssertEqual(center.notice(.dbProgress)?.since, start)
     }
 
     func testProgressIsNoError() {

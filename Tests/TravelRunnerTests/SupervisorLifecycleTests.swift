@@ -2221,14 +2221,52 @@ final class SupervisorLifecycleTests: XCTestCase {
         let cleared = await waitUntil(15) { self.settled("quitter") && self.supervisor.lastError == nil }
         XCTAssertTrue(cleared, supervisor.lastError ?? "nil")
 
-        // An error that is not the banner of this service stays.
+        // Another error of this service goes once it runs; the error of another key stays.
         supervisor.notices.post(.profile, "Could not save profile: disk full")
+        supervisor.notices.post(.service("quitter"), "quitter: something else broke")
+        XCTAssertEqual(supervisor.notices.text(.service("quitter")), "quitter: something else broke", "control")
         supervisor.restartService("quitter")
         let started = await waitUntil(5) { !self.supervisor.actionsInFlight.isEmpty }
         XCTAssertTrue(started)
-        let restarted = await waitUntil(15) { self.settled("quitter") }
+        let restarted = await waitUntil(15) { self.settled("quitter") && self.supervisor.actionsInFlight.isEmpty }
         XCTAssertTrue(restarted)
+        XCTAssertNil(supervisor.notices.notice(.service("quitter")), "the service runs: its notice resolved itself")
         XCTAssertEqual(supervisor.lastError, "Could not save profile: disk full")
+    }
+
+    /// A failed service that ends as skipped gets the skip on its row; its red
+    /// notice must not stay. Here: Stripe after a wake with no network, until the
+    /// restarts run out. The network check is a fake; the test touches no network.
+    func testAServiceThatEndsAsSkippedLeavesNoNotice() async throws {
+        try load(stripe("sleep 30"))
+        _ = captureIssues()
+        let gate = Gate()
+        let supervisor = supervisor!
+        // No network. The first check after the notice holds until the test looks.
+        supervisor.shell = FakeCommandRunner { call in
+            guard call.command.contains("nc -z") else { return FakeCommandRunner.ok() }
+            let posted = await MainActor.run { supervisor.notices.notice(.service("stripe")) != nil }
+            if posted { await gate.wait() }
+            return FakeCommandRunner.failed()
+        }
+        supervisor.clock = FakeClock().clock
+        supervisor.health = .degraded
+        state("stripe").phase = .failed
+
+        supervisor.handleWake()
+
+        let posted = await waitUntil(10) { self.supervisor.notices.notice(.service("stripe")) != nil }
+        XCTAssertTrue(posted)
+        // Control: the notice is there while Stripe still retries.
+        XCTAssertEqual(supervisor.lastError, "Stripe: network not available after wake — will retry")
+        XCTAssertEqual(state("stripe").phase, .failed)
+
+        await gate.open()
+        let skipped = await waitUntil(10) { self.state("stripe").phase == .skipped }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        XCTAssertEqual(state("stripe").condition?.headline, "Stripe stopped — webhooks are off.")
+        XCTAssertNil(supervisor.notices.notice(.service("stripe")), "Stripe no longer retries")
+        XCTAssertNil(supervisor.lastError)
     }
 
     /// The Start control of a row: only for a daemon of the profile that has no

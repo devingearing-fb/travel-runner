@@ -1686,9 +1686,10 @@ final class EnvironmentSupervisor {
     private func recordFailure(_ serviceID: String, error: Error, lastError text: String) {
         guard let state = serviceStates[serviceID] else { return }
         state.phase = .failed
-        postNotice(.service(serviceID), text)
-        // The breaker records why it stopped; the waiter that ends on it adds nothing.
+        // The breaker posted why it stopped; the waiter that ends on it adds nothing.
+        // A notice the person dismissed stays dismissed.
         if case ServiceError.autoRestartStopped = error, state.isCircuitBroken { return }
+        postNotice(.service(serviceID), text)
         recordFailure(serviceID, kind: failureKind(of: error, state: state))
     }
 
@@ -1757,6 +1758,8 @@ final class EnvironmentSupervisor {
         state.failureRecordCount += 1
         state.likelyCause = nil
         state.condition = ServiceCondition(kind: kind, headline: headline, detail: detail, actions: actions, since: clock.date())
+        // The skip replaces the failure, so its notice is stale.
+        notices.resolve(.service(state.id))
     }
 
     /// The Next apps: their `.next` cache can be cleared.

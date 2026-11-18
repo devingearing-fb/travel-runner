@@ -69,9 +69,14 @@ struct NoticeCenter: Equatable, Sendable {
     /// The newest first.
     private(set) var all: [Notice] = []
 
-    /// Sets the notice of `key`. The same text again keeps the notice as it is.
+    /// Sets the notice of `key`. The same text again keeps its first time; an error
+    /// moves to the front, so `newestError` is the error that happened last.
     mutating func post(_ key: NoticeKey, _ text: String, severity: Notice.Severity = .error, now: Date = Date()) {
-        if let current = notice(key), current.text == text, current.severity == severity { return }
+        if let index = all.firstIndex(where: { $0.key == key }),
+           all[index].text == text, all[index].severity == severity {
+            if severity == .error { all.insert(all.remove(at: index), at: 0) }
+            return
+        }
         all.removeAll { $0.key == key }
         all.insert(Notice(key: key, severity: severity, text: text, since: now), at: 0)
     }
