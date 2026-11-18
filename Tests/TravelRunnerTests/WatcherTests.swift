@@ -326,6 +326,7 @@ final class WatcherTests: XCTestCase {
         await watcher.fetchAndCount(fetchInterval: 0)
         XCTAssertEqual(fetches().count, 1)
         XCTAssertEqual(fetches().first?.timeout, .seconds(20))
+        XCTAssertEqual(fetches().first?.environment["GIT_ASKPASS"], "/usr/bin/false")
         XCTAssertEqual(fetches().first?.environment["GIT_TERMINAL_PROMPT"], "0")
         XCTAssertEqual(fetches().first?.environment["GCM_INTERACTIVE"], "never")
         XCTAssertEqual(fetches().first?.environment["SSH_ASKPASS_REQUIRE"], "never")

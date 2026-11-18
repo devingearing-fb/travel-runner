@@ -32,8 +32,11 @@ actor GitBranchWatcher {
     /// The longest wait between two fetches of a remote that keeps failing.
     static let maxFetchBackoff: TimeInterval = 30 * 60
     /// git never asks for a password: the fetch fails instead of waiting for a prompt.
-    /// Git Credential Manager and ssh-askpass open no window either.
+    /// Git Credential Manager and ssh-askpass open no window either. An askpass
+    /// program that always fails overrides the one of the parent (VS Code sets one)
+    /// and core.askPass, so git gets no answer and gives up at once.
     static let environment = [
+        "GIT_ASKPASS": "/usr/bin/false",
         "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "never",
         "SSH_ASKPASS_REQUIRE": "never",
