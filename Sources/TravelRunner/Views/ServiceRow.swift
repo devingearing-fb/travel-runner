@@ -28,9 +28,19 @@ struct ServiceRow: View {
         }
     }
 
-    /// Why a skipped, failed or waiting service is in that phase. A running one has none.
+    /// Why a skipped, failed or waiting service is in that phase, why a start takes
+    /// long, or why a running service is unhealthy.
     private var rowCondition: ServiceCondition? {
-        state.phase == .skipped || state.phase == .failed || state.phase == .waiting ? state.condition : nil
+        switch (state.phase, state.condition?.kind) {
+        case (.skipped, _), (.failed, _), (.waiting, _), (.starting, .slowStart?), (.running, .unhealthy?): state.condition
+        default: nil
+        }
+    }
+
+    /// The buttons of a slow start or an unhealthy service: "Keep waiting", "Restart".
+    private var inlineActions: [RecoveryAction] {
+        guard let condition = rowCondition, condition.kind == .slowStart || condition.kind == .unhealthy else { return [] }
+        return condition.actions.filter { $0 != .openLog && supervisor.canPerform($0, for: state.id) }
     }
 
     private var isActionInFlight: Bool {
@@ -170,9 +180,17 @@ struct ServiceRow: View {
                     if let condition = rowCondition {
                         Text(condition.text)
                             .font(.caption2)
-                            .foregroundStyle(state.phase == .failed ? .red : .secondary)
+                            .foregroundStyle(state.phase == .failed ? .red : condition.kind == .unhealthy ? .orange : .secondary)
                             .lineLimit(2)
                             .help(condition.text)
+                    }
+                    ForEach(inlineActions, id: \.self) { action in
+                        Button(action.title()) {
+                            supervisor.perform(action, for: state.id)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .disabled(isActionInFlight)
                     }
                     if let halt = state.haltReason, rowCondition == nil {
                         Text("\(halt.label) — auto-restart stopped")

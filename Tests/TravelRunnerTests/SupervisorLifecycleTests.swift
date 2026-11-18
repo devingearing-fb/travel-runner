@@ -44,6 +44,12 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.dependencyRecord = DependencyRecord(path: workDir.appendingPathComponent("config/deps.json").path)
         // The diagnostics of an issue read no tool of this Mac.
         supervisor.diagnosticsTools = { _ in [] }
+        // A test runs the liveness checks itself, and its wake checks are short.
+        supervisor.livenessInterval = nil
+        supervisor.wakeTiming = .init(
+            settle: .milliseconds(100), window: .seconds(2), supabaseWindow: .seconds(2),
+            interval: .milliseconds(500), passGap: .milliseconds(500)
+        )
     }
 
     /// Gives the supervisor a shell that holds each "where is the tool" question
@@ -800,8 +806,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         try load(daemon("slow", ["sh", "-c", "echo slow-start; sleep 60"], probeTimeout: 3))
 
         supervisor.restartService("slow")
-        let failed = await waitUntil(20) { self.state("slow").phase == .failed }
-        XCTAssertTrue(failed, "slow is \(state("slow").phase.rawValue)")
+        let slow = await waitUntil(20) { self.state("slow").condition?.kind == .slowStart }
+        XCTAssertTrue(slow, "slow is \(state("slow").phase.rawValue)")
         let captured = await waitUntil(5) { self.supervisor.debugOpenIssueCount == 1 }
         XCTAssertTrue(captured)
 
@@ -813,16 +819,212 @@ final class SupervisorLifecycleTests: XCTestCase {
         let log = try String(contentsOf: issues.appendingPathComponent("open/\(issue.id)/logs-slow.txt"), encoding: .utf8)
         XCTAssertTrue(log.contains("slow-start"), log)
 
-        // F4: the row says why, with the last check of the probe.
+        // L5: the timeout is a soft limit. The process runs, so the start goes on,
+        // and the row says so with the last check of the probe.
         XCTAssertEqual(state("slow").lastProbe, .refused)
-        let said = await waitUntil(5) { self.state("slow").condition != nil }
-        XCTAssertTrue(said)
-        XCTAssertEqual(state("slow").condition?.headline, "slow did not answer on port \(port) within 3s.")
-        XCTAssertEqual(
-            state("slow").condition?.detail,
-            "The process is still running — it may still be compiling. Last check: connection refused."
+        XCTAssertEqual(state("slow").phase, .starting)
+        let headline = try XCTUnwrap(state("slow").condition?.headline)
+        XCTAssertTrue(headline.hasPrefix("slow still starting ("), headline)
+        XCTAssertTrue(headline.hasSuffix(") — last check: no answer on :\(port)"), headline)
+        XCTAssertEqual(state("slow").condition?.actions, [.keepWaiting, .restart])
+        XCTAssertNil(supervisor.lastError)
+    }
+
+    // MARK: - L5: probes that keep running
+
+    /// Finding "startup timeout is terminal": a service that answers after its probe
+    /// timeout runs. Before, it was FAILED with its process alive.
+    func testASlowStartThatAnswersLateRuns() async throws {
+        try load(daemon("slow", ["sh", "-c", "sleep 5; exec \(webServer.joined(separator: " "))"], probeTimeout: 2))
+
+        supervisor.restartService("slow")
+        let slow = await waitUntil(15) { self.state("slow").condition?.kind == .slowStart }
+        XCTAssertTrue(slow, "slow is \(state("slow").phase.rawValue)")
+        XCTAssertEqual(state("slow").phase, .starting)
+        XCTAssertTrue(supervisor.canPerform(.keepWaiting, for: "slow"))
+
+        let ran = await waitUntil(30) { self.settled("slow") }
+        XCTAssertTrue(ran, "slow is \(state("slow").phase.rawValue)")
+        XCTAssertNil(state("slow").condition)
+        XCTAssertFalse(supervisor.canPerform(.keepWaiting, for: "slow"))
+        XCTAssertEqual(state("slow").restartCount, 0)
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
+    /// Finding "probe timeout leaves a zombie": at the hard cap the process is
+    /// stopped, so FAILED holds no live process. "Keep waiting" moves the cap.
+    func testASlowStartIsStoppedAtTheHardCapAndKeepWaitingMovesIt() async throws {
+        supervisor.startHardCap = .seconds(4)
+        try load(daemon("slow", ["sh", "-c", "echo slow-start; sleep 120"], probeTimeout: 2))
+
+        supervisor.restartService("slow")
+        let slow = await waitUntil(15) { self.state("slow").condition?.kind == .slowStart }
+        XCTAssertTrue(slow, "slow is \(state("slow").phase.rawValue)")
+        let pid = try XCTUnwrap(state("slow").pid)
+        let began = Date()
+        supervisor.perform(.keepWaiting, for: "slow")
+
+        // Past the first cap, the start goes on.
+        try await Task.sleep(for: .seconds(3))
+        XCTAssertEqual(state("slow").phase, .starting)
+
+        let failed = await waitUntil(20) { self.state("slow").phase == .failed && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(failed, "slow is \(state("slow").phase.rawValue)")
+        XCTAssertGreaterThan(Date().timeIntervalSince(began), 3.5, "Keep waiting gave it 4 s more")
+        let error = try XCTUnwrap(supervisor.lastError)
+        XCTAssertTrue(error.hasPrefix("slow did not answer in "), error)
+        XCTAssertTrue(error.hasSuffix(" and was stopped."), error)
+        let stopped = await waitUntil(10) { kill(pid, 0) != 0 }
+        XCTAssertTrue(stopped, "the process of a failed start must not run on")
+        let said = await waitUntil(5) { self.state("slow").condition?.headline == error }
+        XCTAssertTrue(said, state("slow").condition?.headline ?? "nil")
+        let lines = await logLines("slow")
+        XCTAssertTrue(lines.contains("[travel-runner] \(error)"), lines.joined(separator: "\n"))
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
+    /// A server that answers with the status in the file `status` (200 without it).
+    private func statusServer() throws -> (cmd: [String], status: URL) {
+        let script = workDir.appendingPathComponent("status_server.py")
+        let status = workDir.appendingPathComponent("status")
+        try """
+        import http.server, sys
+        port, path = int(sys.argv[1]), sys.argv[2]
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                try:
+                    code = int(open(path).read().strip())
+                except Exception:
+                    code = 200
+                self.send_response(code)
+                self.end_headers()
+            def log_message(self, *args):
+                pass
+        http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+        """.write(to: script, atomically: true, encoding: .utf8)
+        return (["python3", "-u", script.path, "\(port)", status.path], status)
+    }
+
+    private func httpDaemon(_ id: String, _ cmd: [String]) -> ServiceDefinition {
+        ServiceDefinition(
+            id: id, name: id, cmd: cmd, cwd: workDir.path,
+            probe: ProbeConfig(
+                type: .http, port: port, host: nil, url: "http://127.0.0.1:\(port)/api/health", pattern: nil,
+                artifact: nil, timeout: 30
+            ),
+            type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
         )
-        XCTAssertEqual(supervisor.lastError, "slow did not pass its health probe in 3s (last check: connection refused)")
+    }
+
+    /// Finding "no probing after RUNNING": three failed checks in a row mark a
+    /// running service unhealthy with Restart. A 5xx is no reason to restart it by
+    /// itself (decision 16), and a pass clears the mark.
+    func testARunningServiceThatAnswers500IsMarkedUnhealthyNotRestarted() async throws {
+        let server = try statusServer()
+        try load(httpDaemon("web", server.cmd))
+        supervisor.restartService("web")
+        let ran = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ran, "web is \(state("web").phase.rawValue)")
+        let pid = state("web").pid
+
+        try "500".write(to: server.status, atomically: true, encoding: .utf8)
+        await supervisor.runLivenessPass()
+        await supervisor.runLivenessPass()
+        XCTAssertNil(state("web").condition, "two failed checks are not enough")
+        await supervisor.runLivenessPass()
+
+        let condition = try XCTUnwrap(state("web").condition)
+        XCTAssertEqual(condition.kind, .unhealthy)
+        XCTAssertTrue(condition.headline.hasPrefix("web answers 500 on /api/health since "), condition.headline)
+        XCTAssertEqual(condition.actions, [.restart, .openLog])
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertEqual(state("web").pid, pid)
+        XCTAssertEqual(state("web").restartCount, 0)
+
+        try "200".write(to: server.status, atomically: true, encoding: .utf8)
+        await supervisor.runLivenessPass()
+        XCTAssertNil(state("web").condition)
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("[travel-runner] web answers again"), lines.joined(separator: "\n"))
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
+    /// The zombie signature (404 on the health route and on /) is the one
+    /// failure that the liveness checks restart by themselves.
+    func testAServerThatAnswers404EverywhereIsRestarted() async throws {
+        let server = try statusServer()
+        try load(httpDaemon("web", server.cmd))
+        supervisor.restartService("web")
+        let ran = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ran, "web is \(state("web").phase.rawValue)")
+        let pid = state("web").pid
+
+        try "404".write(to: server.status, atomically: true, encoding: .utf8)
+        await supervisor.runLivenessPass()
+        await supervisor.runLivenessPass()
+        XCTAssertEqual(state("web").pid, pid)
+        // The new process answers.
+        await supervisor.runLivenessPass()
+        try "200".write(to: server.status, atomically: true, encoding: .utf8)
+
+        let back = await waitUntil(30) { self.settled("web") && self.state("web").pid != pid }
+        XCTAssertTrue(back, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(state("web").restartCount, 1)
+        let lines = await logLines("web")
+        XCTAssertTrue(
+            lines.contains("[travel-runner] web answers 404 on every route (an old server holds the port) — stopping it and restarting"),
+            lines.joined(separator: "\n")
+        )
+    }
+
+    /// Finding "wake check false restarts": one failed pass restarts nothing. A
+    /// service that answers in the second pass keeps its process.
+    func testAWakeCheckNeedsTwoFailedPasses() async throws {
+        supervisor.wakeTiming = .init(
+            settle: .milliseconds(100), window: .seconds(1), supabaseWindow: .seconds(1),
+            interval: .milliseconds(250), passGap: .seconds(3)
+        )
+        try load(daemon("web", webServer))
+        // "Running" for the supervisor, but nothing listens during the first pass.
+        state("web").phase = .running
+        state("web").lastStarted = Date().addingTimeInterval(-3600)
+
+        supervisor.handleWake()
+        try await Task.sleep(for: .milliseconds(1800))
+        // The server is back before the second pass.
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = webServer
+        process.currentDirectoryURL = workDir
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        defer { process.terminate() }
+
+        let done = await waitUntil(20) { self.supervisor.lastWakeSummary != nil }
+        XCTAssertTrue(done)
+        XCTAssertEqual(supervisor.lastWakeSummary, "[travel-runner] Wake check: 1 checked, 0 restarted")
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertEqual(state("web").restartCount, 0)
+        XCTAssertNil(state("web").pid, "no process was started")
+    }
+
+    /// Finding "wake recovery ignores FAILED": a service that was down before the
+    /// wake gets one start, and the summary names it.
+    func testAWakeCheckStartsAFailedServiceAgain() async throws {
+        try load(daemon("web", webServer))
+        state("web").phase = .failed
+        supervisor.health = .degraded
+
+        supervisor.handleWake()
+
+        let back = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(back, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(supervisor.lastWakeSummary, "[travel-runner] Wake check: 1 checked, 1 restarted (web)")
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("[travel-runner] web was down before the wake — starting it again"), lines.joined(separator: "\n"))
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
     }
 
     /// A daemon that crashes once while it starts and then hangs has two waiters: the

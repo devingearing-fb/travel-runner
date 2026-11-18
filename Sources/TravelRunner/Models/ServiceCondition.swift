@@ -38,6 +38,8 @@ struct ServiceCondition: Equatable, Sendable {
 /// fix buttons of the checks.
 enum RecoveryAction: Equatable, Hashable, Sendable {
     case restart
+    /// A start that passed its soft limit: wait another 15 min before the stop.
+    case keepWaiting
     case startService
     /// Stop the processes that listen on `port` (the port of the EADDRINUSE line),
     /// then start again. With no port, the start frees the port of the probe.
@@ -60,6 +62,7 @@ enum RecoveryAction: Equatable, Hashable, Sendable {
     func title(runtime: String = ContainerRuntime.detect().appName) -> String {
         switch self {
         case .restart: "Restart"
+        case .keepWaiting: "Keep waiting"
         case .startService: "Start"
         case .stopForeignAndRetry: "Free port and restart"
         case .openContainerRuntime: "Open \(runtime)"

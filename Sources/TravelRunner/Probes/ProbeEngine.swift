@@ -38,17 +38,19 @@ enum ProbeFactory {
 }
 
 /// Checks until the probe passes or the time is up. Returns the last outcome.
+/// The deadline is awake time: a Mac that sleeps uses none of it.
 func waitForProbe(
     _ probe: Probe,
     timeout: Duration = .seconds(120),
-    interval: Duration = .seconds(2)
+    interval: Duration = .seconds(2),
+    clock: RunnerClock = .awake
 ) async throws -> ProbeOutcome {
-    let deadline = ContinuousClock.now + timeout
+    let deadline = clock.uptime() + timeout
     var last = ProbeOutcome.timedOut
-    while ContinuousClock.now < deadline {
+    while clock.uptime() < deadline {
         last = await probe.outcome()
         if last.isReady { return last }
-        try await Task.sleep(for: interval)
+        try await clock.sleep(for: interval)
     }
     return last
 }
