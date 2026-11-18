@@ -2612,6 +2612,117 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("stripe").condition?.actions, [.installStripe])
     }
 
+    // MARK: - L8: network changes and LAN mode
+
+    /// universal-login on the test's port. It prints the arguments that LAN mode
+    /// adds, and serves on loopback whatever they are.
+    private var lanLogin: ServiceDefinition {
+        daemon("universal-login", ["sh", "-c", "echo args: \"$@\"; exec \(webServer.joined(separator: " "))", "sh"])
+    }
+
+    /// Starts universal-login, then turns LAN mode on as if it ran on `address`.
+    private func runInLanMode(at address: LanAddress) async throws -> pid_t {
+        try load(lanLogin)
+        supervisor.restartService("universal-login")
+        let up = await waitUntil(20) { self.settled("universal-login") }
+        XCTAssertTrue(up, "universal-login is \(state("universal-login").phase.rawValue)")
+        supervisor.networkMode = true
+        supervisor.lanAddress = address
+        return try XCTUnwrap(state("universal-login").pid)
+    }
+
+    /// Finding health-no-network-change-handling: each network change re-applied
+    /// LAN mode and restarted the web servers. A change that keeps the address
+    /// needs no new URLs, so nothing restarts.
+    func testANetworkChangeWithTheSameAddressRestartsNothing() async throws {
+        let before = try await runInLanMode(at: LanAddress(interface: "en0", ip: "10.0.1.23"))
+        // Wi-Fi to Ethernet with the same address: only the interface is new.
+        supervisor.findLanAddress = { LanAddress(interface: "en7", ip: "10.0.1.23") }
+
+        await supervisor.handleNetworkChange()
+        try await Task.sleep(for: .milliseconds(500))
+
+        XCTAssertEqual(state("universal-login").pid, before)
+        XCTAssertEqual(state("universal-login").phase, .running)
+        XCTAssertTrue(supervisor.actionsInFlight.isEmpty, "\(supervisor.actionsInFlight)")
+        XCTAssertEqual(supervisor.lanAddress?.label, "en7 · 10.0.1.23")
+        let lines = await logLines("travel-portal")
+        XCTAssertFalse(lines.contains { $0.contains("LAN address changed") }, lines.joined(separator: "\n"))
+    }
+
+    /// A network change with no address keeps the servers: they still serve localhost.
+    func testANetworkChangeWithNoAddressRestartsNothing() async throws {
+        let before = try await runInLanMode(at: LanAddress(interface: "en0", ip: "10.0.1.23"))
+        supervisor.findLanAddress = { nil }
+
+        await supervisor.handleNetworkChange()
+        try await Task.sleep(for: .milliseconds(500))
+
+        XCTAssertEqual(state("universal-login").pid, before)
+        XCTAssertTrue(supervisor.networkMode)
+        XCTAssertEqual(supervisor.lanAddress?.ip, "10.0.1.23")
+        let lines = await logLines("travel-portal")
+        XCTAssertTrue(lines.contains { $0.contains("there is no LAN address now") }, lines.joined(separator: "\n"))
+    }
+
+    /// A new address needs new URLs: LAN mode is applied again, and the server
+    /// binds all addresses, not the address of the old network.
+    func testANetworkChangeWithANewAddressRestartsTheLanServicesOnAllAddresses() async throws {
+        let before = try await runInLanMode(at: LanAddress(interface: "en0", ip: "10.0.1.23"))
+        supervisor.findLanAddress = { LanAddress(interface: "en0", ip: "192.168.1.20") }
+        var feedback: [String] = []
+        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+
+        await supervisor.handleNetworkChange()
+
+        let restarted = await waitUntil(20) {
+            self.settled("universal-login") && self.state("universal-login").pid != before
+        }
+        XCTAssertTrue(restarted, "universal-login is \(state("universal-login").phase.rawValue)")
+        XCTAssertEqual(supervisor.lanAddress, LanAddress(interface: "en0", ip: "192.168.1.20"))
+        let lines = await logLines("universal-login")
+        XCTAssertTrue(lines.contains("args: --hostname 0.0.0.0"), lines.joined(separator: "\n"))
+        let portal = await logLines("travel-portal")
+        XCTAssertTrue(portal.contains("[travel-runner] LAN address changed (10.0.1.23 → 192.168.1.20) — applying LAN mode again"), portal.joined(separator: "\n"))
+        XCTAssertEqual(feedback.last, "LAN mode on — open http://192.168.1.20:3002 on your phone")
+    }
+
+    /// Finding ux-lan-mode-ip: with no address LAN mode "succeeded" on 127.0.0.1.
+    /// Now it says so, stays off, and restarts nothing.
+    func testLanModeWithoutAnAddressSaysSoAndRestartsNothing() async throws {
+        try load(lanLogin)
+        supervisor.restartService("universal-login")
+        let up = await waitUntil(20) { self.settled("universal-login") }
+        XCTAssertTrue(up)
+        let before = try XCTUnwrap(state("universal-login").pid)
+        supervisor.findLanAddress = { nil }
+        var feedback: [(String, Bool)] = []
+        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+
+        supervisor.toggleNetworkMode()
+
+        let answered = await waitUntil(10) { !feedback.isEmpty && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(answered)
+        XCTAssertEqual(feedback.first?.0, "No LAN address found — connect to Wi-Fi or Ethernet, then try again.")
+        XCTAssertEqual(feedback.first?.1, false)
+        XCTAssertFalse(supervisor.networkMode)
+        XCTAssertNil(supervisor.lanAddress)
+        XCTAssertEqual(state("universal-login").pid, before)
+        let lines = await logLines("universal-login")
+        XCTAssertFalse(lines.contains { $0.contains("args: --hostname") }, lines.joined(separator: "\n"))
+    }
+
+    /// LAN mode is off: a network change does nothing, not even a lookup.
+    func testANetworkChangeOutsideLanModeDoesNothing() async throws {
+        let asked = OSAllocatedUnfairLock(initialState: 0)
+        supervisor.findLanAddress = { asked.withLock { $0 += 1 }; return nil }
+
+        await supervisor.handleNetworkChange()
+
+        XCTAssertEqual(asked.withLock { $0 }, 0)
+        XCTAssertFalse(supervisor.networkMode)
+    }
+
     // MARK: - S2: the portal does not wait for Stripe
 
     /// A Stripe service whose probe waits for a webhook secret in its output.

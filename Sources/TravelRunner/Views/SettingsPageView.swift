@@ -152,10 +152,10 @@ struct SettingsPageView: View {
                     }
                 }
 
-                if supervisor.networkMode, let ip = supervisor.localIP {
+                if supervisor.networkMode, let lan = supervisor.lanAddress {
                     HStack {
                         Spacer()
-                        Text(ip)
+                        Text("LAN: \(lan.label)")
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.green)
                             .padding(.trailing, 8)

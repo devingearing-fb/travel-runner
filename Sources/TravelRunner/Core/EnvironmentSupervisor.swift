@@ -68,7 +68,9 @@ final class EnvironmentSupervisor {
         return dbSeedScenarios.first { $0.id == selectedDbSeedScenarioID }
     }
     var networkMode = false
-    var localIP: String? = nil
+    /// The LAN address of LAN mode. Nil when LAN mode is off.
+    var lanAddress: LanAddress? = nil
+    var localIP: String? { lanAddress?.ip }
     var panelVisible = false
     var rootCauseServiceID: String? = nil
     var phaseTimings: [String: TimeInterval] = [:]
@@ -184,6 +186,8 @@ final class EnvironmentSupervisor {
     @ObservationIgnored var stripeRetryPolicy = StripeRetryPolicy()
     /// Runs in the wake reconnect before it stops the stale CLI. Tests let the CLI exit there.
     @ObservationIgnored var stripeBeforeWakeStop: (@MainActor () async -> Void)?
+    /// Finds the LAN address of the Mac. Tests set a fake.
+    @ObservationIgnored var findLanAddress: @Sendable () async -> LanAddress? = { await LanAddress.current() }
     /// The time of every wait, deadline and time stamp of the supervisor. Tests
     /// set a fake.
     @ObservationIgnored var clock = RunnerClock.live
@@ -206,6 +210,7 @@ final class EnvironmentSupervisor {
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
     private var sleepWakeObserver: SleepWakeObserver?
+    private var networkObserver: NetworkObserver?
     private var startTask: Task<Void, any Error>?
     private var config: ServiceConfig?
     private var isShuttingDown = false
@@ -549,6 +554,11 @@ final class EnvironmentSupervisor {
             self?.handleWake()
         }
         sleepWakeObserver?.startObserving()
+
+        networkObserver = NetworkObserver { [weak self] in
+            Task { await self?.handleNetworkChange() }
+        }
+        networkObserver?.startObserving()
 
         // Start control API server
         startControlServer()
@@ -907,7 +917,7 @@ final class EnvironmentSupervisor {
             startupBeganAt = nil
             isShuttingDown = false
             networkMode = false
-            localIP = nil
+            lanAddress = nil
             resetEnvToLocalhost()
         }
     }
@@ -1337,13 +1347,16 @@ final class EnvironmentSupervisor {
         applyNetworkMode()
     }
 
+    /// What LAN mode says when the Mac has no LAN address.
+    static let noLanAddressText = "No LAN address found — connect to Wi-Fi or Ethernet, then try again."
+
     /// Applies the current `networkMode` to env files and restarts LAN services.
-    /// Re-detects the LAN IP on every call, so it is also used to recover when
-    /// the machine moves networks (stale IP causes EADDRNOTAVAIL on restart).
+    /// It finds the LAN address on every call, so a network change with a new
+    /// address uses it too.
     func applyNetworkMode() {
         guard !isTogglingNetwork else {
-            // Wake recovery stops the web services and then asks for this. If the
-            // request were dropped, they would stay down. Run it after the current one.
+            // A new LAN address can come while a toggle runs. If the request were
+            // dropped, the env files would keep the old address. Run it after the current one.
             networkReapplyPending = true
             return
         }
@@ -1362,13 +1375,19 @@ final class EnvironmentSupervisor {
             }
 
             if mode {
-                let (output, ok) = await shellOutput("ipconfig getifaddr en0")
-                localIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+                guard let found = await findLanAddress() else {
+                    // LAN mode on 127.0.0.1 reaches no phone. Nothing restarts, and
+                    // a LAN mode that is not on yet stays off.
+                    if lanAddress == nil { networkMode = false }
+                    onActionFeedback?(Self.noLanAddressText, false)
+                    return
+                }
+                lanAddress = found
             } else {
-                localIP = nil
+                lanAddress = nil
             }
 
-            let ip = localIP ?? "127.0.0.1"
+            let ip = lanAddress?.ip ?? "localhost"
             writeAppEnv()
 
             var servicesToRestart = ["travel-portal", "universal-login"]
@@ -1401,9 +1420,36 @@ final class EnvironmentSupervisor {
             if restartFailed {
                 onActionFeedback?("LAN mode toggle hit errors — check Status", false)
             } else {
-                onActionFeedback?(mode ? "LAN mode on — \(ip)" : "LAN mode off — localhost only", true)
+                let port = serviceStates["travel-portal"]?.definition.probe?.port ?? 3002
+                onActionFeedback?(mode ? "LAN mode on — open http://\(ip):\(port) on your phone" : "LAN mode off — localhost only", true)
             }
         }
+    }
+
+    /// The network changed (`NetworkObserver`). The web servers listen on all
+    /// addresses, so they keep working on localhost. Only a new LAN address
+    /// needs new URLs in the env files, and so a restart of the LAN services.
+    func handleNetworkChange() async {
+        guard networkMode, !isShuttingDown else { return }
+        let found = await findLanAddress()
+        guard networkMode, !isShuttingDown, let old = lanAddress else { return }
+        guard let found else {
+            await logStore.append(serviceID: "travel-portal", entry: LogEntry(
+                stream: .stdout,
+                text: "[travel-runner] The network changed and there is no LAN address now. Localhost still works; LAN mode waits for a network."
+            ))
+            return
+        }
+        guard found.ip != old.ip else {
+            // Same address, maybe on another interface: the URLs stay right.
+            lanAddress = found
+            return
+        }
+        await logStore.append(serviceID: "travel-portal", entry: LogEntry(
+            stream: .stdout,
+            text: "[travel-runner] LAN address changed (\(old.ip) → \(found.ip)) — applying LAN mode again"
+        ))
+        applyNetworkMode()
     }
 
     private func shellOutput(_ command: String, cwd: String? = nil) async -> (String, Bool) {
@@ -2693,12 +2739,17 @@ final class EnvironmentSupervisor {
         }.value
     }
 
-    /// The service's own command with `--hostname <ip>` appended, so LAN mode keeps the
-    /// configured package manager and port. `npm run` needs `--` before script flags;
+    /// The host that the web servers bind in LAN mode. All addresses: the LAN
+    /// address for the phone, and loopback for the probes and the Stripe CLI. A
+    /// new LAN address does not break the bind.
+    nonisolated static let lanBindHost = "0.0.0.0"
+
+    /// The service's own command with `--hostname 0.0.0.0` appended, so LAN mode keeps
+    /// the configured package manager and port. `npm run` needs `--` before script flags;
     /// pnpm passes trailing flags to the script.
-    nonisolated static func lanCommand(_ cmd: [String], ip: String) -> [String] {
+    nonisolated static func lanCommand(_ cmd: [String]) -> [String] {
         let needsSeparator = cmd.first == "npm" && cmd.dropFirst().first == "run" && !cmd.contains("--")
-        return cmd + (needsSeparator ? ["--"] : []) + ["--hostname", ip]
+        return cmd + (needsSeparator ? ["--"] : []) + ["--hostname", lanBindHost]
     }
 
     private func lanAwareDefinition(for definition: ServiceDefinition, serviceID: String) -> ServiceDefinition {
@@ -2706,7 +2757,7 @@ final class EnvironmentSupervisor {
         let lanServices: Set<String> = ["travel-portal", "universal-login", "partner-portal"]
         guard lanServices.contains(serviceID) else { return definition }
 
-        let cmd = Self.lanCommand(definition.cmd, ip: ip)
+        let cmd = Self.lanCommand(definition.cmd)
         var envOverrides = definition.env ?? [:]
 
         // The portals get their LAN URLs from the runner block in .env.local
@@ -2720,40 +2771,13 @@ final class EnvironmentSupervisor {
             }
         }
 
-        var lanProbe = definition.probe
-        if let probe = lanProbe, probe.type == .tcp {
-            lanProbe = ProbeConfig(
-                type: probe.type,
-                port: probe.port,
-                host: ip,
-                url: probe.url,
-                pattern: probe.pattern,
-                artifact: probe.artifact,
-                timeout: probe.timeout
-            )
-        } else if let probe = lanProbe, probe.type == .http, let url = probe.url {
-            // In LAN mode the server binds only the LAN IP — a loopback probe
-            // URL would refuse even though the service is up.
-            let lanURL = url
-                .replacingOccurrences(of: "127.0.0.1", with: ip)
-                .replacingOccurrences(of: "localhost", with: ip)
-            lanProbe = ProbeConfig(
-                type: probe.type,
-                port: probe.port,
-                host: probe.host,
-                url: lanURL,
-                pattern: probe.pattern,
-                artifact: probe.artifact,
-                timeout: probe.timeout
-            )
-        }
-
+        // The server listens on all addresses, so the loopback probe keeps working.
         return ServiceDefinition(
             id: definition.id,
             name: definition.name,
             cmd: cmd,
             cwd: definition.cwd,
-            probe: lanProbe,
+            probe: definition.probe,
             type: definition.type,
             restart: definition.restart,
             dependsOn: definition.dependsOn,
@@ -3442,22 +3466,6 @@ final class EnvironmentSupervisor {
             try? await clock.sleep(for: .seconds(baseDelay))
             guard serviceStates[serviceID]?.phase == .failed else { return }
 
-            // LAN services: if the machine moved networks, restarting with the
-            // stale IP fails with EADDRNOTAVAIL. Re-detect and re-apply instead.
-            if networkMode,
-               ["travel-portal", "universal-login", "partner-portal"].contains(serviceID) {
-                let (output, ok) = await shellOutput("ipconfig getifaddr en0")
-                let currentIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : ""
-                if !currentIP.isEmpty, currentIP != localIP {
-                    await logStore.append(
-                        serviceID: serviceID,
-                        entry: LogEntry(stream: .stdout, text: "[travel-runner] LAN IP changed (\(localIP ?? "?") → \(currentIP)) — re-applying network mode")
-                    )
-                    applyNetworkMode()
-                    return
-                }
-            }
-
             // A service that failed because the container runtime is down fails again
             // at once. Start the runtime first; if it does not come up, say so and stop.
             let recentLines = await logStore.entries(for: serviceID).map(\.text)
@@ -3546,40 +3554,8 @@ final class EnvironmentSupervisor {
     private func runWakeChecks() async {
         try? await clock.sleep(for: .seconds(3))
 
-        // LAN mode: the network may have changed during sleep. Probing or
-        // restarting against a stale IP causes false probe failures and
-        // EADDRNOTAVAIL crash loops — re-detect before doing anything.
-        if networkMode {
-            // Wi-Fi can take 10-20s to associate after wake. A single check
-            // at +3s falsely concludes "no network" and drops to localhost
-            // while the user expects LAN mode to survive the commute.
-            var currentIP = ""
-            for _ in 0..<7 {
-                let (output, ok) = await shellOutput("ipconfig getifaddr en0")
-                currentIP = ok ? output.trimmingCharacters(in: .whitespacesAndNewlines) : ""
-                if !currentIP.isEmpty { break }
-                try? await clock.sleep(for: .seconds(3))
-            }
-            if currentIP.isEmpty {
-                await logStore.append(
-                    serviceID: "travel-portal",
-                    entry: LogEntry(stream: .stdout, text: "[travel-runner] No LAN IP ~20s after wake — switching back to localhost mode")
-                )
-                await killWebServicePorts()
-                networkMode = false
-                applyNetworkMode()
-                return
-            }
-            if currentIP != localIP {
-                await logStore.append(
-                    serviceID: "travel-portal",
-                    entry: LogEntry(stream: .stdout, text: "[travel-runner] LAN IP changed after wake (\(localIP ?? "?") → \(currentIP)) — re-applying network mode")
-                )
-                await killWebServicePorts()
-                applyNetworkMode()
-                return
-            }
-        }
+        // LAN mode binds all addresses, so a new network after sleep breaks no
+        // probe. The network observer moves the LAN URLs to a new address.
 
         for (serviceID, state) in serviceStates where state.phase == .running {
             guard let probeConfig = state.definition.probe,
@@ -3611,8 +3587,7 @@ final class EnvironmentSupervisor {
                 // (parent killed during sleep) can hold the port and serve
                 // 404s for every route while looking "running". Verify with
                 // a real HTTP request against a route that must exist.
-                let host = (networkMode ? localIP : nil) ?? "localhost"
-                let healthy = await httpServesPages(host: host, port: port, path: healthPath)
+                let healthy = await httpServesPages(host: "localhost", port: port, path: healthPath)
                 guard state.phase == .running else { continue }
                 if !healthy {
                     await logStore.append(
@@ -4547,15 +4522,11 @@ final class EnvironmentSupervisor {
         return result.stdout.split(separator: "\n").first.map(String.init)
     }
 
+    /// LAN mode binds all addresses, so loopback answers for it too. A connect to
+    /// the LAN address is not used: after a network change that address is gone,
+    /// and the connect blocks the main actor for the TCP timeout.
     private func isPortBound(_ port: Int) -> Bool {
-        if isPortBoundOnAddress(port, address: UInt32(INADDR_LOOPBACK).bigEndian) { return true }
-        if let ip = localIP {
-            var lanAddr = in_addr()
-            if inet_pton(AF_INET, ip, &lanAddr) == 1 {
-                if isPortBoundOnAddress(port, address: lanAddr.s_addr) { return true }
-            }
-        }
-        return false
+        isPortBoundOnAddress(port, address: UInt32(INADDR_LOOPBACK).bigEndian)
     }
 
     private func isPortBoundOnAddress(_ port: Int, address: UInt32) -> Bool {

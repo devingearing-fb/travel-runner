@@ -69,7 +69,7 @@ struct DashboardFooter: View {
             }
             .buttonStyle(.borderless)
             .help(supervisor.networkMode
-                ? "LAN Mode ON\(supervisor.localIP.map { " (\($0))" } ?? "")"
+                ? "LAN Mode ON\(supervisor.lanAddress.map { " (\($0.label))" } ?? "")"
                 : "LAN Mode OFF")
         }
         .padding(.horizontal, 10)

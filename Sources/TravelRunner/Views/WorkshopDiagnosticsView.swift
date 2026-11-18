@@ -200,6 +200,7 @@ struct WorkshopDiagnosticsView: View {
             "currentPhase": supervisor.currentPhase.rawValue,
             "networkMode": supervisor.networkMode,
             "localIP": supervisor.localIP ?? "none",
+            "lanInterface": supervisor.lanAddress?.interface ?? "none",
             "generatedAt": ISO8601DateFormatter().string(from: .now),
         ]
 
