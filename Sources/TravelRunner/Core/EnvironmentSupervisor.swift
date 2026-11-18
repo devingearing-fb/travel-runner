@@ -20,13 +20,21 @@ final class EnvironmentSupervisor {
     var currentPhase: StartupPhase = .idle
     var completedPhases: Set<String> = []
     var sortedServiceIDs: [String] = []
-    var lastError: String? = nil
+    /// The header's notices, one per key.
+    var notices = NoticeCenter()
+    /// The newest error notice. Post a notice to set it.
+    var lastError: String? { notices.newestError?.text }
     /// Set when the control API could not listen on a loopback address.
     var controlAPIError: String? = nil
     /// One line for each service of services.json that the last load left out.
     var configIssues: [String] = []
     /// Set when a release copy runs outside an Applications folder, until the person closes it.
     var misplacedCopyNotice: InstanceGuard.MisplacedNotice? = nil
+    /// True when macOS denies the notifications: a crash shows only in the menu bar.
+    var notificationsOff = false
+    /// The person closed the "Notifications are off" banner for this run.
+    var notificationsOffDismissed = false
+    static let notificationsOffText = "Notifications are off — crashes show only as the red menu-bar dot."
     /// Set while the checkout needs a newer runner. No reset and no DB step runs
     /// while it is set; the services still start.
     var compatibilityNotice: Compatibility.Notice? = nil
@@ -90,7 +98,8 @@ final class EnvironmentSupervisor {
     var panelVisible = false
     var rootCauseServiceID: String? = nil
     var phaseTimings: [String: TimeInterval] = [:]
-    var onServiceCrash: (@MainActor (String, Int32) -> Void)? = nil
+    /// A crash, with its cause and what happens next: the notification.
+    var onServiceCrash: (@MainActor (CrashAlert) -> Void)? = nil
     var debugTrackingEnabled = false
     var debugOpenIssueCount = 0
     /// True while "Report a problem" saves its zip.
@@ -98,11 +107,24 @@ final class EnvironmentSupervisor {
     /// Makes the exporter of a report. Tests give one with a temporary folder and a fake zip.
     @ObservationIgnored var makeReportExporter: () -> ReportExporter = { .live() }
     var actionsInFlight: Set<String> = []
-    var onActionFeedback: ((String, Bool) -> Void)?
-    /// Opens the page that shows where each tool was found (the "Open Health" button).
+    /// Shows one feedback as a toast. `showFeedback` also lists it in `recentActivity`.
+    var onFeedback: ((ActionFeedback) -> Void)?
+    /// The last feedback and crashes, the newest first, for Status.
+    private(set) var recentActivity = RecentActivity()
+    /// The short form of `showFeedback`, for an action that only succeeds or fails.
+    var onActionFeedback: ((String, Bool) -> Void)? {
+        { [weak self] message, success in self?.showFeedback(message, success ? .success : .error) }
+    }
+    /// Opens Health: every setup check, and where each tool was found (the "Open Health" button).
     var onOpenHealth: (() -> Void)?
     /// Opens Settings, where the paths of the repos are set.
     var onOpenSettings: (() -> Void)?
+    /// The setup checks of Health. The preflight of a start runs the fast ones
+    /// (see `CheckRegistry`), so Health, the preflight and the Status banner show
+    /// the same results. Built at each config load.
+    private(set) var healthChecker: EnvironmentChecker?
+    /// The paths that `healthChecker` was built for.
+    @ObservationIgnored private var healthCheckerPaths: RepoPaths?
     var gitBranches: [String: String] = [:]
     var gitBehindCounts: [String: Int] = [:]
     var behindBannerDismissed = false
@@ -118,6 +140,10 @@ final class EnvironmentSupervisor {
     private var reconfiguresRunning = 0
     /// `/api/preflight` requests that run their checks now.
     private var preflightRequestsRunning = 0
+    /// True while "Run Checks Now" runs the checks.
+    private(set) var preflightOnlyRunning = false
+    /// The checks of "Run Checks Now". A start cancels it and waits for it.
+    @ObservationIgnored private var preflightOnlyTask: Task<Void, Never>?
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
@@ -163,6 +189,21 @@ final class EnvironmentSupervisor {
 
     func dismissBehindBanner() {
         behindBannerDismissed = true
+    }
+
+    func dismissNotice(_ key: NoticeKey) {
+        notices.dismiss(key)
+    }
+
+    /// `first` false: a later failure of a start. The first failure stays the
+    /// newest error, and this notice goes behind it.
+    private func postNotice(_ key: NoticeKey, _ text: String, severity: Notice.Severity = .error, first: Bool = true) {
+        notices.post(key, text, severity: severity, now: clock.date(), atFront: first)
+    }
+
+    /// A start or a stop makes the notices of the stack stale.
+    private func resolveStackNotices() {
+        notices.resolveAll { $0.endsWithStack }
     }
 
     /// The banner does not come back for this place.
@@ -224,12 +265,9 @@ final class EnvironmentSupervisor {
     /// Where the config and the control server come from.
     @ObservationIgnored var configHost = ConfigHost()
     /// The preflight checks run their commands in the shell of the supervisor and
-    /// wait on its clock.
-    /// Its Stripe check fills the 60 s cache that the start of Stripe reads.
+    /// wait on its clock. The checks of the registry come from Health.
     private var preflightRunner: PreflightRunner {
-        PreflightRunner(shell: shell, clock: clock, stripe: { [weak self] resolution in
-            await self?.stripeAvailability(resolution) ?? .offline
-        })
+        PreflightRunner(shell: shell, clock: clock, environment: resolvedHealthChecker(), profile: profile)
     }
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
@@ -367,7 +405,7 @@ final class EnvironmentSupervisor {
     /// a restart that a person asks for allow one more.
     private var supabaseRepairUsed = false
     /// Tests give the pipeline of a DB setup, so no manifest and no seed scenario
-    /// is read. Nil from the closure starts nothing and sets `lastError`, like a
+    /// is read. Nil from the closure starts nothing and posts a db-setup notice, like a
     /// missing scenario.
     var dbPipelineFactory: ((_ cwd: String, _ profile: String) -> DbSetupPipeline?)?
     /// How a DB step command starts. Tests give a shell that reads no startup files.
@@ -503,8 +541,9 @@ final class EnvironmentSupervisor {
     struct ConfigHost {
         var load: () throws -> ServiceConfig = { try ConfigLoader.load() }
         var controlServer: () -> ControlServer = { ControlServer() }
-        /// False: the load starts no git and no npm watcher on the service folders.
-        /// Tests set it, so no test runs the git of this Mac.
+        /// False: the load starts no git and no npm watcher on the service folders,
+        /// and runs no setup check of Health. Tests set it, so no test runs the git
+        /// of this Mac or asks the network.
         var startsWatchers = true
     }
 
@@ -525,13 +564,18 @@ final class EnvironmentSupervisor {
         bootstrapOnce()
         do {
             try applyConfig()
+            // The fast setup checks run once at launch, so the Status banner is
+            // current. The network checks wait until Health opens.
+            if configHost.startsWatchers, let checker = healthChecker {
+                Task { await checker.runFastChecks() }
+            }
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this
         } catch ConfigLoader.ConfigError.monorepoNotFound {
             // Old three-repo config with no monorepo nearby — setup wizard will handle this
         } catch {
-            lastError = "Config load failed: \(error)"
-            print("[Supervisor] \(lastError!)")
+            postNotice(.config, "Config load failed: \(error)")
+            print("[Supervisor] Config load failed: \(error)")
         }
     }
 
@@ -547,12 +591,12 @@ final class EnvironmentSupervisor {
         }
         do {
             try applyConfig()
-            lastError = nil
+            notices.resolve(.config)
             onActionFeedback?("Paths updated", true)
             return .applied
         } catch {
             let message = "Paths not applied: \(error)"
-            lastError = message
+            postNotice(.config, message)
             onActionFeedback?(message, false)
             return .failed(message)
         }
@@ -669,6 +713,7 @@ final class EnvironmentSupervisor {
             serviceStates[service.id] = ServiceState(definition: service)
         }
         reconfigurePending = false
+        resolvedHealthChecker()
 
         reloadDbSeedScenarios()
         // Another checkout can name another minimum runner version.
@@ -760,6 +805,7 @@ final class EnvironmentSupervisor {
         for service in services {
             serviceStates[service.id] = ServiceState(definition: service)
         }
+        resolvedHealthChecker()
     }
 
     // MARK: - Start / Stop
@@ -776,7 +822,13 @@ final class EnvironmentSupervisor {
     /// Starts the stack. It is a stack operation: it waits for a stop that runs and
     /// for the operation before it, so a Start pressed during a Stop is not lost.
     func startAll(skipPreflight: Bool = false, mode: StartMode = .everything) {
-        guard startTask == nil, graph != nil else { return }
+        guard startTask == nil else {
+            showFeedback(ActionFeedback.startInProgress, .info)
+            return
+        }
+        guard graph != nil else { return }
+        // The start runs the checks of "Run Checks Now" itself (`runStartAll` waits for them).
+        preflightOnlyTask?.cancel()
         let waits = !stackIsIdle
         if !waits {
             prepareStartAll()
@@ -807,7 +859,7 @@ final class EnvironmentSupervisor {
         resetStripeRetries(keepingAvailability: true)
         startRefusal = nil
         applyHealth(HealthSummary(status: .starting))
-        lastError = nil
+        resolveStackNotices()
         startFailure = nil
         supabaseRepairUsed = false
         dbSetupFailedAtStart = false
@@ -875,6 +927,7 @@ final class EnvironmentSupervisor {
         defer { startupBeganAt = nil }
         guard let graph else { return }
         do {
+            await preflightOnlyTask?.value
             await self.waitForEnvResetOfLoad()
 
             // The other runner app uses the same ports, and this start stops what it
@@ -884,7 +937,7 @@ final class EnvironmentSupervisor {
                 await MainActor.run {
                     self.startRefusal = "Not started — \(Flavor.current.sibling.displayName) runs a stack now"
                     self.recalculateHealth(startInFlight: false)
-                    self.lastError = SiblingRunner.refusal(activeServices: siblingServices)
+                    self.postNotice(.siblingRunner, SiblingRunner.refusal(activeServices: siblingServices))
                     self.currentPhase = .idle
                 }
                 return
@@ -901,19 +954,19 @@ final class EnvironmentSupervisor {
             if !skipPreflight {
                 self.currentPhase = .preflight
                 let profileServices = self.loadedServices.filter { self.isInProfile($0.id) && !kept.contains($0.id) }
-                let checks = self.preflightRunner.allChecks(for: profileServices)
+                let runner = self.preflightRunner
+                let checks = runner.allChecks(for: profileServices)
                 await MainActor.run { self.preflightChecks = checks }
 
-                var allPassed = true
+                // The checks run in parallel; each command of a check has a short limit.
+                await runner.runAll(checks)
                 var failedDetails: [String] = []
                 for check in checks {
-                    let result = await self.preflightRunner.run(check: check)
-                    await MainActor.run { check.result = result }
-                    if case .failed(let message, _) = result {
-                        allPassed = false
+                    if case .failed(let message, _) = check.result {
                         failedDetails.append("\(check.name): \(message)")
                     }
                 }
+                let allPassed = failedDetails.isEmpty
 
                 _ = await MainActor.run { self.completedPhases.insert("PREFLIGHT") }
 
@@ -923,7 +976,7 @@ final class EnvironmentSupervisor {
                         let count = failedDetails.count
                         self.startRefusal = "Not started — \(count) check\(count == 1 ? "" : "s") failed"
                         self.recalculateHealth(startInFlight: false)
-                        self.lastError = "Preflight failed — \(summary)"
+                        self.postNotice(.preflight, "Preflight failed — \(summary)")
                         self.currentPhase = .idle
                     }
                     await self.captureDebugIssue(
@@ -945,7 +998,7 @@ final class EnvironmentSupervisor {
                 try await self.registry?.start()
             } catch {
                 await MainActor.run {
-                    self.lastError = "Secret registry failed to start: \(error)"
+                    self.postNotice(.secretRegistry, "Secret registry failed to start: \(error)")
                 }
             }
 
@@ -1112,7 +1165,7 @@ final class EnvironmentSupervisor {
             currentPhase = .idle
             completedPhases = []
             phaseTimings = [:]
-            lastError = nil
+            resolveStackNotices()
             startupBeganAt = nil
             // A newer stop still runs: it owns the end.
             if stopAllCount == stops { isShuttingDown = false }
@@ -1162,6 +1215,52 @@ final class EnvironmentSupervisor {
         return fields
     }
 
+    /// "Run Checks Now": the checks of a start for the profile, run without a
+    /// start. The results replace `preflightChecks`, so Diagnostics and Status
+    /// show each reason and fix. The checks change nothing: a container runtime
+    /// that does not answer fails its check and is not opened. The ports of
+    /// services that run are left out (`preflightPortsLeftOut`). A start that
+    /// runs has its own checks: this is refused then, and says why.
+    func runPreflightOnly() async {
+        guard startTask == nil else {
+            showFeedback(ActionFeedback.checksDuringStart, .info)
+            return
+        }
+        if let running = preflightOnlyTask {
+            await running.value
+            return
+        }
+        var runner = preflightRunner
+        runner.opensContainerRuntime = false
+        let leftOut = Set(preflightPortsLeftOut.map { "port-\($0)" })
+        let checks = runner.allChecks(for: loadedServices.filter { isInProfile($0.id) })
+            .filter { !leftOut.contains($0.id) }
+        preflightChecks = checks
+        preflightOnlyRunning = true
+        preflightRequestsRunning += 1
+        // A start cancels the run: it runs the same checks itself.
+        let task = Task { await runner.runAll(checks) }
+        preflightOnlyTask = task
+        await task.value
+        preflightOnlyTask = nil
+        preflightOnlyRunning = false
+        preflightRequestsRunning -= 1
+    }
+
+    /// The ports that "Run Checks Now" leaves out: the probe port of each service
+    /// that starts, runs or stops. Its own process holds it. The ports of failed,
+    /// stopped and skipped services are checked.
+    var preflightPortsLeftOut: [Int] {
+        let livePhases: Set<ServicePhase> = [.starting, .running, .stopping]
+        let ports = serviceStates.values
+            .filter { livePhases.contains($0.phase) }
+            .compactMap { $0.definition.probe?.port }
+        return Set(ports).sorted()
+    }
+
+    /// True while a start runs. "Run Checks Now" is refused then.
+    var startRunning: Bool { startTask != nil }
+
     /// The answer of `/api/preflight`: the checks of a start that change nothing
     /// (Node, the ports, the folders), run now. Each check has a time limit, so
     /// the answer always comes. Without a config only the Node check runs.
@@ -1169,10 +1268,12 @@ final class EnvironmentSupervisor {
         preflightRequestsRunning += 1
         defer { preflightRequestsRunning -= 1 }
         let runner = preflightRunner
+        let checks = runner.readOnlyChecks(for: loadedServices)
+        await runner.runAll(checks)
         var rows: [[String: String]] = []
-        for check in runner.readOnlyChecks(for: loadedServices) {
+        for check in checks {
             var row = ["id": check.id, "name": check.name]
-            switch await runner.run(check: check) {
+            switch check.result {
             case .pending: row["status"] = "pending"
             case .passed(let detail):
                 row["status"] = "passed"
@@ -1192,6 +1293,34 @@ final class EnvironmentSupervisor {
             return String(decoding: data, as: UTF8.self)
         }
         return "{}"
+    }
+
+    /// The checker of Health for the paths of the config. A new config builds a
+    /// new one. Without a config only the checks of the tools apply. Its commands
+    /// run in the shell that the supervisor has at that moment.
+    @discardableResult
+    func resolvedHealthChecker() -> EnvironmentChecker {
+        let paths = config?.paths
+        if let healthChecker, healthCheckerPaths == paths { return healthChecker }
+        let current: @Sendable () async -> any CommandRunning = { [weak self] in
+            await self?.shell ?? LoginShell()
+        }
+        let checker = EnvironmentChecker(
+            monorepoPath: paths?.monorepo.map(ServiceCatalog.expand) ?? "",
+            loginPath: paths?.universalLogin.map(ServiceCatalog.expand) ?? "",
+            streamServicesPath: paths?.streamServices.map(ServiceCatalog.expand) ?? "",
+            shell: CurrentShell(current: current), tools: tools, clock: clock
+        )
+        checker.buildChecks()
+        healthChecker = checker
+        healthCheckerPaths = paths
+        return checker
+    }
+
+    /// The setup checks of the profile that fail, or that the setup needs and warn.
+    var setupItemsNeedingAttention: [HealthCheck] {
+        guard let healthChecker else { return [] }
+        return CheckRegistry.needsAttention(healthChecker.checks, profile: profile)
     }
 
     private func startControlServer() {
@@ -1289,7 +1418,10 @@ final class EnvironmentSupervisor {
                         return ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"issue not found\"}"
                     },
                     toggleDbMode: { [weak self] in
-                        await MainActor.run { self?.toggleDatabaseMode() }
+                        await MainActor.run {
+                            guard let self else { return }
+                            self.setDatabaseMode(self.dbMode == .local ? .remote : .local)
+                        }
                     },
                     getProfile: { [weak self] in
                         guard let self else { return "{}" }
@@ -1431,10 +1563,13 @@ final class EnvironmentSupervisor {
 
     func clearCacheAndRestart(_ serviceID: String) {
         guard let cwd = serviceCwd(serviceID) else {
-            lastError = "No cwd found for \(serviceID)"
+            postNotice(.service(serviceID), "No cwd found for \(serviceID)")
             return
         }
-        guard queuedCacheClears.insert(serviceID).inserted else { return }
+        guard queuedCacheClears.insert(serviceID).inserted else {
+            showFeedback(ActionFeedback.alreadyRestarting(displayName(serviceID)), .info, serviceID: serviceID)
+            return
+        }
         Task {
             beginAction(serviceID)
             defer { endAction(serviceID) }
@@ -1497,39 +1632,99 @@ final class EnvironmentSupervisor {
         }
     }
 
-    func toggleDatabaseMode() {
-        guard health == .healthy || health == .stopped else {
-            lastError = "Cannot switch database while services are starting"
+    static let dbModeStartingRefusal =
+        "A start is in progress — wait for it to finish, or stop the stack, then switch."
+    static let dbModeSwitchingRefusal = "A database switch is in progress — wait for it to finish."
+    static let dbModeStoppingRefusal = "The stack is stopping — wait for it to stop, then switch."
+    static let devDatabaseConfirmationTitle = "Use the shared dev database?"
+    static let switchToDevTitle = "Switch to Dev"
+    static let dbToolsDevCaption = "Acts on the local database only. The portals currently use dev."
+
+    /// The apps that read the database mode from their env, in the loaded profile.
+    private var databaseModeServices: [String] { webServicesInStartOrder }
+
+    /// The apps that a switch restarts now. A stopped stack restarts none. A service
+    /// that the person stopped, that waits or that was skipped stays as it is; a
+    /// failed one starts with the new env.
+    private var databaseModeRestarts: [String] {
+        guard health != .stopped else { return [] }
+        return databaseModeServices.filter { serviceID in
+            guard let phase = serviceStates[serviceID]?.phase else { return false }
+            return phase != .stopped && phase != .pending && phase != .skipped
+        }
+    }
+
+    /// Why the database mode cannot change to `target` now, or nil when it can. A
+    /// switch is allowed when the stack is stopped, healthy or degraded. The restart
+    /// of one service does not block it: the switch waits for the service's lock.
+    func databaseModeRefusal(for target: DatabaseMode) -> String? {
+        if startTask != nil { return Self.dbModeStartingRefusal }
+        // Stop All resets the env to local when it ends, so a switch now would be lost.
+        if isShuttingDown { return Self.dbModeStoppingRefusal }
+        if actionsInFlight.contains("db-mode") { return Self.dbModeSwitchingRefusal }
+        if target == .remote, let missing = missingHostedDevValues { return missing }
+        return nil
+    }
+
+    /// The notice when a shared .env lacks the hosted dev values, or nil. Hosted dev
+    /// comes from each app's shared .env; the runner block then stops overriding Supabase.
+    private var missingHostedDevValues: String? {
+        let apps = ["travel-portal"] + (isInProfile("partner-portal") ? ["partner-portal"] : [])
+        let lacking = apps.filter { serviceID in
+            guard let shared = sharedEnvPath(serviceID),
+                  let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: shared) else { return true }
+            return url.isEmpty
+        }
+        guard !lacking.isEmpty else { return nil }
+        let files = lacking.map { $0 == "travel-portal" ? "apps/booking-portal/.env" : "apps/partner-portal/.env" }
+        return "Hosted dev values are missing from \(files.joined(separator: " and ")) — import the shared file (Settings → Reconfigure Repos… → Environment Check), then switch again"
+    }
+
+    /// The text under "Use the shared dev database?": which apps restart now and
+    /// which use the dev data at the next start.
+    var devDatabaseConfirmation: String {
+        let restarts = databaseModeRestarts
+        let later = databaseModeServices.filter { !restarts.contains($0) }
+        guard !restarts.isEmpty else {
+            return "\(namesList(later)) will read and write the shared hosted dev data at the next start."
+        }
+        let now = "\(namesList(restarts)) will restart and will read and write the shared hosted dev data."
+        return later.isEmpty ? now : now + " \(namesList(later)) will use it at the next start."
+    }
+
+    /// "A", "A and B", "A, B and C" with display names; "The portals" for none.
+    private func namesList(_ serviceIDs: [String]) -> String {
+        let names = serviceIDs.map(displayName)
+        guard let last = names.last else { return "The portals" }
+        return names.count > 1 ? names.dropLast().joined(separator: ", ") + " and " + last : last
+    }
+
+    /// Switches the database of the apps. A running stack restarts the apps that
+    /// read it. Ask the person before a switch to dev: the dev data is shared.
+    func setDatabaseMode(_ target: DatabaseMode) {
+        guard target != dbMode else { return }
+        if let refusal = databaseModeRefusal(for: target) {
+            postNotice(.dbMode, refusal)
             return
         }
 
-        if dbMode == .local {
-            // Hosted dev comes from each app's shared .env; the runner block then stops
-            // overriding Supabase.
-            let apps = ["travel-portal"] + (isInProfile("partner-portal") ? ["partner-portal"] : [])
-            let lacking = apps.filter { serviceID in
-                guard let shared = sharedEnvPath(serviceID),
-                      let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: shared) else { return true }
-                return url.isEmpty
-            }
-            guard lacking.isEmpty else {
-                let files = lacking.map { $0 == "travel-portal" ? "apps/booking-portal/.env" : "apps/partner-portal/.env" }
-                lastError = "Hosted dev values are missing from \(files.joined(separator: " and ")) — import the shared file (Settings → Reconfigure Repos… → Environment Check), then switch again"
-                return
-            }
+        if target == .remote {
             // The reset of a config load that still waits must not undo this choice.
             envResetAfterLoad?.cancel()
+            notices.resolve(.dbMode)
             dbMode = .remote
             writeAppEnv()
         } else {
+            notices.resolve(.dbMode)
             resetEnvToLocalhost()
         }
 
         guard health != .stopped else { return }
 
-        let servicesToRestart = webServicesInStartOrder
+        // A degraded stack switches too. The question named the same apps, in start order.
+        let servicesToRestart = databaseModeRestarts
+        beginAction("db-mode")
         Task {
-            beginAction("db-mode")
             defer { endAction("db-mode") }
             var switchFailed = false
             for serviceID in servicesToRestart {
@@ -1539,7 +1734,7 @@ final class EnvironmentSupervisor {
                 do {
                     let outcome = try await replaceProcess(serviceID)
                     if let why = notRestarted(serviceID, outcome) {
-                        lastError = "DB mode switch failed for \(displayName(serviceID)): \(why)"
+                        postNotice(.dbMode, "DB mode switch failed for \(displayName(serviceID)): \(why)")
                         switchFailed = true
                     }
                 } catch {
@@ -1651,7 +1846,7 @@ final class EnvironmentSupervisor {
                         )
                     })
                     if let why = notRestarted(serviceID, outcome) {
-                        lastError = "Network mode restart failed for \(displayName(serviceID)): \(why)"
+                        postNotice(.lan, "Network mode restart failed for \(displayName(serviceID)): \(why)")
                         restartFailed = true
                     }
                 } catch {
@@ -1712,8 +1907,11 @@ final class EnvironmentSupervisor {
         if serviceID == "stripe" { resetStripeRetries() }
         let stopsStack = stopsStack && isSupabaseStack(serviceID)
         if isSupabaseStack(serviceID) { supabaseRepairUsed = false }
-        guard queuedRestarts.insert(serviceID).inserted else { return }
         let name = serviceStates[serviceID]?.definition.displayName ?? serviceID
+        guard queuedRestarts.insert(serviceID).inserted else {
+            showFeedback(ActionFeedback.alreadyRestarting(name), .info, serviceID: serviceID)
+            return
+        }
         Task {
             beginAction(serviceID)
             defer { endAction(serviceID) }
@@ -1737,7 +1935,7 @@ final class EnvironmentSupervisor {
                     try? await self.clock.sleep(for: .seconds(1))
                 })
                 if let heldBy {
-                    onActionFeedback?(keptRunningText(serviceID, heldBy), false)
+                    showFeedback(keptRunningText(serviceID, heldBy), .error, serviceID: serviceID)
                     return
                 }
                 // A crash during the start: the automatic restart gives the answer.
@@ -1746,13 +1944,13 @@ final class EnvironmentSupervisor {
                 if ok { clearCleanExitError(serviceID) }
                 // The containers ran on, so the start only reused them: nothing restarted.
                 if stackDidNotStop {
-                    onActionFeedback?(SupabaseStackHealth.didNotStopText, false)
+                    showFeedback(SupabaseStackHealth.didNotStopText, .error, serviceID: serviceID)
                 } else {
-                    onActionFeedback?(text, ok)
+                    showFeedback(text, ok ? .success : .error, serviceID: serviceID)
                 }
             } catch {
                 recordFailure(serviceID, error: error, lastError: "\(error)")
-                onActionFeedback?("\(name) restart failed", false)
+                showFeedback("\(name) restart failed", .error, serviceID: serviceID)
             }
             recalculateHealth()
         }
@@ -2040,7 +2238,7 @@ final class EnvironmentSupervisor {
             ) else { return }
             guard result.succeeded else {
                 let why = Self.installFailure(result, folder: folder)
-                lastError = "\(command) for \(name) \(why)"
+                postNotice(.service(serviceID), "\(command) for \(name) \(why)")
                 onActionFeedback?("\(command) \(why)", false)
                 return
             }
@@ -2178,8 +2376,11 @@ final class EnvironmentSupervisor {
                     : kept.joined()
                 let verb = kept.count == 1 ? "still runs" : "still run"
                 let failure = "\(command) for \(displayName(serviceID)) \(why)"
-                lastError = (failure.hasSuffix(".") ? failure : failure + ".")
-                    + " \(names) \(verb) the old packages; fix the cause, then press Install dependencies."
+                postNotice(
+                    .service(serviceID),
+                    (failure.hasSuffix(".") ? failure : failure + ".")
+                        + " \(names) \(verb) the old packages; fix the cause, then press Install dependencies."
+                )
                 onActionFeedback?("\(command) \(why)", false)
             }
         }
@@ -2217,6 +2418,48 @@ final class EnvironmentSupervisor {
         recalculateHealth()
     }
 
+    /// Shows a toast and lists it in Recent activity. A guard that refuses an action
+    /// says so with `.info`; before, it did nothing.
+    func showFeedback(_ message: String, _ style: ActionFeedback.Style, serviceID: String? = nil) {
+        let feedback = ActionFeedback(message: message, style: style, serviceID: serviceID, at: clock.date())
+        recentActivity.add(feedback)
+        onFeedback?(feedback)
+    }
+
+    /// Lists the crash in Recent activity and posts its notification. The cause
+    /// comes from the log of this launch, so it reads the log first.
+    private func alertCrash(_ state: ServiceState, code: Int32, next: CrashAlert.Next, cause knownCause: String? = nil) {
+        let definition = state.definition
+        let launched = state.lastStarted ?? .distantPast
+        Task {
+            var cause = knownCause
+            if cause == nil {
+                let tail = await launchLogTail(state.id, since: launched)
+                let probe = definition.probe
+                cause = FailureAdvisor.cause(FailureAdvisor.Context(
+                    name: definition.displayName, port: probe?.port, logTail: tail,
+                    likelyCause: CrashCause.likelyCause(in: tail, serviceID: state.id, redactor: makeRedactor()),
+                    runtime: ContainerRuntime.detect().displayName, command: definition.cmd, cwd: definition.resolvedCwd
+                ))
+            }
+            let alert = CrashAlert(
+                serviceID: state.id, name: definition.displayName, exitCode: code, cause: cause, next: next
+            )
+            recentActivity.add(ActionFeedback(
+                message: "\(alert.title): \(alert.body)", style: .error, serviceID: state.id, at: clock.date()
+            ))
+            onServiceCrash?(alert)
+        }
+    }
+
+    /// The last lines of the service's log since `launched`. The log keeps the lines
+    /// of earlier launches; they are not the cause of this one.
+    private func launchLogTail(_ serviceID: String, since launched: Date) async -> [String] {
+        await logStore.entries(for: serviceID)
+            .filter { $0.timestamp >= launched }
+            .suffix(FailureAdvisor.logWindow).map(\.text)
+    }
+
     /// The banner text for a daemon that ended with code 0.
     nonisolated static func cleanExitMessage(_ name: String) -> String {
         "\(name) exited (code 0) and was not restarted — restart it from its row"
@@ -2225,7 +2468,7 @@ final class EnvironmentSupervisor {
     /// The person restarted the service, as the banner asked. A newer error stays.
     private func clearCleanExitError(_ serviceID: String) {
         guard let name = serviceStates[serviceID]?.definition.displayName else { return }
-        if lastError == Self.cleanExitMessage(name) { lastError = nil }
+        notices.resolve(.service(serviceID), ifText: Self.cleanExitMessage(name))
     }
 
     private func clearFailureHistory(_ serviceID: String) {
@@ -2244,14 +2487,16 @@ final class EnvironmentSupervisor {
 
     // MARK: - Failure record
 
-    /// A start that threw: the service is failed, the banner gets `text`, and the
-    /// row gets the reason and the fix. With no `text` the banner keeps its error.
+    /// A start that threw: the service is failed, its notice gets `text`, and the
+    /// row gets the reason and the fix. With no `text` the notice
+    /// goes behind the first failure of the start.
     private func recordFailure(_ serviceID: String, error: Error, lastError text: String?) {
         guard let state = serviceStates[serviceID] else { return }
         state.phase = .failed
-        if let text { lastError = text }
-        // The breaker records why it stopped; the waiter that ends on it adds nothing.
+        // The breaker posted why it stopped; the waiter that ends on it adds nothing.
+        // A notice the person dismissed stays dismissed.
         if case ServiceError.autoRestartStopped = error, state.isCircuitBroken { return }
+        postNotice(.service(serviceID), text ?? "\(error)", first: text != nil)
         recordFailure(serviceID, kind: failureKind(of: error, state: state), ownsBanner: text != nil)
     }
 
@@ -2274,8 +2519,8 @@ final class EnvironmentSupervisor {
     /// Says why the service failed. It reads the log of this launch, so the
     /// condition comes a moment later; a newer record, or a new start, wins.
     /// `CrashCause.likelyCause` runs here whether or not issue capture is on.
-    /// `ownsBanner` false: the banner holds another service's error, and this
-    /// record does not refine it.
+    /// `ownsBanner` false: another service failed first in this start. Its notice
+    /// stays the newest error; the refined notice of this one goes behind it.
     func recordFailure(_ serviceID: String, kind: FailureAdvisor.Kind, ownsBanner: Bool = true) {
         guard let state = serviceStates[serviceID] else { return }
         state.failureRecordCount += 1
@@ -2284,14 +2529,11 @@ final class EnvironmentSupervisor {
         let definition = state.definition
         let probe = definition.probe
         let probePath = probe?.type == .http ? probe?.url.flatMap { URL(string: $0)?.path }.flatMap { $0.isEmpty ? nil : $0 } : nil
-        // The banner of this failure ("exited before it was ready", "failed 3 times in a minute").
-        let banner = ownsBanner ? lastError : nil
+        // The notice of this failure ("exited before it was ready", "failed 3 times in a minute").
+        let banner = notices.text(.service(serviceID))
         Task {
-            // The log keeps the lines of earlier launches; they are not the cause of this one.
-            let tail = await logStore.entries(for: serviceID)
-                .filter { $0.timestamp >= launched }
-                .suffix(FailureAdvisor.logWindow).map(\.text)
-            let likely = CrashCause.likelyCause(in: Array(tail), serviceID: serviceID, redactor: makeRedactor())
+            let tail = await launchLogTail(serviceID, since: launched)
+            let likely = CrashCause.likelyCause(in: tail, serviceID: serviceID, redactor: makeRedactor())
             guard state.failureRecordCount == record, state.phase == .failed else { return }
             let context = FailureAdvisor.Context(
                 name: definition.displayName, port: probe?.port, probePath: probePath, logTail: Array(tail),
@@ -2306,11 +2548,14 @@ final class EnvironmentSupervisor {
             }
             state.condition = condition
             // A pnpm run that ended with 1 because the packages or the script are
-            // missing: the banner says so too, like exit 127. A newer error stays.
+            // missing: the notice says so too, like exit 127. A newer error stays.
             switch kind {
             case .exited, .probeTimeout, .crashLoop, .exhausted:
-                if let banner, lastError == banner, let finding = FailureAdvisor.commandFinding(context) {
-                    lastError = CommandDiagnosis.message(finding, name: definition.displayName)
+                if let banner, notices.text(.service(serviceID)) == banner,
+                   let finding = FailureAdvisor.commandFinding(context) {
+                    postNotice(
+                        .service(serviceID), CommandDiagnosis.message(finding, name: definition.displayName), first: ownsBanner
+                    )
                 }
             default:
                 break
@@ -2326,6 +2571,8 @@ final class EnvironmentSupervisor {
         state.failureRecordCount += 1
         state.likelyCause = nil
         state.condition = ServiceCondition(kind: kind, headline: headline, detail: detail, actions: actions, since: clock.date())
+        // The skip replaces the failure, so its notice is stale.
+        notices.resolve(.service(state.id))
     }
 
     /// Skips a service that cannot run here, with the reason in its row and its log.
@@ -2498,7 +2745,7 @@ final class EnvironmentSupervisor {
     func retryStartAll() {
         preflightChecks = []
         completedPhases = []
-        lastError = nil
+        resolveStackNotices()
         startAll(mode: .missingOnly)
     }
 
@@ -2506,7 +2753,7 @@ final class EnvironmentSupervisor {
     func restartEverything() {
         preflightChecks = []
         completedPhases = []
-        lastError = nil
+        resolveStackNotices()
         startAll(mode: .everything)
     }
 
@@ -2516,9 +2763,10 @@ final class EnvironmentSupervisor {
         do {
             try ConfigLoader.saveProfile(newProfile)
         } catch {
-            lastError = "Could not save profile: \(error)"
+            postNotice(.profile, "Could not save profile: \(error)")
             return
         }
+        notices.resolve(.profile)
         profile = newProfile
         profileMembers = newProfile.members(of: loadedServices)
         onActionFeedback?("Profile: \(newProfile.displayName)", true)
@@ -2803,9 +3051,9 @@ final class EnvironmentSupervisor {
         guard let run = beginDbSetup(cwd: cwd ?? supabaseCwd, profile: profile, reason: reason, origin: origin, from: stepId) else {
             // Start All stops before the portals: the header says so.
             if origin == .emptyDatabaseAtStart {
-                let message = (lastError ?? "the setup did not start")
+                let message = (notices.text(.dbSetup) ?? "the setup did not start")
                     .trimmingCharacters(in: CharacterSet(charactersIn: ". "))
-                lastError = DbResetPolicy.emptySetupFailedText(step: "setup", message: message)
+                postNotice(.dbSetup, DbResetPolicy.emptySetupFailedText(step: "setup", message: message))
             }
             return false
         }
@@ -2813,7 +3061,7 @@ final class EnvironmentSupervisor {
     }
 
     /// The checks and the guard. Nil when nothing may start; the reason is then in
-    /// `lastError`, or another setup runs.
+    /// the db-setup notice, or another setup runs.
     /// `reusePipeline` false builds a new pipeline for a step, also when one is shown.
     /// A single step gets a pipeline of that step alone, so its Retry and Run All
     /// never reach a reset. `stepArguments` go after the command of the step `stepId`
@@ -2825,9 +3073,12 @@ final class EnvironmentSupervisor {
         singleStep: Bool = false, reusePipeline: Bool = true, stepArguments: String? = nil,
         leadingSteps: [String] = []
     ) -> DbSetupRun? {
-        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return nil }
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else {
+            showFeedback(ActionFeedback.dbSetupRunning, .info)
+            return nil
+        }
         guard let cwd else {
-            lastError = "Cannot find supabase service cwd in config"
+            postNotice(.dbSetup, "Cannot find supabase service cwd in config")
             return nil
         }
         guard !refreshCompatibility(cwd: cwd) else { return nil }
@@ -2864,7 +3115,12 @@ final class EnvironmentSupervisor {
         }
 
         dbResetRunning = true
-        lastError = reason
+        notices.resolve(.dbSetup)
+        if let reason {
+            postNotice(.dbProgress, reason, severity: .info)
+        } else {
+            notices.resolve(.dbProgress)
+        }
         migrationApplyError = nil
         migrationsAppliedNotice = nil
         hotelSourceNotice = nil
@@ -2905,24 +3161,26 @@ final class EnvironmentSupervisor {
         if run.runner == nil || dbSetupRunner === run.runner { dbResetRunning = false }
 
         let isApply = !run.singleStep && run.profile == DbResetPolicy.migrateProfile
+        // A newer setup may run by now and show its own progress.
+        if let reason = run.reason { notices.resolve(.dbProgress, ifText: reason) }
         if ok {
-            lastError = nil
+            notices.resolve(.dbSetup)
             if run.pipeline != nil { await refreshLocalSupabaseKeys() }
             if isApply {
                 migrationsAppliedNotice = DbResetPolicy.appliedText
                 onActionFeedback?("Migrations applied", true)
             } else if dbSetupFailedAtStart, !run.singleStep {
                 // The start stays halted until Retry, so the header says what to do.
-                lastError = DbResetPolicy.setUpAfterHaltText
+                postNotice(.dbSetup, DbResetPolicy.setUpAfterHaltText)
             } else if Self.isReset(run.pipeline), !runningPortalIDs.isEmpty {
                 // The portals still hold the old data (sessions, caches).
                 portalRestartNotice = Self.portalRestartText
             }
         } else if let failed {
             let message = failed.errorMessage ?? "unknown error"
-            lastError = run.origin == .emptyDatabaseAtStart
+            postNotice(.dbSetup, run.origin == .emptyDatabaseAtStart
                 ? DbResetPolicy.emptySetupFailedText(step: failed.name, message: message)
-                : "DB setup failed at \(failed.name): \(message)"
+                : "DB setup failed at \(failed.name): \(message)")
             if isApply { migrationApplyError = message }
             // A stop because the hotels cannot be had: the banner offers the way out.
             var notice = HotelCatalog.sourceFailure(
@@ -2940,9 +3198,9 @@ final class EnvironmentSupervisor {
             }
             hotelSourceNotice = notice
             await captureDbSetupFailure(failed, runner: run.runner)
-        } else if let reason = run.reason, lastError == reason {
+        } else if run.reason != nil, notices.notice(.dbSetup) == nil {
             // The run ended with no failed step: it was cancelled between two steps.
-            lastError = Self.dbResetCancelledMessage
+            postNotice(.dbSetup, Self.dbResetCancelledMessage)
         }
         // The automatic callers read the database again themselves.
         if !run.origin.isAutomatic {
@@ -2990,7 +3248,10 @@ final class EnvironmentSupervisor {
     /// Every reset button asks first. The confirmation names the scenario, what
     /// happens to the hotels, and another checkout that built the database.
     func askToResetDatabase() {
-        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return }
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else {
+            showFeedback(ActionFeedback.dbSetupRunning, .info)
+            return
+        }
         let scenario = selectedDbSeedScenario?.name ?? "none selected"
         let cwd = supabaseCwd
         Task {
@@ -3662,6 +3923,7 @@ final class EnvironmentSupervisor {
                 state.phase = .running
                 state.clearCondition()
                 state.progressNote = nil
+                notices.resolve(.service(serviceID))
                 state.lastStarted = clock.date()
                 state.readyAt = clock.date()
                 startBlockedDependents(of: serviceID)
@@ -4043,6 +4305,7 @@ final class EnvironmentSupervisor {
         state.phase = .running
         state.clearCondition()
         state.progressNote = nil
+        notices.resolve(.service(state.id))
         if state.readyAt == nil { state.readyAt = clock.date() }
         startBlockedDependents(of: serviceID)
     }
@@ -4168,9 +4431,10 @@ final class EnvironmentSupervisor {
             // A stop-all or another operation took over after the failure.
             if isShuttingDown || health == .stopped || state.phase == .stopped { return false }
             if state.isCircuitBroken {
-                // The reason is in lastError: a crash loop, or a container runtime that is down.
+                // The reason is in its notice: a crash loop, or a container runtime that is down.
                 throw ServiceError.autoRestartStopped(
-                    lastError ?? "\(state.definition.displayName) keeps failing — auto-restart stopped; see its log"
+                    notices.text(.service(state.id))
+                        ?? "\(state.definition.displayName) keeps failing — auto-restart stopped; see its log"
                 )
             }
             // The supervisor restarts a failed daemon, and the new process can pass this probe.
@@ -4283,8 +4547,8 @@ final class EnvironmentSupervisor {
             // It is not a crash: no notification and no debug issue.
             state.phase = .failed
             state.lastStopped = clock.date()
-            // The header shows the banner only with a text: say which service ended.
-            if owns { lastError = Self.cleanExitMessage(name) }
+            // The header shows the notice only with a text: say which service ended.
+            postNotice(.service(serviceID), Self.cleanExitMessage(name), first: owns)
             recordFailure(serviceID, kind: .cleanExit, ownsBanner: owns)
             Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
                 stream: .stderr, text: "[travel-runner] \(name) exited (code 0) — not restarted"
@@ -4303,10 +4567,8 @@ final class EnvironmentSupervisor {
             recordFailure(serviceID, kind: .killed(signal: signal), ownsBanner: owns)
             // SIGKILL (exit 137) is how macOS ends a process when memory runs low.
             // It gets one notification in each series.
-            if signal == SIGKILL, !state.memoryNotified {
-                state.memoryNotified = true
-                onServiceCrash?(name, 128 + SIGKILL)
-            }
+            let notifiesKill = signal == SIGKILL && !state.memoryNotified
+            if notifiesKill { state.memoryNotified = true }
             let action = restarts ? "restarting it" : "it stays stopped"
             let killed = "\(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))) — \(action)"
             let hint = ServiceTermination.killHint(signal)
@@ -4324,6 +4586,12 @@ final class EnvironmentSupervisor {
             if restarts {
                 scheduleRestart(serviceID: serviceID)
             }
+            // After the schedule: the notification says whether a restart comes.
+            if notifiesKill {
+                let next: CrashAlert.Next = state.isCircuitBroken ? .autoRestartStopped
+                    : restarts && state.phase == .failed ? .restarting(attempt: state.restartCount + 1) : .none
+                alertCrash(state, code: 128 + SIGKILL, next: next)
+            }
 
         case .commandNotRunnable(let code):
             // Exit 126/127: the shell could not run the command. The same command
@@ -4332,21 +4600,21 @@ final class EnvironmentSupervisor {
             state.lastStopped = clock.date()
             let unknown = CommandDiagnosis.Finding.unknown(command: state.definition.cmd.first ?? "its command", code: code)
             let plain = CommandDiagnosis.message(unknown, name: name)
-            if owns { lastError = plain }
+            postNotice(.service(serviceID), plain, first: owns)
             recordFailure(serviceID, kind: .cannotRun(unknown), ownsBanner: owns)
             let record = state.failureRecordCount
             Task {
                 let finding = await commandFinding(forExit: code, pid: termination.pid, of: state)
+                alertCrash(state, code: code, next: .none, cause: CommandDiagnosis.message(finding, name: name))
                 guard finding != unknown else { return }
                 let full = CommandDiagnosis.message(finding, name: name)
                 await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(full)"))
                 // A newer error stays.
-                if owns, lastError == plain { lastError = full }
+                if notices.text(.service(serviceID)) == plain { postNotice(.service(serviceID), full, first: owns) }
                 if state.failureRecordCount == record, state.phase == .failed {
                     recordFailure(serviceID, kind: .cannotRun(finding), ownsBanner: owns)
                 }
             }
-            onServiceCrash?(name, code)
             Task { await captureDebugIssue(
                 trigger: "service_crash",
                 serviceID: serviceID,
@@ -4357,8 +4625,8 @@ final class EnvironmentSupervisor {
             state.phase = .failed
             state.lastStopped = clock.date()
             noteFailure(state, stableFor: stableFor)
-            if !state.isCircuitBroken {
-                onServiceCrash?(name, termination.status)
+            let alerts = !state.isCircuitBroken
+            if alerts {
                 Task { await captureDebugIssue(
                     trigger: "service_crash",
                     serviceID: serviceID,
@@ -4367,6 +4635,12 @@ final class EnvironmentSupervisor {
             }
             if restarts {
                 scheduleRestart(serviceID: serviceID)
+            }
+            // After the schedule: the notification says whether a restart comes.
+            if alerts {
+                let next: CrashAlert.Next = state.isCircuitBroken ? .autoRestartStopped
+                    : restarts && state.phase == .failed ? .restarting(attempt: state.restartCount + 1) : .none
+                alertCrash(state, code: termination.status, next: next)
             }
             // A tripped breaker recorded its own reason.
             if state.phase == .failed, !state.isCircuitBroken {
@@ -4403,7 +4677,7 @@ final class EnvironmentSupervisor {
         case .crashLoop:
             state.haltReason = .crashLoop
             let tripped = "\(name) failed \(AutoRestart.failuresToTrip) times in a minute — auto-restart stopped"
-            lastError = tripped
+            postNotice(.service(serviceID), tripped)
             recordFailure(serviceID, kind: .crashLoop)
             Task { await recordDebugEvent(kind: "breaker_trip", serviceID: serviceID, message: tripped) }
             Task { await captureDebugIssue(
@@ -4418,13 +4692,13 @@ final class EnvironmentSupervisor {
             let times = state.killTimestamps.count
             state.haltReason = .killedRepeatedly(signal: signal, times: times)
             let tripped = "Something else keeps stopping \(name) (\(ServiceTermination.signalName(signal)) \(times) times) — auto-restart stopped"
-            lastError = tripped
+            postNotice(.service(serviceID), tripped)
             recordFailure(serviceID, kind: .killedRepeatedly(signal: signal, times: times))
             Task { await recordDebugEvent(kind: "breaker_trip", serviceID: serviceID, message: tripped) }
             return
         case .exhausted:
             state.haltReason = .exhausted(restarts: AutoRestart.maxRestarts)
-            lastError = "\(name) did not come back after \(AutoRestart.maxRestarts) restarts — auto-restart stopped"
+            postNotice(.service(serviceID), "\(name) did not come back after \(AutoRestart.maxRestarts) restarts — auto-restart stopped")
             recordFailure(serviceID, kind: .exhausted(restarts: AutoRestart.maxRestarts))
             Task { await recordDebugEvent(
                 kind: "breaker_trip", serviceID: serviceID,
@@ -4459,7 +4733,7 @@ final class EnvironmentSupervisor {
                 ))
                 guard await ContainerRuntime.ensureRunning(shell: shell, clock: clock) else {
                     state.haltReason = .runtimeDown(runtime: runtime.displayName, waiting: true)
-                    lastError = Self.runtimeWaitText(runtime, name)
+                    postNotice(.service(serviceID), Self.runtimeWaitText(runtime, name))
                     recordFailure(serviceID, kind: .runtimeDown(waiting: true))
                     await recordDebugEvent(
                         kind: "breaker_trip", serviceID: serviceID,
@@ -4505,15 +4779,15 @@ final class EnvironmentSupervisor {
                 await logStore.append(serviceID: serviceID, entry: LogEntry(
                     stream: .stdout, text: "[travel-runner] \(runtime.displayName) is back — starting \(name)"
                 ))
-                if lastError == Self.runtimeWaitText(runtime, name) { lastError = nil }
+                notices.resolve(.service(serviceID), ifText: Self.runtimeWaitText(runtime, name))
                 restartService(serviceID)
                 return
             }
             // It did not come back: the row stops saying that it waits.
             guard waiting() else { return }
             state.haltReason = .runtimeDown(runtime: runtime.displayName, waiting: false)
-            if lastError == Self.runtimeWaitText(runtime, name) {
-                lastError = "\(runtime.displayName) is not running — open \(runtime.appName), then restart \(name)"
+            if notices.text(.service(serviceID)) == Self.runtimeWaitText(runtime, name) {
+                postNotice(.service(serviceID), "\(runtime.displayName) is not running — open \(runtime.appName), then restart \(name)")
             }
             recordFailure(serviceID, kind: .runtimeDown(waiting: false))
             await logStore.append(serviceID: serviceID, entry: LogEntry(
@@ -5147,6 +5421,25 @@ final class EnvironmentSupervisor {
         return await tracker.issueFolderPath(id: id, status: status)
     }
 
+    /// "Copy Diagnostics Bundle": the snapshot and the last
+    /// `DiagnosticsBundle.maxLogLines` lines of each failed service and DB step,
+    /// redacted, as JSON.
+    func diagnosticsBundleJSON(home: String = NSHomeDirectory()) async -> String {
+        let snapshot = await diagnosticsSnapshot(home: home)
+        var logs: [String: [LogEntry]] = [:]
+        for id in DiagnosticsBundle.failedLogIDs(in: snapshot) {
+            logs[id] = await logStore.entries(for: id)
+        }
+        return DiagnosticsBundle.make(
+            snapshot: snapshot,
+            redactor: makeRedactor(),
+            logs: logs,
+            rootCause: rootCauseDescription,
+            controlAPIError: controlAPIError,
+            configIssues: configIssues
+        ).json()
+    }
+
     // MARK: - Problem report
 
     /// Saves the problem report to Downloads (`ReportExporter`): the snapshot of
@@ -5631,12 +5924,12 @@ final class EnvironmentSupervisor {
         let origin: DbSetupOrigin
         switch decision {
         case .blocked(let message):
-            lastError = message
+            postNotice(.dbSetup, message)
             return .notRun
         case .none, .offerMigrate, .offerReset:
             return .notRun
         case .autoSetup:
-            reason = "Empty database detected — running db:reset..."
+            reason = Self.emptyDatabaseProgressText(scenario: selectedDbSeedScenario?.name ?? selectedDbSeedScenarioID)
             origin = atStart ? .emptyDatabaseAtStart : .emptyDatabase
         case .autoReset:
             let count = migrations.map { $0.missing.count + $0.extra.count } ?? 0
@@ -5680,6 +5973,11 @@ final class EnvironmentSupervisor {
         )
     }
 
+    /// The progress notice of the setup of an empty database.
+    nonisolated static func emptyDatabaseProgressText(scenario: String?) -> String {
+        "Empty database — running the reset now" + (scenario.map { " (seed: \($0))" } ?? "")
+    }
+
     /// A query that hangs counts as a failed query, never as an empty database.
     nonisolated static let databaseQueryTimeout: Duration = .seconds(20)
 
@@ -5687,11 +5985,11 @@ final class EnvironmentSupervisor {
         "The database reset stopped before it finished. Open DB Tools and click Reset Database to run it again."
 
     /// A pipeline for the manifest profile with the selected seed scenario, or nil (and
-    /// `lastError` set) when no valid scenario is selected.
+    /// a db-setup notice) when no valid scenario is selected.
     private func makeDbSetupPipeline(cwd: String, profile: String) -> DbSetupPipeline? {
         if let dbPipelineFactory {
             guard let pipeline = dbPipelineFactory(cwd, profile) else {
-                lastError = "No DB setup pipeline for the profile \(profile)."
+                postNotice(.dbSetup, "No DB setup pipeline for the profile \(profile).")
                 return nil
             }
             return pipeline
@@ -5701,12 +5999,12 @@ final class EnvironmentSupervisor {
         // and a reset without hotels must not load them.
         if profile == DbResetPolicy.migrateProfile,
            DbManifestLoader.profileNames(from: manifestPath)?.contains(profile) != true {
-            lastError = DbResetPolicy.noMigrateProfileText
+            postNotice(.dbSetup, DbResetPolicy.noMigrateProfileText)
             return nil
         }
         if profile == HotelCatalog.withoutHotelsProfile,
            DbManifestLoader.profileNames(from: manifestPath)?.contains(profile) != true {
-            lastError = HotelCatalog.noWithoutHotelsProfileText
+            postNotice(.dbSetup, HotelCatalog.noWithoutHotelsProfileText)
             return nil
         }
         reloadDbSeedScenarios()
@@ -5714,8 +6012,8 @@ final class EnvironmentSupervisor {
         let scenario = selectedDbSeedScenario
             ?? (profile == DbResetPolicy.migrateProfile ? DbResetPolicy.noScenario : nil)
         guard let seedScenario = scenario else {
-            lastError = dbSeedScenarioLoadError
-                ?? "Choose a valid seed scenario before resetting the database."
+            postNotice(.dbSetup, dbSeedScenarioLoadError
+                ?? "Choose a valid seed scenario before resetting the database.")
             return nil
         }
         // A bad manifest or a profile it lacks runs nothing. Only a checkout with no
@@ -5724,7 +6022,7 @@ final class EnvironmentSupervisor {
         do {
             steps = try DbManifestLoader.load(from: manifestPath, profile: profile)
         } catch {
-            lastError = error.localizedDescription
+            postNotice(.dbSetup, error.localizedDescription)
             return nil
         }
         let pipeline = DbSetupPipeline(profile: profile, seedScenario: seedScenario)

@@ -44,6 +44,22 @@ extension CommandRunning {
     }
 }
 
+/// Runs each command with the runner that `current` gives at that moment, so a
+/// long-lived checker follows a runner that tests replace.
+struct CurrentShell: CommandRunning {
+    let current: @Sendable () async -> any CommandRunning
+
+    func run(
+        _ command: String,
+        cwd: String?,
+        environment: [String: String],
+        timeout: Duration,
+        onLine: (@Sendable (_ line: String, _ stream: LogEntry.Stream) -> Void)?
+    ) async -> CommandResult {
+        await current().run(command, cwd: cwd, environment: environment, timeout: timeout, onLine: onLine)
+    }
+}
+
 /// A command in a login shell (`zsh -l -c`) with the PATH of `ToolEnvironment`.
 struct LoginShell: CommandRunning {
     var tools: ToolEnvironment = .shared

@@ -192,6 +192,12 @@ enum FailureAdvisor {
         return nil
     }
 
+    /// The cause of a crash in one line, for its notification: the cause with one
+    /// fix, or the line of the log that says why. Nil when the log shows none.
+    static func cause(_ context: Context) -> String? {
+        logCause(context)?.headline ?? context.likelyCause
+    }
+
     /// What `CommandDiagnosis` finds in the log, when it is the cause that the
     /// advisor names. pnpm ends with 1, not 127, when the packages or the script
     /// are missing. A down container runtime and a taken port come first.
@@ -225,7 +231,7 @@ enum FailureAdvisor {
     }
 
     /// Ends a cause with a full stop, unless it has one.
-    private static func sentence(_ text: String) -> String {
+    static func sentence(_ text: String) -> String {
         guard let last = text.last else { return text }
         return ".!?…".contains(last) ? text : text + "."
     }

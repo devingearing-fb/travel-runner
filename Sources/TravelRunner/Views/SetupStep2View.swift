@@ -4,6 +4,9 @@ struct SetupStep2View: View {
     let checker: EnvironmentChecker
     /// True in the first run, where the end of the wizard starts the stack.
     var startsOnComplete = true
+    /// True in Health: the list only, without the header and the buttons of the
+    /// wizard. The checks run when they have not run yet; Re-check All runs them again.
+    var embedded = false
     let onBack: () -> Void
     /// The argument is true when the stack must start.
     let onComplete: (_ start: Bool) -> Void
@@ -13,22 +16,24 @@ struct SetupStep2View: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Header
-            HStack {
-                Image(systemName: "checkmark.shield")
-                    .font(.title2)
-                    .foregroundStyle(.green)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Environment Check")
-                        .font(.headline)
-                    Text("Verifying everything needed for local development")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+            if !embedded {
+                HStack {
+                    Image(systemName: "checkmark.shield")
+                        .font(.title2)
+                        .foregroundStyle(.green)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Environment Check")
+                            .font(.headline)
+                        Text("Verifying everything needed for local development")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
                 }
-                Spacer()
-            }
-            .padding(14)
+                .padding(14)
 
-            Divider()
+                Divider()
+            }
 
             // Summary bar
             summaryBar
@@ -53,34 +58,36 @@ struct SetupStep2View: View {
                 .padding(14)
             }
 
-            Divider()
+            if !embedded {
+                Divider()
 
-            // Footer
-            HStack {
-                Button("Back") { onBack() }
-                    .buttonStyle(.bordered)
-                    .controlSize(.regular)
-                Spacer()
-                // Only a required check decides. The way out is never disabled: a check that hangs
-                // or a long fix must not hold the wizard.
-                if checker.canFinish {
-                    if startsOnComplete {
-                        Button("Save without starting") { onComplete(false) }
+                // Footer
+                HStack {
+                    Button("Back") { onBack() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                    Spacer()
+                    // Only a required check decides. The way out is never disabled: a check that hangs
+                    // or a long fix must not hold the wizard.
+                    if checker.canFinish {
+                        if startsOnComplete {
+                            Button("Save without starting") { onComplete(false) }
+                                .buttonStyle(.bordered)
+                                .controlSize(.regular)
+                        }
+                        Button(action: { onComplete(startsOnComplete) }) {
+                            Label(startsOnComplete ? "Save & Start" : "Save", systemImage: "checkmark.circle")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.regular)
+                    } else {
+                        Button("Continue anyway…") { confirmContinue = true }
                             .buttonStyle(.bordered)
                             .controlSize(.regular)
                     }
-                    Button(action: { onComplete(startsOnComplete) }) {
-                        Label(startsOnComplete ? "Save & Start" : "Save", systemImage: "checkmark.circle")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.regular)
-                } else {
-                    Button("Continue anyway…") { confirmContinue = true }
-                        .buttonStyle(.bordered)
-                        .controlSize(.regular)
                 }
+                .padding(14)
             }
-            .padding(14)
         }
         .alert(checker.blockers.isEmpty ? "Continue before the checks finish?" : "Continue with failed checks?",
                isPresented: $confirmContinue) {
@@ -93,8 +100,13 @@ struct SetupStep2View: View {
             Text(EnvironmentChecker.impactLines(for: checker.unresolved).joined(separator: "\n"))
         }
         .task {
-            checker.buildChecks()
-            await checker.runAllChecks()
+            if embedded {
+                // Health shares its checks with the preflight: they are built already.
+                if checker.lastRunAt == nil { await checker.runAllChecks() }
+            } else {
+                checker.buildChecks()
+                await checker.runAllChecks()
+            }
         }
         .sheet(item: Binding(
             get: { checker.activeFix },

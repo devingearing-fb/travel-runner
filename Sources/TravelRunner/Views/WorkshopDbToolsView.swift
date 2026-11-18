@@ -21,15 +21,7 @@ struct WorkshopDbToolsView: View {
             VStack(alignment: .leading, spacing: 16) {
                 sectionHeader("Database Mode")
 
-                Picker("Mode", selection: Binding(
-                    get: { supervisor.dbMode },
-                    set: { _ in supervisor.toggleDatabaseMode() }
-                )) {
-                    Text("Local").tag(EnvironmentSupervisor.DatabaseMode.local)
-                    Text("Dev").tag(EnvironmentSupervisor.DatabaseMode.remote)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 200)
+                DatabaseModeControl(style: .segmented(width: 200))
 
                 Divider()
 
@@ -55,6 +47,13 @@ struct WorkshopDbToolsView: View {
                 Divider()
 
                 sectionHeader("Actions")
+
+                if supervisor.dbMode == .remote {
+                    Label(EnvironmentSupervisor.dbToolsDevCaption, systemImage: "info.circle")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 12) {

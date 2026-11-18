@@ -19,6 +19,18 @@ struct WorkshopStatusView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 8) {
+                // The header shows the newest few; this lists them all.
+                if supervisor.notices.header.more > 0 {
+                    noticesSection
+                }
+
+                let setupItems = supervisor.setupItemsNeedingAttention.count
+                if setupItems > 0 {
+                    HealthAttentionBanner(count: setupItems) {
+                        WorkshopPanel.shared.open(section: .health)
+                    }
+                }
+
                 ForEach(failedServices) { state in
                     TriageCard(
                         state: state,
@@ -76,6 +88,10 @@ struct WorkshopStatusView: View {
                         )
                     }
                 }
+
+                if !supervisor.recentActivity.entries.isEmpty {
+                    recentActivitySection
+                }
             }
             .padding(16)
         }
@@ -93,60 +109,83 @@ struct WorkshopStatusView: View {
         }
     }
 
-    private var preflightSection: some View {
-        DisclosureGroup("Preflight Checks", isExpanded: $preflightExpanded) {
-            ForEach(supervisor.preflightChecks) { check in
-                HStack(spacing: 8) {
-                    Group {
-                        switch check.result {
-                        case .pending:
-                            ProgressView().controlSize(.small)
-                        case .passed:
-                            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                        case .warning:
-                            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                        case .failed:
-                            Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
-                        }
-                    }
-                    .frame(width: 16)
-
+    private var noticesSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Notices")
+                .font(.caption)
+                .fontWeight(.medium)
+            ForEach(supervisor.notices.all) { notice in
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: notice.severity == .error ? "exclamationmark.triangle.fill" : "info.circle.fill")
+                        .foregroundStyle(notice.severity == .error ? .red : .blue)
+                        .frame(width: 16)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(check.name)
+                        Text(notice.text)
                             .font(.caption)
-                        if case .warning(let message) = check.result {
-                            Text(message)
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                        }
-                        if case .failed(let message, let fix) = check.result {
-                            Text(message)
-                                .font(.caption2)
-                                .foregroundStyle(.red)
-                            if let fix {
-                                Text("Fix: \(fix)")
-                                    .font(.caption2)
-                                    .foregroundStyle(.orange)
-                            }
-                        }
-                    }
-
-                    Spacer()
-
-                    if case .passed(let detail) = check.result {
-                        Text(detail)
+                            .textSelection(.enabled)
+                        Text(notice.since, style: .relative)
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
+                    Spacer()
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(notice.text, forType: .string)
+                    } label: {
+                        Image(systemName: "doc.on.doc").font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Copy the text")
+                    Button {
+                        supervisor.dismissNotice(notice.key)
+                    } label: {
+                        Image(systemName: "xmark").font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
                 }
-                .padding(.vertical, 4)
-                .padding(.horizontal, 6)
-                .background {
-                    if case .failed = check.result {
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(Color.red.opacity(0.08))
+            }
+        }
+        .padding(10)
+        .background(Color.secondary.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    /// The toasts and the crashes of this run: a toast that went by can be read here.
+    private var recentActivitySection: some View {
+        DisclosureGroup("Recent activity") {
+            ForEach(supervisor.recentActivity.entries) { entry in
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: entry.style.icon)
+                        .foregroundStyle(entry.style.color)
+                        .frame(width: 16)
+                    Text(entry.message)
+                        .font(.caption)
+                        .textSelection(.enabled)
+                    Spacer()
+                    Text(entry.at, style: .time)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if let serviceID = entry.serviceID {
+                        Button {
+                            WorkshopPanel.shared.navigation.selectedLogServiceID = serviceID
+                            WorkshopPanel.shared.open(section: .logs)
+                        } label: {
+                            Image(systemName: "terminal").font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Open the log")
                     }
                 }
+            }
+        }
+        .font(.caption)
+    }
+
+    private var preflightSection: some View {
+        DisclosureGroup("Preflight Checks", isExpanded: $preflightExpanded) {
+            ForEach(supervisor.preflightChecks) { check in
+                PreflightCheckRow(check: check)
             }
         }
         .font(.caption)

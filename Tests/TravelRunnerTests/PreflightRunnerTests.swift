@@ -53,49 +53,145 @@ final class PreflightRunnerTests: XCTestCase {
         return url.path
     }
 
-    // MARK: - Node
+    // MARK: - The checks of the registry
 
-    /// nvm, fnm and Volta put Node on the PATH only for some shells. The check runs
-    /// in the cwd of the booking portal, where its `.nvmrc` is.
+    /// A checker of Health for a checkout in the folder of the test, or without a
+    /// checkout. Its commands go to `shell`, and it reads no tool of this Mac.
+    private func environment(_ shell: FakeCommandRunner, monorepo: String? = nil, login: String? = nil) -> EnvironmentChecker {
+        let checker = EnvironmentChecker(
+            monorepoPath: monorepo ?? "",
+            loginPath: login ?? "",
+            streamServicesPath: "",
+            flavor: .standard, shell: shell, tools: ToolEnvironment(home: "/nonexistent/home")
+        )
+        checker.buildChecks()
+        return checker
+    }
+
+    /// The preflight with the checks of the registry, and the shell of both.
+    private func preflight(_ answers: [String: CommandResult], profile: RunProfile = .both, monorepo: String? = nil, login: String? = nil)
+        -> (PreflightRunner, FakeCommandRunner, EnvironmentChecker) {
+        let (runner, shell) = runner(answers)
+        var preflight = runner
+        let checker = environment(shell, monorepo: monorepo, login: login)
+        preflight.environment = checker
+        preflight.profile = profile
+        return (preflight, shell, checker)
+    }
+
+    /// One Node check: the Node row of Health. nvm, fnm and Volta put Node on the
+    /// PATH only for some shells; the check runs in the monorepo, where its `.nvmrc` is.
+    /// The threshold is `engines.node` of the monorepo, here 22.
     func testTheNodeCheckForEachAnswerOfNode() async throws {
-        let portal = try folder("apps/booking-portal")
-        let check = PreflightRunner().allChecks(for: [service("travel-portal", cwd: portal)])
-            .first { $0.id == "node-version" }!
-        let install = "Install Node 22 via nvm or brew"
+        let monorepo = try folder("mono")
+        try #"{"engines":{"node":">=22"}}"#.write(toFile: (monorepo as NSString).appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+        let fix = "Open Health → How to install"
         let rows: [(name: String, answer: CommandResult, expected: String)] = [
             ("Node 22", FakeCommandRunner.ok("v22.3.0\n"), "passed: v22.3.0"),
             ("a newer Node", FakeCommandRunner.ok("v24.11.1\n"), "passed: v24.11.1"),
             ("a login profile that prints first", FakeCommandRunner.ok("Now using node v22.3.0 (npm v10.8.1)\nv22.3.0\n"),
              "passed: v22.3.0"),
-            ("Node 20", FakeCommandRunner.ok("v20.11.1\n"), "warning: v20.11.1 — recommend v22+"),
-            ("Node 16", FakeCommandRunner.ok("v16.20.2\n"), "failed: v16.20.2 — require v18+ | fix: \(install)"),
+            // The wizard said "need 22+" and the preflight let Node 20 start: one threshold now.
+            ("Node 20", FakeCommandRunner.ok("v20.11.1\n"), "failed: v20.11.1 — need 22+ | fix: \(fix)"),
+            ("Node 16", FakeCommandRunner.ok("v16.20.2\n"), "failed: v16.20.2 — need 22+ | fix: \(fix)"),
             ("no Node on the PATH of the shell", FakeCommandRunner.failed(127, stderr: "zsh:1: command not found: node"),
-             "failed: Node.js not found | fix: \(install)"),
+             "failed: Node.js not found | fix: \(fix)"),
             ("a Node that prints no version", FakeCommandRunner.ok("nvm: N/A version is not installed\n"),
-             "failed: node --version printed no version: nvm: N/A version is not installed | fix: Run node --version in the portal folder"),
+             "failed: node --version printed no version: nvm: N/A version is not installed | fix: \(fix)"),
             ("a Node that prints nothing", FakeCommandRunner.ok(""),
-             "failed: Node.js not found | fix: \(install)"),
+             "failed: Node.js not found | fix: \(fix)"),
+            // A hang tries once more with the limit of Health before it fails the start.
             ("a Node that hangs", FakeCommandRunner.timedOut,
-             "failed: node --version did not answer in 15 s | fix: Run node --version in a terminal to see what it waits for"),
+             "failed: node --version did not answer in 20 s | fix: \(fix)"),
         ]
         for row in rows {
-            let (preflight, shell) = runner(["node --version": row.answer])
+            let (preflight, shell, checker) = self.preflight(["node --version": row.answer], monorepo: monorepo)
+            let check = try XCTUnwrap(preflight.allChecks(for: []).first { $0.id == "node" }, row.name)
             let result = await preflight.run(check: check)
             XCTAssertEqual(describe(result), row.expected, row.name)
-            XCTAssertEqual(shell.calls.map(\.cwd), [portal], row.name)
-            XCTAssertEqual(shell.calls.map(\.timeout), [PreflightRunner.checkTimeout], row.name)
+            let limits = row.answer.timedOut
+                ? [CheckRegistry.preflightLimit, EnvironmentChecker.checkTimeout] : [CheckRegistry.preflightLimit]
+            XCTAssertEqual(shell.calls.map(\.cwd), limits.map { _ in monorepo }, row.name)
+            XCTAssertEqual(shell.calls.map(\.timeout), limits, row.name)
+            // The Health row shows the same result.
+            let health = checker.checks.first { $0.id == "node" }?.status
+            XCTAssertEqual(health.map { CheckRegistry.preflightResult($0, severity: .blocksStart, fixLabel: "How to install") }.map(describe),
+                           row.expected, row.name)
         }
     }
 
-    /// A portal folder that is not there is not the cwd of the command: the
-    /// folder check reports it, and Node is still asked.
-    func testTheNodeCheckOfAMissingFolderRunsWithoutACwd() async {
-        let check = PreflightRunner().allChecks(for: [service("travel-portal", cwd: workDir.appendingPathComponent("gone").path)])
-            .first { $0.id == "node-version" }!
-        let (preflight, shell) = runner(["node --version": FakeCommandRunner.ok("v22.3.0\n")])
-        let result = await preflight.run(check: check)
-        XCTAssertEqual(describe(result), "passed: v22.3.0")
-        XCTAssertEqual(shell.calls.map(\.cwd), [nil])
+    /// The preflight runs the fast checks of the registry that the setup needs,
+    /// for the profile. A check that asks the network, an optional check, and a
+    /// check that the preflight runs as its own start step are left out.
+    func testThePreflightTakesTheFastChecksOfTheRegistry() throws {
+        let monorepo = try folder("mono")
+        let login = try folder("login")
+        let (preflight, _, checker) = self.preflight([:], monorepo: monorepo, login: login)
+
+        let ids = preflight.allChecks(for: []).map(\.id)
+
+        XCTAssertEqual(ids, ["node", "workspace-modules", "login-modules", "login-env", "docker"])
+        for id in ["pnpm", "registry-auth", "stripe-auth", "booking-env", "partner-env", "hotel-data"] {
+            XCTAssertEqual(checker.checks.first { $0.id == id }?.cost, .slow, id)
+            XCTAssertFalse(ids.contains(id), id)
+        }
+        // Negative control: without the registry the preflight has only its own steps.
+        XCTAssertEqual(PreflightRunner().allChecks(for: []).map(\.id), ["docker"])
+    }
+
+    /// Only a check that blocks the start fails the preflight. Packages that are
+    /// not installed warn: the start installs them.
+    func testOnlyACheckThatBlocksTheStartFailsThePreflight() async throws {
+        let monorepo = try folder("mono")
+        let login = try folder("login")
+        let (preflight, _, _) = self.preflight(["node --version": FakeCommandRunner.ok("v22.3.0\n")], monorepo: monorepo, login: login)
+        let checks = preflight.allChecks(for: [])
+
+        await preflight.runAll(checks)
+
+        let results = Dictionary(uniqueKeysWithValues: checks.map { ($0.id, describe($0.result)) })
+        XCTAssertEqual(results["node"], "passed: v22.3.0")
+        XCTAssertEqual(results["workspace-modules"], "warning: Run pnpm install at the monorepo root")
+        XCTAssertEqual(results["login-modules"], "warning: Run npm install")
+        XCTAssertEqual(results["login-env"], "warning: Missing")
+    }
+
+    /// The checks run in parallel: the Node check waits for the container runtime
+    /// step, which a run one by one would start only after it.
+    func testThePreflightChecksRunInParallel() async throws {
+        let dockerAsked = Gate()
+        let shell = FakeCommandRunner { call in
+            if call.command.hasPrefix("docker ps") {
+                await dockerAsked.open()
+                return FakeCommandRunner.ok()
+            }
+            if call.command == "node --version" {
+                await dockerAsked.wait()
+                return FakeCommandRunner.ok("v22.3.0\n")
+            }
+            return FakeCommandRunner.ok()
+        }
+        var preflight = PreflightRunner(shell: shell, clock: FakeClock().clock)
+        preflight.environment = environment(shell)
+        let checks = preflight.allChecks(for: [])
+        XCTAssertEqual(checks.map(\.id), ["node", "docker"], "Node comes first")
+
+        let ran = Task { await preflight.runAll(checks) }
+        let finished = await waitUntil(5) { checks.allSatisfy { if case .pending = $0.result { false } else { true } } }
+        if !finished { await dockerAsked.open() }
+        await ran.value
+
+        XCTAssertTrue(finished, "the Node check waited for a step that never ran")
+        XCTAssertTrue(checks.allSatisfy { $0.result.isPassed }, "\(checks.map { describe($0.result) })")
+    }
+
+    private func waitUntil(_ seconds: Double, _ condition: @MainActor () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return condition()
     }
 
     // MARK: - Container runtime
@@ -120,83 +216,6 @@ final class PreflightRunnerTests: XCTestCase {
             let result = await preflight.run(check: PreflightCheck(id: "docker", name: runtime.displayName))
             XCTAssertEqual(describe(result), row.expected, row.name)
             XCTAssertEqual(shell.commands.filter { $0.hasPrefix("open -a") }.count, row.opened, row.name)
-        }
-    }
-
-    // MARK: - Stripe
-
-    /// Stripe is optional: no row blocks the start. The test key goes to the CLI
-    /// in its environment, never in the command.
-    func testTheStripeCheckForEachKeyAndAnswer() async throws {
-        let withKey = try folder("key/apps/booking-portal")
-        let key = "sk_test_madeUpForThePreflightTests"
-        try "STRIPE_SECRET_KEY=\(key)\n".write(toFile: (withKey as NSString).appendingPathComponent(".env"), atomically: true, encoding: .utf8)
-        let withoutKey = try folder("nokey/apps/booking-portal")
-        let skipped = "Stripe will be skipped"
-
-        let rows: [(name: String, portal: String, installed: Bool, auth: CommandResult, expected: String)] = [
-            ("no Stripe CLI", withKey, false, FakeCommandRunner.ok(),
-             "warning: Not installed — \(skipped); run: brew install stripe/stripe-cli/stripe"),
-            ("the test key works", withKey, true, FakeCommandRunner.ok(), "passed: Test key from apps/booking-portal/.env"),
-            ("Stripe rejects the test key", withKey, true, FakeCommandRunner.failed(1, stderr: "Request failed, status=401"),
-             "warning: Stripe rejected STRIPE_SECRET_KEY from apps/booking-portal/.env — \(skipped); import a current .env"),
-            ("no network", withKey, true, FakeCommandRunner.failed(1, stderr: "dial tcp: lookup api.stripe.com: no such host"),
-             "warning: No network, or Stripe did not answer — Stripe reconnects when the network is back"),
-            ("no key, and the login works", withoutKey, true, FakeCommandRunner.ok(), "passed: Authenticated"),
-            ("no key, and the login expired", withoutKey, true, FakeCommandRunner.failed(1, stderr: "error: api_key_expired"),
-             "warning: Session invalid or expired — \(skipped); run: stripe login"),
-            ("a failure with no known line", withKey, true, FakeCommandRunner.failed(1, stderr: "Request failed, status=503"),
-             "warning: Stripe could not be checked — the runner tries again after the start"),
-            ("Stripe does not answer", withKey, true, FakeCommandRunner.timedOut,
-             "warning: No network, or Stripe did not answer — Stripe reconnects when the network is back"),
-        ]
-        for row in rows {
-            let check = PreflightRunner().allChecks(for: [service("travel-portal", cwd: row.portal), service("stripe", cwd: row.portal)])
-                .first { $0.id == "stripe-auth" }!
-            let (preflight, shell) = runner([
-                "which stripe": row.installed ? FakeCommandRunner.ok() : FakeCommandRunner.failed(1),
-                StripeLauncher.authCheckCommand: row.auth,
-            ])
-            let result = await preflight.run(check: check)
-            XCTAssertEqual(describe(result), row.expected, row.name)
-            XCTAssertFalse(result.isFailed, row.name)
-            XCTAssertFalse(shell.commands.contains { $0.contains(key) }, row.name)
-            let auth = shell.calls.first { $0.command == StripeLauncher.authCheckCommand }
-            XCTAssertEqual(auth?.environment[StripeLauncher.apiKeyVariable], row.installed && row.portal == withKey ? key : nil, row.name)
-        }
-    }
-
-    // MARK: - Shared env files
-
-    /// A missing or stale shared `.env` warns: local mode runs without it.
-    func testTheSharedEnvCheckForEachReportOfTheScript() async throws {
-        let monorepo = try folder("mono")
-        let portal = try folder("mono/apps/booking-portal")
-        let recorded = try String(
-            contentsOf: MonolithCheckout.snapshot.appendingPathComponent("recorded/env-check-booking.json"), encoding: .utf8
-        )
-        func report(exists: Bool, missing: [String] = []) -> String {
-            let names = missing.map { "\"\($0)\"" }.joined(separator: ",")
-            let ok = exists && missing.isEmpty
-            return #"{"version":1,"ok":\#(ok),"apps":[{"app":"booking","dir":"apps/booking-portal","envFile":"x","exists":\#(exists),"shared":21,"missing":[\#(names)],"blank":[],"shadowed":[],"ok":\#(ok)}]}"#
-        }
-        let rows: [(name: String, output: String, expected: String)] = [
-            ("a complete file", report(exists: true), "passed: All 21 shared keys"),
-            ("no file", report(exists: false),
-             "warning: Missing — import the shared file. Local mode runs without it; remote mode needs it"),
-            ("an old copy (the recorded output of the script)", recorded,
-             "warning: Out of date: 20 of 21 shared keys missing (AMATEUR_SUPABASE_URL, AMATEUR_SUPABASE_ANON_KEY, AMATEUR_SUPABASE_SIGNING_KEY +17 more) — import a fresh copy"),
-            ("a checkout without the script", "node:internal/modules/cjs/loader: Cannot find module",
-             "warning: Could not run scripts/env-check.mjs — pull the latest monorepo dev"),
-        ]
-        let check = PreflightRunner().allChecks(for: [service("travel-portal", cwd: portal)])
-            .first { $0.id == "env-diff-travel-portal" }!
-        for row in rows {
-            let (preflight, shell) = runner(["node ": FakeCommandRunner.ok(row.output)])
-            let result = await preflight.run(check: check)
-            XCTAssertEqual(describe(result), row.expected, row.name)
-            XCTAssertEqual(shell.calls.map(\.command), [SharedEnvFiles.command(monorepo: monorepo, app: .booking)], row.name)
-            XCTAssertEqual(shell.calls.map(\.cwd), [monorepo], row.name)
         }
     }
 
@@ -260,26 +279,21 @@ final class PreflightRunnerTests: XCTestCase {
             // A service of an optional repo that is there keeps its port check.
             service("cache-apply-transport", cwd: monorepo, port: 3007),
         ]
+        let (preflight, _, _) = self.preflight([:])
 
-        let checks = PreflightRunner().allChecks(for: services)
+        let checks = preflight.allChecks(for: services)
 
+        // Without a checkout only the Node check of the registry applies.
         XCTAssertEqual(checks.map(\.id), [
-            "docker", "node-version", "stripe-auth", "env-diff-travel-portal", "env-diff-partner-portal",
+            "node", "docker",
             "port-3002", "port-3003", "port-3007", "port-3010", "port-54322",
             "dir-mono", "dir-booking-portal", "dir-partner-portal",
         ])
-        XCTAssertEqual(checks.first { $0.id == "node-version" }?.metadata["cwd"], booking)
-        XCTAssertEqual(checks.first { $0.id == "stripe-auth" }?.metadata["cwd"], booking)
         // /api/preflight runs only the checks that change nothing.
-        XCTAssertEqual(PreflightRunner().readOnlyChecks(for: services).map(\.id), [
-            "node-version", "port-3002", "port-3003", "port-3007", "port-3010", "port-54322",
+        XCTAssertEqual(preflight.readOnlyChecks(for: services).map(\.id), [
+            "node", "port-3002", "port-3003", "port-3007", "port-3010", "port-54322",
             "dir-mono", "dir-booking-portal", "dir-partner-portal",
         ])
-        // Without a portal Node is asked in the first folder of the stack.
-        XCTAssertEqual(
-            PreflightRunner().allChecks(for: [service("supabase", cwd: monorepo)]).first { $0.id == "node-version" }?.metadata["cwd"],
-            monorepo
-        )
     }
 
     // MARK: - Sockets of the test

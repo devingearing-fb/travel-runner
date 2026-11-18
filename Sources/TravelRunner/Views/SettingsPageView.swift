@@ -66,19 +66,7 @@ struct SettingsPageView: View {
                         Label("Database", systemImage: "cylinder")
                             .font(.system(.caption, design: .monospaced))
                         Spacer()
-                        if supervisor.actionsInFlight.contains("db-mode") {
-                            ProgressView().controlSize(.small)
-                        }
-                        Picker("", selection: Binding(
-                            get: { supervisor.dbMode },
-                            set: { _ in supervisor.toggleDatabaseMode() }
-                        )) {
-                            Text("Local").tag(EnvironmentSupervisor.DatabaseMode.local)
-                            Text("Dev").tag(EnvironmentSupervisor.DatabaseMode.remote)
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(width: 120)
-                        .disabled(supervisor.actionsInFlight.contains("db-mode"))
+                        DatabaseModeControl(style: .segmented(width: 120))
                     }
                 }
 

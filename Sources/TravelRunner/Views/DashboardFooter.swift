@@ -37,24 +37,7 @@ struct DashboardFooter: View {
 
             Spacer()
 
-            Menu {
-                Button("Local Database") { supervisor.toggleDatabaseMode() }
-                    .disabled(supervisor.dbMode == .local)
-                Button("Dev Database") { supervisor.toggleDatabaseMode() }
-                    .disabled(supervisor.dbMode == .remote)
-            } label: {
-                HStack(spacing: 3) {
-                    Image(systemName: supervisor.dbMode == .local ? "externaldrive" : "cloud")
-                        .font(.system(size: 8))
-                    Text("DB: \(supervisor.dbMode == .local ? "local" : "dev")")
-                        .font(.system(.caption2, design: .monospaced))
-                }
-                .padding(.horizontal, 5)
-                .padding(.vertical, 2)
-                .background(supervisor.dbMode == .remote ? Color.purple.opacity(0.2) : Color.secondary.opacity(0.1))
-                .clipShape(RoundedRectangle(cornerRadius: 3))
-            }
-            .menuStyle(.borderlessButton)
+            DatabaseModeControl(style: .menu)
 
             Button {
                 supervisor.toggleNetworkMode()

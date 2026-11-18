@@ -150,15 +150,20 @@ final class StartAllTests: XCTestCase {
              "Not started — \(Flavor.current.sibling.displayName) runs a stack now"),
             ("no Node on the PATH of the shell (nvm, fnm, Volta)",
              Setup(node: FakeCommandRunner.failed(127, stderr: "zsh:1: command not found: node")),
-             "Preflight failed — Node.js \u{2265} 22: Node.js not found",
+             "Preflight failed — Node.js 22+: Node.js not found",
              one),
             ("a Node that hangs",
              Setup(node: FakeCommandRunner.timedOut),
-             "Preflight failed — Node.js \u{2265} 22: node --version did not answer in 15 s",
+             "Preflight failed — Node.js 22+: node --version did not answer in 20 s",
              one),
             ("a Node that is too old",
              Setup(node: FakeCommandRunner.ok("v16.20.2\n")),
-             "Preflight failed — Node.js \u{2265} 22: v16.20.2 — require v18+",
+             "Preflight failed — Node.js 22+: v16.20.2 — need 22+",
+             one),
+            // The Environment Check said "need 22+" and the preflight let Node 20 start: one threshold now.
+            ("Node 20",
+             Setup(node: FakeCommandRunner.ok("v20.11.1\n")),
+             "Preflight failed — Node.js 22+: v20.11.1 — need 22+",
              one),
             ("a container runtime that does not come up",
              Setup(dockerAnswers: false),
@@ -170,7 +175,7 @@ final class StartAllTests: XCTestCase {
              one),
             ("two checks fail",
              Setup(node: FakeCommandRunner.ok(""), webFolder: "web-moved"),
-             "Preflight failed — Node.js \u{2265} 22: Node.js not found · web-moved exists: Directory not found — open Settings → Reconfigure Repos",
+             "Preflight failed — Node.js 22+: Node.js not found · web-moved exists: Directory not found — open Settings → Reconfigure Repos",
              "Not started — 2 checks failed"),
         ]
         for row in rows {
@@ -250,7 +255,6 @@ final class StartAllTests: XCTestCase {
     /// Answers of the checks that warn and let the stack start.
     func testEachWarningLetsTheStackStart() async throws {
         let rows: [(name: String, setup: Setup)] = [
-            ("Node 20", Setup(node: FakeCommandRunner.ok("v20.11.1\n"), applied: builtByLocalDb)),
             ("a login profile that prints before the Node version",
              Setup(node: FakeCommandRunner.ok("Now using node v22.3.0 (npm v10.8.1)\nv22.3.0\n"), applied: builtByLocalDb)),
         ]

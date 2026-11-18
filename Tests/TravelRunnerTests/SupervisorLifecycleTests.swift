@@ -11,12 +11,14 @@ final class SupervisorLifecycleTests: XCTestCase {
     private var port = 0
     private var workDir: URL!
     private var crashes: [(name: String, code: Int32)] = []
+    private var alerts: [CrashAlert] = []
 
     override func setUp() async throws {
         port = Self.freePort()
         workDir = FileManager.default.temporaryDirectory.appendingPathComponent("SupervisorLifecycleTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         crashes = []
+        alerts = []
         try makeSupervisor(tools: .shared)
     }
 
@@ -37,8 +39,9 @@ final class SupervisorLifecycleTests: XCTestCase {
             kill: { pid in if Self.process(pid, runsIn: ownedDirectory) { PortTools.live.kill(pid) } },
             killCommands: { _ in }
         )
-        supervisor.onServiceCrash = { [weak self] name, code in
-            self?.crashes.append((name, code))
+        supervisor.onServiceCrash = { [weak self] alert in
+            self?.crashes.append((alert.name, alert.exitCode))
+            self?.alerts.append(alert)
         }
         // deps.json of a test is in its own folder, never in ~/.config.
         supervisor.dependencyRecord = DependencyRecord(path: workDir.appendingPathComponent("config/deps.json").path)
@@ -393,6 +396,105 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(trips.map(\.serviceId), ["boom"])
         XCTAssertEqual(trips.first?.message, "boom failed 3 times in a minute — auto-restart stopped")
         XCTAssertEqual(state("boom").haltReason, .crashLoop)
+    }
+
+    // MARK: - Feedback and notifications (E4)
+
+    /// The notification said only "Exited with code 1". It now names the cause from
+    /// the log and the restart that comes, and it carries the service for "Open Logs".
+    func testACrashNotificationNamesTheCauseAndTheRestart() async throws {
+        let marker = workDir.appendingPathComponent("crash-now").path
+        // It runs until the marker is there, then crashes once with EADDRINUSE.
+        let script = "python3 -u -m http.server \(port) --bind 127.0.0.1 & srv=$!; "
+            + "while [ ! -f '\(marker)' ]; do sleep 0.1; done; rm '\(marker)'; kill $srv; wait $srv; "
+            + "echo 'Error: listen EADDRINUSE: address already in use :::3002' >&2; exit 1"
+        try load(daemon("web", ["sh", "-c", script]))
+        supervisor.restartService("web")
+        let ready = await waitUntil(20) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        XCTAssertTrue(alerts.isEmpty, "\(alerts)")
+
+        FileManager.default.createFile(atPath: marker, contents: nil)
+
+        let alerted = await waitUntil(20) { !self.alerts.isEmpty }
+        XCTAssertTrue(alerted, "no crash notification")
+        let alert = try XCTUnwrap(alerts.first)
+        XCTAssertEqual(alert.serviceID, "web")
+        XCTAssertEqual(alert.title, "web crashed")
+        XCTAssertEqual(alert.exitCode, 1)
+        XCTAssertEqual(alert.next, .restarting(attempt: 1))
+        XCTAssertEqual(alert.body, "Port 3002 is already in use by another process. Restarting (attempt 1).")
+        // The crash is in Recent activity, with the service.
+        let entry = try XCTUnwrap(supervisor.recentActivity.entries.first { $0.style == .error })
+        XCTAssertEqual(entry.message, "web crashed: Port 3002 is already in use by another process. Restarting (attempt 1).")
+        XCTAssertEqual(entry.serviceID, "web")
+
+        // The restart comes, and the notification counted it right.
+        let back = await waitUntil(30) { self.settled("web") && self.state("web").restartCount == 1 }
+        XCTAssertTrue(back, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(alerts.count, 1)
+    }
+
+    /// Negative control: a crash with no cause in the log says the exit code.
+    func testACrashNotificationWithoutACauseSaysTheExitCode() async throws {
+        let marker = workDir.appendingPathComponent("crash-now").path
+        let script = "python3 -u -m http.server \(port) --bind 127.0.0.1 & srv=$!; "
+            + "while [ ! -f '\(marker)' ]; do sleep 0.1; done; rm '\(marker)'; kill $srv; wait $srv; exit 3"
+        try load(daemon("web", ["sh", "-c", script]))
+        supervisor.restartService("web")
+        let ready = await waitUntil(20) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+
+        FileManager.default.createFile(atPath: marker, contents: nil)
+
+        let alerted = await waitUntil(20) { !self.alerts.isEmpty }
+        XCTAssertTrue(alerted, "no crash notification")
+        XCTAssertEqual(alerts.first?.body, "Exited with code 3. Restarting (attempt 1).")
+        _ = await waitUntil(30) { self.settled("web") }
+    }
+
+    /// A guard that refused an action did nothing visible. Now it says so with an
+    /// info toast, and the toasts are in Recent activity.
+    func testAGuardThatRefusesAnActionSaysSo() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        try supervisor.loadServices([daemon("web", webServer)])
+        var feedback: [ActionFeedback] = []
+        supervisor.onFeedback = { feedback.append($0) }
+
+        supervisor.startAll(skipPreflight: true)
+        XCTAssertTrue(feedback.isEmpty, "the first start is not refused: \(feedback.map(\.message))")
+        supervisor.startAll(skipPreflight: true)
+        XCTAssertEqual(feedback.map(\.message), ["A start is already in progress."])
+        XCTAssertEqual(feedback.last?.style, .info)
+        let up = await waitUntil(40) { self.settled("web") && self.supervisor.health == .healthy }
+        XCTAssertTrue(up, "web is \(state("web").phase.rawValue)")
+
+        feedback = []
+        supervisor.restartService("web")
+        supervisor.restartService("web")
+        XCTAssertEqual(feedback.map(\.message), ["web is already restarting."])
+        XCTAssertEqual(feedback.first?.style, .info)
+        XCTAssertEqual(feedback.first?.serviceID, "web")
+        let restarted = await waitUntil(30) { feedback.count == 2 }
+        XCTAssertTrue(restarted)
+        XCTAssertEqual(feedback.last?.message, "web restarted")
+        XCTAssertEqual(feedback.last?.style, .success)
+
+        feedback = []
+        supervisor.dbResetRunning = true
+        supervisor.runDbSetup()
+        supervisor.askToResetDatabase()
+        supervisor.dbResetRunning = false
+        XCTAssertEqual(feedback.map(\.message), Array(repeating: "A database setup is already running.", count: 2))
+
+        // Recent activity has them all, the newest first.
+        XCTAssertEqual(
+            supervisor.recentActivity.entries.prefix(5).map(\.message),
+            [
+                "A database setup is already running.", "A database setup is already running.",
+                "web restarted", "web is already restarting.", "A start is already in progress.",
+            ]
+        )
     }
 
     /// A tripped breaker must not outlive a deliberate restart: the next failure of
@@ -1503,7 +1605,7 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         // Control: a database that answers with no tables is reset, as before.
         state("supabase").phase = .running
-        supervisor.lastError = nil
+        supervisor.notices = NoticeCenter()
         let emptyDatabase = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
         XCTAssertTrue(emptyDatabase)
         XCTAssertEqual(resets, 1)
@@ -1541,7 +1643,7 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         // Control: the same path with a database that answers "no tables" is reset.
         docker.respond { _ in FakeCommandRunner.ok("0\n") }
-        supervisor.lastError = nil
+        supervisor.notices = NoticeCenter()
         let emptyDatabase = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: true)
         XCTAssertTrue(emptyDatabase)
         XCTAssertEqual(resets, 1)
@@ -1751,7 +1853,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             resets += 1
             // The same request while this one runs.
             second = await supervisor?.resetDatabaseIfNeeded(cwd: cwd, checkMigrations: false)
-            supervisor?.lastError = "DB reset failed at Load hotels: HTTP 401"
+            supervisor?.notices.post(.dbSetup, "DB reset failed at Load hotels: HTTP 401")
             return false
         }
 
@@ -2176,6 +2278,68 @@ final class SupervisorLifecycleTests: XCTestCase {
 
     private func statusObject() throws -> [String: Any] {
         try XCTUnwrap(JSONSerialization.jsonObject(with: Data(supervisor.statusJSON().utf8)) as? [String: Any])
+    }
+
+    /// Finding ux-global-lasterror-slot: one global banner that stayed after the
+    /// service ran again. The notice of a service resolves when it runs; the notice
+    /// of another key stays.
+    func testTheNoticeOfAServiceResolvesWhenItRunsAndOtherNoticesStay() async throws {
+        let marker = workDir.appendingPathComponent("fixed").path
+        let script = "if [ -f '\(marker)' ]; then exec \(webServer.joined(separator: " ")); else exit 1; fi"
+        try load(ServiceDefinition(
+            id: "web", name: "Web App", cmd: ["sh", "-c", script], cwd: workDir.path,
+            probe: ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30),
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        ))
+
+        supervisor.restartService("web")
+        let failed = await waitUntil(20) {
+            self.state("web").phase == .failed && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(failed, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(supervisor.notices.text(.service("web")), "Web App exited before it was ready — see its log")
+        supervisor.notices.post(.profile, "Could not save profile: disk full")
+        XCTAssertEqual(supervisor.lastError, "Could not save profile: disk full", "the newest error")
+        XCTAssertEqual(supervisor.notices.all.count, 2, "one notice per key; the newer one hides no other")
+
+        FileManager.default.createFile(atPath: marker, contents: nil)
+        supervisor.restartService("web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+
+        XCTAssertNil(supervisor.notices.notice(.service("web")), "the service runs: its notice resolved itself")
+        XCTAssertEqual(supervisor.notices.all.map(\.key), [.profile])
+        XCTAssertEqual(supervisor.lastError, "Could not save profile: disk full")
+
+        // A start makes the notices of the stack stale; the profile's stays.
+        supervisor.notices.post(.preflight, "Preflight failed — Docker: not running")
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(supervisor.notices.all.map(\.key), [.profile])
+    }
+
+    /// The setup of an empty database shows its progress as an info notice. It is
+    /// no error, and it goes when the setup ends.
+    func testTheProgressOfAnEmptyDatabaseSetupIsInfoAndGoesWhenItEnds() async throws {
+        try loadSupabase()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "0", stderr: "") }
+        var during: Notice?
+        var errorDuring: String?
+        supervisor.dbResetAction = { [supervisor] _ in
+            during = supervisor?.notices.notice(.dbProgress)
+            errorDuring = supervisor?.lastError
+            return true
+        }
+
+        let didReset = await supervisor.resetDatabaseIfNeeded(cwd: workDir.path, checkMigrations: false)
+
+        XCTAssertTrue(didReset)
+        XCTAssertEqual(during?.severity, .info)
+        XCTAssertEqual(during?.text.hasPrefix("Empty database — running the reset now"), true, during?.text ?? "nil")
+        XCTAssertNil(errorDuring, "progress is no error")
+        XCTAssertNil(supervisor.notices.notice(.dbProgress))
+        XCTAssertTrue(supervisor.notices.all.isEmpty)
     }
 
     /// The breaker gives its own reason, and the exit of the third crash does not
@@ -2812,14 +2976,41 @@ final class SupervisorLifecycleTests: XCTestCase {
         let cleared = await waitUntil(15) { self.settled("quitter") && self.supervisor.lastError == nil }
         XCTAssertTrue(cleared, supervisor.lastError ?? "nil")
 
-        // An error that is not the banner of this service stays.
-        supervisor.lastError = "Could not save profile: disk full"
+        // Another error of this service goes once it runs; the error of another key stays.
+        supervisor.notices.post(.profile, "Could not save profile: disk full")
+        supervisor.notices.post(.service("quitter"), "quitter: something else broke")
+        XCTAssertEqual(supervisor.notices.text(.service("quitter")), "quitter: something else broke", "control")
         supervisor.restartService("quitter")
         let started = await waitUntil(5) { !self.supervisor.actionsInFlight.isEmpty }
         XCTAssertTrue(started)
-        let restarted = await waitUntil(15) { self.settled("quitter") }
+        let restarted = await waitUntil(15) { self.settled("quitter") && self.supervisor.actionsInFlight.isEmpty }
         XCTAssertTrue(restarted)
+        XCTAssertNil(supervisor.notices.notice(.service("quitter")), "the service runs: its notice resolved itself")
         XCTAssertEqual(supervisor.lastError, "Could not save profile: disk full")
+    }
+
+    /// A failed service that ends as skipped gets the skip on its row; its red
+    /// notice must not stay. Here: Stripe after a wake with no network waits for
+    /// the network (S3). The network check and the Stripe probe are fakes; the test
+    /// touches no network.
+    func testAServiceThatEndsAsSkippedLeavesNoNotice() async throws {
+        try load(stripe("sleep 30"))
+        _ = captureIssues()
+        supervisor.stripeNetworkUp = { false }
+        supervisor.stripeTooling = FakeStripeTooling.answering(.offline)
+        supervisor.health = .degraded
+        state("stripe").phase = .failed
+        supervisor.notices.post(.service("stripe"), "Stripe CLI failed")
+        // Control: the notice is there while Stripe is failed.
+        XCTAssertEqual(supervisor.lastError, "Stripe CLI failed")
+
+        supervisor.handleWake()
+
+        let skipped = await waitUntil(15) { self.state("stripe").phase == .skipped && self.state("stripe").condition?.kind == .retrying }
+        XCTAssertTrue(skipped, "stripe is \(state("stripe").phase.rawValue)")
+        XCTAssertEqual(state("stripe").condition?.headline, StripeOffReason.afterWake.headline)
+        XCTAssertNil(supervisor.notices.notice(.service("stripe")), "Stripe waits for the network, not failed")
+        XCTAssertNil(supervisor.lastError)
     }
 
     /// The Start control of a row: only for a daemon of the profile that has no
@@ -2867,7 +3058,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         try load(stripe("echo stripe-start; sleep 30"))
         supervisor.stripeTooling = FakeStripeTooling.answering(.notAuthenticated)
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
 
         supervisor.restartService("stripe")
 
@@ -3318,7 +3509,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lanEnv.contains("NEXT_PUBLIC_SITE_URL=http://10.0.1.23:3000"), lanEnv)
         supervisor.findLanAddress = { nil }
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style != .error)) }
 
         await supervisor.handleNetworkChange()
 
@@ -3350,7 +3541,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             return call == 1 ? LanAddress(interface: "en0", ip: "192.168.1.20") : nil
         }
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style != .error)) }
 
         await supervisor.handleNetworkChange()
 
@@ -3372,7 +3563,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         let before = try await runInLanMode(at: LanAddress(interface: "en0", ip: "10.0.1.23"))
         supervisor.findLanAddress = { LanAddress(interface: "en0", ip: "192.168.1.20") }
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
 
         await supervisor.handleNetworkChange()
 
@@ -3398,7 +3589,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         let before = try XCTUnwrap(state("universal-login").pid)
         supervisor.findLanAddress = { nil }
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style != .error)) }
 
         supervisor.toggleNetworkMode()
 
@@ -3983,7 +4174,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             webDependingOn(["base"]),
         ])
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
 
         supervisor.startAll(skipPreflight: true)
         let ended = await startAllEnded()
@@ -4061,7 +4252,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         try supervisor.loadServices([daemon("web", webServer)])
         XCTAssertEqual(supervisor.health, .stopped)
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style != .error)) }
 
         supervisor.restartService("web")
 
@@ -4081,7 +4272,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             + "else touch '\(marker)'; sleep 0.5; exit 1; fi"
         try load(daemon("flaky", ["sh", "-c", script], probeTimeout: 8))
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
 
         supervisor.restartService("flaky")
 
@@ -4174,7 +4365,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         let pid = try XCTUnwrap(state("web").pid)
         state("base").phase = .failed
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style != .error)) }
 
         supervisor.restartService("web")
 
@@ -4207,7 +4398,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             return ["other"]
         }
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
 
         supervisor.startAll(skipPreflight: true)
         supervisor.runDbSetup(profile: "reset")
@@ -4239,7 +4430,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             return self.pipeline([self.step("first", "true")])
         }
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style != .error)) }
 
         supervisor.stopAll()
         supervisor.runDbSetup(profile: "reset")
@@ -4488,7 +4679,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(supervisor.completedPhases.contains("PREFLIGHT"))
         XCTAssertEqual(
             supervisor.preflightChecks.map(\.id),
-            ["docker", "node-version", "port-\(port)", "dir-\(workDir.lastPathComponent)"]
+            ["node", "docker", "port-\(port)", "dir-\(workDir.lastPathComponent)"]
         )
         XCTAssertFalse(supervisor.preflightChecks.contains { $0.result.isFailed })
         XCTAssertTrue(shell.commands.contains("node --version"), "\(shell.commands)")
@@ -4519,10 +4710,29 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         let failed = await waitUntil(10) { self.supervisor.health == .degraded }
         XCTAssertTrue(failed)
-        XCTAssertEqual(supervisor.lastError, "Preflight failed — Node.js \u{2265} 22: Node.js not found")
+        XCTAssertEqual(supervisor.lastError, "Preflight failed — Node.js 22+: Node.js not found")
         XCTAssertEqual(supervisor.currentPhase, .idle)
         XCTAssertNil(state("web").lastStarted)
         XCTAssertEqual(Self.listeners(on: port), [])
+    }
+
+    /// Finding: the wizard said "need 22+" while the preflight let Node 20 start,
+    /// and the full check was only in the wizard. Now the preflight runs the Node
+    /// row of Health: Health and the Status banner show what the start found.
+    func testThePreflightFillsTheHealthRowAndTheBanner() async throws {
+        _ = fakeTheOutsideOfStartAll(node: "v20.11.1\n")
+        try supervisor.loadServices([daemon("web", webServer)])
+        XCTAssertEqual(supervisor.setupItemsNeedingAttention.map(\.id), [], "nothing ran yet")
+
+        supervisor.startAll()
+
+        let failed = await waitUntil(10) { self.supervisor.health == .degraded }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(supervisor.lastError, "Preflight failed — Node.js 22+: v20.11.1 — need 22+")
+        let row = supervisor.healthChecker?.checks.first { $0.id == "node" }
+        XCTAssertEqual(row?.status, .failing("v20.11.1 — need 22+"))
+        XCTAssertEqual(supervisor.setupItemsNeedingAttention.map(\.id), ["node"])
+        XCTAssertNil(state("web").lastStarted)
     }
 
     /// After the GROUND phase Start All asks the fake database. A database with
@@ -4779,7 +4989,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         // has no seed scenario, so the next guard stops it.
         _ = try checkoutLackingAMigration(profiles: ["reset", HotelCatalog.withoutHotelsProfile])
         supervisor.dbResetAction = nil
-        supervisor.lastError = nil
+        supervisor.notices = NoticeCenter()
         supervisor.resetWithoutHotels()
         XCTAssertNotNil(supervisor.lastError)
         XCTAssertNotEqual(supervisor.lastError, HotelCatalog.noWithoutHotelsProfileText)
@@ -5438,7 +5648,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
         let loads = fakeConfigHost(services: ["other"])
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
         let needsStop = await supervisor.reconfigure()
         XCTAssertEqual(needsStop, .needsStop)
 
@@ -5462,7 +5672,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     func testReconfigureOfAStoppedStackLoadsTheConfigAndKeepsOneControlServer() async throws {
         let loads = fakeConfigHost(services: ["first"])
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
 
         supervisor.loadConfig()
         XCTAssertEqual(supervisor.sortedServiceIDs, ["first"])
@@ -5531,7 +5741,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         let preflight = try await get("/api/preflight")
         XCTAssertEqual(preflight["configured"] as? Bool, false)
         let checks = try XCTUnwrap(preflight["checks"] as? [[String: String]])
-        XCTAssertEqual(checks.map { $0["id"] }, ["node-version"], "only checks that change nothing, and no service has a port yet")
+        XCTAssertEqual(checks.map { $0["id"] }, ["node"], "only checks that change nothing, and no service has a port yet")
         XCTAssertEqual(checks.first?["status"], "failed")
         XCTAssertEqual(checks.first?["detail"], "Node.js not found")
         XCTAssertEqual(shell.commands, ["node --version"], "no container runtime and no Stripe is asked")
@@ -5551,7 +5761,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.loadConfig()
         let before = state("first")
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style == .success)) }
         loads.error = ConfigLoader.ConfigError.monorepoNotFound
 
         let result = await supervisor.reconfigure()
@@ -5709,7 +5919,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.loadConfig()
         let reset = try XCTUnwrap(supervisor.envResetAfterLoad)
 
-        supervisor.toggleDatabaseMode()
+        supervisor.setDatabaseMode(.remote)
         XCTAssertEqual(supervisor.dbMode, .remote, "error: \(supervisor.lastError ?? "none")")
 
         await gate.open()
@@ -5848,7 +6058,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             call.command == "pnpm db:stop" ? FakeCommandRunner.failed(1, stderr: "stop failed") : FakeCommandRunner.ok()
         }
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style != .error)) }
         try load(supabaseStack(["sh", "-c", "echo db-start; exit 0"]))
 
         supervisor.restartService("supabase", stopsStack: true)
@@ -5871,7 +6081,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             call.command == "pnpm db:stop" ? FakeCommandRunner.failed(1, stderr: "stop failed") : FakeCommandRunner.ok()
         }
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style != .error)) }
         try load(supabaseStack(["sh", "-c", "echo db-start; exit 0"]))
         // The reset check after Supabase asks the database once.
         supervisor.databaseProbeRetry = (.milliseconds(10), .zero)
@@ -6025,7 +6235,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         let shell = FakeCommandRunner()
         supervisor.shell = shell
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style != .error)) }
         try load(supabaseStack(["sh", "-c", "exit 0"]))
         XCTAssertTrue(supervisor.hasSupabaseStack)
 
@@ -6068,6 +6278,293 @@ final class SupervisorLifecycleTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(100))
         } while Date() < deadline
         return lines
+    }
+
+    // MARK: - Database mode
+
+    /// The apps of a database switch. The booking portal is stopped and holds the
+    /// shared .env with the hosted values; the login runs a small server.
+    private func loadDatabaseModeApps() throws {
+        try "AMATEUR_SUPABASE_URL=https://hosted.example.test\n"
+            .write(to: workDir.appendingPathComponent(".env"), atomically: true, encoding: .utf8)
+        try supervisor.loadServices([
+            daemon("travel-portal", ["sleep", "30"]),
+            daemon("universal-login", webServer),
+            ServiceDefinition(
+                id: "broken", name: nil, cmd: ["sleep", "1"], cwd: nil, probe: nil, type: .daemon, restart: .never,
+                dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+            ),
+        ])
+    }
+
+    /// Finding "DB switch: wrong refusal": a degraded stack refused the switch with
+    /// "while services are starting". Now it switches and restarts the apps that run.
+    func testADegradedStackSwitchesTheDatabaseAndRestartsTheRunningApps() async throws {
+        try loadDatabaseModeApps()
+        supervisor.health = .healthy
+        supervisor.restartService("universal-login")
+        let up = await waitUntil(20) { self.settled("universal-login") }
+        XCTAssertTrue(up, "universal-login is \(state("universal-login").phase.rawValue)")
+        let firstPid = try XCTUnwrap(state("universal-login").pid)
+        supervisor.serviceStates["broken"]?.phase = .failed
+        // The person stopped the booking portal.
+        supervisor.serviceStates["travel-portal"]?.phase = .stopped
+        supervisor.recalculateHealth()
+        XCTAssertEqual(supervisor.health, .degraded)
+        XCTAssertNil(supervisor.databaseModeRefusal(for: .remote))
+        // The question names only the apps that restart; the stopped one uses dev later.
+        XCTAssertEqual(
+            supervisor.devDatabaseConfirmation,
+            "universal-login will restart and will read and write the shared hosted dev data."
+                + " travel-portal will use it at the next start."
+        )
+
+        supervisor.setDatabaseMode(.remote)
+
+        XCTAssertEqual(supervisor.dbMode, .remote, "error: \(supervisor.lastError ?? "none")")
+        XCTAssertNil(supervisor.notices.notice(.dbMode))
+        // A second switch while the first restarts the apps waits for it.
+        supervisor.setDatabaseMode(.local)
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        XCTAssertEqual(supervisor.notices.text(.dbMode), EnvironmentSupervisor.dbModeSwitchingRefusal)
+
+        let restarted = await waitUntil(20) {
+            self.settled("universal-login") && self.state("universal-login").pid != firstPid
+        }
+        XCTAssertTrue(restarted, "universal-login is \(state("universal-login").phase.rawValue)")
+        XCTAssertEqual(state("travel-portal").phase, .stopped, "a stopped app stays stopped")
+        let loginEnv = try String(contentsOf: workDir.appendingPathComponent(".env.local"), encoding: .utf8)
+        XCTAssertTrue(loginEnv.contains("AMATEUR_SUPABASE_URL=https://hosted.example.test"), loginEnv)
+    }
+
+    /// A start in progress refuses the switch, with the text that says what to do.
+    func testTheDatabaseSwitchIsRefusedWhileTheStackStarts() async throws {
+        try loadDatabaseModeApps()
+        // The start waits for the other app's answer until the test opens the gate.
+        let gate = Gate()
+        supervisor.siblingActiveServices = {
+            await gate.wait()
+            return ["supabase"]
+        }
+        supervisor.startAll(skipPreflight: true)
+
+        supervisor.setDatabaseMode(.remote)
+
+        XCTAssertEqual(supervisor.dbMode, .local)
+        XCTAssertEqual(
+            supervisor.notices.text(.dbMode),
+            "A start is in progress — wait for it to finish, or stop the stack, then switch."
+        )
+
+        // Negative control: after the start the same switch goes through.
+        await gate.open()
+        let ended = await waitUntil(10) { self.supervisor.databaseModeRefusal(for: .remote) == nil }
+        XCTAssertTrue(ended, "refusal: \(supervisor.databaseModeRefusal(for: .remote) ?? "none")")
+        supervisor.setDatabaseMode(.remote)
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        XCTAssertNil(supervisor.notices.notice(.dbMode), "the switch resolves the refusal")
+    }
+
+    /// The restart of one service shows the stack as starting, but no start runs.
+    /// The switch goes through: it waits for the service's lock.
+    func testTheRestartOfOneServiceDoesNotRefuseTheDatabaseSwitch() async throws {
+        try loadDatabaseModeApps()
+        supervisor.health = .starting
+
+        XCTAssertNil(supervisor.databaseModeRefusal(for: .remote))
+        supervisor.setDatabaseMode(.remote)
+        XCTAssertEqual(supervisor.dbMode, .remote, "error: \(supervisor.lastError ?? "none")")
+        XCTAssertNil(supervisor.notices.notice(.dbMode))
+    }
+
+    /// Finding: a switch during Stop All was taken, and the end of the stop set the
+    /// mode back to local without a word. Now it is refused until the stack stops.
+    func testTheDatabaseSwitchIsRefusedWhileTheStackStops() async throws {
+        try loadDatabaseModeApps()
+        supervisor.health = .healthy
+        supervisor.restartService("universal-login")
+        let up = await waitUntil(20) { self.settled("universal-login") }
+        XCTAssertTrue(up, "universal-login is \(state("universal-login").phase.rawValue)")
+
+        // The stop runs in a task; until it ends the stack still looks up.
+        supervisor.stopAll()
+        supervisor.setDatabaseMode(.remote)
+
+        XCTAssertEqual(supervisor.dbMode, .local)
+        XCTAssertEqual(
+            supervisor.notices.text(.dbMode),
+            "The stack is stopping — wait for it to stop, then switch."
+        )
+        XCTAssertFalse(supervisor.actionsInFlight.contains("db-mode"), "no restart was started")
+
+        // Negative control: after the stop the switch goes through and stays.
+        let stopped = await waitUntil(10) { self.supervisor.databaseModeRefusal(for: .remote) == nil }
+        XCTAssertTrue(stopped, "refusal: \(supervisor.databaseModeRefusal(for: .remote) ?? "none")")
+        XCTAssertEqual(supervisor.health, .stopped)
+        supervisor.setDatabaseMode(.remote)
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        XCTAssertNil(supervisor.notices.notice(.dbMode))
+    }
+
+    /// A stopped stack switches and restarts nothing; the apps use the mode at the
+    /// next start, and the question says so.
+    func testAStoppedStackSwitchesTheDatabaseWithoutARestart() async throws {
+        try loadDatabaseModeApps()
+        XCTAssertEqual(supervisor.health, .stopped)
+        XCTAssertEqual(
+            supervisor.devDatabaseConfirmation,
+            "travel-portal and universal-login will read and write the shared hosted dev data at the next start."
+        )
+
+        supervisor.setDatabaseMode(.remote)
+
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        XCTAssertFalse(supervisor.actionsInFlight.contains("db-mode"))
+        XCTAssertNil(state("universal-login").lastStarted)
+        // The same mode again changes nothing.
+        supervisor.setDatabaseMode(.remote)
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        supervisor.setDatabaseMode(.local)
+        XCTAssertEqual(supervisor.dbMode, .local)
+        XCTAssertNil(state("universal-login").lastStarted)
+    }
+
+    /// Without hosted values in the shared .env the switch to dev stays local and says why.
+    func testASwitchToDevWithoutHostedValuesStaysLocal() async throws {
+        try loadDatabaseModeApps()
+        try FileManager.default.removeItem(at: workDir.appendingPathComponent(".env"))
+        supervisor.health = .healthy
+
+        // The control asks this before the question, so it shows the notice instead.
+        let refusal = supervisor.databaseModeRefusal(for: .remote)
+        XCTAssertEqual(refusal?.hasPrefix("Hosted dev values are missing from apps/booking-portal/.env"), true)
+        XCTAssertNil(supervisor.databaseModeRefusal(for: .local), "local needs no hosted values")
+
+        supervisor.setDatabaseMode(.remote)
+
+        XCTAssertEqual(supervisor.dbMode, .local)
+        XCTAssertEqual(supervisor.notices.text(.dbMode), refusal)
+    }
+
+    // MARK: - Run Checks Now
+
+    private static func checkedService(_ id: String, port: Int? = nil) -> ServiceDefinition {
+        ServiceDefinition(
+            id: id, name: nil, cmd: ["true"], cwd: nil,
+            probe: port.map { ProbeConfig(type: .tcp, port: $0, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5) },
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+    }
+
+    private func checkIDs() -> [String] { supervisor.preflightChecks.map(\.id) }
+
+    /// Finding: with any service live, Run Checks Now dropped every port check,
+    /// so a stray process on the port of a failed portal never showed. Only the
+    /// port of a service that runs is left out.
+    func testRunChecksNowChecksThePortOfAFailedServiceWhileAnotherRuns() async throws {
+        supervisor.shell = FakeCommandRunner()
+        let livePort = Self.freePort()
+        let failedPort = Self.freePort()
+        try supervisor.loadServices([
+            Self.checkedService("db", port: livePort),
+            Self.checkedService("portal", port: failedPort),
+        ])
+
+        // The control: a stopped stack checks every port.
+        XCTAssertEqual(supervisor.preflightPortsLeftOut, [])
+        await supervisor.runPreflightOnly()
+        XCTAssertTrue(checkIDs().contains("port-\(livePort)"), "\(checkIDs())")
+        XCTAssertTrue(checkIDs().contains("port-\(failedPort)"), "\(checkIDs())")
+
+        supervisor.serviceStates["db"]?.phase = .running
+        supervisor.serviceStates["portal"]?.phase = .failed
+        XCTAssertEqual(supervisor.preflightPortsLeftOut, [livePort])
+        await supervisor.runPreflightOnly()
+
+        XCTAssertFalse(checkIDs().contains("port-\(livePort)"), "the running service holds its port")
+        let failed = try XCTUnwrap(supervisor.preflightChecks.first { $0.id == "port-\(failedPort)" })
+        XCTAssertTrue(failed.result.isPassed, "\(failed.result)")
+    }
+
+    /// The checks open no app: a container runtime that does not answer fails
+    /// its check with the fix to open it.
+    func testRunChecksNowDoesNotOpenTheContainerRuntime() async throws {
+        let shell = FakeCommandRunner { call in
+            call.command.contains("docker ps") ? FakeCommandRunner.failed() : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        try supervisor.loadServices([Self.checkedService("api")])
+
+        await supervisor.runPreflightOnly()
+
+        let docker = try XCTUnwrap(supervisor.preflightChecks.first { $0.id == "docker" })
+        guard case .failed(_, let fix) = docker.result else { return XCTFail("the runtime check is \(docker.result)") }
+        XCTAssertEqual(fix?.hasPrefix("Open "), true)
+        XCTAssertFalse(shell.commands.contains { $0.hasPrefix("open ") }, "\(shell.commands)")
+    }
+
+    /// Finding: during a start the button did nothing and said nothing. Now it
+    /// is disabled while a start runs, and a refused call says why.
+    func testRunChecksNowDuringAStartSaysWhy() async throws {
+        let gate = Gate()
+        supervisor.siblingActiveServices = {
+            await gate.wait()
+            return ["supabase"]
+        }
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        try supervisor.loadServices([Self.checkedService("api")])
+        supervisor.startAll()
+        XCTAssertTrue(supervisor.startRunning)
+
+        await supervisor.runPreflightOnly()
+
+        XCTAssertEqual(supervisor.recentActivity.entries.first?.message, ActionFeedback.checksDuringStart)
+        XCTAssertFalse(supervisor.preflightOnlyRunning)
+        XCTAssertTrue(shell.commands.isEmpty, "no check ran: \(shell.commands)")
+        await gate.open()
+        let ended = await waitUntil(5) { !self.supervisor.startRunning }
+        XCTAssertTrue(ended)
+    }
+
+    /// Finding: a start during Run Checks Now ran the same checks twice at once.
+    /// The start stops the check-only run and waits for it.
+    func testAStartStopsTheChecksOfRunChecksNow() async throws {
+        let gate = Gate()
+        let shell = FakeCommandRunner { call in
+            if call.command.contains("node --version") {
+                await gate.wait()
+                return FakeCommandRunner.ok("v22.11.0")
+            }
+            return FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        // The start ends at the question to the other app, before its own checks.
+        let asked = LockedPids()
+        supervisor.siblingActiveServices = {
+            asked.set([1])
+            return ["supabase"]
+        }
+        try supervisor.loadServices([Self.checkedService("api")])
+
+        let checks = Task { await supervisor.runPreflightOnly() }
+        let held = await waitUntil(5) { shell.commands.contains { $0.contains("node --version") } }
+        XCTAssertTrue(held)
+        supervisor.startAll()
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(asked.pids.isEmpty, "the start waits for the check-only run")
+
+        await gate.open()
+        await checks.value
+
+        let ended = await waitUntil(5) { !self.supervisor.startRunning }
+        XCTAssertTrue(ended)
+        XCTAssertFalse(asked.pids.isEmpty, "the start went on")
+        XCTAssertFalse(supervisor.preflightOnlyRunning)
+        let node = supervisor.preflightChecks.first { $0.id == "node" }
+        guard case .pending = node?.result else {
+            return XCTFail("the cancelled run kept a result: \(String(describing: node?.result))")
+        }
     }
 }
 

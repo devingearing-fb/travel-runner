@@ -281,13 +281,11 @@ struct ReportExporter: Sendable {
             }
         }
         // An id without a file (no sink, or a write that failed) has its lines in memory.
-        let formatter = Self.lineFormatter(timeZone)
+        let formatter = LogEntry.timeFormatter("yyyy-MM-dd'T'HH:mm:ss.SSSZ", timeZone: timeZone)
         for id in input.memoryLogs.keys.sorted() {
             let fileName = "\(LogFileSink.fileName(for: id)).log"
             guard !written.contains(fileName), let entries = input.memoryLogs[id], !entries.isEmpty else { continue }
-            let lines = entries.suffix(Self.maxLogLines).map { entry in
-                "\(formatter.string(from: entry.timestamp)) [\(entry.stream == .stdout ? "out" : "err")] \(redactor.redact(entry.text))"
-            }
+            let lines = entries.suffix(Self.maxLogLines).map { $0.reportLine(time: formatter, redactor: redactor) }
             try write(lines.joined(separator: "\n") + "\n", to: logs.appendingPathComponent(fileName))
         }
 
@@ -328,16 +326,6 @@ struct ReportExporter: Sendable {
     private func write(_ text: String, to url: URL) throws {
         try Data(text.utf8).write(to: url, options: .atomic)
         try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-    }
-
-    /// The time format of the log files.
-    private static func lineFormatter(_ timeZone: TimeZone) -> DateFormatter {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.timeZone = timeZone
-        formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSZ"
-        return formatter
     }
 
     static let readme = """

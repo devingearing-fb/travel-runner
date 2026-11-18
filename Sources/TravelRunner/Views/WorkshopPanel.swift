@@ -12,6 +12,7 @@ final class KeyablePanel: NSPanel {
 
 enum WorkshopSection: String, CaseIterable, Identifiable {
     case status = "Status"
+    case health = "Health"
     case issues = "Issues"
     case logs = "Terminals"
     case rooms = "Rooms"
@@ -29,6 +30,7 @@ enum WorkshopSection: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .status: "heart.text.clipboard"
+        case .health: "checkmark.shield"
         case .issues: "ant"
         case .logs: "terminal"
         case .rooms: "bed.double"
@@ -70,11 +72,13 @@ final class WorkshopPanel {
     func configure(supervisor: EnvironmentSupervisor, updateController: UpdateController? = nil) {
         self.supervisor = supervisor
         self.updateController = updateController
-        supervisor.onActionFeedback = { [weak toastCenter] message, success in
-            toastCenter?.show(message, style: success ? .success : .error)
+        supervisor.onFeedback = { [weak toastCenter] feedback in
+            toastCenter?.show(feedback)
         }
-        // The Tools block of Diagnostics says where each tool was found.
-        supervisor.onOpenHealth = { [weak self] in self?.open(section: .diagnostics) }
+        // An error toast opens Status, where the failed service has its triage card.
+        toastCenter.onOpen = { [weak self] _ in self?.open(section: .status) }
+        // Health lists the setup checks and where each tool was found.
+        supervisor.onOpenHealth = { [weak self] in self?.open(section: .health) }
         supervisor.onOpenSettings = { [weak self] in self?.open(section: .settings) }
     }
 

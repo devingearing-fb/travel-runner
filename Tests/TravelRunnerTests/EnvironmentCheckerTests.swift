@@ -268,13 +268,222 @@ final class EnvironmentCheckerTests: XCTestCase {
         )
     }
 
-    func testEveryRequiredCheckHasAnImpact() {
+    func testEveryCheckHasAnImpact() {
+        for flavor in [Flavor.standard, .hackathon] {
+            let checker = EnvironmentChecker(
+                monorepoPath: "/nonexistent/mono", loginPath: "/nonexistent/login", streamServicesPath: "", flavor: flavor
+            )
+            checker.buildChecks()
+
+            for check in checker.checks {
+                XCTAssertNotNil(check.impact, "\(check.id) has no impact text")
+            }
+        }
+    }
+
+    // MARK: - The registry
+
+    /// Each check has its cost, its severity and its profiles in one place.
+    func testTheRegistryDescribesEachCheck() {
         let checker = EnvironmentChecker(monorepoPath: "/nonexistent/mono", loginPath: "/nonexistent/login", streamServicesPath: "")
         checker.buildChecks()
+        func check(_ id: String) -> HealthCheck? { checker.checks.first { $0.id == id } }
 
-        for check in checker.checks where check.isRequired {
-            XCTAssertNotNil(EnvironmentChecker.impact(of: check.id), "\(check.id) has no impact text")
+        // Only the container runtime and Node stop Start All.
+        XCTAssertEqual(Set(checker.checks.filter { $0.severity == .blocksStart }.map(\.id)), ["docker", "node"])
+        XCTAssertEqual(check("pnpm")?.severity, .required)
+        XCTAssertEqual(check("stripe-cli")?.severity, .optional)
+        // A check that asks the network is slow.
+        XCTAssertEqual(check("registry-auth")?.cost, .slow)
+        XCTAssertEqual(check("stripe-auth")?.cost, .slow)
+        XCTAssertEqual(check("node")?.cost, .fast)
+        XCTAssertEqual(check("workspace-modules")?.cost, .fast)
+        // A check of the booking portal does not apply to the partner profile.
+        XCTAssertEqual(check("booking-env")?.applies(to: .partner), false)
+        XCTAssertEqual(check("booking-env")?.applies(to: .both), true)
+        XCTAssertEqual(check("partner-env")?.applies(to: .booking), false)
+        XCTAssertEqual(check("stream-modules")?.applies(to: .both), false)
+        XCTAssertEqual(check("stream-modules")?.applies(to: .full), true)
+        XCTAssertEqual(check("node")?.applies(to: .partner), true)
+    }
+
+    /// The preflight subset: fast, needed by the setup, in the profile, and with a folder.
+    func testThePreflightSubsetForEachProfile() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("Registry-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let mono = root.appendingPathComponent("mono").path
+        try FileManager.default.createDirectory(atPath: mono, withIntermediateDirectories: true)
+        let checker = EnvironmentChecker(monorepoPath: mono, loginPath: root.appendingPathComponent("login").path, streamServicesPath: "")
+        checker.buildChecks()
+
+        for profile in RunProfile.allCases {
+            XCTAssertEqual(checker.preflightSubset(profile: profile).map(\.id),
+                           ["node", "workspace-modules", "login-modules", "login-env"], profile.rawValue)
         }
+        // A check of a folder that is not set is left out: its path is not absolute.
+        let noLogin = EnvironmentChecker(monorepoPath: mono, loginPath: "", streamServicesPath: "")
+        noLogin.buildChecks()
+        XCTAssertEqual(noLogin.preflightSubset(profile: .both).map(\.id), ["node", "workspace-modules"])
+        // Without a checkout only the tools are checked.
+        let noCheckout = EnvironmentChecker(monorepoPath: "", loginPath: "", streamServicesPath: "", flavor: .standard)
+        noCheckout.buildChecks()
+        XCTAssertEqual(Set(noCheckout.checks.map(\.section)), [.prerequisites])
+        XCTAssertEqual(noCheckout.preflightSubset(profile: .both).map(\.id), ["node"])
+    }
+
+    /// The Status banner counts what fails, and what warns only for a check that
+    /// the setup needs, for the profile that runs.
+    func testTheSetupItemsThatNeedAttention() {
+        let checks = [
+            check("node", .failing("v20.11.1 — need 22+")),
+            check("login-env", .warning("ALLOW_LOCALHOST_REDIRECTS is not set — Add missing keys adds it")),
+            check("stripe-cli", required: false, .warning("Not installed — webhooks won't work")),
+            check("partner-env", required: false, .failing("Missing")),
+            check("pnpm", .passing("v10.34.5")),
+            check("docker", .pending),
+        ]
+
+        XCTAssertEqual(CheckRegistry.needsAttention(checks, profile: .both).map(\.id), ["node", "login-env", "partner-env"])
+        // The partner .env does not apply to the booking profile.
+        XCTAssertEqual(CheckRegistry.needsAttention(checks, profile: .booking).map(\.id), ["node", "login-env"])
+        XCTAssertEqual(CheckRegistry.attentionText(count: 3), "3 setup items need attention — Open Health")
+        XCTAssertEqual(CheckRegistry.attentionText(count: 1), "1 setup item needs attention — Open Health")
+    }
+
+    // MARK: - The Node threshold
+
+    func testTheNodeThresholdComesFromEnginesNode() {
+        let rows: [(engines: String, major: Int?)] = [
+            (">=22", 22),
+            ("^22.11.0", 22),
+            ("22.x", 22),
+            ("~20.9", 20),
+            (">=20.9.0 <23", 20),
+            ("<23 >=20", 20),
+            ("20 || 22", 20),
+            ("v24", 24),
+            ("*", nil),
+        ]
+        for row in rows {
+            XCTAssertEqual(NodeRequirement.minimumMajor(engines: row.engines), row.major, row.engines)
+        }
+    }
+
+    /// The Node row reads engines.node of the checkout: Node 22 fails where the
+    /// monorepo asks for 24. Without engines.node the threshold is 22.
+    func testTheNodeRowUsesTheThresholdOfTheCheckout() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("NodeRow-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try #"{"engines":{"node":">=24"}}"#.write(to: root.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+        func checker(_ monorepo: String) -> EnvironmentChecker {
+            let checker = EnvironmentChecker(
+                monorepoPath: monorepo, loginPath: "/nonexistent/login", streamServicesPath: "",
+                flavor: .standard, shell: FakeCommandRunner { _ in FakeCommandRunner.ok("v22.3.0\n") },
+                tools: ToolEnvironment(home: "/nonexistent/home"), registry: Self.offlineRegistry()
+            )
+            checker.buildChecks()
+            return checker
+        }
+
+        let newer = checker(root.path)
+        XCTAssertEqual(newer.checks.first { $0.id == "node" }?.name, "Node.js 24+")
+        _ = await newer.runForPreflight("node")
+        XCTAssertEqual(status("node", in: newer), .failing("v22.3.0 — need 24+"))
+
+        // Control: a checkout without engines.node.
+        let plain = checker("/nonexistent/mono")
+        XCTAssertEqual(plain.checks.first { $0.id == "node" }?.name, "Node.js 22+")
+        _ = await plain.runForPreflight("node")
+        XCTAssertEqual(status("node", in: plain), .passing("v22.3.0"))
+    }
+
+    /// A check that runs for the preflight stops its commands after 3 s; the same
+    /// check in Health keeps 20 s. A check that blocks the start and times out
+    /// tries once more with the limit of Health before it fails the start.
+    func testThePreflightLimitIsOnlyForThePreflight() async {
+        let runner = FakeCommandRunner { _ in FakeCommandRunner.timedOut }
+        let checker = makeChecker(runner)
+
+        let result = await checker.runForPreflight("node")
+
+        guard case .failed(let message, let fix) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(message, "node --version did not answer in 20 s")
+        XCTAssertEqual(fix, "Open Health → How to install")
+        XCTAssertEqual(runner.calls.map(\.timeout), [CheckRegistry.preflightLimit, EnvironmentChecker.checkTimeout])
+
+        // Control: Health keeps its own limit and runs once.
+        await checker.runAllChecks()
+        XCTAssertEqual(status("node", in: checker), .failing("node --version did not answer in 20 s"))
+    }
+
+    /// Finding: a cold login shell after wake took more than 3 s, and the start
+    /// failed although Node was fine. The second try with the Health limit passes.
+    func testASlowShellDoesNotFailTheNodeCheckOfAStart() async {
+        let runner = FakeCommandRunner { call in
+            call.timeout == CheckRegistry.preflightLimit ? FakeCommandRunner.timedOut : FakeCommandRunner.ok("v22.3.0\n")
+        }
+        let checker = makeChecker(runner)
+
+        let result = await checker.runForPreflight("node")
+
+        guard case .passed(let detail) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(detail, "v22.3.0")
+        XCTAssertEqual(runner.calls.map(\.timeout), [CheckRegistry.preflightLimit, EnvironmentChecker.checkTimeout])
+        XCTAssertEqual(status("node", in: checker), .passing("v22.3.0"))
+    }
+
+    /// Control: a Node that is not found or too old fails the start at once,
+    /// with no second try.
+    func testAMissingNodeFailsTheStartWithoutASecondTry() async {
+        let missing = FakeCommandRunner { _ in FakeCommandRunner.failed(127) }
+        let result = await makeChecker(missing).runForPreflight("node")
+        guard case .failed(let message, _) = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(message, "Node.js not found")
+        XCTAssertEqual(missing.calls.count, 1)
+
+        let old = FakeCommandRunner { _ in FakeCommandRunner.ok("v20.11.1\n") }
+        let oldResult = await makeChecker(old).runForPreflight("node")
+        guard case .failed(let oldMessage, _) = oldResult else { return XCTFail("\(oldResult)") }
+        XCTAssertEqual(oldMessage, "v20.11.1 — need 22+")
+        XCTAssertEqual(old.calls.count, 1)
+    }
+
+    /// Control: a timeout of a check that does not block the start only warns,
+    /// so it does not try again.
+    func testATimeoutOfACheckThatDoesNotBlockTheStartIsNotRetried() async {
+        let runner = FakeCommandRunner { _ in FakeCommandRunner.timedOut }
+        let checker = makeChecker(runner)
+
+        let result = await checker.runForPreflight("stripe-cli")
+
+        guard case .warning = result else { return XCTFail("\(result)") }
+        XCTAssertEqual(runner.calls.map(\.timeout), [CheckRegistry.preflightLimit])
+    }
+
+    /// The launch runs only the fast checks: nothing asks the network, Stripe or
+    /// pnpm. Health still runs every check when it opens.
+    func testTheLaunchRunsOnlyTheFastChecks() async {
+        let runner = FakeCommandRunner()
+        let checker = makeChecker(runner)
+
+        await checker.runFastChecks()
+
+        XCTAssertNil(checker.lastRunAt, "Health still runs every check when it opens")
+        for check in checker.checks {
+            if check.cost == .slow {
+                XCTAssertEqual(check.status, .pending, check.id)
+            } else {
+                XCTAssertNotEqual(check.status, .pending, check.id)
+            }
+        }
+        XCTAssertFalse(runner.commands.contains { $0.contains("stripe balance") }, "\(runner.commands)")
+        XCTAssertFalse(runner.commands.contains { $0.contains("pnpm") }, "\(runner.commands)")
+
+        // Control: the full run asks them.
+        await checker.runAllChecks()
+        XCTAssertNotNil(checker.lastRunAt)
+        XCTAssertFalse(checker.checks.contains { $0.status == .pending })
     }
 
     // MARK: - Commands of the checks

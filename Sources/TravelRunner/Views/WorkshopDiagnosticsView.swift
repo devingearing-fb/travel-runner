@@ -4,8 +4,6 @@ import AppKit
 struct WorkshopDiagnosticsView: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
     @State private var diagnosticCopied = false
-    /// Nil while the first read runs.
-    @State private var toolReports: [ToolReport]?
 
     var body: some View {
         ScrollView {
@@ -23,6 +21,10 @@ struct WorkshopDiagnosticsView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
 
+                Text("Copies this Mac, the stack, the checks and the last \(DiagnosticsBundle.maxLogLines) lines of each failed service and DB step. Secrets are masked.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
                 Button {
                     ReportProblem.run(supervisor: supervisor)
                 } label: {
@@ -37,47 +39,11 @@ struct WorkshopDiagnosticsView: View {
 
                 Divider()
 
-                sectionHeader("Preflight Checks")
-
-                if supervisor.preflightChecks.isEmpty {
-                    Text("No preflight checks have run yet")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ForEach(supervisor.preflightChecks) { check in
-                        HStack(spacing: 8) {
-                            Group {
-                                switch check.result {
-                                case .pending:
-                                    ProgressView().controlSize(.small)
-                                case .passed:
-                                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                                case .warning:
-                                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                                case .failed:
-                                    Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
-                                }
-                            }
-                            .frame(width: 16)
-
-                            Text(check.name)
-                                .font(.caption)
-
-                            Spacer()
-
-                            if case .passed(let detail) = check.result {
-                                Text(detail)
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .padding(.vertical, 2)
-                    }
-                }
+                preflightSection
 
                 Divider()
 
-                toolsSection
+                ToolsSection()
 
                 Divider()
 
@@ -114,14 +80,84 @@ struct WorkshopDiagnosticsView: View {
             }
             .padding(20)
         }
+    }
+
+    /// The start checks with each reason and fix, and a button that runs them now.
+    @ViewBuilder
+    private var preflightSection: some View {
+        HStack {
+            sectionHeader("Preflight Checks")
+            Spacer()
+            Button {
+                Task { await supervisor.runPreflightOnly() }
+            } label: {
+                if supervisor.preflightOnlyRunning {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Text("Run Checks Now")
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.mini)
+            .disabled(supervisor.preflightOnlyRunning || supervisor.startRunning)
+            .help(supervisor.startRunning ? ActionFeedback.checksDuringStart : "Runs the checks without a start. Opens no app.")
+        }
+
+        if supervisor.preflightChecks.isEmpty {
+            Text("No checks have run yet. Press Run Checks Now to run them without a start.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        } else {
+            ForEach(supervisor.preflightChecks) { check in
+                PreflightCheckRow(check: check)
+            }
+        }
+        let leftOut = supervisor.preflightPortsLeftOut
+        if !leftOut.isEmpty {
+            Text("Run Checks Now leaves out the ports of running services (\(leftOut.map(String.init).joined(separator: ", "))): those services hold them.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.system(size: 10, weight: .bold, design: .monospaced))
+            .foregroundStyle(.secondary)
+    }
+
+    private func copyDiagnosticBundle() async {
+        let json = await supervisor.diagnosticsBundleJSON()
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(json, forType: .string)
+        diagnosticCopied = true
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            diagnosticCopied = false
+        }
+    }
+}
+
+/// Where each tool is and which version the services get. Diagnostics and Health
+/// show it.
+struct ToolsSection: View {
+    @Environment(EnvironmentSupervisor.self) var supervisor
+    /// Nil while the first read runs.
+    @State private var toolReports: [ToolReport]?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            rows
+        }
         .task { await loadTools() }
     }
 
-    /// Where each tool is and which version the services get.
     @ViewBuilder
-    private var toolsSection: some View {
+    private var rows: some View {
         HStack {
-            sectionHeader("Tools")
+            Text("TOOLS")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(.secondary)
             Spacer()
             Button("Look Again") {
                 Task {
@@ -179,84 +215,4 @@ struct WorkshopDiagnosticsView: View {
         return path
     }
 
-    private func sectionHeader(_ title: String) -> some View {
-        Text(title.uppercased())
-            .font(.system(size: 10, weight: .bold, design: .monospaced))
-            .foregroundStyle(.secondary)
-    }
-
-    private func fetchGitBranch(_ path: String) async -> String? {
-        let result = await Shell.execute(
-            "/usr/bin/git", ["-C", path, "rev-parse", "--abbrev-ref", "HEAD"], timeout: .seconds(5)
-        )
-        let branch = result.trimmedOutput
-        return result.succeeded && !branch.isEmpty ? branch : nil
-    }
-
-    private func copyDiagnosticBundle() async {
-        let redactor = supervisor.makeRedactor()
-        var bundle: [String: Any] = [
-            "health": supervisor.health.rawValue,
-            "currentPhase": supervisor.currentPhase.rawValue,
-            "networkMode": supervisor.networkMode,
-            "localIP": supervisor.localIP ?? "none",
-            "lanInterface": supervisor.lanAddress?.interface ?? "none",
-            "generatedAt": ISO8601DateFormatter().string(from: .now),
-        ]
-
-        if let error = supervisor.lastError { bundle["lastError"] = redactor.redact(error) }
-        if let error = supervisor.controlAPIError { bundle["controlAPIError"] = error }
-        if !supervisor.configIssues.isEmpty { bundle["configIssues"] = supervisor.configIssues }
-        if let rootCause = supervisor.rootCauseDescription { bundle["rootCause"] = redactor.redact(rootCause) }
-
-        var services: [String: [String: Any]] = [:]
-        for (id, state) in supervisor.serviceStates {
-            var info: [String: Any] = [
-                "phase": state.phase.rawValue,
-                "restartCount": state.restartCount,
-            ]
-            if let pid = state.pid { info["pid"] = pid }
-            if let exitCode = state.exitCode { info["exitCode"] = exitCode }
-            if let started = state.lastStarted { info["uptimeSeconds"] = Int(Date.now.timeIntervalSince(started)) }
-            if state.isCircuitBroken { info["circuitBroken"] = true }
-            services[id] = info
-        }
-        bundle["services"] = services
-
-        var gitBranches: [String: String] = [:]
-        for id in supervisor.sortedServiceIDs {
-            if let cwd = supervisor.serviceCwd(id) {
-                if let branch = await fetchGitBranch(cwd) {
-                    gitBranches[id] = branch
-                }
-            }
-        }
-        bundle["gitBranches"] = gitBranches
-
-        let tools = await supervisor.tools.report(runner: supervisor.shell, cwd: toolsCwd)
-        bundle["tools"] = Dictionary(uniqueKeysWithValues: tools.map { tool in
-            var entry = ["path": tool.path ?? (tool.isUnread ? "not read" : "not found"), "version": tool.version ?? "unknown"]
-            if let problem = tool.problem { entry["problem"] = problem }
-            return (tool.name, entry)
-        })
-        if let searched = tools.map(\.searchedPath).first(where: { !$0.isEmpty }) { bundle["toolsPath"] = searched }
-
-        var logs: [String: [String]] = [:]
-        for id in supervisor.sortedServiceIDs {
-            let entries = await supervisor.logStore.entries(for: id)
-            logs[id] = entries.suffix(20).map { redactor.redact($0.text) }
-        }
-        bundle["recentLogs"] = logs
-
-        if let data = try? JSONSerialization.data(withJSONObject: bundle, options: [.prettyPrinted, .sortedKeys]),
-           let json = String(data: data, encoding: .utf8) {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(json, forType: .string)
-            diagnosticCopied = true
-            Task {
-                try? await Task.sleep(for: .seconds(2))
-                diagnosticCopied = false
-            }
-        }
-    }
 }

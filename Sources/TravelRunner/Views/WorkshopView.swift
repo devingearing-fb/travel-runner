@@ -34,13 +34,16 @@ struct WorkshopView: View {
                         List(WorkshopSection.visible(), selection: $navigation.selectedSection) { section in
                             Label(section.rawValue, systemImage: section.icon)
                                 .badge(section == .issues ? supervisor.debugOpenIssueCount
-                                       : section == .status ? failedServiceCount : 0)
+                                       : section == .status ? failedServiceCount
+                                       : section == .health ? supervisor.setupItemsNeedingAttention.count : 0)
                         }
                         .navigationSplitViewColumnWidth(min: 140, ideal: 160, max: 200)
                     } detail: {
                         switch navigation.selectedSection {
                         case .status:
                             WorkshopStatusView()
+                        case .health:
+                            WorkshopHealthView()
                         case .issues:
                             WorkshopIssuesView()
                         case .logs:

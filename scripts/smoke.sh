@@ -137,7 +137,7 @@ STATUS="$(get /api/status 5)"
 PREFLIGHT="$(get /api/preflight 45)"
 NODE_ID="$(field "$PREFLIGHT" checks.0.id)"
 NODE_STATUS="$(field "$PREFLIGHT" checks.0.status)"
-[ "$NODE_ID" = "node-version" ] || fail "/api/preflight has no Node check first: $PREFLIGHT"
+[ "$NODE_ID" = "node" ] || fail "/api/preflight has no Node check first: $PREFLIGHT"
 case "$NODE_STATUS" in
     passed|warning|failed) ;;
     *) fail "the Node check has no result ('$NODE_STATUS'): $PREFLIGHT" ;;
