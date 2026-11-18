@@ -6870,8 +6870,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         shell.respond { call in
             call.command == "pnpm db:stop" ? FakeCommandRunner.failed(1, stderr: "stop failed") : FakeCommandRunner.ok()
         }
-        var feedback: [(String, Bool)] = []
-        supervisor.onFeedback = { feedback.append(($0.message, $0.style != .error)) }
+        var feedback: [ActionFeedback] = []
+        supervisor.onFeedback = { feedback.append($0) }
         try load(supabaseStack(["sh", "-c", "echo db-start; exit 0"]))
         // The reset check after Supabase asks the database once.
         supervisor.databaseProbeRetry = (.milliseconds(10), .zero)
@@ -6881,7 +6881,10 @@ final class SupervisorLifecycleTests: XCTestCase {
         let done = await waitUntil(20) { !feedback.isEmpty }
         XCTAssertTrue(done)
         XCTAssertEqual(stackStops(shell), 1)
-        XCTAssertEqual(feedback.first?.0, "Supabase did not stop — see its log")
+        XCTAssertEqual(feedback.first?.message, "Supabase did not stop — see its log")
+        XCTAssertEqual(feedback.first?.style, .error)
+        // A click on the toast opens the triage card of Supabase.
+        XCTAssertEqual(feedback.first?.serviceID, "supabase")
     }
 
     /// Another project's database that takes the port during the start stops the

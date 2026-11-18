@@ -110,9 +110,12 @@ struct WorkshopStatusView: View {
                 guard let serviceID else { return }
                 navigation.focusedServiceID = nil
                 guard failedServices.contains(where: { $0.id == serviceID }) else { return }
-                withAnimation { proxy.scrollTo(Self.triageAnchor(serviceID), anchor: .top) }
                 highlightedServiceID = serviceID
-                Task {
+                Task { @MainActor in
+                    // On a fresh open this runs before the first layout, and a scroll
+                    // then does nothing. A short wait lets the window lay out first.
+                    try? await Task.sleep(for: .milliseconds(100))
+                    withAnimation { proxy.scrollTo(Self.triageAnchor(serviceID), anchor: .top) }
                     try? await Task.sleep(for: .seconds(2))
                     if highlightedServiceID == serviceID {
                         withAnimation { highlightedServiceID = nil }

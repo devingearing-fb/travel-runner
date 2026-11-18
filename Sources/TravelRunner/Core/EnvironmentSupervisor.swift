@@ -1817,7 +1817,7 @@ final class EnvironmentSupervisor {
                     try? await self.clock.sleep(for: .seconds(1))
                 })
                 if let heldBy {
-                    onActionFeedback?(keptRunningText(serviceID, heldBy), false)
+                    showFeedback(keptRunningText(serviceID, heldBy), .error, serviceID: serviceID)
                     return
                 }
                 clearCleanExitError(serviceID)
@@ -2361,7 +2361,7 @@ final class EnvironmentSupervisor {
             self.serviceStates["supabase"]?.phase = .stopping
             let ok = await self.stopSupabaseStack(definition)
             self.serviceStates["supabase"]?.phase = .stopped
-            self.onActionFeedback?(ok ? "Supabase stopped" : SupabaseStackHealth.didNotStopText, ok)
+            self.showFeedback(ok ? "Supabase stopped" : SupabaseStackHealth.didNotStopText, ok ? .success : .error, serviceID: "supabase")
         }
     }
 
@@ -2484,7 +2484,7 @@ final class EnvironmentSupervisor {
             guard result.succeeded else {
                 let why = Self.installFailure(result, folder: folder)
                 postNotice(.service(serviceID), "\(command) for \(name) \(why)")
-                onActionFeedback?("\(command) \(why)", false)
+                showFeedback("\(command) \(why)", .error, serviceID: serviceID)
                 return
             }
             restartService(serviceID, announce: true)
@@ -2626,7 +2626,7 @@ final class EnvironmentSupervisor {
                     (failure.hasSuffix(".") ? failure : failure + ".")
                         + " \(names) \(verb) the old packages; fix the cause, then press Install dependencies."
                 )
-                onActionFeedback?("\(command) \(why)", false)
+                showFeedback("\(command) \(why)", .error, serviceID: serviceID)
             }
         }
         for serviceID in serviceIDs {
@@ -2960,7 +2960,7 @@ final class EnvironmentSupervisor {
                         // A crash during the start: the automatic restart gives the answer.
                         await awaitReplacingLaunch(id)
                     case .refused(let why):
-                        onActionFeedback?(why, false)
+                        showFeedback(why, .error, serviceID: id)
                         return
                     default:
                         break
@@ -2969,13 +2969,13 @@ final class EnvironmentSupervisor {
                     let text = Self.restartWithDependentsFailedText(displayName(id), cause: "\(error)")
                     recordFailure(id, error: error, lastError: text)
                     recalculateHealth()
-                    onActionFeedback?(text, false)
+                    showFeedback(text, .error, serviceID: id)
                     return
                 }
                 if serviceStates[id]?.phase == .failed {
                     recalculateHealth()
                     let cause = serviceStates[id]?.condition?.headline ?? "it failed"
-                    onActionFeedback?(Self.restartWithDependentsFailedText(displayName(id), cause: cause), false)
+                    showFeedback(Self.restartWithDependentsFailedText(displayName(id), cause: cause), .error, serviceID: id)
                     return
                 }
                 clearCleanExitError(id)
@@ -2990,7 +2990,7 @@ final class EnvironmentSupervisor {
             recalculateHealth()
             // The containers ran on, so the start only reused them.
             if stackDidNotStop {
-                onActionFeedback?(SupabaseStackHealth.didNotStopText, false)
+                showFeedback(SupabaseStackHealth.didNotStopText, .error, serviceID: "supabase")
             } else {
                 onActionFeedback?("\(name) restarted with dependents", true)
             }
@@ -6251,7 +6251,7 @@ final class EnvironmentSupervisor {
             if result.succeeded {
                 restartService("stripe", announce: true)
             } else {
-                onActionFeedback?("\(command) failed — see the Stripe log", false)
+                showFeedback("\(command) failed — see the Stripe log", .error, serviceID: "stripe")
             }
         }
     }
@@ -6272,7 +6272,7 @@ final class EnvironmentSupervisor {
     /// portal, then a start of Stripe on its key.
     func importSharedEnvForStripe() {
         guard let monorepo = supabaseCwd ?? monorepoPath else {
-            onActionFeedback?("No monorepo path — set it in Settings > Paths, then import the .env again", false)
+            showFeedback("No monorepo path — set it in Settings > Paths, then import the .env again", .error, serviceID: "stripe")
             return
         }
         let checker = EnvironmentChecker(
@@ -6284,7 +6284,10 @@ final class EnvironmentSupervisor {
             case true?:
                 restartService("stripe", announce: true)
             case false?:
-                onActionFeedback?("The .env was not imported — check the file and that apps/booking-portal can be written, then try again", false)
+                showFeedback(
+                    "The .env was not imported — check the file and that apps/booking-portal can be written, then try again",
+                    .error, serviceID: "stripe"
+                )
             case nil:
                 break
             }
