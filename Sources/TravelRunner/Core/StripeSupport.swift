@@ -164,11 +164,13 @@ enum StripeLauncher {
     }
 
     /// Asks Stripe with the test key in `STRIPE_API_KEY`, as `stripe listen` gets it.
-    /// The output stays in the runner: the row shows no line of it.
+    /// The row shows at most the message of Stripe's error, which masks the key.
     static let keyCheckCommand = "stripe balance retrieve"
 
     /// The setup row "Stripe CLI Auth" in test-key mode, from `keyCheckCommand`.
     /// Nil `result`: the CLI is not installed, so the key was not asked.
+    /// A refused request prints `Request failed, status=401, body={"error": {"message": …}}`
+    /// to stderr (CLI 1.40, checked by hand with a made-up sk_test_ key).
     static func testKeyStatus(source: String, result: CommandResult?) -> CheckStatus {
         guard let result else {
             return .warning("The test key from \(source) is not checked — install the Stripe CLI: \(installCommand)")
@@ -177,11 +179,29 @@ enum StripeLauncher {
         // Stripe's answer to a wrong or rolled key. A balance can hold any number, so no "401".
         let rejected = ["Invalid API Key", "Expired API Key", "api_key_expired"].contains { output.contains($0) }
         if rejected { return .warning(keyRejected(source: source)) }
-        if result.succeeded, !output.contains("\"error\"") {
+        let message = errorMessage(in: output)
+        if result.succeeded, message == nil, !output.contains("\"error\"") {
             return .passing("Stripe accepts the test key from \(source)")
+        }
+        if let message {
+            return .warning("Stripe answered the test key from \(source): \(message) — re-check later")
         }
         return .warning("Could not check the test key from \(source) (exit \(result.exitCode)) — check the network, then re-check")
     }
+
+    /// The first line of the `"message"` of a Stripe error in `output`, with any secret
+    /// removed, or nil when Stripe sent no error.
+    static func errorMessage(in output: String) -> String? {
+        guard let match = errorMessagePattern.firstMatch(in: output, range: NSRange(output.startIndex..., in: output)),
+              let range = Range(match.range(at: 1), in: output) else { return nil }
+        let raw = String(output[range]).replacingOccurrences(of: "\\n", with: "\n").replacingOccurrences(of: "\\\"", with: "\"")
+        guard let line = raw.split(whereSeparator: \.isNewline).first?.trimmingCharacters(in: .whitespaces),
+              !line.isEmpty else { return nil }
+        let short = line.count > 200 ? String(line.prefix(200)) + "…" : line
+        return Redactor.patterns.redact(short)
+    }
+
+    private static let errorMessagePattern = try! NSRegularExpression(pattern: #""message"\s*:\s*"((?:[^"\\]|\\.)*)""#)
 
     /// The setup fix "Log in…" when the CLI is missing: Terminal is not opened.
     static let notInstalledForLoginText =

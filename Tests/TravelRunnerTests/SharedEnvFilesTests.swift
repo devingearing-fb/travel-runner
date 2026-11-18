@@ -189,6 +189,17 @@ final class SharedEnvFilesTests: XCTestCase {
         XCTAssertTrue(SharedEnvFiles.restore(moved, to: target))
         XCTAssertEqual(try String(contentsOfFile: target, encoding: .utf8), "TEAMMATE=1\n")
 
+        // A file that doppler-env.sh wrote stays: the script replaces it, so no copy piles up.
+        let pulled = "\(SharedEnvFiles.dopplerMarker)\nDOPPLER=1\n"
+        try pulled.write(toFile: target, atomically: true, encoding: .utf8)
+        XCTAssertNil(try SharedEnvFiles.moveAside(target, now: now))
+        XCTAssertEqual(try String(contentsOfFile: target, encoding: .utf8), pulled)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: moved), "no .env.bak copy of a Doppler file")
+        // Control: the marker on a later line does not count.
+        try "TEAMMATE=1\n\(SharedEnvFiles.dopplerMarker)\n".write(toFile: target, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(atPath: try XCTUnwrap(try SharedEnvFiles.moveAside(target, now: now)))
+        try "TEAMMATE=1\n".write(toFile: target, atomically: true, encoding: .utf8)
+
         // Control: a pull that wrote a file keeps it, and the copy stays.
         let again = try XCTUnwrap(try SharedEnvFiles.moveAside(target, now: now))
         try "DOPPLER=1\n".write(toFile: target, atomically: true, encoding: .utf8)
@@ -267,9 +278,11 @@ final class SharedEnvFilesTests: XCTestCase {
         XCTAssertTrue(row.isRequired)
         XCTAssertEqual(row.fixLabel, "Grant access in System Settings")
         XCTAssertNotNil(EnvironmentChecker.impact(of: "folder-access"))
-        guard case .guidance(let text, nil, let url) = checker.fixAction(for: "folder-access") else { return XCTFail() }
+        guard case .guidance(let text, nil, let url, let linkTitle) = checker.fixAction(for: "folder-access") else { return XCTFail() }
         XCTAssertTrue(text.contains("Files and Folders"), text)
         XCTAssertEqual(url, EnvironmentChecker.filesAndFoldersURL)
+        XCTAssertEqual(linkTitle, "Open Files and Folders settings")
+        XCTAssertFalse(row.checkDescription.contains("opens System Settings"), "the fix shows a sheet; it does not open the settings")
         // The shared .env rows have Pull from Doppler beside Import….
         XCTAssertEqual(checker.checks.first { $0.id == "booking-env" }?.altFixLabel, "Pull from Doppler")
         XCTAssertEqual(checker.checks.first { $0.id == "partner-env" }?.altFixLabel, "Pull from Doppler")
@@ -296,6 +309,25 @@ final class SharedEnvFilesTests: XCTestCase {
         XCTAssertEqual(HotelCatalog.preflightStatus(FakeCommandRunner.failed(1)), .failing("fetch-hotels.mjs --preflight failed (exit 1)"))
         XCTAssertEqual(HotelCatalog.preflightStatus(FakeCommandRunner.timedOut),
                        .warning("The test of the hotel keys did not answer in 30 s — the keys are not checked"))
+    }
+
+    /// A pass that did not ask dev (a dump in the checkout, a published dump) says what it found.
+    func testAPreflightPassThatDidNotTestTheKeysShowsTheScriptsDetail() {
+        let inCheckout = "Cached — 209,823 rows, 2026-08-11"
+        XCTAssertEqual(HotelCatalog.preflightStatus(FakeCommandRunner.ok("##db:health:pass:\(inCheckout)\n")), .passing(inCheckout))
+        let published = "No cached dump; dumps.example.com can serve one"
+        XCTAssertEqual(HotelCatalog.preflightStatus(FakeCommandRunner.ok("##db:health:pass:\(published)\n")), .passing(published))
+        XCTAssertEqual(HotelCatalog.preflightStatus(FakeCommandRunner.ok()), .passing("fetch-hotels.mjs --preflight passed"))
+    }
+
+    /// Only exit 10 (no credentials) and 11 (401/403) are about the keys.
+    func testOnlyAMissingOrRefusedKeyCountsAsAKeyRejection() {
+        XCTAssertTrue(HotelCatalog.keysRejected(FakeCommandRunner.failed(10)))
+        XCTAssertTrue(HotelCatalog.keysRejected(FakeCommandRunner.failed(11)))
+        for code: Int32 in [0, 1, 12, 13, 127, 130] {
+            XCTAssertFalse(HotelCatalog.keysRejected(CommandResult(exitCode: code, stdout: "", stderr: "")), "exit \(code)")
+        }
+        XCTAssertFalse(HotelCatalog.keysRejected(FakeCommandRunner.timedOut))
     }
 
     /// A checkout whose shared booking .env has the three hotel keys and no dump is cached.
@@ -341,12 +373,36 @@ final class SharedEnvFilesTests: XCTestCase {
     /// Control: keys that dev accepts pass both rows.
     @MainActor
     func testKeysThatDevAcceptsPassTheHotelRow() async throws {
-        let (checker, _) = try hotelChecker(script: "// --preflight\n", preflight: FakeCommandRunner.ok("##db:health:pass:ok\n"))
+        let (checker, _) = try hotelChecker(
+            script: "// --preflight\n", preflight: FakeCommandRunner.ok("##db:health:pass:No cached dump; dev Supabase can serve one\n")
+        )
 
         await checker.runAllChecks()
 
         XCTAssertEqual(checker.checks.first { $0.id == "hotel-data" }?.status, .passing(HotelCatalog.keysAcceptedText))
         XCTAssertEqual(checker.checks.first { $0.id == "booking-env" }?.status, .passing("All 3 shared keys"))
+    }
+
+    /// Negative control: a preflight that fails for a reason other than the keys fails the
+    /// hotel row only. The booking .env row keeps the env-check result and blocks nothing.
+    @MainActor
+    func testAPreflightFailureThatIsNotAboutTheKeysLeavesTheBookingEnvAlone() async throws {
+        let noPython = "python3 was not found on PATH. Install Python 3, then run the step again."
+        for preflight in [
+            CommandResult(exitCode: 1, stdout: "##db:health:fail:\(noPython)\n", stderr: ""),
+            CommandResult(exitCode: 13, stdout: "##db:health:fail:Dev Supabase has no hotel rows to download\n", stderr: ""),
+            CommandResult(exitCode: 127, stdout: "", stderr: "node: command not found"),
+        ] {
+            let (checker, _) = try hotelChecker(script: "// --preflight\n", preflight: preflight)
+
+            await checker.runAllChecks()
+
+            guard case .failing = checker.checks.first(where: { $0.id == "hotel-data" })?.status else {
+                return XCTFail("exit \(preflight.exitCode): the hotel row fails")
+            }
+            XCTAssertEqual(checker.checks.first { $0.id == "booking-env" }?.status, .passing("All 3 shared keys"), "exit \(preflight.exitCode)")
+            XCTAssertFalse(checker.blockers.contains { $0.id == "booking-env" }, "exit \(preflight.exitCode)")
+        }
     }
 
     /// An older fetch-hotels.mjs has no --preflight and would download: it is not run.
@@ -370,8 +426,25 @@ final class SharedEnvFilesTests: XCTestCase {
         XCTAssertEqual(StripeLauncher.testKeyStatus(source: source, result: invalid), .warning(StripeLauncher.keyRejected(source: source)))
         let expired = CommandResult(exitCode: 0, stdout: #"{"error": {"code": "api_key_expired"}}"#, stderr: "")
         XCTAssertEqual(StripeLauncher.testKeyStatus(source: source, result: expired), .warning(StripeLauncher.keyRejected(source: source)))
+        // As CLI 1.40 prints a refused request, to stderr.
+        let realInvalid = CommandResult(exitCode: 1, stdout: "", stderr: """
+            Request failed, status=401, body={
+              "error": {
+                "message": "Invalid API Key provided: sk_test_********************0000",
+                "type": "invalid_request_error"
+              }
+            }
+            """)
+        XCTAssertEqual(StripeLauncher.testKeyStatus(source: source, result: realInvalid), .warning(StripeLauncher.keyRejected(source: source)))
+        // Another error: the row shows Stripe's message and does not blame the network.
+        let limited = CommandResult(exitCode: 1, stdout: "", stderr: """
+            Request failed, status=429, body={"error": {"message": "Too many requests hit the API too quickly.\\nRetry later.", "type": "rate_limit_error"}}
+            """)
+        XCTAssertEqual(StripeLauncher.testKeyStatus(source: source, result: limited),
+                       .warning("Stripe answered the test key from apps/booking-portal/.env: Too many requests hit the API too quickly. — re-check later"))
         guard case .warning(let offline) = StripeLauncher.testKeyStatus(source: source, result: FakeCommandRunner.failed(1)) else { return XCTFail() }
         XCTAssertTrue(offline.hasPrefix("Could not check the test key"), offline)
+        XCTAssertTrue(offline.contains("network"), offline)
         guard case .warning(let noCLI) = StripeLauncher.testKeyStatus(source: source, result: nil) else { return XCTFail() }
         XCTAssertTrue(noCLI.contains(StripeLauncher.installCommand), noCLI)
     }

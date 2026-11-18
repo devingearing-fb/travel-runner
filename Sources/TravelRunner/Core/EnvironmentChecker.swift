@@ -286,7 +286,7 @@ final class EnvironmentChecker {
             HealthCheck(id: "folder-access", name: "Folder access", section: .prerequisites,
                         fixLabel: Self.grantAccessLabel,
                         checkCommand: "ls \(ShellQuote.quote((monorepoPath as NSString).abbreviatingWithTildeInPath))",
-                        checkDescription: "When a checkout is in Documents, Desktop or Downloads, macOS asks once whether \(flavor.displayName) may open that folder. Allow it: the services run from there. After a denied prompt every read fails with \"Operation not permitted\" (EPERM); the row then says which folder, and the fix opens System Settings.",
+                        checkDescription: "When a checkout is in Documents, Desktop or Downloads, macOS asks once whether \(flavor.displayName) may open that folder. Allow it: the services run from there. After a denied prompt every read fails with \"Operation not permitted\" (EPERM); the row then says which folder, and the fix shows the steps and a link to the settings.",
                         checkPath: monorepoPath),
             HealthCheck(id: "docker", name: runtime.displayName, section: .prerequisites,
                         fixLabel: "Open \(runtime.appName)",
@@ -338,12 +338,12 @@ final class EnvironmentChecker {
             HealthCheck(id: "booking-env", name: "Booking .env (shared values)", section: .supabase,
                         isRequired: false, fixLabel: "Import…", altFixLabel: Self.dopplerPullLabel,
                         checkCommand: "pnpm env:check",
-                        checkDescription: "apps/booking-portal/.env holds the shared dev values (Stripe, HotelPlanner, hosted Supabase…). Get it from a teammate and import it (another worktree's copy is offered first), or use Pull from Doppler (pnpm env:pull) with Doppler access. Either way the current file is kept as .env.bak-<date>. The runner writes local overrides into .env.local on top of it.",
+                        checkDescription: "apps/booking-portal/.env holds the shared dev values (Stripe, HotelPlanner, hosted Supabase…). Get it from a teammate and import it (another worktree's copy is offered first), or use Pull from Doppler (pnpm env:pull) with Doppler access. Either way the current file is kept as .env.bak-<date>, unless Doppler wrote it. The runner writes local overrides into .env.local on top of it.",
                         checkPath: (bookingPath as NSString).appendingPathComponent(".env")),
             HealthCheck(id: "partner-env", name: "Partner .env (shared values)", section: .supabase,
                         isRequired: false, fixLabel: "Import…", altFixLabel: Self.dopplerPullLabel,
                         checkCommand: "pnpm env:check",
-                        checkDescription: "apps/partner-portal/.env holds the shared dev values. Get it from a teammate and import it (another worktree's copy is offered first), or use Pull from Doppler (pnpm env:pull) with Doppler access. Either way the current file is kept as .env.bak-<date>.",
+                        checkDescription: "apps/partner-portal/.env holds the shared dev values. Get it from a teammate and import it (another worktree's copy is offered first), or use Pull from Doppler (pnpm env:pull) with Doppler access. Either way the current file is kept as .env.bak-<date>, unless Doppler wrote it.",
                         checkPath: (partnerPath as NSString).appendingPathComponent(".env")),
             HealthCheck(id: "backend-baseline", name: "Backend migration baseline", section: .supabase,
                         isRequired: false,
@@ -691,7 +691,11 @@ final class EnvironmentChecker {
             checks.first { $0.id == id }?.requiredNow = required
             let keysPresent = HotelCatalog.devKeysPresent(monorepo: monorepoPath)
             var rejection: String?
-            if required, keysPresent, case .failing(let reason)? = await testedHotelKeys() { rejection = reason }
+            // Only a refusal of the keys fails this row; other preflight failures stay on the hotel row.
+            if required, keysPresent, let tested = await testedHotelKeys(), HotelCatalog.keysRejected(tested),
+               case .failing(let reason) = HotelCatalog.preflightStatus(tested) {
+                rejection = reason
+            }
             return Self.bookingEnvStatus(status, required: required, hotelKeysPresent: keysPresent, rejection: rejection)
 
         case "backend-baseline":
@@ -711,7 +715,7 @@ final class EnvironmentChecker {
             let cached = await cachedHotelDump()
             let keysPresent = HotelCatalog.devKeysPresent(monorepo: monorepoPath)
             // Without a dump the keys must work, not only be there.
-            if cached == nil, keysPresent, let tested = await testedHotelKeys() { return tested }
+            if cached == nil, keysPresent, let tested = await testedHotelKeys() { return HotelCatalog.preflightStatus(tested) }
             return HotelCatalog.sourceStatus(cached: cached, keysPresent: keysPresent)
 
         case "sb-linked":
@@ -840,19 +844,19 @@ final class EnvironmentChecker {
     /// The read of the hotel dump of this round of checks.
     private var hotelCache: Task<String?, Never>?
     /// The test of the shared hotel keys of this round of checks.
-    private var hotelKeysCache: Task<CheckStatus?, Never>?
+    private var hotelKeysCache: Task<CommandResult?, Never>?
 
-    /// What dev said to the shared hotel keys, or nil when the checkout cannot ask
+    /// The run of `fetch-hotels.mjs --preflight`, or nil when the checkout cannot ask
     /// without a download. Asked once per round, for the hotel row and the booking .env row.
-    private func testedHotelKeys() async -> CheckStatus? {
+    private func testedHotelKeys() async -> CommandResult? {
         if let hotelKeysCache { return await hotelKeysCache.value }
-        let task = Task { () -> CheckStatus? in
+        let task = Task { () -> CommandResult? in
             guard HotelCatalog.supportsPreflight(monorepo: self.monorepoPath) else { return nil }
             let result = await self.commandRunner.run(
                 HotelCatalog.preflightCommand(monorepo: self.monorepoPath, dump: self.hotelDumpPath),
                 cwd: self.commandCwd, timeout: HotelCatalog.preflightTimeout
             )
-            return HotelCatalog.preflightStatus(result)
+            return result
         }
         hotelKeysCache = task
         return await task.value
@@ -976,7 +980,10 @@ final class EnvironmentChecker {
         }
         switch id {
         case "folder-access":
-            return .guidance(text: Self.folderAccessGuidance(appName: flavor.displayName), copyCommand: nil, url: Self.filesAndFoldersURL)
+            return .guidance(
+                text: Self.folderAccessGuidance(appName: flavor.displayName), copyCommand: nil,
+                url: Self.filesAndFoldersURL, linkTitle: "Open Files and Folders settings"
+            )
         case "docker":
             // Opening the app and waiting does not fix a missing CLI or a refused socket.
             switch dockerProbe {

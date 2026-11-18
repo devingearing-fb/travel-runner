@@ -137,14 +137,25 @@ enum SharedEnvFiles {
             ? nil : "\(dopplerScript) is missing in this checkout — pull dev"
     }
 
+    /// The first line of every `.env` that `doppler-env.sh` writes.
+    static let dopplerMarker = "# Written by scripts/doppler-env.sh from Doppler — do not edit; rerun the script."
+
     /// `doppler-env.sh` refuses a `.env` it did not write ("move it away first"). Before a
-    /// pull the runner moves the file to `<target>.bak-<yyyyMMdd-HHmmss>` (0600), and puts
-    /// it back when the pull writes nothing. Returns the path of the moved file, or nil.
+    /// pull the runner moves such a file to `<target>.bak-<yyyyMMdd-HHmmss>` (0600), and puts
+    /// it back when the pull writes nothing. A file the script wrote stays: the script
+    /// replaces it, so repeated pulls leave no copies. Returns the path of the moved file, or nil.
     static func moveAside(_ target: String, now: Date) throws -> String? {
-        guard FileManager.default.fileExists(atPath: target) else { return nil }
+        guard FileManager.default.fileExists(atPath: target), !writtenByDoppler(target) else { return nil }
         let name = try BackupCopy.make(of: target, now: now, permissions: 0o600)
         try FileManager.default.removeItem(atPath: target)
         return ((target as NSString).deletingLastPathComponent as NSString).appendingPathComponent(name)
+    }
+
+    /// True when the first line of the file is `dopplerMarker`, as `doppler-env.sh` checks it.
+    static func writtenByDoppler(_ path: String) -> Bool {
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
+        return content.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first
+            .map { String($0) == dopplerMarker } ?? false
     }
 
     /// Puts a moved file back when the pull left no `.env`. True when it did.
