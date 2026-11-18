@@ -97,6 +97,56 @@ enum ServiceCatalog {
         "capacity-contention", "capacity-block-edit-race", "capacity-overflow",
     ]
 
+    /// The services that run from an optional repo, with the repo. A missing repo
+    /// skips them, and the rest of the stack starts.
+    static let optionalRepoServices: [String: RepoDetector.RepoRole] = [
+        "stream-services-install": .streamServices, "stream-db-setup": .streamServices,
+        "stream-services": .streamServices,
+        "cache-apply-transport": .loadTest, "capacity-contention": .loadTest,
+        "capacity-block-edit-race": .loadTest, "capacity-overflow": .loadTest,
+        "cache-cdc-rehearsal": .loadTest, "cache-cutover-audit": .loadTest,
+    ]
+
+    /// The repo that `definition` runs from, when it is optional and its folder is
+    /// not there: the reason of its skip. Nil when the service can start.
+    static func missingOptionalRepo(_ definition: ServiceDefinition) -> String? {
+        guard let role = optionalRepoServices[definition.id] else { return nil }
+        // The CDC setup runs in the booking app and reads the stream repo from its env.
+        let path = definition.env?["STREAM_SERVICES_DIR"] ?? definition.resolvedCwd ?? ""
+        var isDirectory: ObjCBool = false
+        if !path.isEmpty, FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue {
+            return nil
+        }
+        return repoNotFound(role, path: path)
+    }
+
+    /// Edges that only set the order. The CDC setup anchors its slot after the
+    /// verification runs, so their fixture churn does not reach Sequin. A skipped
+    /// verification run does not skip the CDC setup.
+    static let orderingOnlyDependencies: [String: Set<String>] = [
+        "stream-db-setup": ["capacity-overflow"],
+    ]
+
+    static func repoNotFound(_ role: RepoDetector.RepoRole, path: String) -> String {
+        "\(role.rawValue) repo not found at \(path.isEmpty ? "(no path set)" : path) — set it in Settings > Paths."
+    }
+
+    static let streamInstallID = "stream-services-install"
+    static let qstashID = "stream-qstash"
+    static let sequinID = "stream-sequin"
+
+    /// The local QStash CLI, in the booking app's packages.
+    static let qstashBinary = "node_modules/.bin/qstash"
+    static let qstashMissing = "QStash CLI missing — run pnpm install at the monorepo root."
+
+    /// The seed scenario that the verification services of the full profile need.
+    static let verificationSeedScenarioID = "redis-cache"
+    static let verificationSeedServices: Set<String> = [
+        "cache-apply-transport", "capacity-contention", "capacity-block-edit-race", "capacity-overflow",
+    ]
+    static let verificationSeedHint =
+        "The full profile needs the 'Redis cache integration' seed: DB Tools > choose it > Reset & Seed Data, then start again."
+
     /// Services of the old three-repo layout that a config upgrade drops.
     static let retiredIDs: Set<String> = ["yalc-link"]
 
@@ -146,7 +196,8 @@ enum ServiceCatalog {
             service("stripe", "Stripe CLI",
                     StripeLauncher.command,
                     probe: ProbeConfig(type: .stdoutRegex, port: nil, host: nil, url: nil,
-                                       pattern: "whsec_[A-Za-z0-9]+", artifact: "STRIPE_WEBHOOK_SECRET", timeout: nil),
+                                       pattern: "whsec_[A-Za-z0-9]+", artifact: "STRIPE_WEBHOOK_SECRET",
+                                       timeout: StripeLauncher.connectTimeout),
                     restart: .onFailure, phase: "gateway", dependsOn: ["supabase"]),
             // The portal does not wait for Stripe. A new webhook secret restarts it.
             service("travel-portal", "Travel Portal", ["pnpm", "dev"], cwd: booking,
@@ -167,7 +218,7 @@ enum ServiceCatalog {
             service("stream-services-install", "Stream Services Install",
                     ["npm", "install", "--prefer-offline", "--no-audit", "--no-fund"], cwd: stream,
                     type: .oneshot, restart: .never, phase: "stream", dependsOn: ["supabase"]),
-            service("stream-qstash", "Local QStash", ["./node_modules/.bin/qstash", "dev"], cwd: booking,
+            service("stream-qstash", "Local QStash", ["./" + qstashBinary, "dev"], cwd: booking,
                     probe: tcp(8080, timeout: 120), restart: .onFailure, phase: "stream", dependsOn: ["supabase"]),
             service("stream-db-setup", "Stream CDC Database Setup", ["./scripts/local-cdc/runner-db-setup.sh"],
                     cwd: booking, type: .oneshot, restart: .never, phase: "stream",

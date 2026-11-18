@@ -4,6 +4,23 @@
 
 ## Resolved
 
+### A missing optional repo blocked the whole stack
+
+**Resolved:** S4, 2026-11.
+
+The full profile ran a folder check for each repo in the preflight. Without the stream-services or the load-test repo the preflight failed, and nothing started. A skipped verification run would also have skipped the CDC setup, and QStash crash-looped without its CLI.
+
+**Fix:**
+- The services of an optional repo are skipped: "Stream Services repo not found at <path> — set it in Settings > Paths." The row has an Open Settings button. The portals start normally.
+- A service whose dependency is skipped is skipped too: "Skipped: <dependency> is not available." The row names the reason of the dependency. A dependency outside the profile counts as met. `stream-db-setup` still starts after `capacity-overflow`, so the fixture churn of the verification runs does not reach the CDC slot, but that edge only sets the order: a skipped `capacity-overflow` does not skip it.
+- The preflight skips the folder and port checks of an optional repo that is not there.
+- QStash without `node_modules/.bin/qstash` is skipped: "QStash CLI missing — run pnpm install at the monorepo root."
+- `stream-services-install` runs only when the packages are missing or changed.
+- A branch change leaves Sequin running: "[travel-runner] Branch changed — Sequin keeps running; restart it if scripts/local-cdc changed."
+- A verification service of the full profile without the 'Redis cache integration' seed says so in its log and its failure.
+
+**Still open:** QStash uses the fixed port 8080. The Sequin image is `sequin/sequin:latest` in the monolith and is not pinned yet.
+
 ### Two requests for one service started two processes (EADDRINUSE)
 
 **Resolved:** 2026-11-10
@@ -100,11 +117,11 @@ Moving the machine between networks (e.g., office → home WiFi) while LAN mode 
 
 ### Stripe restart permanently abandoned when network not ready
 
-**Resolved:** 2026-06-10
+**Resolved:** 2026-06-10. **Replaced:** S3, 2026-11.
 
 Both `handleWake()` (30s wait) and `scheduleRestart()` (15s wait) gave up permanently if the network wasn't ready, leaving Stripe FAILED until a manual restart.
 
-**Fix:** Both paths now schedule a retry with exponential backoff (capped by the existing restartCount < 5 guard) instead of abandoning.
+**Fix now (S3):** Stripe has its own state machine (see "Stripe CLI crash-loops after macOS sleep/wake"). `scheduleRestart()` has no Stripe path any more.
 
 ### Watcher tasks leaked on config reload
 
@@ -124,14 +141,17 @@ The timeout watchdog task slept for the full step timeout even after the process
 
 ### Stripe CLI crash-loops after macOS sleep/wake
 
-**Resolved:** 2026-06-02
+**Resolved:** 2026-06-02. **Replaced:** S3, 2026-11.
 
-Stripe's WebSocket to api.stripe.com dies during macOS sleep. On wake, the CLI enters a "Session expired, reconnecting..." loop that eventually fails with a DNS resolution error and exits code 1. The `handleWake()` method skipped stdout_regex services, so Stripe was never health-checked after wake.
+Stripe's WebSocket to api.stripe.com dies during macOS sleep. On wake, the CLI enters a "Session expired, reconnecting..." loop that eventually fails with a DNS resolution error and exits code 1.
 
-**Fix:**
-- `handleWake()` now proactively restarts Stripe after wake with a network readiness check (`waitForNetwork()` polls DNS for up to 30s)
-- `scheduleRestart()` checks network availability before restarting Stripe, preventing the circuit breaker from tripping on transient DNS failures
-- Added WebSocket degradation early warning: if "Session expired, reconnecting..." messages persist for >2 minutes without successful webhook forwarding, Stripe is automatically restarted
+**Fix now (S3, `StripeSupport.swift`):**
+- One probe, `StripeCLI`, says `ok`, `notInstalled`, `offline`, `notAuthenticated`, `outdated` or `unverified`. Only an auth line in its output blames the key or login; a failure with no known line, or a hung `which stripe`, is `unverified` and Stripe tries again. Each command has a timeout, and Start All's preflight and the start of Stripe share one answer for 60 s.
+- `StripeExitClassifier` reads the log of each exit: a 401 never retries; `no such host`, `dial tcp`, a TLS handshake timeout, an i/o timeout or a reset connection waits for the network and retries after 5 s, doubling up to 60 s, with no issue and no red state; a crash or an unknown exit gets 2 restarts, then Stripe is off and one issue is filed.
+- On wake the runner stops Stripe itself and starts it again while the portals are probed. With no network the row says "Reconnecting Stripe after wake…" and no issue is filed. A stale CLI that exits by itself during the reconnect is part of it, not a crash.
+- Start All starts Stripe's retry counts over, as a restart from its row does.
+- `stripe listen` that prints no webhook secret in 25 s turns Stripe off ("Stripe did not connect within 25s — webhooks are off."), not FAILED.
+- The 2-minute "Session expired, reconnecting" watchdog is gone.
 
 ### Travel Portal EADDRINUSE on rapid LAN mode toggle
 

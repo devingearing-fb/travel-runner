@@ -172,10 +172,10 @@ struct SettingsPageView: View {
                     }
                 }
 
-                if supervisor.networkMode, let ip = supervisor.localIP {
+                if supervisor.networkMode, let lan = supervisor.lanAddress {
                     HStack {
                         Spacer()
-                        Text(ip)
+                        Text("LAN: \(lan.label)")
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.green)
                             .padding(.trailing, 8)
@@ -231,6 +231,9 @@ struct SettingsPageView: View {
                 Divider().padding(.leading, 32)
                 pathRow(label: "Stream Services", icon: "arrow.triangle.branch",
                         path: expandedPath(config?.paths?.streamServices))
+                Divider().padding(.leading, 32)
+                pathRow(label: "Travel Load Test", icon: "gauge.with.dots.needle.67percent",
+                        path: expandedPath(config?.paths?.loadTest))
             }
             .background(Color.secondary.opacity(0.06))
             .clipShape(RoundedRectangle(cornerRadius: 8))

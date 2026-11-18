@@ -21,7 +21,7 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 - **Shared code**: `packages/travel-data` hot-reloads into both apps — nothing to build or link
 - **Console tabs**: Live logs for Stripe, Booking Portal, and Universal Login with Pino JSON formatting
 - **Crash recovery**: Auto-restarts failed services with exponential backoff, and stops after 3 failures in a minute (circuit breaker). A service that someone stops from outside (`kill`) comes back without a crash report
-- **LAN mode**: Toggle to make all services accessible from other devices (mobile testing); rewrites both apps' runner blocks
+- **LAN mode**: Toggle to make all services accessible from other devices (mobile testing); the web servers listen on all addresses, both apps' runner blocks get the address of the default-route interface, and a network change with a new address applies it again
 - **Database mode**: Toggle between local Supabase and hosted dev (needs each profile app's shared `.env`)
 - **Sleep/wake**: Re-probes services after macOS wake, one pass per wake
 - **Rooms tab**: For one event and hotel, shows how many rooms of each room type are booked, held and free on each night, and who holds them. A switch selects the local stack or dev. The tab is read-only. It shows the page of the monolith's holds viewer (`scripts/holds-viewer`): the copy in your checkout, or the copy of `origin/dev` when your branch does not have it. Dev needs only the shared `apps/<app>/.env`, not Doppler. The viewer runs while the tab is open and stops 10 minutes after it closes. `defaults write ai.fastbreak.travel-runner holdsViewerPath <folder>` makes the tab use a copy from another folder; `defaults delete ai.fastbreak.travel-runner holdsViewerPath` removes that

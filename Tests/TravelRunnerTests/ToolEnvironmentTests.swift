@@ -615,7 +615,7 @@ final class ToolEnvironmentTests: XCTestCase {
 
         let stripe = await preflight.run(check: PreflightCheck(id: "stripe-auth", name: "Stripe"))
         guard case .warning(let warning) = stripe else { return XCTFail("\(stripe)") }
-        XCTAssertEqual(warning, "stripe balance retrieve did not answer in 15 s — Stripe will be skipped")
+        XCTAssertEqual(warning, "No network, or Stripe did not answer — Stripe reconnects when the network is back")
 
         XCTAssertTrue(runner.calls.allSatisfy { $0.timeout == .seconds(15) }, "each check command has a timeout")
     }

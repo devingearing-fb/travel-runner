@@ -6,17 +6,15 @@ struct WorkshopHeaderBar: View {
     @State private var confirmingResetWithoutHotels = false
 
     private var healthLabel: String {
-        switch supervisor.health {
-        case .stopped: return "Stopped"
-        case .starting: return "Starting..."
-        case .healthy: return "All OK"
-        case .degraded:
-            let failCount = supervisor.sortedServiceIDs
-                .compactMap { supervisor.serviceStates[$0] }
-                .filter { $0.phase == .failed || $0.isCircuitBroken }
-                .count
-            return failCount > 0 ? "\(failCount) Failing" : "Degraded"
-        }
+        // A test or a direct write can leave the summary behind the status.
+        let summary = supervisor.healthSummary
+        return summary.status == supervisor.health ? summary.label : HealthSummary(status: supervisor.health).label
+    }
+
+    /// The reason of the summary, only while the summary matches the status.
+    private var healthReason: String? {
+        let summary = supervisor.healthSummary
+        return summary.status == supervisor.health ? summary.reason : nil
     }
 
     private var isIncident: Bool {
@@ -59,6 +57,18 @@ struct WorkshopHeaderBar: View {
                     .fontWeight(.medium)
                     .foregroundStyle(isIncident ? .red : .primary)
                     .lineLimit(1)
+                    .help(healthReason ?? healthLabel)
+
+                // Why: the failed service, the services that are off, or the refused start.
+                if let reason = healthReason {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .textSelection(.enabled)
+                        .help(reason)
+                }
 
                 if supervisor.health == .starting, let began = supervisor.startupBeganAt {
                     Text(began, style: .relative)

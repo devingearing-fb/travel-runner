@@ -129,7 +129,10 @@ final class ServiceCatalogTests: XCTestCase {
         XCTAssertLessThan(try level("cache-apply-transport"), try level("capacity-contention"))
         XCTAssertLessThan(try level("capacity-contention"), try level("capacity-block-edit-race"))
         XCTAssertLessThan(try level("capacity-block-edit-race"), try level("capacity-overflow"))
+        // The CDC setup anchors its slot after the verification runs. The edge only sets
+        // the order: a skipped verification run does not skip the CDC setup (decision 16).
         XCTAssertLessThan(try level("capacity-overflow"), try level("stream-db-setup"))
+        XCTAssertEqual(ServiceCatalog.orderingOnlyDependencies["stream-db-setup"], ["capacity-overflow"])
         XCTAssertLessThan(try level("stream-qstash"), try level("stream-services"))
         XCTAssertLessThan(try level("stream-services"), try level("stream-qstash-wire"))
         XCTAssertLessThan(try level("stream-qstash-wire"), try level("stream-sequin"))
@@ -172,5 +175,44 @@ final class ServiceCatalogTests: XCTestCase {
         XCTAssertTrue(partner.contains("db-tool"))
         XCTAssertFalse(partner.contains("portal-tool"))
         XCTAssertTrue(RunProfile.booking.members(of: services + custom).contains("portal-tool"))
+    }
+
+    func testAServiceOfAMissingOptionalRepoHasItsSkipReason() throws {
+        let missing = try XCTUnwrap(byID["stream-services"])
+        XCTAssertEqual(
+            ServiceCatalog.missingOptionalRepo(missing),
+            "Stream Services repo not found at /work/stream-services — set it in Settings > Paths."
+        )
+        // The CDC setup runs in the booking app; its repo is the one of its env.
+        XCTAssertNotNil(ServiceCatalog.missingOptionalRepo(try XCTUnwrap(byID["stream-db-setup"])))
+        // A portal is no optional service.
+        XCTAssertNil(ServiceCatalog.missingOptionalRepo(try XCTUnwrap(byID["travel-portal"])))
+
+        let here = FileManager.default.temporaryDirectory.path
+        let present = ServiceDefinition(
+            id: "stream-services", name: nil, cmd: ["true"], cwd: here, probe: nil, type: nil,
+            restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        XCTAssertNil(ServiceCatalog.missingOptionalRepo(present))
+        let unset = ServiceDefinition(
+            id: "cache-apply-transport", name: nil, cmd: ["true"], cwd: "", probe: nil, type: nil,
+            restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        XCTAssertEqual(
+            ServiceCatalog.missingOptionalRepo(unset),
+            "Travel Load Test repo not found at (no path set) — set it in Settings > Paths."
+        )
+    }
+
+    func testABranchChangeKeepsSequin() {
+        let changed: Set<String> = [ServiceCatalog.sequinID, "travel-portal", "partner-portal"]
+        let phases: [String: ServicePhase] = [
+            ServiceCatalog.sequinID: .running, "travel-portal": .running, "partner-portal": .stopped,
+        ]
+        XCTAssertEqual(EnvironmentSupervisor.branchChangeRestarts(changed, phases: phases), ["travel-portal"])
+        XCTAssertEqual(
+            EnvironmentSupervisor.sequinBranchChangeLine,
+            "[travel-runner] Branch changed — Sequin keeps running; restart it if scripts/local-cdc changed."
+        )
     }
 }

@@ -142,34 +142,52 @@ final class StartAllTests: XCTestCase {
     /// Nothing starts, nothing is killed, and the database is not asked.
     func testEachRefusalStartsNothingAndNamesTheCause() async throws {
         let runtime = ContainerRuntime.detect()
-        let rows: [(name: String, setup: Setup, error: String)] = [
+        let one = "Not started — 1 check failed"
+        let rows: [(name: String, setup: Setup, error: String, reason: String)] = [
             ("the other app runs a stack",
              Setup(siblingServices: ["supabase", "travel-portal"]),
-             SiblingRunner.refusal(activeServices: ["supabase", "travel-portal"])),
+             SiblingRunner.refusal(activeServices: ["supabase", "travel-portal"]),
+             "Not started — \(Flavor.current.sibling.displayName) runs a stack now"),
             ("no Node on the PATH of the shell (nvm, fnm, Volta)",
              Setup(node: FakeCommandRunner.failed(127, stderr: "zsh:1: command not found: node")),
-             "Preflight failed — Node.js \u{2265} 22: Node.js not found"),
+             "Preflight failed — Node.js \u{2265} 22: Node.js not found",
+             one),
             ("a Node that hangs",
              Setup(node: FakeCommandRunner.timedOut),
-             "Preflight failed — Node.js \u{2265} 22: node --version did not answer in 15 s"),
+             "Preflight failed — Node.js \u{2265} 22: node --version did not answer in 15 s",
+             one),
             ("a Node that is too old",
              Setup(node: FakeCommandRunner.ok("v16.20.2\n")),
-             "Preflight failed — Node.js \u{2265} 22: v16.20.2 — require v18+"),
+             "Preflight failed — Node.js \u{2265} 22: v16.20.2 — require v18+",
+             one),
             ("a container runtime that does not come up",
              Setup(dockerAnswers: false),
-             "Preflight failed — \(runtime.displayName): \(runtime.displayName) not responding"),
+             "Preflight failed — \(runtime.displayName): \(runtime.displayName) not responding",
+             one),
             ("a service folder that is not there",
              Setup(webFolder: "web-moved"),
-             "Preflight failed — web-moved exists: Directory not found — open Settings → Reconfigure Repos"),
+             "Preflight failed — web-moved exists: Directory not found — open Settings → Reconfigure Repos",
+             one),
             ("two checks fail",
              Setup(node: FakeCommandRunner.ok(""), webFolder: "web-moved"),
-             "Preflight failed — Node.js \u{2265} 22: Node.js not found · web-moved exists: Directory not found — open Settings → Reconfigure Repos"),
+             "Preflight failed — Node.js \u{2265} 22: Node.js not found · web-moved exists: Directory not found — open Settings → Reconfigure Repos",
+             "Not started — 2 checks failed"),
         ]
         for row in rows {
             let (run, shell) = try await startAll(row.setup)
 
             XCTAssertEqual(supervisor.health, .degraded, row.name)
             XCTAssertEqual(supervisor.lastError, row.error, row.name)
+            // The header says "Not started", and the reason reaches the tooltip and the API.
+            let reason = row.reason
+            XCTAssertTrue(supervisor.healthSummary.notStarted, row.name)
+            XCTAssertEqual(supervisor.healthSummary.label, "Not started", row.name)
+            XCTAssertEqual(supervisor.healthSummary.reason, reason, row.name)
+            let status = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: Data(supervisor.statusJSON().utf8)) as? [String: Any]
+            )
+            XCTAssertEqual(status["health"] as? String, "DEGRADED", row.name)
+            XCTAssertEqual(status["health_reason"] as? String, reason, row.name)
             XCTAssertEqual(started, [], row.name)
             XCTAssertEqual(run.queries, [], row.name)
             XCTAssertEqual(run.resets, 0, row.name)

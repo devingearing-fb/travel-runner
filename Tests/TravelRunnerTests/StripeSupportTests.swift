@@ -179,12 +179,13 @@ final class StripeSupportTests: XCTestCase {
             "Stripe rejected STRIPE_SECRET_KEY from apps/booking-portal/.env — import a current .env."
         )
         XCTAssertEqual(StripeLauncher.exitCause(known: CrashCause.noNetwork, mode: mode), CrashCause.noNetwork)
-        XCTAssertFalse(StripeLauncher.unavailableCause(mode).contains("stripe login"))
+        XCTAssertEqual(StripeOffReason.notAuthenticated(mode).actions, [.importSharedEnv])
+        XCTAssertFalse(StripeOffReason.notAuthenticated(mode).headline.contains("stripe login"))
         XCTAssertFalse(StripeLauncher.unknownExitHint(mode).contains("stripe login"))
         // Control: in login mode a 401 is an expired session.
         let login = StripeMode.login(reason: StripeLauncher.noKeyReason)
         XCTAssertEqual(StripeLauncher.exitCause(known: CrashCause.stripeSessionExpired, mode: login), CrashCause.stripeSessionExpired)
-        XCTAssertTrue(StripeLauncher.unavailableCause(login).contains("stripe login"))
+        XCTAssertEqual(StripeOffReason.notAuthenticated(login), .loginExpired)
     }
 
     // MARK: - Setup checks
@@ -217,7 +218,7 @@ final class StripeSupportTests: XCTestCase {
 
     func testTheAuthRowWithALiveKeyAsksForTheLoginAndSaysWhy() async throws {
         try write(".env", "STRIPE_SECRET_KEY=sk_live_madeUpLiveKey789\n")
-        let checker = makeChecker(FakeCommandRunner { _ in FakeCommandRunner.failed() })
+        let checker = makeChecker(FakeCommandRunner { _ in FakeCommandRunner.failed(stderr: "Request failed, status=401") })
 
         await checker.runAllChecks()
 
@@ -293,8 +294,12 @@ final class StripeSupportTests: XCTestCase {
             id: "travel-portal", name: nil, cmd: ["pnpm", "dev"], cwd: booking.path, probe: nil, type: nil,
             restart: nil, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
         )
+        let stripe = ServiceDefinition(
+            id: "stripe", name: nil, cmd: StripeLauncher.command, cwd: monorepo.path, probe: nil, type: nil,
+            restart: nil, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
         let preflight = PreflightRunner(shell: runner)
-        let check = try! XCTUnwrap(preflight.allChecks(for: [portal]).first { $0.id == "stripe-auth" })
+        let check = try! XCTUnwrap(preflight.allChecks(for: [portal, stripe]).first { $0.id == "stripe-auth" })
         return await preflight.run(check: check)
     }
 
@@ -314,7 +319,8 @@ final class StripeSupportTests: XCTestCase {
     func testPreflightWithARejectedTestKeyDoesNotAskForALogin() async throws {
         try write(".env", "STRIPE_SECRET_KEY=\(testKey)\n")
         let runner = FakeCommandRunner { call in
-            call.command == StripeLauncher.authCheckCommand ? FakeCommandRunner.failed() : FakeCommandRunner.ok()
+            call.command == StripeLauncher.authCheckCommand
+                ? FakeCommandRunner.failed(stderr: "Request failed, status=401") : FakeCommandRunner.ok()
         }
 
         let result = await preflightStatus(runner)
@@ -322,6 +328,21 @@ final class StripeSupportTests: XCTestCase {
         guard case .warning(let message) = result else { return XCTFail("\(result)") }
         XCTAssertTrue(message.contains("STRIPE_SECRET_KEY from apps/booking-portal/.env"), message)
         XCTAssertFalse(message.contains("stripe login"), message)
+    }
+
+    /// A profile without Stripe does not ask Stripe.
+    func testThePreflightAsksStripeOnlyWhenStripeIsInTheProfile() {
+        let portal = ServiceDefinition(
+            id: "travel-portal", name: nil, cmd: ["pnpm", "dev"], cwd: booking.path, probe: nil, type: nil,
+            restart: nil, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        let stripe = ServiceDefinition(
+            id: "stripe", name: nil, cmd: StripeLauncher.command, cwd: monorepo.path, probe: nil, type: nil,
+            restart: nil, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        XCTAssertFalse(PreflightRunner().allChecks(for: [portal]).contains { $0.id == "stripe-auth" })
+        // Control: with Stripe the check is there.
+        XCTAssertTrue(PreflightRunner().allChecks(for: [portal, stripe]).contains { $0.id == "stripe-auth" })
     }
 
     func testPreflightWithoutAKeyChecksTheLogin() async {
@@ -332,5 +353,164 @@ final class StripeSupportTests: XCTestCase {
         guard case .passed(let detail) = result else { return XCTFail("\(result)") }
         XCTAssertEqual(detail, "Authenticated")
         XCTAssertEqual(runner.calls.first { $0.command == StripeLauncher.authCheckCommand }?.environment, [:])
+    }
+
+    // MARK: - S3: the state machine
+
+    func testTheExitClassifierReadsTheMarkersOfTheLog() {
+        let rows: [(lines: [String], expected: StripeExitClassifier.Kind)] = [
+            (["Authorization failed, status=401, body={...}"], .auth),
+            (["Request failed, status=401"], .auth),
+            (["error: api_key_expired"], .auth),
+            (["dial tcp: lookup api.stripe.com: no such host"], .network),
+            (["Get \"https://api.stripe.com\": dial tcp 1.2.3.4:443: connect: network is unreachable"], .network),
+            (["lookup api.stripe.com: no such host"], .network),
+            (["Post \"https://api.stripe.com/v1/balance\": net/http: TLS handshake timeout"], .network),
+            (["dial: i/o timeout"], .network),
+            (["read tcp 10.0.0.2:51234->34.1.2.3:443: read: connection reset by peer"], .network),
+            (["panic: runtime error: invalid memory address", "goroutine 1 [running]:"], .cliCrash),
+            (["Ready! Your webhook signing secret is whsec_x", "some other line"], .unknown),
+            ([], .unknown),
+        ]
+        for row in rows {
+            XCTAssertEqual(StripeExitClassifier.classify(logTail: row.lines), row.expected, "\(row.lines)")
+        }
+        // A 401 wins over the DNS error that the CLI prints after it.
+        XCTAssertEqual(StripeExitClassifier.classify(logTail: ["status=401", "dial tcp: no such host"]), .auth)
+        // A marker that left the window does not count.
+        let old = ["status=401"] + Array(repeating: "line", count: StripeExitClassifier.window)
+        XCTAssertEqual(StripeExitClassifier.classify(logTail: old), .unknown)
+    }
+
+    func testTheAuthCheckTellsARejectedKeyFromNoNetwork() {
+        let mode = StripeMode.testKey(source: "apps/booking-portal/.env")
+        func classify(_ result: CommandResult) -> StripeAvailability {
+            StripeAvailability.classify(authCheck: result, mode: mode)
+        }
+        XCTAssertEqual(classify(FakeCommandRunner.ok("{}")), .ok(mode))
+        XCTAssertEqual(classify(FakeCommandRunner.timedOut), .offline)
+        XCTAssertEqual(classify(FakeCommandRunner.failed(stderr: "Request failed, status=401, body=...")), .notAuthenticated)
+        XCTAssertEqual(classify(FakeCommandRunner.failed(stderr: "dial tcp: lookup api.stripe.com: no such host")), .offline)
+        XCTAssertEqual(classify(CommandResult(exitCode: 1, stdout: "Invalid API Key provided: sk_test_****abcd", stderr: "")), .notAuthenticated)
+        // Only an auth line blames the key. A failure that says nothing, a 5xx or a
+        // crash of the CLI could not be checked.
+        XCTAssertEqual(classify(FakeCommandRunner.failed()), .unverified)
+        XCTAssertEqual(classify(FakeCommandRunner.failed(stderr: "Request failed, status=503, body=upstream error")), .unverified)
+        XCTAssertEqual(classify(FakeCommandRunner.failed(stderr: "panic: runtime error: index out of range")), .unverified)
+        XCTAssertEqual(classify(FakeCommandRunner.failed(stderr: "net/http: TLS handshake timeout")), .offline)
+        XCTAssertEqual(StripeOffReason.unavailable(.unverified, mode: mode), .unverified)
+        XCTAssertFalse(StripeOffReason.unverified.headline.contains("STRIPE_SECRET_KEY"))
+        XCTAssertTrue(StripeOffReason.unverified.retries)
+    }
+
+    func testTheCLIProbeSaysWhyStripeCannotRun() async {
+        let key = StripeLauncher.resolve(values: [(file: "apps/booking-portal/.env", value: testKey)])
+
+        let missing = FakeCommandRunner { $0.command == StripeLauncher.installedCommand ? FakeCommandRunner.failed() : FakeCommandRunner.ok() }
+        let notInstalled = await StripeCLI(shell: missing).availability(key)
+        XCTAssertEqual(notInstalled, .notInstalled)
+        XCTAssertEqual(missing.commands, [StripeLauncher.installedCommand], "no auth check without the CLI")
+
+        // A hung PATH lookup is not the network.
+        let hung = FakeCommandRunner { $0.command == StripeLauncher.installedCommand ? FakeCommandRunner.timedOut : FakeCommandRunner.ok() }
+        let unchecked = await StripeCLI(shell: hung).availability(key)
+        XCTAssertEqual(unchecked, .unverified)
+        XCTAssertEqual(hung.commands, [StripeLauncher.installedCommand])
+
+        let offline = FakeCommandRunner { call in
+            call.command == StripeLauncher.authCheckCommand
+                ? FakeCommandRunner.failed(stderr: "dial tcp: lookup api.stripe.com: no such host") : FakeCommandRunner.ok()
+        }
+        let noNetwork = await StripeCLI(shell: offline, timeout: .seconds(7)).availability(key)
+        XCTAssertEqual(noNetwork, .offline)
+        XCTAssertEqual(offline.calls.last?.environment, ["STRIPE_API_KEY": testKey], "the key is in the env of the check")
+        XCTAssertTrue(offline.calls.allSatisfy { $0.timeout == .seconds(7) }, "each command has a timeout")
+        XCTAssertFalse(offline.calls.contains { $0.command.contains(testKey) })
+
+        let fine = FakeCommandRunner()
+        let ok = await StripeCLI(shell: fine).availability(key)
+        XCTAssertEqual(ok, .ok(key.mode))
+        XCTAssertFalse(fine.commands.contains(StripeLauncher.versionCommand), "no version check without a minimum")
+    }
+
+    func testAnOldCLIIsOutdatedWhenAMinimumIsSet() async {
+        let key = StripeLauncher.resolve(values: [])
+        let shell = FakeCommandRunner { call in
+            call.command == StripeLauncher.versionCommand ? FakeCommandRunner.ok("stripe version 1.13.2\n") : FakeCommandRunner.ok()
+        }
+        let old = await StripeCLI(shell: shell, minimumVersion: StripeVersion([1, 19])).availability(key)
+        XCTAssertEqual(old, .outdated(version: "1.13.2"))
+        XCTAssertFalse(shell.commands.contains(StripeLauncher.authCheckCommand))
+        // Control: a new enough CLI goes on to the auth check.
+        let new = await StripeCLI(shell: FakeCommandRunner { call in
+            call.command == StripeLauncher.versionCommand ? FakeCommandRunner.ok("stripe version 1.21.8\n") : FakeCommandRunner.ok()
+        }, minimumVersion: StripeVersion([1, 19])).availability(key)
+        XCTAssertEqual(new, .ok(key.mode))
+        XCTAssertEqual(StripeOffReason.outdated(version: "1.13.2").actions, [.updateStripe])
+    }
+
+    func testStripeVersionsCompareByNumber() {
+        XCTAssertEqual(StripeVersion(parsing: "stripe version 1.21.8")?.description, "1.21.8")
+        XCTAssertEqual(StripeVersion(parsing: "stripe version v1.9")?.parts, [1, 9])
+        XCTAssertNil(StripeVersion(parsing: "stripe version master"))
+        XCTAssertLessThan(StripeVersion([1, 9, 9]), StripeVersion([1, 19]))
+        XCTAssertLessThan(StripeVersion([1, 19]), StripeVersion([1, 19, 1]))
+        XCTAssertFalse(StripeVersion([1, 19, 0]) < StripeVersion([1, 19]))
+    }
+
+    func testTheNetworkRetryWaits5sThenTwiceAsLongUpTo60s() {
+        let policy = StripeRetryPolicy()
+        XCTAssertEqual((0..<7).map { policy.networkDelay(attempt: $0) }, [
+            .seconds(5), .seconds(10), .seconds(20), .seconds(40), .seconds(60), .seconds(60), .seconds(60),
+        ])
+        XCTAssertEqual(policy.networkDelay(attempt: 1000), .seconds(60))
+        XCTAssertEqual(policy.crashRestarts, 2)
+    }
+
+    func testTheProbeAnswerIsKeptFor60s() {
+        let key = StripeLauncher.resolve(values: [(file: "apps/booking-portal/.env", value: testKey)])
+        let other = StripeLauncher.resolve(values: [])
+        let start = Date(timeIntervalSince1970: 1_000_000)
+        var cache = StripeAvailabilityCache()
+        XCTAssertNil(cache.value(for: key, now: start))
+
+        cache.store(.offline, for: key, at: start)
+
+        XCTAssertEqual(cache.value(for: key, now: start.addingTimeInterval(59)), .offline)
+        XCTAssertNil(cache.value(for: key, now: start.addingTimeInterval(60)), "too old")
+        XCTAssertNil(cache.value(for: other, now: start.addingTimeInterval(1)), "another key")
+        cache.invalidate()
+        XCTAssertNil(cache.value(for: key, now: start.addingTimeInterval(1)))
+    }
+
+    /// The row texts of the plan, one per cause.
+    func testTheRowSaysWhyStripeIsOff() {
+        let rows: [(reason: StripeOffReason, text: String, actions: [RecoveryAction], retries: Bool)] = [
+            (.notInstalled, "Stripe CLI not installed — webhooks are off. Run: brew install stripe/stripe-cli/stripe", [.installStripe], false),
+            (.loginExpired, "Stripe CLI login expired — webhooks are off.", [.stripeLogin], false),
+            (.keyRejected(source: "apps/booking-portal/.env"),
+             "Stripe rejected STRIPE_SECRET_KEY from apps/booking-portal/.env — import a current .env.", [.importSharedEnv], false),
+            (.offline, "No network — Stripe reconnects when the network is back.", [], true),
+            (.afterWake, "Reconnecting Stripe after wake…", [], true),
+            (.unverified, "Stripe could not be checked — the runner tries again.", [], true),
+            (.didNotConnect(seconds: 25), "Stripe did not connect within 25s — webhooks are off.", [.startService], false),
+            (.crashedTwice, "Stripe CLI crashed twice (see log) — webhooks are off.", [.startService, .openLog], false),
+        ]
+        for row in rows {
+            XCTAssertEqual(row.reason.headline, row.text)
+            XCTAssertEqual(row.reason.actions, row.actions, row.text)
+            XCTAssertEqual(row.reason.kind, row.retries ? .retrying : .optionalOff, row.text)
+        }
+        let mode = StripeMode.login(reason: StripeLauncher.noKeyReason)
+        XCTAssertNil(StripeOffReason.unavailable(.ok(mode), mode: mode))
+        XCTAssertEqual(StripeOffReason.unavailable(.offline, mode: mode), .offline)
+        XCTAssertEqual(StripeOffReason.unavailable(.notInstalled, mode: mode), .notInstalled)
+    }
+
+    func testStripeGetsAShortConnectTimeout() throws {
+        let stripe = try XCTUnwrap(
+            ServiceCatalog.services(paths: RepoPaths(monorepo: monorepo.path), flavor: .standard).first { $0.id == "stripe" }
+        )
+        XCTAssertEqual(stripe.probe?.timeout, 25)
     }
 }

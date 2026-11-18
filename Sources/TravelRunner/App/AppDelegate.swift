@@ -342,6 +342,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pulseState = false
         }
 
+        // The tooltip says why, so a hover answers "why is it red?".
+        let summary = supervisor.healthSummary
+        let label = summary.status == currentHealth ? summary.label : HealthSummary(status: currentHealth).label
+        let tooltip = ["\(Flavor.current.displayName): \(label)", summary.status == currentHealth ? summary.reason : nil]
+            .compactMap { $0 }.joined(separator: "\n")
+        if button.toolTip != tooltip { button.toolTip = tooltip }
+
         if currentHealth == lastIconHealth && currentHealth != .starting { return }
         lastIconHealth = currentHealth
 

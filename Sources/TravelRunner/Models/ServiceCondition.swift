@@ -57,6 +57,7 @@ enum RecoveryAction: Equatable, Hashable, Sendable {
     case retryFromStep
     case ghAuth
     case openHealth
+    case openSettingsPaths
 
     /// The button text. `runtime` is the name of the container app on this Mac.
     func title(runtime: String = ContainerRuntime.detect().appName) -> String {
@@ -78,6 +79,7 @@ enum RecoveryAction: Equatable, Hashable, Sendable {
         case .retryFromStep: "Retry from this step"
         case .ghAuth: "Log in to GitHub"
         case .openHealth: "Open Health"
+        case .openSettingsPaths: "Open Settings"
         }
     }
 }

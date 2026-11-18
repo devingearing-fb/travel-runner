@@ -26,16 +26,16 @@ final class ShellQuoteTests: XCTestCase {
 
     func testLanCommandKeepsPackageManagerAndPort() {
         XCTAssertEqual(
-            EnvironmentSupervisor.lanCommand(["pnpm", "dev"], ip: "10.0.0.5"),
-            ["pnpm", "dev", "--hostname", "10.0.0.5"]
+            EnvironmentSupervisor.lanCommand(["pnpm", "dev"]),
+            ["pnpm", "dev", "--hostname", "0.0.0.0"]
         )
         XCTAssertEqual(
-            EnvironmentSupervisor.lanCommand(["npm", "run", "dev"], ip: "10.0.0.5"),
-            ["npm", "run", "dev", "--", "--hostname", "10.0.0.5"]
+            EnvironmentSupervisor.lanCommand(["npm", "run", "dev"]),
+            ["npm", "run", "dev", "--", "--hostname", "0.0.0.0"]
         )
         XCTAssertEqual(
-            EnvironmentSupervisor.lanCommand(["npm", "run", "dev", "--", "-p", "3006"], ip: "10.0.0.5"),
-            ["npm", "run", "dev", "--", "-p", "3006", "--hostname", "10.0.0.5"]
+            EnvironmentSupervisor.lanCommand(["npm", "run", "dev", "--", "-p", "3006"]),
+            ["npm", "run", "dev", "--", "-p", "3006", "--hostname", "0.0.0.0"]
         )
     }
 

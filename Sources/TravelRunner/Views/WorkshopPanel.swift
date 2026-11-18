@@ -75,6 +75,7 @@ final class WorkshopPanel {
         }
         // The Tools block of Diagnostics says where each tool was found.
         supervisor.onOpenHealth = { [weak self] in self?.open(section: .diagnostics) }
+        supervisor.onOpenSettings = { [weak self] in self?.open(section: .settings) }
     }
 
     func open(section: WorkshopSection = .status) {
