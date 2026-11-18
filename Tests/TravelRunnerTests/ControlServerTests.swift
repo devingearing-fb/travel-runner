@@ -52,6 +52,21 @@ final class ControlServerTests: XCTestCase {
         return server
     }
 
+    /// A server on a port from the system that listens on both loopback addresses.
+    /// The system picks a port that is free on [::1]; another program can hold it on
+    /// 127.0.0.1, and a request there then reaches that program. Such a port is
+    /// skipped. Returns the server and its port.
+    private func startOnFreePort(actions: ControlServer.Actions) async throws -> (ControlServer, UInt16) {
+        for _ in 0..<10 {
+            let server = makeServer(port: 0)
+            let failures = await server.start(actions: actions, logStore: LogStore())
+            let boundPort = await server.boundPort
+            if failures.isEmpty, let port = boundPort { return (server, port) }
+            await server.stop()
+        }
+        throw XCTSkip("no port was free on both loopback addresses")
+    }
+
     /// The body of GET /api/status on one host, or nil when nothing answers.
     private func status(host: String, port: UInt16) async -> String? {
         let config = URLSessionConfiguration.ephemeral
@@ -179,10 +194,7 @@ final class ControlServerTests: XCTestCase {
     }
 
     func testStopFreesBothAddresses() async throws {
-        let server = makeServer(port: 0)
-        _ = await server.start(actions: Self.actions(status: "up"), logStore: LogStore())
-        let boundPort = await server.boundPort
-        let port = try XCTUnwrap(boundPort)
+        let (server, port) = try await startOnFreePort(actions: Self.actions(status: "up"))
 
         await server.stop()
 
@@ -196,10 +208,7 @@ final class ControlServerTests: XCTestCase {
     /// old for the checkout, and run nothing.
     /// The release smoke test asks this route (`scripts/smoke.sh`).
     func testThePreflightRouteGivesTheAnswerOfTheAction() async throws {
-        let server = makeServer(port: 0)
-        _ = await server.start(actions: Self.actions(status: "{}"), logStore: LogStore())
-        let boundPort = await server.boundPort
-        let port = try XCTUnwrap(boundPort)
+        let (_, port) = try await startOnFreePort(actions: Self.actions(status: "{}"))
         let config = URLSessionConfiguration.ephemeral
         config.connectionProxyDictionary = [:]
         config.timeoutIntervalForRequest = 5
@@ -236,13 +245,9 @@ final class ControlServerTests: XCTestCase {
         }
 
         let blockedCalls = Calls()
-        let blocked = makeServer(port: 0)
-        _ = await blocked.start(
-            actions: Self.actions(status: "{}", resetBlock: refusal, onDbChange: { blockedCalls.add($0) }),
-            logStore: LogStore()
+        let (_, blockedPort) = try await startOnFreePort(
+            actions: Self.actions(status: "{}", resetBlock: refusal, onDbChange: { blockedCalls.add($0) })
         )
-        let blockedBound = await blocked.boundPort
-        let blockedPort = try XCTUnwrap(blockedBound)
         for route in routes {
             let (code, body) = try await post(route, port: blockedPort)
             XCTAssertEqual(code, 409, route)
@@ -252,13 +257,9 @@ final class ControlServerTests: XCTestCase {
 
         // Control: with no refusal, every route runs its action.
         let openCalls = Calls()
-        let open = makeServer(port: 0)
-        _ = await open.start(
-            actions: Self.actions(status: "{}", onDbChange: { openCalls.add($0) }),
-            logStore: LogStore()
+        let (_, openPort) = try await startOnFreePort(
+            actions: Self.actions(status: "{}", onDbChange: { openCalls.add($0) })
         )
-        let openBound = await open.boundPort
-        let openPort = try XCTUnwrap(openBound)
         for route in routes {
             let (code, _) = try await post(route, port: openPort)
             XCTAssertEqual(code, 200, route)

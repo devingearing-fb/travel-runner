@@ -1715,6 +1715,37 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(supervisor.dependencyRecord.hash(for: workDir.path), "a failed install records no hash")
     }
 
+    /// Stop all during the install before a start cancels the install, and that start
+    /// runs no process, also when a new start follows at once.
+    func testStopAllCancelsTheInstallBeforeTheStart() async throws {
+        try makeWorkspace()
+        let cancelled = LockedPids()
+        let shell = FakeCommandRunner { call in
+            guard call.command == Self.pnpmInstall else { return FakeCommandRunner.ok() }
+            while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(20)) }
+            cancelled.set([1])
+            return CommandResult(exitCode: -1, stdout: "", stderr: "Cancelled")
+        }
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+        let installing = await waitUntil(10) { shell.calls.contains { $0.command == Self.pnpmInstall } }
+        XCTAssertTrue(installing)
+
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { cancelled.pids == [1] && self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped, "the install was cancelled: \(cancelled.pids)")
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertNotEqual(state("web").phase, .running)
+        XCTAssertNil(state("web").condition, "a stop is not a failure")
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertEqual(Self.listeners(on: port), [], "the cancelled start runs no process")
+        XCTAssertNil(supervisor.dependencyRecord.hash(for: workDir.path), "a cancelled install records no hash")
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("[travel-runner] Stop all stopped the pnpm install --frozen-lockfile"), lines.joined(separator: "\n"))
+    }
+
     /// Decision 11: stale packages (the lockfile changed after the install) are not
     /// installed at a start. The row offers the install instead.
     func testStalePackagesDoNotInstallAtTheStart() async throws {
@@ -1722,7 +1753,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         Self.markInstalled(workDir)
         let marker = workDir.appendingPathComponent("node_modules/.modules.yaml").path
         try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_600_000_000)], ofItemAtPath: marker)
-        supervisor.dependencyRecord.record("hash of lock A", for: workDir.path)
+        supervisor.dependencyRecord.record("hash of lock A", marker: nil, for: workDir.path)
         XCTAssertEqual(DependencyWatcher.state(of: workDir.path, record: supervisor.dependencyRecord), .stale)
         let shell = fakeInstaller()
         supervisor.shell = shell
@@ -1788,7 +1819,10 @@ final class SupervisorLifecycleTests: XCTestCase {
         try Data("lock B".utf8).write(to: workDir.appendingPathComponent("pnpm-lock.yaml"))
         await supervisor.restartAfterBranchChange(["web"])
 
-        XCTAssertEqual(supervisor.lastError, "pnpm install --frozen-lockfile for web failed (exit 1) — see its log")
+        XCTAssertEqual(
+            supervisor.lastError,
+            "pnpm install --frozen-lockfile for web failed (exit 1) — see its log. web still runs the old packages; fix the cause, then press Install dependencies."
+        )
         try await Task.sleep(for: .seconds(1.5))
         XCTAssertEqual(state("web").pid, pid)
         XCTAssertEqual(state("web").phase, .running)

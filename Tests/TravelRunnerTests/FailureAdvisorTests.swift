@@ -29,6 +29,23 @@ final class FailureAdvisorTests: XCTestCase {
         XCTAssertEqual(advise(.message(text), portal()).actions, [.openLog, .restart])
     }
 
+    /// The install runs with --frozen-lockfile. A lockfile that does not match a
+    /// package.json says how to fix it; other failures point to the log.
+    func testAnOutdatedLockfileSaysHowToFixIt() {
+        let outdated = CommandResult(
+            exitCode: 1, stdout: "",
+            stderr: " ERR_PNPM_OUTDATED_LOCKFILE  Cannot install with \"frozen-lockfile\" because pnpm-lock.yaml is not up to date with apps/web/package.json"
+        )
+        XCTAssertEqual(
+            EnvironmentSupervisor.installFailure(outdated, folder: "/repo"),
+            "failed: the lockfile does not match package.json — run pnpm install in /repo"
+        )
+        XCTAssertEqual(
+            EnvironmentSupervisor.installFailure(CommandResult(exitCode: 1, stdout: "", stderr: "ERR! network"), folder: "/repo"),
+            "failed (exit 1) — see its log"
+        )
+    }
+
     func testAProbeTimeoutWithTheProcessAliveSaysItMayStillCompile() {
         let condition = advise(.probeTimeout(seconds: 240, processAlive: true, lastProbe: .refused), portal())
         XCTAssertEqual(condition.headline, "Booking Portal did not answer on port 3002 within 240s.")

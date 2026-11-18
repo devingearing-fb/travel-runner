@@ -183,7 +183,10 @@ final class EnvironmentSupervisor {
     /// Tests give a file in their own folder.
     @ObservationIgnored var dependencyRecord = DependencyRecord.live
     /// The install that runs in each install folder. A second caller waits for it.
+    /// Stop-all cancels them, which kills the install.
     private var installTasks: [String: Task<CommandResult, Never>] = [:]
+    /// Counts the stop-alls. An install that sees a new count stops what it was for.
+    private var stopAllCount = 0
     private var gitWatcherTask: Task<Void, Never>?
     private var depsWatcherTask: Task<Void, Never>?
     private var isTogglingNetwork = false
@@ -682,8 +685,10 @@ final class EnvironmentSupervisor {
     @discardableResult
     private func beginStopAll() -> Task<Void, Never> {
         isShuttingDown = true
+        stopAllCount += 1
         startTask?.cancel()
         startTask = nil
+        for install in installTasks.values { install.cancel() }
         return Task {
             for serviceID in sortedServiceIDs {
                 serviceStates[serviceID]?.phase = .stopping
@@ -1262,11 +1267,12 @@ final class EnvironmentSupervisor {
         Task {
             beginAction(serviceID)
             defer { endAction(serviceID) }
-            let result = await installPackages(
+            // Nil: a stop-all stopped the install.
+            guard let result = await installPackages(
                 serviceID, cwd: cwd, announce: "[travel-runner] Running \(command) in \(folder)"
-            )
+            ) else { return }
             guard result.succeeded else {
-                let why = Self.installFailure(result)
+                let why = Self.installFailure(result, folder: folder)
                 lastError = "\(command) for \(name) \(why)"
                 onActionFeedback?("\(command) \(why)", false)
                 return
@@ -1278,15 +1284,18 @@ final class EnvironmentSupervisor {
     /// Installs the packages of the service's repo, with the output in the service's
     /// log. One install runs per install folder: a second caller writes one line and
     /// waits for the install that runs. A successful install records the lockfile
-    /// hash in `deps.json`.
-    private func installPackages(_ serviceID: String, cwd: String, announce: String) async -> CommandResult {
+    /// hash in `deps.json`. Nil when a stop-all came during the install: it cancels
+    /// the install, and the caller does nothing more.
+    private func installPackages(_ serviceID: String, cwd: String, announce: String) async -> CommandResult? {
         let (folder, command) = DependencyWatcher.installTarget(for: cwd)
         let logStore = logStore
+        let stops = stopAllCount
         if let running = installTasks[folder] {
             await logStore.append(serviceID: serviceID, entry: LogEntry(
                 stream: .stdout, text: "[travel-runner] Waiting for the \(command) that runs in \(folder)"
             ))
-            return await running.value
+            let result = await running.value
+            return stopAllCount == stops ? result : nil
         }
         let shell = shell
         let record = dependencyRecord
@@ -1303,14 +1312,18 @@ final class EnvironmentSupervisor {
             )
             sink.finish()
             await writer.value
-            if result.succeeded, let hash = DependencyWatcher.lockHash(folder: folder) {
-                record.record(hash, for: folder)
-            }
+            if result.succeeded { DependencyWatcher.recordInstall(folder: folder, record: record) }
             return result
         }
         installTasks[folder] = task
         let result = await task.value
-        installTasks[folder] = nil
+        if installTasks[folder] == task { installTasks[folder] = nil }
+        guard stopAllCount == stops else {
+            await logStore.append(serviceID: serviceID, entry: LogEntry(
+                stream: .stdout, text: "[travel-runner] Stop all stopped the \(command)"
+            ))
+            return nil
+        }
         if result.succeeded {
             // The row drops its install button now, not at the next watcher check.
             npmStaleServices = npmStaleServices.filter { id in
@@ -1320,10 +1333,18 @@ final class EnvironmentSupervisor {
         return result
     }
 
-    /// Why an install failed, after its command: "failed (exit 1) — see its log".
-    nonisolated static func installFailure(_ result: CommandResult) -> String {
-        if (result.stdout + result.stderr).contains(EnvironmentChecker.registryRejectedMarker) {
+    /// pnpm prints this when `--frozen-lockfile` finds a lockfile that does not
+    /// match a package.json.
+    nonisolated static let outdatedLockfileMarker = "ERR_PNPM_OUTDATED_LOCKFILE"
+
+    /// Why an install in `folder` failed, after its command: "failed (exit 1) — see its log".
+    nonisolated static func installFailure(_ result: CommandResult, folder: String) -> String {
+        let output = result.stdout + result.stderr
+        if output.contains(EnvironmentChecker.registryRejectedMarker) {
             return "failed: \(EnvironmentChecker.registryRejectedText)"
+        }
+        if output.contains(outdatedLockfileMarker) {
+            return "failed: the lockfile does not match package.json — run pnpm install in \(folder)"
         }
         let minutes = EnvironmentChecker.installTimeout.components.seconds / 60
         return result.timedOut
@@ -1350,7 +1371,8 @@ final class EnvironmentSupervisor {
     /// A branch change restarts the running services of the repo. When their packages
     /// are not fresh (the new branch changed the lockfile), the install runs first: the
     /// old packages would make the portal crash in a loop. After a failed install the
-    /// services of that folder keep their process, and the banner says why.
+    /// services of that folder keep their process, and the banner says why and what
+    /// to do. After a stop-all during the install nothing restarts.
     func restartAfterBranchChange(_ serviceIDs: [String]) async {
         var installed: [String: Bool] = [:]
         for serviceID in serviceIDs {
@@ -1367,10 +1389,20 @@ final class EnvironmentSupervisor {
                 announce: "[travel-runner] The lockfile changed — running \(command) before the restart"
             )
             endAction(serviceID)
+            guard let result else { return }
             installed[folder] = result.succeeded
             if !result.succeeded {
-                let why = Self.installFailure(result)
-                lastError = "\(command) for \(displayName(serviceID)) \(why)"
+                let why = Self.installFailure(result, folder: folder)
+                let kept = serviceIDs.filter {
+                    serviceCwd($0).map { DependencyWatcher.installTarget(for: $0).folder } == folder
+                }.map(displayName)
+                let names = kept.count > 1
+                    ? kept.dropLast().joined(separator: ", ") + " and " + kept[kept.count - 1]
+                    : kept.joined()
+                let verb = kept.count == 1 ? "still runs" : "still run"
+                let failure = "\(command) for \(displayName(serviceID)) \(why)"
+                lastError = (failure.hasSuffix(".") ? failure : failure + ".")
+                    + " \(names) \(verb) the old packages; fix the cause, then press Install dependencies."
                 onActionFeedback?("\(command) \(why)", false)
             }
         }
@@ -2347,9 +2379,15 @@ final class EnvironmentSupervisor {
             let result = await installPackages(
                 serviceID, cwd: cwd, announce: "[travel-runner] packages are not installed — running \(command)"
             )
+            // Nil: a stop-all cancelled the install. A start after it has its own run.
+            guard let result else {
+                if state.phase == .starting || state.phase == .pending { state.phase = .stopped }
+                return nil
+            }
             guard result.succeeded else {
                 throw ServiceError.installFailed(
-                    name: definition.displayName, command: command, why: Self.installFailure(result)
+                    name: definition.displayName, command: command,
+                    why: Self.installFailure(result, folder: DependencyWatcher.installTarget(for: cwd).folder)
                 )
             }
         }

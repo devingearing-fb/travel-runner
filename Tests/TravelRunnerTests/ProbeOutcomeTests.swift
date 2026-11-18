@@ -159,11 +159,15 @@ final class ProbeOutcomeTests: XCTestCase {
         let tcp = await TcpProbe(port: port).outcome()
         XCTAssertEqual(tcp, .refused)
         // Now and then, after other loopback requests of the run, URLSession reports
-        // a refused connect as "The network connection was lost." (a reset). The
-        // supervisor checks again; so does the test, up to three times.
+        // a refused connect as "The network connection was lost." (ECONNRESET). It
+        // does so for every request for a short time, on any closed port, so quick
+        // retries all fail. The supervisor checks again later; so does the test, on a
+        // new closed port after a pause, up to five times.
         var http = ProbeOutcome.noMatchYet
-        for _ in 0..<3 {
-            http = await HttpProbe(url: "http://127.0.0.1:\(port)/", requestTimeout: 5).outcome()
+        for attempt in 0..<5 {
+            if attempt > 0 { try await Task.sleep(for: .milliseconds(250)) }
+            let closed = try Self.closedPort()
+            http = await HttpProbe(url: "http://127.0.0.1:\(closed)/", requestTimeout: 5).outcome()
             if http == .refused { break }
         }
         XCTAssertEqual(http, .refused)

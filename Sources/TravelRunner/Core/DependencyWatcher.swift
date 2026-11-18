@@ -11,9 +11,18 @@ enum DependencyState: String, Equatable, Sendable {
 }
 
 /// `deps.json` in the config folder: for each install folder, the SHA-256 of its
-/// lockfile at the last successful install. A branch that changes the lockfile
-/// and changes it back is fresh again, which a file time cannot tell.
+/// lockfile at the last successful install, and the time of its install marker
+/// then. A branch that changes the lockfile and changes it back is fresh again,
+/// which a file time cannot tell. The hash counts only while the marker is
+/// unchanged: an install by hand on another branch changes the packages.
 final class DependencyRecord: @unchecked Sendable {
+    struct Entry: Codable, Equatable, Sendable {
+        var hash: String
+        /// The modification time of the install marker, in seconds since 1970.
+        /// Nil when there was no marker file.
+        var marker: Double?
+    }
+
     let path: String
     private let lock = NSLock()
 
@@ -24,18 +33,23 @@ final class DependencyRecord: @unchecked Sendable {
     /// `~/.config/<storage name>/deps.json`.
     static let live = DependencyRecord(path: (ConfigLoader.configDir as NSString).appendingPathComponent("deps.json"))
 
-    func hash(for folder: String) -> String? {
+    func entry(for folder: String) -> Entry? {
         lock.lock()
         defer { lock.unlock() }
         return read()[folder]
     }
 
-    func record(_ hash: String, for folder: String) {
+    func hash(for folder: String) -> String? {
+        entry(for: folder)?.hash
+    }
+
+    func record(_ hash: String, marker: Date?, for folder: String) {
+        let entry = Entry(hash: hash, marker: marker?.timeIntervalSince1970)
         lock.lock()
         defer { lock.unlock() }
         var entries = read()
-        guard entries[folder] != hash else { return }
-        entries[folder] = hash
+        guard entries[folder] != entry else { return }
+        entries[folder] = entry
         do {
             try FileManager.default.createDirectory(
                 atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true
@@ -48,9 +62,11 @@ final class DependencyRecord: @unchecked Sendable {
         }
     }
 
-    private func read() -> [String: String] {
+    /// An unreadable file (or one of an older format) reads as empty: the file
+    /// times decide until the next install.
+    private func read() -> [String: Entry] {
         guard let data = FileManager.default.contents(atPath: path) else { return [:] }
-        return (try? JSONDecoder().decode([String: String].self, from: data)) ?? [:]
+        return (try? JSONDecoder().decode([String: Entry].self, from: data)) ?? [:]
     }
 }
 
@@ -82,7 +98,8 @@ actor DependencyWatcher {
     /// - No `package.json` (and no pnpm workspace): `.fresh`, there is nothing to install.
     /// - No `node_modules/.modules.yaml` at the workspace root, or no `node_modules`
     ///   in an npm repo: `.missing`.
-    /// - A lockfile whose hash is the one in `record`: `.fresh`.
+    /// - A lockfile whose hash is the one in `record`, with the install marker unchanged
+    ///   since then: `.fresh`.
     /// - Otherwise the file times decide (`needsInstall`). When the install marker is
     ///   newer, someone installed by hand: the hash goes into `record` and the state is `.fresh`.
     static func state(of directory: String, record: DependencyRecord?) -> DependencyState {
@@ -93,15 +110,34 @@ actor DependencyWatcher {
         if workspace == nil, !fm.fileExists(atPath: (directory as NSString).appendingPathComponent("package.json")) {
             return .fresh
         }
-        let marker = workspace == nil ? "node_modules" : "node_modules/.modules.yaml"
-        guard fm.fileExists(atPath: (folder as NSString).appendingPathComponent(marker)) else { return .missing }
+        let installed = workspace == nil ? "node_modules" : "node_modules/.modules.yaml"
+        guard fm.fileExists(atPath: (folder as NSString).appendingPathComponent(installed)) else { return .missing }
 
         let installedAfterChange = !needsInstall(directory)
         guard let hash = lockHash(folder: folder) else { return installedAfterChange ? .fresh : .stale }
-        if record?.hash(for: folder) == hash { return .fresh }
+        let marker = markerTime(folder: folder)
+        if let entry = record?.entry(for: folder), entry.hash == hash,
+           let marker, entry.marker == marker.timeIntervalSince1970 {
+            return .fresh
+        }
         guard installedAfterChange else { return .stale }
-        record?.record(hash, for: folder)
+        record?.record(hash, marker: marker, for: folder)
         return .fresh
+    }
+
+    /// Records a successful install in `folder`: the hash of its lockfile and the
+    /// time of its install marker.
+    static func recordInstall(folder: String, record: DependencyRecord) {
+        guard let hash = lockHash(folder: folder) else { return }
+        record.record(hash, marker: markerTime(folder: folder), for: folder)
+    }
+
+    /// The modification time of the file that an install writes: `node_modules/.modules.yaml`
+    /// in a pnpm workspace, `node_modules/.package-lock.json` in an npm repo.
+    static func markerTime(folder: String) -> Date? {
+        let isWorkspace = FileManager.default.fileExists(atPath: (folder as NSString).appendingPathComponent("pnpm-workspace.yaml"))
+        let marker = isWorkspace ? "node_modules/.modules.yaml" : "node_modules/.package-lock.json"
+        return mtime((folder as NSString).appendingPathComponent(marker))
     }
 
     /// The SHA-256 of the lockfile of an install folder: `pnpm-lock.yaml` of a pnpm

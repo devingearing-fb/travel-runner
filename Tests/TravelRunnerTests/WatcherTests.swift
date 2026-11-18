@@ -108,7 +108,7 @@ final class WatcherTests: XCTestCase {
         let (workspace, app) = try workspace(lock: "lock A")
         try installed(workspace, at: 20)
         let deps = record()
-        deps.record("an older hash", for: workspace.path)
+        deps.record("an older hash", marker: nil, for: workspace.path)
         XCTAssertEqual(DependencyWatcher.state(of: app.path, record: deps), .fresh)
         XCTAssertEqual(deps.hash(for: workspace.path), DependencyWatcher.lockHash(folder: workspace.path))
     }
@@ -117,11 +117,35 @@ final class WatcherTests: XCTestCase {
     func testRecordPersists() throws {
         let deps = record()
         XCTAssertNil(deps.hash(for: "/repo"))
-        deps.record("abc", for: "/repo")
-        deps.record("def", for: "/other")
+        deps.record("abc", marker: date(20), for: "/repo")
+        deps.record("def", marker: nil, for: "/other")
         let again = record()
-        XCTAssertEqual(again.hash(for: "/repo"), "abc")
-        XCTAssertEqual(again.hash(for: "/other"), "def")
+        XCTAssertEqual(again.entry(for: "/repo"), DependencyRecord.Entry(hash: "abc", marker: date(20).timeIntervalSince1970))
+        XCTAssertEqual(again.entry(for: "/other"), DependencyRecord.Entry(hash: "def", marker: nil))
+    }
+
+    /// A matching hash counts only while the install marker is unchanged. Install on
+    /// lock A, install lock B by hand, then check out lock A again: the packages are
+    /// B's, so the state is stale although the hash of lock A is in the record.
+    func testAHandInstallOnAnotherLockfileMakesTheRecordedHashStale() throws {
+        let (workspace, app) = try workspace(lock: "lock A")
+        try installed(workspace, at: 20)
+        let deps = record()
+        XCTAssertEqual(DependencyWatcher.state(of: app.path, record: deps), .fresh)
+        XCTAssertEqual(deps.hash(for: workspace.path), DependencyWatcher.lockHash(folder: workspace.path))
+
+        // No check runs between these steps: the runner was closed.
+        try write("lock B", to: workspace.appendingPathComponent("pnpm-lock.yaml"), at: date(30))
+        try installed(workspace, at: 40)
+        try write("lock A", to: workspace.appendingPathComponent("pnpm-lock.yaml"), at: date(50))
+        XCTAssertEqual(DependencyWatcher.state(of: app.path, record: deps), .stale)
+
+        // The same steps with a check after the hand install: still stale.
+        try write("lock B", to: workspace.appendingPathComponent("pnpm-lock.yaml"), at: date(60))
+        try installed(workspace, at: 70)
+        XCTAssertEqual(DependencyWatcher.state(of: app.path, record: deps), .fresh, "the hand install of lock B")
+        try write("lock A", to: workspace.appendingPathComponent("pnpm-lock.yaml"), at: date(80))
+        XCTAssertEqual(DependencyWatcher.state(of: app.path, record: deps), .stale)
     }
 
     /// The watcher lists missing and stale services, once per folder.
