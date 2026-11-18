@@ -5,7 +5,8 @@ struct SetupStep2View: View {
     /// True in the first run, where the end of the wizard starts the stack.
     var startsOnComplete = true
     let onBack: () -> Void
-    let onComplete: () -> Void
+    /// The argument is true when the stack must start.
+    let onComplete: (_ start: Bool) -> Void
 
     @State private var confirmContinue = false
 
@@ -31,6 +32,13 @@ struct SetupStep2View: View {
 
             // Summary bar
             summaryBar
+                // The token sheet hangs here: the view itself has the fix sheet.
+                .sheet(isPresented: Binding(
+                    get: { checker.tokenEntryOpen },
+                    set: { checker.tokenEntryOpen = $0 }
+                )) {
+                    RegistryTokenSheet(checker: checker)
+                }
             Divider()
 
             ScrollView {
@@ -56,7 +64,12 @@ struct SetupStep2View: View {
                 // Only a required check decides. The way out is never disabled: a check that hangs
                 // or a long fix must not hold the wizard.
                 if checker.canFinish {
-                    Button(action: onComplete) {
+                    if startsOnComplete {
+                        Button("Save without starting") { onComplete(false) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.regular)
+                    }
+                    Button(action: { onComplete(startsOnComplete) }) {
                         Label(startsOnComplete ? "Save & Start" : "Save", systemImage: "checkmark.circle")
                     }
                     .buttonStyle(.borderedProminent)
@@ -71,7 +84,10 @@ struct SetupStep2View: View {
         }
         .alert(checker.blockers.isEmpty ? "Continue before the checks finish?" : "Continue with failed checks?",
                isPresented: $confirmContinue) {
-            Button(startsOnComplete ? "Save & Start" : "Save", action: onComplete)
+            Button(startsOnComplete ? "Save & Start" : "Save") { onComplete(startsOnComplete) }
+            if startsOnComplete {
+                Button("Save without starting") { onComplete(false) }
+            }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(EnvironmentChecker.impactLines(for: checker.unresolved).joined(separator: "\n"))
@@ -79,6 +95,12 @@ struct SetupStep2View: View {
         .task {
             checker.buildChecks()
             await checker.runAllChecks()
+        }
+        .sheet(item: Binding(
+            get: { checker.activeFix },
+            set: { if $0 == nil { checker.closeFixSheet() } }
+        )) { run in
+            FixLogSheet(run: run, onClose: checker.closeFixSheet)
         }
     }
 
@@ -186,6 +208,8 @@ struct SetupStep2View: View {
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
                     .tint(.blue)
+                    // One fix runs at a time.
+                    .disabled(checker.activeFix?.isRunning == true)
                 }
             }
 

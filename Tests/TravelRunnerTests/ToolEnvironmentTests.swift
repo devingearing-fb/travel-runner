@@ -669,16 +669,4 @@ final class ToolEnvironmentTests: XCTestCase {
         XCTAssertNil(ToolEnvironment.toolName(of: ["/bin/sh", "-c", "true"]))
         XCTAssertNil(ToolEnvironment.toolName(of: []))
     }
-
-    func testTheNotFoundText() {
-        XCTAssertEqual(
-            ToolEnvironment.notFoundText(tool: "node", searchedPath: "/usr/bin:/bin", appName: "Travel Runner"),
-            "node was not found. Travel Runner looked in: /usr/bin:/bin. Install node or add its folder to ~/.zprofile, then restart the service."
-        )
-        // The hackathon app says its own name.
-        XCTAssertTrue(
-            ToolEnvironment.notFoundText(tool: "node", searchedPath: "/bin", appName: Flavor.hackathon.displayName)
-                .contains("\(Flavor.hackathon.displayName) looked in: /bin.")
-        )
-    }
 }

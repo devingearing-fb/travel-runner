@@ -69,9 +69,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupGlobalHotkey()
 
         // `open -a … --args --open-panel` shows the window at once (scripts, screenshots).
-        // Without a usable config, the setup wizard is the only way forward: show it.
+        // Without a usable config, or when the wizard never completed, show the wizard.
         // A smoke launch shows no window by itself.
-        if CommandLine.arguments.contains("--open-panel") || (ConfigLoader.needsSetup && !LaunchEnvironment.isSmoke()) {
+        let opensWizard = SetupState.opensWizard(needsSetup: ConfigLoader.needsSetup, completed: SetupState.live.completed)
+        if CommandLine.arguments.contains("--open-panel") || (opensWizard && !LaunchEnvironment.isSmoke()) {
             openPanel()
         }
     }

@@ -14,6 +14,25 @@ struct EnvCompatLayer: Sendable {
         }
     }
 
+    /// Writes each pair whose key a file does not set yet. A key that is there keeps
+    /// its value, also when the line is `export KEY=…`. Throws when a file cannot be
+    /// read or written. Returns the keys it added, in the order of `pairs`.
+    @discardableResult
+    func addMissing(_ pairs: [(key: String, value: String)]) throws -> [String] {
+        var added: [String] = []
+        for path in envFilePaths {
+            let expandedPath = NSString(string: path).expandingTildeInPath
+            let content = FileManager.default.fileExists(atPath: expandedPath)
+                ? try String(contentsOfFile: expandedPath, encoding: .utf8) : ""
+            let present = Set(content.components(separatedBy: .newlines).compactMap(RunnerEnv.assignedKey))
+            for pair in pairs where !present.contains(pair.key) {
+                try writeToEnvFile(at: expandedPath, key: pair.key, value: pair.value)
+                if !added.contains(pair.key) { added.append(pair.key) }
+            }
+        }
+        return added
+    }
+
     private func writeToEnvFile(at path: String, key: String, value: String) throws {
         let url = URL(fileURLWithPath: path)
         var lines: [String]

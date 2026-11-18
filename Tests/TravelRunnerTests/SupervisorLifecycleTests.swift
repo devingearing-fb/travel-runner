@@ -39,6 +39,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.onServiceCrash = { [weak self] name, code in
             self?.crashes.append((name, code))
         }
+        // deps.json of a test is in its own folder, never in ~/.config.
+        supervisor.dependencyRecord = DependencyRecord(path: workDir.appendingPathComponent("config/deps.json").path)
     }
 
     /// Gives the supervisor a shell that holds each "where is the tool" question
@@ -97,7 +99,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         return text.split(separator: "\n").contains { $0.hasPrefix("n") && $0.hasSuffix("/" + directory) }
     }
 
-    private static func listeners(on port: Int) -> [pid_t] {
+    private nonisolated static func listeners(on port: Int) -> [pid_t] {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
         process.arguments = ["-ti", "TCP:\(port)", "-sTCP:LISTEN"]
@@ -457,11 +459,92 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(failed)
         try await Task.sleep(for: .seconds(6))
 
-        let attempts = await logLines("ghost").filter { $0.contains("no-such-script.sh") }.count
+        // The runner's own line names the file too; it is not an attempt.
+        let attempts = await logLines("ghost")
+            .filter { $0.contains("no-such-script.sh") && !$0.hasPrefix("[travel-runner]") }.count
         XCTAssertEqual(attempts, 1)
         XCTAssertEqual(state("ghost").restartCount, 0)
         XCTAssertEqual(state("ghost").phase, .failed)
-        XCTAssertTrue(supervisor.lastError?.contains("cannot start") == true, supervisor.lastError ?? "nil")
+        let expected = "ghost cannot start: this branch has no file `./no-such-script.sh` in \(workDir.path). "
+            + "Switch branch or pull, then restart ghost."
+        let said = await waitUntil(10) { self.supervisor.lastError == expected }
+        XCTAssertTrue(said, supervisor.lastError ?? "nil")
+    }
+
+    /// Exit 127 for a tool of the packages (`./node_modules/.bin/next`): the row
+    /// says that the packages are not installed and offers the install.
+    func testExit127ForAToolOfThePackagesOffersTheInstall() async throws {
+        try #"{"name":"web","scripts":{"dev":"next dev"}}"#.write(
+            to: workDir.appendingPathComponent("package.json"), atomically: true, encoding: .utf8
+        )
+        try load(daemon("web", ["./node_modules/.bin/next", "dev"]))
+
+        supervisor.restartService("web")
+
+        let expected = "web cannot start: its packages are not installed in \(workDir.path)."
+        let said = await waitUntil(20) {
+            self.state("web").phase == .failed && self.state("web").condition?.headline == expected
+        }
+        XCTAssertTrue(said, state("web").condition?.headline ?? "no condition")
+        XCTAssertEqual(state("web").condition?.actions, [.installDependencies, .openLog])
+        XCTAssertEqual(state("web").restartCount, 0)
+        XCTAssertTrue(supervisor.canPerform(.installDependencies, for: "web"))
+    }
+
+    /// pnpm ends with 1, not 127, when `node_modules` is missing, so the service
+    /// restarts until the breaker trips. The halted row still offers the install,
+    /// and the banner says what is missing.
+    func testAPnpmRunWithoutPackagesThatTripsTheBreakerOffersTheInstall() async throws {
+        // A fake pnpm that says what the real one says without node_modules.
+        let bin = workDir.appendingPathComponent("fake bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let pnpm = bin.appendingPathComponent("pnpm")
+        try "#!/bin/sh\necho ' WARN   Local package.json exists, but node_modules missing, did you mean to install?' >&2\nexit 1\n"
+            .write(to: pnpm, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: pnpm.path)
+        try #"{"name":"web","scripts":{"dev":"next dev"}}"#.write(
+            to: workDir.appendingPathComponent("package.json"), atomically: true, encoding: .utf8
+        )
+        let shell = FakeCommandRunner { _ in
+            FakeCommandRunner.ok("__TR_ENV_START__\nPATH=\(bin.path):/usr/bin:/bin\n__TR_ENV_END__\n")
+        }
+        let tools = ToolEnvironment(home: workDir.appendingPathComponent("home").path)
+        await tools.resolve(runner: shell)
+        try makeSupervisor(tools: tools)
+        try load(daemon("web", ["pnpm", "dev"], probeTimeout: 60))
+
+        supervisor.restartService("web")
+
+        let expected = "web cannot start: its packages are not installed in \(workDir.path)."
+        let halted = await waitUntil(40) {
+            self.state("web").isCircuitBroken && self.state("web").condition?.kind == .halted(reason: "crash loop")
+        }
+        XCTAssertTrue(halted, state("web").condition?.text ?? "no condition")
+        XCTAssertEqual(state("web").exitCode, 1)
+        let condition = try XCTUnwrap(state("web").condition)
+        XCTAssertEqual(condition.detail, "Cause: \(expected)")
+        XCTAssertEqual(condition.actions, [.installDependencies, .openLog, .restart])
+        let said = await waitUntil(10) { self.supervisor.lastError == expected }
+        XCTAssertTrue(said, supervisor.lastError ?? "nil")
+    }
+
+    /// Exit 126: the file exists but has no execute bit. The row names the file.
+    func testExit126NamesTheFileThatIsNotExecutable() async throws {
+        let script = workDir.appendingPathComponent("run.sh")
+        try "#!/bin/sh\necho hi\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: script.path)
+        try load(daemon("plain", ["./run.sh"]))
+
+        supervisor.restartService("plain")
+
+        let said = await waitUntil(20) {
+            self.state("plain").phase == .failed
+                && self.state("plain").condition?.headline.hasSuffix("is not executable (exit 126).") == true
+        }
+        XCTAssertTrue(said, state("plain").condition?.headline ?? "no condition")
+        XCTAssertEqual(state("plain").exitCode, 126)
+        XCTAssertTrue(state("plain").condition?.headline.contains("run.sh") == true)
+        XCTAssertEqual(state("plain").restartCount, 0)
     }
 
     /// Exit 127 for a tool, not a script: the error names the tool and the PATH
@@ -472,17 +555,19 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         supervisor.restartService("toolless")
 
-        let expected = "toolless cannot start: \(tool) was not found. \(Flavor.current.displayName) looked in: "
+        let expected = "toolless cannot start: `\(tool)` is not on \(Flavor.current.displayName)'s PATH. It looked in: "
         let named = await waitUntil(30) {
             self.state("toolless").phase == .failed && self.supervisor.lastError?.hasPrefix(expected) == true
         }
         XCTAssertTrue(named, supervisor.lastError ?? "nil")
         XCTAssertTrue(supervisor.lastError?.contains("/usr/bin") == true, supervisor.lastError ?? "nil")
         XCTAssertTrue(
-            supervisor.lastError?.hasSuffix("Install \(tool) or add its folder to ~/.zprofile, then restart the service.") == true,
+            supervisor.lastError?.hasSuffix("Open Health to see where each tool was found.") == true,
             supervisor.lastError ?? "nil"
         )
         XCTAssertEqual(state("toolless").restartCount, 0)
+        let offered = await waitUntil(10) { self.state("toolless").condition?.actions == [.openHealth, .openLog] }
+        XCTAssertTrue(offered, "\(state("toolless").condition?.actions ?? [])")
     }
 
     /// The PATH question takes time. A stop that arrives while it runs keeps the
@@ -532,7 +617,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("toolless").phase, .failed)
         XCTAssertEqual(
             supervisor.lastError,
-            "toolless cannot start: \(ToolEnvironment.notFoundText(tool: tool, searchedPath: "/fake/bin"))"
+            CommandDiagnosis.message(.toolMissing(tool: tool, searchedPath: "/fake/bin"), name: "toolless")
         )
         XCTAssertEqual(question.calls, 2, "one question: the PATH of the launch, then the PATH of the new read")
     }
@@ -576,6 +661,17 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(issue.errorMessage, "slow did not pass its startup probe in 3s (process alive: yes)")
         let log = try String(contentsOf: issues.appendingPathComponent("open/\(issue.id)/logs-slow.txt"), encoding: .utf8)
         XCTAssertTrue(log.contains("slow-start"), log)
+
+        // F4: the row says why, with the last check of the probe.
+        XCTAssertEqual(state("slow").lastProbe, .refused)
+        let said = await waitUntil(5) { self.state("slow").condition != nil }
+        XCTAssertTrue(said)
+        XCTAssertEqual(state("slow").condition?.headline, "slow did not answer on port \(port) within 3s.")
+        XCTAssertEqual(
+            state("slow").condition?.detail,
+            "The process is still running — it may still be compiling. Last check: connection refused."
+        )
+        XCTAssertEqual(supervisor.lastError, "slow did not pass its health probe in 3s (last check: connection refused)")
     }
 
     /// A daemon that crashes once while it starts and then hangs has two waiters: the
@@ -678,6 +774,26 @@ final class SupervisorLifecycleTests: XCTestCase {
             XCTAssertFalse(lines.contains("custom-start"), "the process must not start")
             XCTAssertNil(state("custom").pid)
         }
+    }
+
+    /// A service whose folder services.json does not set has the cwd "". Started on
+    /// its own, it must not run in the app's own folder.
+    func testAServiceWithNoFolderFailsWithAMessageAndStartsNothing() async throws {
+        try load(ServiceDefinition(
+            id: "custom", name: "Custom", cmd: ["sh", "-c", "echo custom-start; sleep 30"], cwd: "",
+            probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        ))
+
+        supervisor.restartService("custom")
+
+        let failed = await waitUntil(20) {
+            self.state("custom").phase == .failed && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(failed, "custom is \(state("custom").phase.rawValue)")
+        XCTAssertEqual(supervisor.lastError, "Custom cannot start: no folder is set — open Settings → Reconfigure Repos")
+        let lines = await logLines("custom")
+        XCTAssertFalse(lines.contains("custom-start"), "the process must not start")
+        XCTAssertNil(state("custom").pid)
     }
 
     /// Ticket "failed wake probe" with a recurrence five seconds later: two wake
@@ -1438,6 +1554,458 @@ final class SupervisorLifecycleTests: XCTestCase {
         )
     }
 
+    /// Finding ux-triage-no-cause: FAILED with three raw lines and no cause. A failed
+    /// service now says why and offers the fix; the reason goes when it runs again.
+    func testAFailedServiceSaysWhyAndTheReasonGoesWhenItRuns() async throws {
+        let marker = workDir.appendingPathComponent("installed").path
+        let script = "if [ -f '\(marker)' ]; then exec \(webServer.joined(separator: " ")); "
+            + "else echo \"Error: Cannot find module 'next'\"; exit 1; fi"
+        try load(ServiceDefinition(
+            id: "web", name: "Web App", cmd: ["sh", "-c", script], cwd: workDir.path,
+            probe: ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30),
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        ))
+
+        supervisor.restartService("web")
+
+        // The exit says why at once; the wait for the probe ends up to two seconds later.
+        let said = await waitUntil(20) {
+            self.state("web").phase == .failed && self.state("web").condition != nil
+                && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(said, "web is \(state("web").phase.rawValue)")
+        let condition = try XCTUnwrap(state("web").condition)
+        XCTAssertEqual(condition.headline, "A package is missing — dependencies are out of date.")
+        XCTAssertEqual(condition.action, .installDependencies)
+        XCTAssertEqual(state("web").likelyCause, "Error: Cannot find module 'next'")
+        XCTAssertEqual(supervisor.lastError, "Web App exited before it was ready — see its log")
+        let failed = EnvironmentSupervisor.statusFields(state("web"))
+        XCTAssertEqual(failed["reason"], condition.text)
+        XCTAssertEqual(failed["likely_cause"], "Error: Cannot find module 'next'")
+        XCTAssertNil(failed["skip_reason"])
+
+        FileManager.default.createFile(atPath: marker, contents: nil)
+        supervisor.restartService("web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        XCTAssertNil(state("web").condition)
+        XCTAssertNil(state("web").likelyCause)
+        XCTAssertEqual(state("web").lastProbe, .ok)
+        let running = EnvironmentSupervisor.statusFields(state("web"))
+        XCTAssertNil(running["reason"])
+        XCTAssertNil(running["likely_cause"])
+        XCTAssertEqual(running["last_probe"], "ready")
+    }
+
+    /// The breaker gives its own reason, and the exit of the third crash does not
+    /// replace it.
+    func testATrippedBreakerSaysItStoppedRetrying() async throws {
+        try load(daemon("boom", ["sh", "-c", "echo boom-start; exit 1"], probeTimeout: 60))
+
+        supervisor.restartService("boom")
+
+        let tripped = await waitUntil(40) {
+            self.state("boom").isCircuitBroken && self.supervisor.actionsInFlight.isEmpty
+                && self.state("boom").condition != nil
+        }
+        XCTAssertTrue(tripped)
+        try await Task.sleep(for: .seconds(1))
+        let condition = try XCTUnwrap(state("boom").condition)
+        XCTAssertEqual(condition.kind, .halted(reason: "crash loop"))
+        XCTAssertEqual(condition.text, "Stopped retrying after 3 crashes in a minute. Cause: not clear from the log.")
+        XCTAssertEqual(condition.action, .restart)
+    }
+
+    /// A kill from outside says so, also when the log of the launch has a line with
+    /// a fix of its own (a page that did not compile while the server ran).
+    func testAnOutsideKillSaysSoWhateverTheLogSays() async throws {
+        let line = "Module not found: Can't resolve './x'"
+        try load(ServiceDefinition(
+            id: "web", name: "Web App", cmd: ["sh", "-c", "echo \"\(line)\"; exec \(webServer.joined(separator: " "))"],
+            cwd: workDir.path,
+            probe: ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30),
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        ))
+        supervisor.restartService("web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains(line), lines.joined(separator: "\n"))
+        let pid = try XCTUnwrap(Self.listeners(on: port).first)
+
+        kill(pid, SIGTERM)
+
+        let said = await waitUntil(10) { self.state("web").phase == .failed && self.state("web").condition != nil }
+        XCTAssertTrue(said, "web is \(state("web").phase.rawValue)")
+        let condition = try XCTUnwrap(state("web").condition)
+        XCTAssertEqual(condition.headline, "Web App was stopped from outside Travel Runner (SIGTERM).")
+        XCTAssertEqual(condition.actions, [.restart, .openLog])
+    }
+
+    /// Kills from outside until the breaker trips: the reason is the crash loop. The
+    /// kill records its reason first, and the breaker's reason replaces it.
+    func testOutsideKillsThatTripTheBreakerSayItStoppedRetrying() async throws {
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        var last: pid_t = 0
+        for kill in 1...AutoRestart.failuresToTrip {
+            let up = await waitUntil(40) {
+                self.settled("web") && Self.listeners(on: self.port).first.map { $0 != last } == true
+            }
+            XCTAssertTrue(up, "kill \(kill): web is \(state("web").phase.rawValue)")
+            last = try XCTUnwrap(Self.listeners(on: port).first)
+            Darwin.kill(last, SIGTERM)
+        }
+
+        let tripped = await waitUntil(20) {
+            self.state("web").isCircuitBroken && self.state("web").condition?.kind == .halted(reason: "crash loop")
+        }
+        XCTAssertTrue(tripped, "web: \(state("web").condition?.text ?? "no condition")")
+        // A late record of the last kill does not replace it.
+        try await Task.sleep(for: .seconds(1))
+        let condition = try XCTUnwrap(state("web").condition)
+        XCTAssertEqual(condition.text, "Stopped retrying after 3 crashes in a minute. Cause: not clear from the log.")
+        XCTAssertEqual(condition.action, .restart)
+        XCTAssertEqual(state("web").phase, .failed)
+    }
+
+    /// A service outside the profile is skipped, and `/api/status` says why.
+    func testAServiceOutsideTheProfileHasASkipReason() async throws {
+        let partner = ServiceDefinition(
+            id: "partner-portal", name: "Partner Portal", cmd: ["sleep", "30"], cwd: workDir.path, probe: nil,
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        let anchor = ServiceDefinition(
+            id: "anchor", name: nil, cmd: ["sleep", "1"], cwd: nil, probe: nil, type: .daemon, restart: .never,
+            dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([partner, anchor], profile: .booking)
+        supervisor.serviceStates["anchor"]?.phase = .running
+        supervisor.health = .healthy
+
+        supervisor.restartService("partner-portal")
+
+        let skipped = await waitUntil(10) {
+            self.state("partner-portal").phase == .skipped && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(skipped, "partner-portal is \(state("partner-portal").phase.rawValue)")
+        XCTAssertEqual(state("partner-portal").condition?.kind, .notInProfile)
+        let fields = EnvironmentSupervisor.statusFields(state("partner-portal"))
+        XCTAssertEqual(fields["skip_reason"], "Not in the Booking profile.")
+        XCTAssertNil(fields["reason"])
+    }
+
+    /// "Install dependencies": the install runs in the folder of the service, its output
+    /// goes to the service's log in order, and then the service starts again.
+    func testTheInstallButtonInstallsThenRestarts() async throws {
+        let output = (1...200).map { "install line \($0)" }
+        let shell = FakeCommandRunner { call in
+            call.command == "npm install" ? FakeCommandRunner.ok(output.joined(separator: "\n")) : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+        XCTAssertTrue(supervisor.canPerform(.installDependencies, for: "web"))
+        // Negative control: a service that is not a Next app has no cache to clear.
+        XCTAssertFalse(supervisor.canPerform(.clearCacheAndRestart, for: "web"))
+
+        supervisor.perform(.installDependencies, for: "web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let install = try XCTUnwrap(shell.calls.first { $0.command == "npm install" })
+        XCTAssertEqual(install.cwd, workDir.path, "a folder without a pnpm workspace runs npm in the service folder")
+        let lines = await logLines("web")
+        XCTAssertEqual(lines.filter { $0.hasPrefix("install line ") }, output, "the install output keeps its order")
+        let started = try XCTUnwrap(lines.firstIndex { $0.hasPrefix("[travel-runner] Running npm install") })
+        let lastInstall = try XCTUnwrap(lines.lastIndex(of: "install line 200"))
+        XCTAssertLessThan(started, lastInstall)
+        XCTAssertNotNil(Self.listeners(on: port).first, "the restart started the service")
+    }
+
+    /// A failed install does not restart the service; the banner says why.
+    func testAFailedInstallDoesNotRestart() async throws {
+        let shell = FakeCommandRunner { call in
+            call.command == "npm install" ? FakeCommandRunner.failed(1, stderr: "ERR! network") : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+
+        supervisor.perform(.installDependencies, for: "web")
+
+        let done = await waitUntil(10) { self.supervisor.lastError != nil && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(done)
+        XCTAssertEqual(supervisor.lastError, "npm install for web failed (exit 1) — see its log")
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertNotEqual(state("web").phase, .running)
+        XCTAssertEqual(Self.listeners(on: port), [], "no restart after a failed install")
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("ERR! network"), lines.joined(separator: "\n"))
+    }
+
+    // MARK: - Dependencies before start (O6)
+
+    private nonisolated static let pnpmInstall = "pnpm install --frozen-lockfile"
+
+    /// Makes the folder of the test a pnpm workspace with no packages installed.
+    private func makeWorkspace(lock: String = "lock A") throws {
+        let old = Date(timeIntervalSince1970: 1_700_000_000)
+        for (name, text) in [("pnpm-workspace.yaml", "packages: []\n"), ("package.json", "{}\n"), ("pnpm-lock.yaml", lock)] {
+            let url = workDir.appendingPathComponent(name)
+            try Data(text.utf8).write(to: url)
+            try FileManager.default.setAttributes([.modificationDate: old], ofItemAtPath: url.path)
+        }
+    }
+
+    private nonisolated static func markInstalled(_ folder: URL) {
+        let modules = folder.appendingPathComponent("node_modules")
+        try? FileManager.default.createDirectory(at: modules, withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: modules.appendingPathComponent(".modules.yaml").path, contents: Data())
+    }
+
+    /// A fake pnpm install that writes the install marker, as the real one does.
+    private func fakeInstaller(gate: Gate? = nil, during: (@Sendable () -> Void)? = nil) -> FakeCommandRunner {
+        let folder = workDir!
+        return FakeCommandRunner { call in
+            guard call.command == Self.pnpmInstall else { return FakeCommandRunner.ok() }
+            await gate?.wait()
+            during?()
+            Self.markInstalled(folder)
+            return FakeCommandRunner.ok("Packages: +1\nDone")
+        }
+    }
+
+    /// Finding "lifecycle-deps-stale-badge-only": a service whose packages are not
+    /// installed is started only after an install, which runs in its log.
+    func testMissingPackagesAreInstalledBeforeTheStart() async throws {
+        try makeWorkspace()
+        let shell = fakeInstaller()
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let installs = shell.calls.filter { $0.command == Self.pnpmInstall }
+        XCTAssertEqual(installs.map(\.cwd), [workDir.path])
+        XCTAssertEqual(installs.first?.timeout, EnvironmentChecker.installTimeout)
+        let lines = await logLines("web")
+        let announce = try XCTUnwrap(lines.firstIndex(of: "[travel-runner] packages are not installed — running pnpm install --frozen-lockfile"))
+        let done = try XCTUnwrap(lines.firstIndex(of: "Done"))
+        XCTAssertLessThan(announce, done)
+        XCTAssertEqual(supervisor.dependencyRecord.hash(for: workDir.path), DependencyWatcher.lockHash(folder: workDir.path))
+        XCTAssertNotNil(Self.listeners(on: port).first)
+    }
+
+    /// Two services of one workspace that start together share one install.
+    func testOneInstallPerWorkspaceRoot() async throws {
+        try makeWorkspace()
+        let gate = Gate()
+        let shell = fakeInstaller(gate: gate)
+        supervisor.shell = shell
+        let worker = ServiceDefinition(
+            id: "worker", name: nil, cmd: ["sleep", "30"], cwd: workDir.path, probe: nil, type: .daemon,
+            restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        let anchor = ServiceDefinition(
+            id: "anchor", name: nil, cmd: ["sleep", "1"], cwd: nil, probe: nil, type: .daemon, restart: .never,
+            dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([daemon("web", webServer), worker, anchor])
+        supervisor.serviceStates["anchor"]?.phase = .running
+        supervisor.health = .healthy
+
+        supervisor.restartService("web")
+        supervisor.restartService("worker")
+
+        let joined = await waitUntil(10) { shell.calls.contains { $0.command == Self.pnpmInstall } }
+        XCTAssertTrue(joined)
+        var waiting = false
+        for _ in 0..<100 where !waiting {
+            let all = await logLines("web") + logLines("worker")
+            waiting = all.contains { $0.hasPrefix("[travel-runner] Waiting for the pnpm install --frozen-lockfile that runs in") }
+            if !waiting { try await Task.sleep(for: .milliseconds(50)) }
+        }
+        XCTAssertTrue(waiting, "the second service waits for the install that runs")
+        await gate.open()
+
+        let ready = await waitUntil(30) { self.settled("web") && self.settled("worker") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue), worker is \(state("worker").phase.rawValue)")
+        XCTAssertEqual(shell.commands.filter { $0 == Self.pnpmInstall }.count, 1)
+    }
+
+    /// A failed install leaves the service failed, with a reason and the install
+    /// button. GitHub Packages' 401 names the row that fixes it.
+    func testAFailedInstallBeforeTheStartSaysWhy() async throws {
+        try makeWorkspace()
+        let shell = FakeCommandRunner { call in
+            call.command == Self.pnpmInstall
+                ? FakeCommandRunner.failed(1, stderr: " ERR_PNPM_FETCH_401  GET https://npm.pkg.github.com/x: Unauthorized - 401")
+                : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+
+        let failed = await waitUntil(10) {
+            self.state("web").phase == .failed && self.state("web").condition != nil && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(failed, "web is \(state("web").phase.rawValue)")
+        let text = "web cannot start: its packages are not installed and pnpm install --frozen-lockfile failed: GitHub Packages rejected your token — fix the 'GitHub Packages auth' row, then retry."
+        XCTAssertEqual(supervisor.lastError, text)
+        XCTAssertEqual(state("web").condition?.headline, text)
+        XCTAssertEqual(state("web").condition?.actions, [.installDependencies, .openLog])
+        XCTAssertEqual(Self.listeners(on: port), [], "nothing started")
+        XCTAssertNil(supervisor.dependencyRecord.hash(for: workDir.path), "a failed install records no hash")
+    }
+
+    /// Stop all during the install before a start cancels the install, and that start
+    /// runs no process, also when a new start follows at once.
+    func testStopAllCancelsTheInstallBeforeTheStart() async throws {
+        try makeWorkspace()
+        let cancelled = LockedPids()
+        let shell = FakeCommandRunner { call in
+            guard call.command == Self.pnpmInstall else { return FakeCommandRunner.ok() }
+            while !Task.isCancelled { try? await Task.sleep(for: .milliseconds(20)) }
+            cancelled.set([1])
+            return CommandResult(exitCode: -1, stdout: "", stderr: "Cancelled")
+        }
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+        let installing = await waitUntil(10) { shell.calls.contains { $0.command == Self.pnpmInstall } }
+        XCTAssertTrue(installing)
+
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { cancelled.pids == [1] && self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped, "the install was cancelled: \(cancelled.pids)")
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertNotEqual(state("web").phase, .running)
+        XCTAssertNil(state("web").condition, "a stop is not a failure")
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertEqual(Self.listeners(on: port), [], "the cancelled start runs no process")
+        XCTAssertNil(supervisor.dependencyRecord.hash(for: workDir.path), "a cancelled install records no hash")
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("[travel-runner] Stop all stopped the pnpm install --frozen-lockfile"), lines.joined(separator: "\n"))
+    }
+
+    /// Decision 11: stale packages (the lockfile changed after the install) are not
+    /// installed at a start. The row offers the install instead.
+    func testStalePackagesDoNotInstallAtTheStart() async throws {
+        try makeWorkspace(lock: "lock B")
+        Self.markInstalled(workDir)
+        let marker = workDir.appendingPathComponent("node_modules/.modules.yaml").path
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_600_000_000)], ofItemAtPath: marker)
+        supervisor.dependencyRecord.record("hash of lock A", marker: nil, for: workDir.path)
+        XCTAssertEqual(DependencyWatcher.state(of: workDir.path, record: supervisor.dependencyRecord), .stale)
+        let shell = fakeInstaller()
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        XCTAssertFalse(shell.commands.contains(Self.pnpmInstall))
+        XCTAssertTrue(supervisor.canPerform(.installDependencies, for: "web"))
+    }
+
+    /// Critic item 26: a branch change that changes the lockfile installs before the
+    /// restart, while the old process still runs. Without a lockfile change it only restarts.
+    func testBranchChangeWithANewLockfileInstallsBeforeTheRestart() async throws {
+        try makeWorkspace(lock: "lock A")
+        Self.markInstalled(workDir)
+        let port = port
+        let duringInstall = LockedPids()
+        let shell = fakeInstaller(during: { duringInstall.set(Self.listeners(on: port)) })
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let first = try XCTUnwrap(state("web").pid)
+
+        // Negative control: the same lockfile, so no install.
+        await supervisor.restartAfterBranchChange(["web"])
+        let restarted = await waitUntil(30) { self.settled("web") && self.state("web").pid != first }
+        XCTAssertTrue(restarted)
+        XCTAssertFalse(shell.commands.contains(Self.pnpmInstall))
+        let second = try XCTUnwrap(state("web").pid)
+
+        try Data("lock B".utf8).write(to: workDir.appendingPathComponent("pnpm-lock.yaml"))
+        await supervisor.restartAfterBranchChange(["web"])
+
+        XCTAssertEqual(shell.commands.filter { $0 == Self.pnpmInstall }.count, 1)
+        XCTAssertEqual(duringInstall.pids, [second], "the old process ran during the install")
+        let again = await waitUntil(30) { self.settled("web") && self.state("web").pid != second }
+        XCTAssertTrue(again)
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("[travel-runner] The lockfile changed — running pnpm install --frozen-lockfile before the restart"))
+        XCTAssertEqual(DependencyWatcher.state(of: workDir.path, record: supervisor.dependencyRecord), .fresh)
+    }
+
+    /// After a failed install on a branch change the old process keeps running: a
+    /// restart on the old packages would crash in a loop.
+    func testBranchChangeWithAFailedInstallKeepsTheProcess() async throws {
+        try makeWorkspace(lock: "lock A")
+        Self.markInstalled(workDir)
+        let shell = FakeCommandRunner { call in
+            call.command == Self.pnpmInstall ? FakeCommandRunner.failed(1, stderr: "ERR! network") : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let pid = try XCTUnwrap(state("web").pid)
+
+        try Data("lock B".utf8).write(to: workDir.appendingPathComponent("pnpm-lock.yaml"))
+        await supervisor.restartAfterBranchChange(["web"])
+
+        XCTAssertEqual(
+            supervisor.lastError,
+            "pnpm install --frozen-lockfile for web failed (exit 1) — see its log. web still runs the old packages; fix the cause, then press Install dependencies."
+        )
+        try await Task.sleep(for: .seconds(1.5))
+        XCTAssertEqual(state("web").pid, pid)
+        XCTAssertEqual(state("web").phase, .running)
+    }
+
+    /// "Free port and restart" frees the port of the EADDRINUSE line, also when it is
+    /// not the port of the probe, and keeps a container's port helper alive.
+    func testFreePortAndRestartFreesThePortItNames() async throws {
+        let hmr = try Self.listeningSocket()
+        let published = try Self.listeningSocket()
+        defer { close(hmr.fd); close(published.fd) }
+        let calls = PortToolCalls()
+        let commands = [hmr.port: "node", published.port: "OrbStack Helper"]
+        supervisor.portTools = PortTools(
+            listeners: { port in commands[port].map { [PortOwner.Listener(pid: pid_t(port), command: $0)] } ?? [] },
+            kill: { calls.addKill($0) },
+            killCommands: { calls.addPattern($0) }
+        )
+        try load(daemon("web", webServer))
+
+        supervisor.perform(.stopForeignAndRetry(port: hmr.port), for: "web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(calls.kills, [pid_t(hmr.port)])
+
+        // Negative control: a container's port helper is not killed.
+        calls.reset()
+        let before = try XCTUnwrap(Self.listeners(on: port).first)
+        supervisor.perform(.stopForeignAndRetry(port: published.port), for: "web")
+        let again = await waitUntil(30) {
+            self.settled("web") && Self.listeners(on: self.port).first.map { $0 != before } == true
+        }
+        XCTAssertTrue(again, "the service did not restart")
+        XCTAssertEqual(calls.kills, [])
+    }
+
     /// A daemon that ends with code 0 has no process, and nothing starts it again.
     /// The environment showed "starting" with no end.
     func testACleanExitOfADaemonGivesDegradedNotStarting() async throws {
@@ -1560,6 +2128,14 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(skips.count, 1)
         XCTAssertEqual(skips.first?.serviceId, "stripe")
         XCTAssertTrue(skips.first?.message.contains("stripe login") == true, "\(skips)")
+
+        // F4: a skip has a reason on the row and in the status API.
+        let condition = try XCTUnwrap(state("stripe").condition)
+        XCTAssertEqual(condition.kind, .optionalOff)
+        XCTAssertEqual(condition.headline, "Stripe CLI is not installed or not logged in — webhooks are off.")
+        let fields = EnvironmentSupervisor.statusFields(state("stripe"))
+        XCTAssertEqual(fields["skip_reason"], condition.text)
+        XCTAssertNil(fields["reason"])
     }
 
     /// A Stripe CLI that fails (an expired session, say) is skipped, not restarted in
@@ -3019,4 +3595,20 @@ private struct HeldPathQuestion {
 
     /// How often the shell was asked where a tool is.
     var calls: Int { shell.commands.filter { $0.contains("command -v") }.count }
+}
+
+/// The pids that a fake install saw on the port of the test.
+private final class LockedPids: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [pid_t] = []
+    var pids: [pid_t] {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+    func set(_ pids: [pid_t]) {
+        lock.lock()
+        stored = pids
+        lock.unlock()
+    }
 }

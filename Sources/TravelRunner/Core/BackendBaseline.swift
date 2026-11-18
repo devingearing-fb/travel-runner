@@ -26,8 +26,9 @@ enum BackendBaseline {
     /// The checkout that `local-db.sh` would use for the monorepo at `root`, in the
     /// login shell that runs it. A shell profile can set `FB_AMATEUR_BACKEND_DIR` that
     /// the runner itself does not have, for example when it opens from Finder.
-    static func resolve(root: String, shell: any CommandRunning) async -> Source {
-        let result = await shell.run(environmentCommand, cwd: root, timeout: .seconds(15))
+    /// `timeout` is the check timeout of the caller.
+    static func resolve(root: String, shell: any CommandRunning, timeout: Duration = .seconds(15)) async -> Source {
+        let result = await shell.run(environmentCommand, cwd: root, timeout: timeout)
         let dir = result.exitCode == 0 ? environmentValue(result.stdout) : nil
         return source(root: root, environment: dir.map { ["FB_AMATEUR_BACKEND_DIR": $0] } ?? [:])
     }

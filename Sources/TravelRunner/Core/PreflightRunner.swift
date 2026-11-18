@@ -74,6 +74,16 @@ struct PreflightRunner: Sendable {
         // at its start. Its folder is not a condition for the rest of the stack.
         let cwds = Set(services.filter { !ServiceCatalog.forkAppIDs.contains($0.id) }.compactMap { $0.resolvedCwd })
         for cwd in cwds.sorted() {
+            // A repo whose path services.json does not set.
+            if cwd.isEmpty {
+                let names = services.filter { $0.resolvedCwd == "" }.map { $0.name ?? $0.id }.sorted()
+                checks.append(PreflightCheck(
+                    id: "dir-unset",
+                    name: "Folder of \(names.joined(separator: ", "))",
+                    metadata: ["path": ""]
+                ))
+                continue
+            }
             let dirName = URL(fileURLWithPath: cwd).lastPathComponent
             checks.append(PreflightCheck(
                 id: "dir-\(dirName)",
@@ -183,10 +193,15 @@ struct PreflightRunner: Sendable {
 
             if check.id.hasPrefix("dir-") {
                 let path = check.metadata["path"] ?? ""
+                if path.isEmpty {
+                    return .failed(message: "No folder is set — open Settings → Reconfigure Repos",
+                                   fix: nil)
+                }
                 let exists = FileManager.default.fileExists(atPath: path)
                 return exists
                     ? .passed(detail: "Found")
-                    : .failed(message: "Directory not found", fix: "Check services.json paths")
+                    : .failed(message: "Directory not found — open Settings → Reconfigure Repos",
+                              fix: nil)
             }
 
             return .passed(detail: "OK")

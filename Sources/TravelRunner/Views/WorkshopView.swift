@@ -7,7 +7,7 @@ struct WorkshopView: View {
     @State private var showSetup = false
 
     private var isFirstRun: Bool {
-        supervisor.sortedServiceIDs.isEmpty && ConfigLoader.needsSetup
+        (supervisor.sortedServiceIDs.isEmpty && ConfigLoader.needsSetup) || !SetupState.live.completed
     }
 
     private var failedServiceCount: Int {

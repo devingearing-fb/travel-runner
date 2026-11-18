@@ -175,7 +175,13 @@ final class DbSetupProtocolTests: XCTestCase {
         XCTAssertEqual(EnvironmentChecker.linkedChecks(of: "booking-env"), ["hotel-data"])
         // Negative control: another row changes no other row.
         XCTAssertEqual(EnvironmentChecker.linkedChecks(of: "stream-modules"), [])
-        XCTAssertEqual(EnvironmentChecker.fixFailedText(for: "hotel-data"), "Fix failed — try manually")
+        XCTAssertEqual(checker.fixAction(for: "hotel-data"), .importFile)
+        // A failed command fix of a row names its error, with no hotel download hint.
+        let failed = CommandResult(exitCode: 1, stdout: "", stderr: "Local Supabase is not running\n")
+        XCTAssertEqual(
+            EnvironmentChecker.fixFailedText(for: "hotel-data", result: failed, timeout: EnvironmentChecker.fixTimeout),
+            "Fix failed (exit 1): Local Supabase is not running"
+        )
     }
 
     // MARK: - What the runner tells the scripts
