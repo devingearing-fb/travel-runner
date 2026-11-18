@@ -224,18 +224,8 @@ enum EventDirectoryLauncher {
     /// The service with the values of `env` for its process.
     static func definition(_ definition: ServiceDefinition, env: [String: String]) -> ServiceDefinition {
         guard !env.isEmpty else { return definition }
-        return ServiceDefinition(
-            id: definition.id,
-            name: definition.name,
-            cmd: definition.cmd,
-            cwd: definition.cwd,
-            probe: definition.probe,
-            type: definition.type,
-            restart: definition.restart,
-            dependsOn: definition.dependsOn,
-            env: (definition.env ?? [:]).merging(env) { _, passed in passed },
-            phase: definition.phase,
-            reuseIfRunning: definition.reuseIfRunning
-        )
+        var copy = definition
+        copy.env = (definition.env ?? [:]).merging(env) { _, passed in passed }
+        return copy
     }
 }

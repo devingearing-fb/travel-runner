@@ -335,9 +335,10 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertEqual(termination?.stoppedByRunner, true)
     }
 
-    /// Finding "2 s grace kills Sequin teardown": the stop verb runs while the
-    /// service still runs, in its folder, with its grace as the timeout.
-    func testAStopRunsTheStopVerbBeforeTheSignals() async throws {
+    /// Finding "2 s grace kills Sequin teardown": SIGTERM goes first, so the
+    /// wrapper's own trap tears down cleanly. The stop verb runs after the service
+    /// has ended, as a backup, in its folder, with its grace as the timeout.
+    func testAStopRunsTheStopVerbAfterTheSignals() async throws {
         let folder = try makeFolder()
         let alive = AliveAtVerb()
         let box = Box()
@@ -360,7 +361,7 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertEqual(shell.calls, [FakeCommandRunner.Call(
             command: "./run.sh stop", cwd: folder.path, environment: [:], timeout: .seconds(7)
         )])
-        XCTAssertEqual(alive.value, true, "the stop verb ran before the first signal")
+        XCTAssertEqual(alive.value, false, "the stop verb ran after the service had ended")
         XCTAssertFalse(isAlive(pid))
         let termination = await waitForTermination(box)
         XCTAssertEqual(termination?.stoppedByRunner, true)

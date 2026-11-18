@@ -445,18 +445,9 @@ enum AgentLauncher {
 
     /// The service with the Node and the env of `launch`.
     static func definition(_ definition: ServiceDefinition, launch: Launch) -> ServiceDefinition {
-        ServiceDefinition(
-            id: definition.id,
-            name: definition.name,
-            cmd: launch.nodeBin.map { NodeLocator.command(definition.cmd, nodeBin: $0) } ?? definition.cmd,
-            cwd: definition.cwd,
-            probe: definition.probe,
-            type: definition.type,
-            restart: definition.restart,
-            dependsOn: definition.dependsOn,
-            env: (definition.env ?? [:]).merging(launch.env) { _, passed in passed },
-            phase: definition.phase,
-            reuseIfRunning: definition.reuseIfRunning
-        )
+        var copy = definition
+        if let nodeBin = launch.nodeBin { copy.cmd = NodeLocator.command(definition.cmd, nodeBin: nodeBin) }
+        copy.env = (definition.env ?? [:]).merging(launch.env) { _, passed in passed }
+        return copy
     }
 }

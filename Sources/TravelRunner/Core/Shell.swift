@@ -58,9 +58,29 @@ struct LoginShell: CommandRunning {
         // A command that starts during a resolve waits for the new PATH.
         await tools.settled()
         return await Shell.execute(
-            "/bin/zsh", ["-l", "-c", tools.wrap(command, cwd: cwd)],
+            Self.executable, Self.arguments(command, cwd: cwd, tools: tools),
             cwd: cwd, environment: environment, timeout: timeout, onLine: onLine
         )
+    }
+
+    static let executable = "/bin/zsh"
+
+    /// The arguments of `zsh` that run `command` with the PATH of `tools`.
+    static func arguments(_ command: String, cwd: String?, tools: ToolEnvironment) -> [String] {
+        ["-l", "-c", tools.wrap(command, cwd: cwd)]
+    }
+
+    /// A process that runs `command` in a login shell, in `cwd`, with `environment`
+    /// added to the environment of the app. The caller sets its pipes and runs it.
+    static func process(
+        _ command: String, cwd: String?, environment: [String: String]?, tools: ToolEnvironment
+    ) -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments(command, cwd: cwd, tools: tools)
+        if let cwd { process.currentDirectoryURL = URL(fileURLWithPath: cwd) }
+        process.environment = ProcessInfo.processInfo.environment.merging(environment ?? [:]) { _, new in new }
+        return process
     }
 }
 

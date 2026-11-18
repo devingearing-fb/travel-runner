@@ -155,17 +155,19 @@ struct RepoPaths: Codable, Sendable, Equatable {
 struct ServiceDefinition: Codable, Sendable, Identifiable {
     let id: String
     let name: String?
-    let cmd: [String]
+    /// `var`, so a launch can copy the definition and change it without losing a field.
+    var cmd: [String]
     let cwd: String?
     let probe: ProbeConfig?
     let type: ServiceType?
     let restart: RestartPolicy?
     let dependsOn: [String]
-    let env: [String: String]?
+    var env: [String: String]?
     let phase: String?
     let reuseIfRunning: Bool?
     /// A command that tears the service down (a `compose down`). A stop runs it
-    /// before the signals and before any port sweep.
+    /// after the grace of SIGTERM, as a backup to the service's own cleanup, and
+    /// before any port sweep.
     var stopCmd: [String]? = nil
     /// The wait between SIGTERM and SIGKILL of a stop. Nil is `defaultStopGrace`.
     var stopGraceSeconds: Int? = nil

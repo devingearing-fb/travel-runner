@@ -86,6 +86,31 @@ final class ServiceCatalogTests: XCTestCase {
         XCTAssertEqual(plain.resolvedStopGrace, .seconds(5))
     }
 
+    /// The agent and the event directory copy their definition at launch. The copy
+    /// keeps the stop verb, the grace and the note.
+    func testALaunchCopyKeepsTheStopFields() {
+        var service = ServiceDefinition(
+            id: "svc", name: nil, cmd: ["node", "server.js"], cwd: nil, probe: nil, type: nil, restart: nil,
+            dependsOn: [], env: ["A": "1"], phase: nil, reuseIfRunning: nil
+        )
+        service.stopCmd = ["./run.sh", "stop"]
+        service.stopGraceSeconds = 12
+        service.stopNote = "svc (teardown)"
+
+        let agent = AgentLauncher.definition(
+            service, launch: AgentLauncher.Launch(nodeBin: "/node/bin", env: ["B": "2"], notes: [])
+        )
+        let directory = EventDirectoryLauncher.definition(service, env: ["B": "2"])
+        for copy in [agent, directory] {
+            XCTAssertEqual(copy.resolvedStopCmd, ["./run.sh", "stop"])
+            XCTAssertEqual(copy.resolvedStopGrace, .seconds(12))
+            XCTAssertEqual(copy.stopNote, "svc (teardown)")
+            XCTAssertEqual(copy.env, ["A": "1", "B": "2"])
+        }
+        XCTAssertNotEqual(agent.cmd, service.cmd, "the agent runs the Node of the launch")
+        XCTAssertEqual(directory.cmd, service.cmd)
+    }
+
     func testCacheApplySecretIsSharedAcrossTheChain() {
         let secret = byID["travel-portal"]?.env?["CACHE_APPLY_SECRET_CURRENT"]
         XCTAssertNotNil(secret)

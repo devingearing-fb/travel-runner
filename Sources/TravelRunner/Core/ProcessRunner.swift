@@ -74,24 +74,11 @@ actor ProcessRunner {
             }
         }
 
-        let process = Process()
+        let process = LoginShell.process(
+            ShellQuote.join(service.cmd), cwd: service.resolvedCwd, environment: service.env, tools: tools
+        )
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
-
-        if let cwd = service.resolvedCwd {
-            process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        }
-
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-l", "-c", tools.wrap(ShellQuote.join(service.cmd), cwd: service.resolvedCwd)]
-
-        var env = ProcessInfo.processInfo.environment
-        if let overrides = service.env {
-            for (key, value) in overrides {
-                env[key] = value
-            }
-        }
-        process.environment = env
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
@@ -141,23 +128,26 @@ actor ProcessRunner {
         return pid
     }
 
-    /// Runs the stop command of the service, then sends SIGTERM, and SIGKILL after
-    /// the grace of the service.
+    /// Sends SIGTERM, and SIGKILL after the grace of the service. Then it runs the
+    /// stop command of the service, as a backup to the service's own cleanup.
+    ///
+    /// SIGTERM goes first so a wrapper's trap (Sequin's `compose down`) ends it
+    /// cleanly. A teardown from outside while the wrapper still runs makes it log
+    /// "stopped unexpectedly". The stop command still runs before any port sweep.
     func stop(serviceID: String) async {
         guard let launch = launches[serviceID] else { return }
         launch.stopFlag.set()
 
-        // `tree` reads the whole tree before the first signal.
-        let tree = ProcessTree.tree(of: launch.pid)
+        // `tree` reads the whole tree right before the first signal.
+        await ProcessTree.terminate(ProcessTree.tree(of: launch.pid), grace: launch.service.resolvedStopGrace)
         await runStopCommand(of: launch)
-        await ProcessTree.terminate(tree, grace: launch.service.resolvedStopGrace)
 
         if launches[serviceID]?.pid == launch.pid {
             launches.removeValue(forKey: serviceID)
         }
     }
 
-    /// `stop` for every launch at once. Each one gets its own stop command and grace.
+    /// `stop` for every launch at once. Each one gets its own grace and stop command.
     func stopAll() async {
         let stopping = launches
         var trees: [(launch: Launch, pids: [pid_t])] = []
@@ -169,8 +159,8 @@ actor ProcessRunner {
         await withTaskGroup(of: Void.self) { group in
             for (launch, pids) in trees {
                 group.addTask {
-                    await self.runStopCommand(of: launch)
                     await ProcessTree.terminate(pids, grace: launch.service.resolvedStopGrace)
+                    await self.runStopCommand(of: launch)
                 }
             }
         }
@@ -187,13 +177,9 @@ actor ProcessRunner {
         of service: ServiceDefinition, tools: ToolEnvironment = .shared
     ) -> pid_t? {
         guard let command = service.resolvedStopCmd else { return nil }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-l", "-c", tools.wrap(ShellQuote.join(command), cwd: service.resolvedCwd)]
-        if let cwd = service.resolvedCwd {
-            process.currentDirectoryURL = URL(fileURLWithPath: cwd)
-        }
-        process.environment = ProcessInfo.processInfo.environment.merging(service.env ?? [:]) { _, new in new }
+        let process = LoginShell.process(
+            ShellQuote.join(command), cwd: service.resolvedCwd, environment: service.env, tools: tools
+        )
         process.standardInput = FileHandle.nullDevice
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
@@ -218,7 +204,8 @@ actor ProcessRunner {
     // MARK: - Private
 
     /// Runs the stop command and waits for it, at most for the grace of the service.
-    /// Its output goes to the log of the service.
+    /// Its output goes to the log of the service. It runs after the process has
+    /// ended, so it must be safe to run when the cleanup already ran.
     private func runStopCommand(of launch: Launch) async {
         guard let command = launch.service.resolvedStopCmd else { return }
         let text = ShellQuote.join(command)

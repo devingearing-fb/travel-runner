@@ -745,8 +745,8 @@ final class SupervisorLifecycleTests: XCTestCase {
     }
 
     /// Findings "SIGKILL after 2 s cuts cleanup" and "2 s grace kills Sequin
-    /// teardown": Stop All runs the stop verb first, waits for a cleanup of three
-    /// seconds, and sweeps the port last. The listener runs outside the service's
+    /// teardown": Stop All waits for a cleanup of three seconds on SIGTERM, then
+    /// runs the stop verb, and sweeps the port last. The listener runs outside the service's
     /// process tree, as a container's port does, so only the sweep stops it.
     func testStopAllRunsTheStopVerbAndTheCleanupBeforeThePortSweep() async throws {
         let order = workDir.appendingPathComponent("order")
@@ -784,7 +784,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(stopped)
 
         let lines = ((try? String(contentsOf: order, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
-        XCTAssertEqual(lines, ["verb", "cleanup", "sweep"])
+        XCTAssertEqual(lines, ["cleanup", "verb", "sweep"])
         XCTAssertTrue(Self.listeners(on: port).filter { Self.process($0, runsIn: ownedDirectory) }.isEmpty)
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
     }
