@@ -48,23 +48,83 @@ final class LanAddressTests: XCTestCase {
         XCTAssertNil(LanAddress.pick(defaultInterface: nil, from: []))
     }
 
-    /// A move between networks sends several path updates. The supervisor hears one.
+    /// A move between networks sends several path updates. The supervisor hears
+    /// one, after the path was quiet for the debounce time.
     @MainActor
     func testTheObserverReportsABurstOfChangesOnce() async throws {
+        let time = FakeClock()
+        // A wait that a failed check leaves behind must not keep the run going.
+        addTeardownBlock { time.advance(by: .seconds(3600)) }
         var changes = 0
-        let observer = NetworkObserver(debounce: .milliseconds(200)) { changes += 1 }
+        let observer = NetworkObserver(debounce: .seconds(5), clock: time.manual) { changes += 1 }
 
         observer.pathChanged()
-        try await Task.sleep(for: .milliseconds(50))
+        await until { time.heldWaits == 1 }
+        time.advance(by: .seconds(4))
         observer.pathChanged()
         observer.pathChanged()
-        XCTAssertEqual(changes, 0)
-        try await Task.sleep(for: .milliseconds(600))
+        await until { time.heldWaits == 1 && time.sleeps.count >= 2 }
+        time.advance(by: .seconds(4))
+        await drain()
+        XCTAssertEqual(changes, 0, "each change starts the debounce again")
+        time.advance(by: .seconds(1))
+        await until { changes == 1 }
         XCTAssertEqual(changes, 1)
 
         observer.pathChanged()
+        await until { time.heldWaits == 1 }
         observer.stopObserving()
-        try await Task.sleep(for: .milliseconds(400))
+        await until { time.heldWaits == 0 }
+        time.advance(by: .seconds(10))
+        await drain()
         XCTAssertEqual(changes, 1, "a stop drops the change that waits")
+    }
+
+    /// NWPathMonitor sends the current path when it starts. That is no change.
+    @MainActor
+    func testTheFirstPathUpdateIsNoChange() async throws {
+        let time = FakeClock()
+        // A wait that a failed check leaves behind must not keep the run going.
+        addTeardownBlock { time.advance(by: .seconds(3600)) }
+        var changes = 0
+        let observer = NetworkObserver(debounce: .seconds(5), clock: time.manual) { changes += 1 }
+
+        observer.pathUpdated()
+        await drain()
+        XCTAssertEqual(time.heldWaits, 0)
+        time.advance(by: .seconds(10))
+        await drain()
+        XCTAssertEqual(changes, 0)
+
+        observer.pathUpdated()
+        await until { time.heldWaits == 1 }
+        time.advance(by: .seconds(5))
+        await until { changes == 1 }
+        XCTAssertEqual(changes, 1, "the second update is a change")
+
+        // A new start sends the current path again.
+        observer.stopObserving()
+        observer.pathUpdated()
+        await drain()
+        XCTAssertEqual(time.heldWaits, 0)
+    }
+
+    /// Lets the tasks that can run, run, so a check that nothing happened means it.
+    @MainActor
+    private func drain() async {
+        for _ in 0..<20 {
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+    }
+
+    /// Waits for tasks to reach a state. It asserts nothing about time.
+    @MainActor
+    private func until(_ condition: @MainActor () -> Bool) async {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !condition(), ContinuousClock.now < deadline {
+            await Task.yield()
+            try? await Task.sleep(for: .milliseconds(1))
+        }
     }
 }

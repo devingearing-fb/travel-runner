@@ -40,7 +40,7 @@ final class NetworkObserver {
     }
 
     /// The monitor sends the current path when it starts. That is no change.
-    private func pathUpdated() {
+    func pathUpdated() {
         guard sawFirstPath else {
             sawFirstPath = true
             return

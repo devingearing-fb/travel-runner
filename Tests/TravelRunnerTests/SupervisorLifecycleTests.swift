@@ -2650,19 +2650,63 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertFalse(lines.contains { $0.contains("LAN address changed") }, lines.joined(separator: "\n"))
     }
 
-    /// A network change with no address keeps the servers: they still serve localhost.
-    func testANetworkChangeWithNoAddressRestartsNothing() async throws {
+    /// A network change with no address: the env files named an address the Mac
+    /// no longer has, so localhost could not reach Supabase or the login either.
+    /// LAN mode goes back to localhost and writes localhost URLs.
+    func testANetworkChangeWithNoAddressGoesBackToLocalhost() async throws {
         let before = try await runInLanMode(at: LanAddress(interface: "en0", ip: "10.0.1.23"))
+        supervisor.writeAppEnv()
+        let envFile = workDir.appendingPathComponent(".env.local")
+        let lanEnv = try String(contentsOf: envFile, encoding: .utf8)
+        XCTAssertTrue(lanEnv.contains("NEXT_PUBLIC_SITE_URL=http://10.0.1.23:3000"), lanEnv)
         supervisor.findLanAddress = { nil }
+        var feedback: [(String, Bool)] = []
+        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
 
         await supervisor.handleNetworkChange()
-        try await Task.sleep(for: .milliseconds(500))
 
-        XCTAssertEqual(state("universal-login").pid, before)
-        XCTAssertTrue(supervisor.networkMode)
-        XCTAssertEqual(supervisor.lanAddress?.ip, "10.0.1.23")
+        let restarted = await waitUntil(20) {
+            self.settled("universal-login") && self.state("universal-login").pid != before
+                && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(restarted, "universal-login is \(state("universal-login").phase.rawValue)")
+        XCTAssertFalse(supervisor.networkMode)
+        XCTAssertNil(supervisor.lanAddress)
+        let env = try String(contentsOf: envFile, encoding: .utf8)
+        XCTAssertTrue(env.contains("NEXT_PUBLIC_SITE_URL=http://localhost:3000"), env)
+        XCTAssertFalse(env.contains("10.0.1.23"), env)
         let lines = await logLines("travel-portal")
-        XCTAssertTrue(lines.contains { $0.contains("there is no LAN address now") }, lines.joined(separator: "\n"))
+        XCTAssertTrue(lines.contains(EnvironmentSupervisor.lanAddressLostLine), lines.joined(separator: "\n"))
+        XCTAssertFalse(lines.contains { $0.contains("Localhost still works") }, lines.joined(separator: "\n"))
+        XCTAssertEqual(feedback.last?.0, "LAN mode off — localhost only")
+        XCTAssertEqual(feedback.last?.1, true)
+    }
+
+    /// The network flaps after the change found a new address. The apply step
+    /// uses that address and does not look again, so no "No LAN address" error
+    /// shows for a toggle the user did not make.
+    func testANetworkChangeAppliesTheAddressItFound() async throws {
+        let before = try await runInLanMode(at: LanAddress(interface: "en0", ip: "10.0.1.23"))
+        let asked = OSAllocatedUnfairLock(initialState: 0)
+        supervisor.findLanAddress = {
+            let call = asked.withLock { $0 += 1; return $0 }
+            return call == 1 ? LanAddress(interface: "en0", ip: "192.168.1.20") : nil
+        }
+        var feedback: [(String, Bool)] = []
+        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+
+        await supervisor.handleNetworkChange()
+
+        let restarted = await waitUntil(20) {
+            self.settled("universal-login") && self.state("universal-login").pid != before
+                && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(restarted, "universal-login is \(state("universal-login").phase.rawValue)")
+        XCTAssertEqual(asked.withLock { $0 }, 1)
+        XCTAssertTrue(supervisor.networkMode)
+        XCTAssertEqual(supervisor.lanAddress?.ip, "192.168.1.20")
+        XCTAssertFalse(feedback.contains { $0.0 == EnvironmentSupervisor.noLanAddressText }, "\(feedback)")
+        XCTAssertEqual(feedback.last?.0, "LAN mode on — open http://192.168.1.20:3002 on your phone")
     }
 
     /// A new address needs new URLs: LAN mode is applied again, and the server

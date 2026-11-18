@@ -1349,11 +1349,13 @@ final class EnvironmentSupervisor {
 
     /// What LAN mode says when the Mac has no LAN address.
     static let noLanAddressText = "No LAN address found — connect to Wi-Fi or Ethernet, then try again."
+    /// What the log says when LAN mode loses its address and goes back to localhost.
+    static let lanAddressLostLine = "[travel-runner] The network changed and there is no LAN address now — switching back to localhost mode"
 
     /// Applies the current `networkMode` to env files and restarts LAN services.
-    /// It finds the LAN address on every call, so a network change with a new
-    /// address uses it too.
-    func applyNetworkMode() {
+    /// It uses `address` when the caller found one, and else finds the LAN
+    /// address, so a network change with a new address uses it too.
+    func applyNetworkMode(address: LanAddress? = nil) {
         guard !isTogglingNetwork else {
             // A new LAN address can come while a toggle runs. If the request were
             // dropped, the env files would keep the old address. Run it after the current one.
@@ -1361,9 +1363,10 @@ final class EnvironmentSupervisor {
             return
         }
         isTogglingNetwork = true
-        let mode = networkMode
+        let requestedMode = networkMode
 
         Task {
+            var mode = requestedMode
             beginAction("lan-mode")
             defer {
                 isTogglingNetwork = false
@@ -1375,14 +1378,24 @@ final class EnvironmentSupervisor {
             }
 
             if mode {
-                guard let found = await findLanAddress() else {
-                    // LAN mode on 127.0.0.1 reaches no phone. Nothing restarts, and
-                    // a LAN mode that is not on yet stays off.
-                    if lanAddress == nil { networkMode = false }
+                var found = address
+                if found == nil { found = await findLanAddress() }
+                if let found {
+                    lanAddress = found
+                } else if lanAddress == nil {
+                    // The user turned LAN mode on. LAN mode on 127.0.0.1 reaches
+                    // no phone, so it stays off and nothing restarts.
+                    networkMode = false
                     onActionFeedback?(Self.noLanAddressText, false)
                     return
+                } else {
+                    // LAN mode was on and its address is gone: the env files point
+                    // at an address the Mac no longer has, so go back to localhost.
+                    await logStore.append(serviceID: "travel-portal", entry: LogEntry(stream: .stdout, text: Self.lanAddressLostLine))
+                    networkMode = false
+                    mode = false
+                    lanAddress = nil
                 }
-                lanAddress = found
             } else {
                 lanAddress = nil
             }
@@ -1427,17 +1440,19 @@ final class EnvironmentSupervisor {
     }
 
     /// The network changed (`NetworkObserver`). The web servers listen on all
-    /// addresses, so they keep working on localhost. Only a new LAN address
-    /// needs new URLs in the env files, and so a restart of the LAN services.
+    /// addresses, so the same address needs nothing. A new LAN address needs new
+    /// URLs in the env files, and so a restart of the LAN services. No address
+    /// goes back to localhost mode, as the env files name an address that is gone.
     func handleNetworkChange() async {
         guard networkMode, !isShuttingDown else { return }
         let found = await findLanAddress()
         guard networkMode, !isShuttingDown, let old = lanAddress else { return }
         guard let found else {
-            await logStore.append(serviceID: "travel-portal", entry: LogEntry(
-                stream: .stdout,
-                text: "[travel-runner] The network changed and there is no LAN address now. Localhost still works; LAN mode waits for a network."
-            ))
+            // The env files still name the old address, which the Mac no longer
+            // has, so the browser on localhost cannot reach Supabase or the login.
+            await logStore.append(serviceID: "travel-portal", entry: LogEntry(stream: .stdout, text: Self.lanAddressLostLine))
+            networkMode = false
+            applyNetworkMode()
             return
         }
         guard found.ip != old.ip else {
@@ -1449,7 +1464,7 @@ final class EnvironmentSupervisor {
             stream: .stdout,
             text: "[travel-runner] LAN address changed (\(old.ip) → \(found.ip)) — applying LAN mode again"
         ))
-        applyNetworkMode()
+        applyNetworkMode(address: found)
     }
 
     private func shellOutput(_ command: String, cwd: String? = nil) async -> (String, Bool) {
