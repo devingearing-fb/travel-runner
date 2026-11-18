@@ -203,16 +203,28 @@ final class StripeSupportTests: XCTestCase {
         checker.checks.first { $0.id == id }?.status
     }
 
-    func testTheAuthRowPassesWithTheTestKeyWithoutALogin() async throws {
+    /// With a test key the row asks Stripe with that key, as `stripe listen` gets it,
+    /// not with the login. The key is in the environment, never in the command.
+    func testTheAuthRowAsksStripeWithTheTestKeyNotTheLogin() async throws {
         try write(".env", "STRIPE_SECRET_KEY=\(testKey)\n")
-        let runner = FakeCommandRunner { _ in FakeCommandRunner.failed() }
+        let runner = FakeCommandRunner()
         let checker = makeChecker(runner)
 
         await checker.runAllChecks()
 
-        XCTAssertEqual(status("stripe-auth", in: checker), .passing("Using the test key from apps/booking-portal/.env"))
-        XCTAssertFalse(runner.commands.contains { $0.contains("balance") }, "no login is asked for")
+        XCTAssertEqual(status("stripe-auth", in: checker), .passing("Stripe accepts the test key from apps/booking-portal/.env"))
+        let asks = runner.calls.filter { $0.command.contains("balance") }
+        XCTAssertEqual(asks.map(\.command), [StripeLauncher.keyCheckCommand])
+        XCTAssertEqual(asks.first?.environment, [StripeLauncher.apiKeyVariable: testKey])
         XCTAssertFalse(runner.calls.contains { $0.command.contains(testKey) })
+
+        // Without the CLI the key is not asked, and the row says so.
+        let noCLI = FakeCommandRunner { _ in FakeCommandRunner.failed() }
+        let other = makeChecker(noCLI)
+        await other.runAllChecks()
+        XCTAssertFalse(noCLI.commands.contains { $0.contains("balance") })
+        guard case .warning(let text)? = status("stripe-auth", in: other) else { return XCTFail() }
+        XCTAssertTrue(text.hasPrefix("The test key from apps/booking-portal/.env is not checked"), text)
     }
 
     func testTheAuthRowWithALiveKeyAsksForTheLoginAndSaysWhy() async throws {

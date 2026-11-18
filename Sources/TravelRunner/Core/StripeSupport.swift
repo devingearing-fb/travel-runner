@@ -163,6 +163,26 @@ enum StripeLauncher {
         }
     }
 
+    /// Asks Stripe with the test key in `STRIPE_API_KEY`, as `stripe listen` gets it.
+    /// The output stays in the runner: the row shows no line of it.
+    static let keyCheckCommand = "stripe balance retrieve"
+
+    /// The setup row "Stripe CLI Auth" in test-key mode, from `keyCheckCommand`.
+    /// Nil `result`: the CLI is not installed, so the key was not asked.
+    static func testKeyStatus(source: String, result: CommandResult?) -> CheckStatus {
+        guard let result else {
+            return .warning("The test key from \(source) is not checked — install the Stripe CLI: \(installCommand)")
+        }
+        let output = result.stdout + "\n" + result.stderr
+        // Stripe's answer to a wrong or rolled key. A balance can hold any number, so no "401".
+        let rejected = ["Invalid API Key", "Expired API Key", "api_key_expired"].contains { output.contains($0) }
+        if rejected { return .warning(keyRejected(source: source)) }
+        if result.succeeded, !output.contains("\"error\"") {
+            return .passing("Stripe accepts the test key from \(source)")
+        }
+        return .warning("Could not check the test key from \(source) (exit \(result.exitCode)) — check the network, then re-check")
+    }
+
     /// The setup fix "Log in…" when the CLI is missing: Terminal is not opened.
     static let notInstalledForLoginText =
         "The Stripe CLI is not installed — install it with: \(installCommand), then log in"

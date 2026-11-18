@@ -167,6 +167,47 @@ enum HotelCatalog {
         return keysPresent ? .passing(keysOnlyText) : .failing(noSourceText)
     }
 
+    // MARK: - The keys, tested
+
+    /// True when the checkout's `fetch-hotels.mjs` has `--preflight`. An older script
+    /// ignores the flag and downloads, so the runner never passes it to one.
+    static func supportsPreflight(monorepo: String) -> Bool {
+        let path = (monorepo as NSString).appendingPathComponent("scripts/db/fetch-hotels.mjs")
+        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
+        return content.contains("--preflight")
+    }
+
+    /// `fetch-hotels.mjs --preflight`: reads the keys and asks dev for one row. Downloads nothing.
+    static func preflightCommand(monorepo: String, dump: String) -> String {
+        "TRAVEL_HOTEL_DUMP=\(ShellQuote.quote(dump)) "
+            + ShellQuote.join(["node", (monorepo as NSString).appendingPathComponent("scripts/db/fetch-hotels.mjs"), "--preflight"])
+    }
+
+    /// The script gives up after 25 s; this is the limit for a script that hangs.
+    static let preflightTimeout: Duration = .seconds(30)
+
+    static let keysAcceptedText =
+        "Not cached — dev Supabase accepts the shared keys; the first reset downloads the hotels (3–5 min)"
+
+    /// The hotel row when the shared keys were tested. Dev refusing them fails the row.
+    /// No network only warns: the keys may be fine.
+    static func preflightStatus(_ result: CommandResult) -> CheckStatus {
+        if result.timedOut {
+            return .warning("\(Shell.timeoutText("The test of the hotel keys", after: preflightTimeout)) — the keys are not checked")
+        }
+        if result.succeeded { return .passing(keysAcceptedText) }
+        let prefix = "##db:health:fail:"
+        let reason = result.stdout.split(whereSeparator: \.isNewline)
+            .last { $0.hasPrefix(prefix) }
+            .map { String($0.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+            ?? "fetch-hotels.mjs --preflight failed (exit \(result.exitCode))"
+        if result.exitCode == 12 {
+            return .warning("\(reason) — the keys are not checked")
+        }
+        return .failing(reason)
+    }
+
     // MARK: - The catalog, after Start
 
     /// Fewer hotels than this is an empty catalog: dev has about 200,000.
