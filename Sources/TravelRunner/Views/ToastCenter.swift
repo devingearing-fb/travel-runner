@@ -108,8 +108,11 @@ struct ToastOverlay: View {
                         .strokeBorder(toast.style.color.opacity(0.4))
                 )
                 .contentShape(RoundedRectangle(cornerRadius: 8))
-                .onTapGesture { if toast.opensTriage { center.open(toast) } }
-                .help(toast.opensTriage ? "Open Status" : "")
+                .onTapGesture { center.open(toast) }
+                .help("Open Status")
+                // Only an error toast takes clicks. The others, and the space around
+                // them, pass clicks to the view below.
+                .allowsHitTesting(toast.opensTriage)
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }

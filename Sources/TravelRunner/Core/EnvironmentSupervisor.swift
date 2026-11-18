@@ -1832,7 +1832,7 @@ final class EnvironmentSupervisor {
                     try? await self.clock.sleep(for: .seconds(1))
                 })
                 if let heldBy {
-                    onActionFeedback?(keptRunningText(serviceID, heldBy), false)
+                    showFeedback(keptRunningText(serviceID, heldBy), .error, serviceID: serviceID)
                     return
                 }
                 clearCleanExitError(serviceID)
@@ -2148,13 +2148,15 @@ final class EnvironmentSupervisor {
     /// A restart that a person or the API asks for. It clears the failure history:
     /// the circuit breaker and the backoff start again. With `stopsStack`, a restart
     /// of Supabase stops its containers first; without it, it only starts what is down.
-    func restartService(_ serviceID: String, stopsStack: Bool = false) {
+    /// `announce` is true when a person pressed a button: a restart that is already
+    /// queued then says so. A restart the runner starts by itself stays quiet.
+    func restartService(_ serviceID: String, stopsStack: Bool = false, announce: Bool = false) {
         if serviceID == "stripe" { resetStripeRetries() }
         let stopsStack = stopsStack && isSupabaseStack(serviceID)
         if isSupabaseStack(serviceID) { supabaseRepairUsed = false }
         let name = serviceStates[serviceID]?.definition.displayName ?? serviceID
         guard queuedRestarts.insert(serviceID).inserted else {
-            showFeedback(ActionFeedback.alreadyRestarting(name), .info, serviceID: serviceID)
+            if announce { showFeedback(ActionFeedback.alreadyRestarting(name), .info, serviceID: serviceID) }
             return
         }
         Task {
@@ -2329,7 +2331,7 @@ final class EnvironmentSupervisor {
     /// A restart from the panel. Supabase asks first: its restart stops the containers.
     func requestRestart(_ serviceID: String) {
         guard isSupabaseStack(serviceID), health != .stopped else {
-            restartService(serviceID)
+            restartService(serviceID, announce: true)
             return
         }
         supabaseRestartConfirmation = .service
@@ -2348,7 +2350,7 @@ final class EnvironmentSupervisor {
         guard let request = supabaseRestartConfirmation else { return }
         supabaseRestartConfirmation = nil
         switch request {
-        case .service: restartService("supabase", stopsStack: true)
+        case .service: restartService("supabase", stopsStack: true, announce: true)
         case .withDependents: restartCascade("supabase")
         }
     }
@@ -2374,7 +2376,7 @@ final class EnvironmentSupervisor {
             self.serviceStates["supabase"]?.phase = .stopping
             let ok = await self.stopSupabaseStack(definition)
             self.serviceStates["supabase"]?.phase = .stopped
-            self.onActionFeedback?(ok ? "Supabase stopped" : SupabaseStackHealth.didNotStopText, ok)
+            self.showFeedback(ok ? "Supabase stopped" : SupabaseStackHealth.didNotStopText, ok ? .success : .error, serviceID: "supabase")
         }
     }
 
@@ -2420,7 +2422,7 @@ final class EnvironmentSupervisor {
         case .keepWaiting:
             keepWaiting(serviceID)
         case .startService:
-            restartService(serviceID)
+            restartService(serviceID, announce: true)
         case .stopForeignAndRetry(let port):
             // The port can be another port of the app (the HMR port). With no port in
             // the line, the button frees the port of the probe: the start alone
@@ -2428,7 +2430,7 @@ final class EnvironmentSupervisor {
             let target = port ?? serviceStates[serviceID]?.definition.probe?.port
             Task {
                 if let target { await freePort(target, includingForeign: true) }
-                restartService(serviceID)
+                restartService(serviceID, announce: true)
             }
         case .stopProcessAndRetry(let pid, let startTime, let port, _):
             // The person pressed the button: the process need not be the runner's.
@@ -2442,7 +2444,7 @@ final class EnvironmentSupervisor {
                         stream: .stderr, text: "[travel-runner] PID \(pid) is no longer the process that blocked the start. Not stopped."
                     ))
                 }
-                restartService(serviceID)
+                restartService(serviceID, announce: true)
             }
         case .clearCacheAndRestart:
             clearCacheAndRestart(serviceID)
@@ -2497,10 +2499,10 @@ final class EnvironmentSupervisor {
             guard result.succeeded else {
                 let why = Self.installFailure(result, folder: folder)
                 postNotice(.service(serviceID), "\(command) for \(name) \(why)")
-                onActionFeedback?("\(command) \(why)", false)
+                showFeedback("\(command) \(why)", .error, serviceID: serviceID)
                 return
             }
-            restartService(serviceID)
+            restartService(serviceID, announce: true)
         }
     }
 
@@ -2639,7 +2641,7 @@ final class EnvironmentSupervisor {
                     (failure.hasSuffix(".") ? failure : failure + ".")
                         + " \(names) \(verb) the old packages; fix the cause, then press Install dependencies."
                 )
-                onActionFeedback?("\(command) \(why)", false)
+                showFeedback("\(command) \(why)", .error, serviceID: serviceID)
             }
         }
         for serviceID in serviceIDs {
@@ -2973,7 +2975,7 @@ final class EnvironmentSupervisor {
                         // A crash during the start: the automatic restart gives the answer.
                         await awaitReplacingLaunch(id)
                     case .refused(let why):
-                        onActionFeedback?(why, false)
+                        showFeedback(why, .error, serviceID: id)
                         return
                     default:
                         break
@@ -2982,13 +2984,13 @@ final class EnvironmentSupervisor {
                     let text = Self.restartWithDependentsFailedText(displayName(id), cause: "\(error)")
                     recordFailure(id, error: error, lastError: text)
                     recalculateHealth()
-                    onActionFeedback?(text, false)
+                    showFeedback(text, .error, serviceID: id)
                     return
                 }
                 if serviceStates[id]?.phase == .failed {
                     recalculateHealth()
                     let cause = serviceStates[id]?.condition?.headline ?? "it failed"
-                    onActionFeedback?(Self.restartWithDependentsFailedText(displayName(id), cause: cause), false)
+                    showFeedback(Self.restartWithDependentsFailedText(displayName(id), cause: cause), .error, serviceID: id)
                     return
                 }
                 clearCleanExitError(id)
@@ -3003,7 +3005,7 @@ final class EnvironmentSupervisor {
             recalculateHealth()
             // The containers ran on, so the start only reused them.
             if stackDidNotStop {
-                onActionFeedback?(SupabaseStackHealth.didNotStopText, false)
+                showFeedback(SupabaseStackHealth.didNotStopText, .error, serviceID: "supabase")
             } else {
                 onActionFeedback?("\(name) restarted with dependents", true)
             }
@@ -3048,7 +3050,8 @@ final class EnvironmentSupervisor {
         let changed = newProfile != profile
         profile = newProfile
         profileMembers = newProfile.members(of: loadedServices)
-        if health == .stopped, startTask == nil, stopTask == nil {
+        // A stack that stops takes the profile at its next start, as a stopped one does.
+        if stopTask != nil || (health == .stopped && startTask == nil) {
             profileApplyPending = false
             onActionFeedback?("Profile: \(newProfile.displayName)", true)
         } else {
@@ -3059,29 +3062,39 @@ final class EnvironmentSupervisor {
 
     /// "Apply now": stops the services that left the profile, then starts the ones
     /// that joined it ("Retry failed": the services that run stay as they are).
+    /// Pressed during a start, it acts after that start ends. A stack that is
+    /// stopped or stops first takes the profile at its next start.
     func applyProfileNow() {
         profileApplyPending = false
-        let live: Set<ServicePhase> = [.running, .starting, .pending, .waiting, .failed]
-        let leaving = sortedServiceIDs.filter { id in
-            guard !isInProfile(id), let phase = serviceStates[id]?.phase else { return false }
-            return live.contains(phase)
-        }
-        if !leaving.isEmpty {
-            enqueueStackOperation { [self] in
-                // Dependents first: a service stops before what it needs.
-                for id in leaving.reversed() {
-                    await lifecycle.withLock(id) {
-                        serviceStates[id]?.phase = .stopping
-                        await processRunner.stop(serviceID: id)
-                        serviceStates[id]?.phase = .stopped
-                        serviceStates[id]?.clearCondition()
-                    }
-                    notices.resolve(.service(id))
-                }
-                recalculateHealth()
+        guard stopTask == nil, startTask != nil || health != .stopped else { return }
+        let stops = stopAllCount
+        let leave = enqueueStackOperation { [self] in
+            let live: Set<ServicePhase> = [.running, .starting, .pending, .waiting, .failed]
+            let leaving = sortedServiceIDs.filter { id in
+                guard !isInProfile(id), let phase = serviceStates[id]?.phase else { return false }
+                return live.contains(phase)
             }
+            guard !leaving.isEmpty else { return }
+            // Dependents first: a service stops before what it needs.
+            for id in leaving.reversed() {
+                await lifecycle.withLock(id) {
+                    serviceStates[id]?.phase = .stopping
+                    await processRunner.stop(serviceID: id)
+                    serviceStates[id]?.phase = .stopped
+                    serviceStates[id]?.clearCondition()
+                }
+                notices.resolve(.service(id))
+            }
+            recalculateHealth()
         }
-        startAll(mode: .missingOnly)
+        Task { [weak self] in
+            await leave.value
+            // A Stop All since the press ends it: the stack stays stopped.
+            guard let self, self.stopAllCount == stops else { return }
+            // A Start pressed since then is queued after this step and takes the profile.
+            guard self.startTask == nil else { return }
+            self.startAll(mode: .missingOnly)
+        }
     }
 
     private func startDepsWatching(watcher: DependencyWatcher) async {
@@ -3665,7 +3678,7 @@ final class EnvironmentSupervisor {
     /// "Restart portals": each portal that runs restarts on the fresh data.
     func restartPortals() {
         portalRestartNotice = nil
-        for id in runningPortalIDs { restartService(id) }
+        for id in runningPortalIDs { restartService(id, announce: true) }
     }
 
     func dismissPortalRestartNotice() {
@@ -5031,8 +5044,10 @@ final class EnvironmentSupervisor {
             }
             // After the schedule: the notification says whether a restart comes.
             if notifiesKill {
-                let next: CrashAlert.Next = state.isCircuitBroken ? .autoRestartStopped
-                    : restarts && state.phase == .failed ? .restarting(attempt: state.restartCount + 1) : .none
+                let next = CrashAlert.Next.after(
+                    circuitBroken: state.isCircuitBroken, restarts: restarts,
+                    phase: state.phase, restartCount: state.restartCount
+                )
                 alertCrash(state, code: 128 + SIGKILL, next: next)
             }
 
@@ -5081,8 +5096,10 @@ final class EnvironmentSupervisor {
             }
             // After the schedule: the notification says whether a restart comes.
             if alerts {
-                let next: CrashAlert.Next = state.isCircuitBroken ? .autoRestartStopped
-                    : restarts && state.phase == .failed ? .restarting(attempt: state.restartCount + 1) : .none
+                let next = CrashAlert.Next.after(
+                    circuitBroken: state.isCircuitBroken, restarts: restarts,
+                    phase: state.phase, restartCount: state.restartCount
+                )
                 alertCrash(state, code: termination.status, next: next)
             }
             // A tripped breaker recorded its own reason.
@@ -6268,9 +6285,9 @@ final class EnvironmentSupervisor {
             let output = (result.stdout + "\n" + result.stderr).split(whereSeparator: \.isNewline).suffix(20)
             await logStore.appendBatch(serviceID: "stripe", entries: output.map { LogEntry(stream: .stdout, text: String($0)) })
             if result.succeeded {
-                restartService("stripe")
+                restartService("stripe", announce: true)
             } else {
-                onActionFeedback?("\(command) failed — see the Stripe log", false)
+                showFeedback("\(command) failed — see the Stripe log", .error, serviceID: "stripe")
             }
         }
     }
@@ -6291,7 +6308,7 @@ final class EnvironmentSupervisor {
     /// portal, then a start of Stripe on its key.
     func importSharedEnvForStripe() {
         guard let monorepo = supabaseCwd ?? monorepoPath else {
-            onActionFeedback?("No monorepo path — set it in Settings > Paths, then import the .env again", false)
+            showFeedback("No monorepo path — set it in Settings > Paths, then import the .env again", .error, serviceID: "stripe")
             return
         }
         let checker = EnvironmentChecker(
@@ -6301,9 +6318,12 @@ final class EnvironmentSupervisor {
             // Nil is a cancel: the person chose not to import.
             switch await checker.importSharedEnv(.booking) {
             case true?:
-                restartService("stripe")
+                restartService("stripe", announce: true)
             case false?:
-                onActionFeedback?("The .env was not imported — check the file and that apps/booking-portal can be written, then try again", false)
+                showFeedback(
+                    "The .env was not imported — check the file and that apps/booking-portal can be written, then try again",
+                    .error, serviceID: "stripe"
+                )
             case nil:
                 break
             }
