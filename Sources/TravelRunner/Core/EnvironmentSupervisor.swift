@@ -845,9 +845,6 @@ final class EnvironmentSupervisor {
             await awaitReplacingLaunch(serviceID)
         } catch {
             recordFailure(serviceID, error: error, lastError: "\(error)")
-            if let hint = verificationSeedHint(serviceID), let condition = serviceStates[serviceID]?.condition {
-                serviceStates[serviceID]?.condition?.detail = [condition.detail, hint].compactMap { $0 }.joined(separator: " ")
-            }
             recalculateHealth()
         }
         finishStartAllService(inPhase: phase.rawValue)
@@ -1685,6 +1682,11 @@ final class EnvironmentSupervisor {
     nonisolated static let sequinBranchChangeLine =
         "[travel-runner] Branch changed — Sequin keeps running; restart it if scripts/local-cdc changed."
 
+    /// The changed services that a branch change restarts: the running ones, but not Sequin.
+    nonisolated static func branchChangeRestarts(_ changed: Set<String>, phases: [String: ServicePhase]) -> Set<String> {
+        changed.filter { phases[$0] == .running && !keptOnBranchChange.contains($0) }
+    }
+
     /// A branch change restarts the running services of the repo. When their packages
     /// are not fresh (the new branch changed the lockfile), the install runs first: the
     /// old packages would make the portal crash in a loop. After a failed install the
@@ -1823,7 +1825,12 @@ final class EnvironmentSupervisor {
                 runtime: ContainerRuntime.detect().displayName, command: definition.cmd, cwd: definition.resolvedCwd
             )
             state.likelyCause = likely
-            state.condition = FailureAdvisor.advise(kind, context, now: clock.date())
+            var condition = FailureAdvisor.advise(kind, context, now: clock.date())
+            // A verification run of the full profile fails without its seed: say which one.
+            if let hint = verificationSeedHint(serviceID) {
+                condition.detail = [condition.detail, hint].compactMap { $0 }.joined(separator: " ")
+            }
+            state.condition = condition
             // A pnpm run that ended with 1 because the packages or the script are
             // missing: the banner says so too, like exit 127. A newer error stays.
             switch kind {
@@ -1848,18 +1855,41 @@ final class EnvironmentSupervisor {
     }
 
     /// Skips a service that cannot run here, with the reason in its row and its log.
-    private func skipOptional(_ state: ServiceState, _ headline: String, actions: [RecoveryAction]) async {
+    private func skipOptional(
+        _ state: ServiceState, _ headline: String, detail: String? = nil, actions: [RecoveryAction]
+    ) async {
         state.phase = .skipped
         state.pid = nil
-        noteSkip(state, .optionalOff, headline, actions: actions)
-        await logStore.append(serviceID: state.id, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(headline)"))
+        noteSkip(state, .optionalOff, headline, detail: detail, actions: actions)
+        let text = [headline, detail].compactMap { $0 }.joined(separator: " ")
+        await logStore.append(serviceID: state.id, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(text)"))
+    }
+
+    /// Why the skipped dependency `blocker` did not run, as "<name>: <reason>", with
+    /// its buttons that do not act on a service. A dependency that was itself skipped
+    /// for its dependency passes on that reason.
+    private func dependencySkipReason(_ blocker: String) -> (detail: String?, actions: [RecoveryAction]) {
+        guard let condition = serviceStates[blocker]?.condition else { return (nil, []) }
+        let actions = condition.actions.filter { $0 == .openSettingsPaths || $0 == .openHealth }
+        if let definition = graph?.nodes[blocker], ServiceCatalog.missingOptionalRepo(definition) == nil,
+           unavailableDependency(of: definition) != nil {
+            return (condition.detail, actions)
+        }
+        return ("\(displayName(blocker)): \(condition.headline)", actions)
+    }
+
+    nonisolated static func qstashCLIExists(_ cwd: String) -> Bool {
+        FileManager.default.isExecutableFile(atPath: (cwd as NSString).appendingPathComponent(ServiceCatalog.qstashBinary))
     }
 
     /// The first dependency of the profile that was skipped because it cannot run.
-    /// A dependency outside the profile counts as met.
+    /// A dependency outside the profile counts as met, and so does an edge that only
+    /// sets the order.
     private func unavailableDependency(of definition: ServiceDefinition) -> String? {
-        definition.dependsOn.first { dependency in
-            guard isInProfile(dependency), let state = serviceStates[dependency], state.phase == .skipped else {
+        let orderingOnly = ServiceCatalog.orderingOnlyDependencies[definition.id] ?? []
+        return definition.dependsOn.first { dependency in
+            guard !orderingOnly.contains(dependency), isInProfile(dependency),
+                  let state = serviceStates[dependency], state.phase == .skipped else {
                 return false
             }
             return state.condition?.kind != .notInProfile
@@ -2041,10 +2071,15 @@ final class EnvironmentSupervisor {
             for serviceID in changed {
                 let branchName = allBranches[serviceID] ?? "unknown"
                 let displayName = serviceStates[serviceID]?.definition.displayName ?? serviceID
-                // A restart of Sequin tears down and rebuilds its containers: it keeps running.
-                let text = Self.keptOnBranchChange.contains(serviceID)
-                    ? Self.sequinBranchChangeLine
-                    : "[travel-runner] Branch changed to '\(branchName)' — restarting \(displayName)"
+                // A restart of Sequin tears down and rebuilds its containers: it keeps
+                // running. A Sequin that does not run gets no line.
+                let text: String
+                if Self.keptOnBranchChange.contains(serviceID) {
+                    guard serviceStates[serviceID]?.phase == .running else { continue }
+                    text = Self.sequinBranchChangeLine
+                } else {
+                    text = "[travel-runner] Branch changed to '\(branchName)' — restarting \(displayName)"
+                }
                 await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: text))
             }
 
@@ -2066,9 +2101,7 @@ final class EnvironmentSupervisor {
                 self.behindBannerDismissed = false
             }
 
-            let runningChanged = changed.filter {
-                serviceStates[$0]?.phase == .running && !Self.keptOnBranchChange.contains($0)
-            }
+            let runningChanged = Self.branchChangeRestarts(changed, phases: serviceStates.mapValues(\.phase))
             await restartAfterBranchChange(sortedServiceIDs.filter { runningChanged.contains($0) })
         }
     }
@@ -2905,9 +2938,20 @@ final class EnvironmentSupervisor {
             return nil
         }
 
-        // A dependency that is not available skips the services that need it.
+        // A dependency that is not available skips the services that need it. The row
+        // names the reason of the dependency; a start of this one would skip again.
         if let blocker = unavailableDependency(of: definition) {
-            await skipOptional(state, "Skipped: \(displayName(blocker)) is not available.", actions: [.startService])
+            let (detail, actions) = dependencySkipReason(blocker)
+            await skipOptional(state, "Skipped: \(displayName(blocker)) is not available.", detail: detail, actions: actions)
+            return nil
+        }
+
+        // QStash runs the CLI of the booking app's packages. Without it, QStash is
+        // skipped before the port is freed: a skip leaves other processes alone. When
+        // the packages are missing, the install below runs first.
+        if serviceID == ServiceCatalog.qstashID, let cwd = definition.resolvedCwd, !Self.qstashCLIExists(cwd),
+           await dependencyState(serviceID) != .missing {
+            await skipOptional(state, ServiceCatalog.qstashMissing, actions: [.installDependencies])
             return nil
         }
 
@@ -3117,10 +3161,8 @@ final class EnvironmentSupervisor {
             }
         }
 
-        // QStash runs the CLI of the booking app's packages. Without it, QStash is
-        // skipped, and the services that need it say so.
-        if serviceID == ServiceCatalog.qstashID, let cwd = definition.resolvedCwd,
-           !FileManager.default.isExecutableFile(atPath: (cwd as NSString).appendingPathComponent(ServiceCatalog.qstashBinary)) {
+        // The install did not bring the QStash CLI: QStash is skipped.
+        if serviceID == ServiceCatalog.qstashID, let cwd = definition.resolvedCwd, !Self.qstashCLIExists(cwd) {
             await skipOptional(state, ServiceCatalog.qstashMissing, actions: [.installDependencies])
             return nil
         }

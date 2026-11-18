@@ -3276,7 +3276,8 @@ final class SupervisorLifecycleTests: XCTestCase {
             cwd: workDir.path, probe: nil, type: .oneshot, restart: .never, dependsOn: ["stream-services"],
             env: nil, phase: nil, reuseIfRunning: nil
         )
-        try supervisor.loadServices([daemon("web", webServer), stream, wire])
+        let tail = oneshot("chain-tail", dependsOn: ["stream-qstash-wire"])
+        try supervisor.loadServices([daemon("web", webServer), stream, wire, tail])
 
         supervisor.startAll()
 
@@ -3294,11 +3295,89 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         XCTAssertEqual(state("stream-qstash-wire").phase, .skipped)
         XCTAssertEqual(state("stream-qstash-wire").condition?.headline, "Skipped: Stream Services is not available.")
+        // The row names the reason of the dependency and its button, not a start that skips again.
+        XCTAssertEqual(state("stream-qstash-wire").condition?.detail, "Stream Services: \(reason)")
+        XCTAssertEqual(state("stream-qstash-wire").condition?.actions, [.openSettingsPaths])
+        // A service further down names the first reason too.
+        XCTAssertEqual(state("chain-tail").phase, .skipped)
+        XCTAssertEqual(state("chain-tail").condition?.headline, "Skipped: QStash Worker Wiring is not available.")
+        XCTAssertEqual(state("chain-tail").condition?.detail, "Stream Services: \(reason)")
         let streamLines = await logLines("stream-services")
         let wireLines = await logLines("stream-qstash-wire")
         XCTAssertFalse(streamLines.contains("stream-start"))
         XCTAssertFalse(wireLines.contains("wire-start"))
         XCTAssertTrue(streamLines.contains("[travel-runner] \(reason)"))
+    }
+
+    /// The CDC setup starts after the verification runs, so their churn does not reach
+    /// Sequin. A verification run skipped for a missing load-test repo does not skip it.
+    func testASkippedVerificationRunDoesNotSkipTheCdcSetup() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        let overflow = ServiceDefinition(
+            id: "capacity-overflow", name: "Capacity Overflow E2E", cmd: ["sh", "-c", "echo overflow-ran"],
+            cwd: workDir.appendingPathComponent("travel-load-test").path, probe: nil, type: .oneshot,
+            restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        let setup = ServiceDefinition(
+            id: "stream-db-setup", name: "Stream CDC Database Setup", cmd: ["sh", "-c", "echo setup-ran"],
+            cwd: workDir.path, probe: nil, type: .oneshot, restart: .never, dependsOn: ["capacity-overflow"],
+            env: ["STREAM_SERVICES_DIR": workDir.path], phase: nil, reuseIfRunning: nil
+        )
+        // Negative control: a real dependency of the skipped run is skipped.
+        let rehearsal = oneshot("cache-cdc-rehearsal", dependsOn: ["capacity-overflow"])
+        try supervisor.loadServices([daemon("web", webServer), overflow, setup, rehearsal])
+
+        supervisor.startAll()
+
+        let done = await waitUntil(40) {
+            self.state("stream-db-setup").phase == .completed && self.state("cache-cdc-rehearsal").phase == .skipped
+        }
+        XCTAssertTrue(done, "setup is \(state("stream-db-setup").phase.rawValue), rehearsal is \(state("cache-cdc-rehearsal").phase.rawValue)")
+        XCTAssertEqual(state("capacity-overflow").phase, .skipped)
+        let setupLines = await logLines("stream-db-setup")
+        XCTAssertTrue(setupLines.contains("setup-ran"), setupLines.joined(separator: "\n"))
+        XCTAssertEqual(state("cache-cdc-rehearsal").condition?.headline, "Skipped: Capacity Overflow E2E is not available.")
+    }
+
+    /// A verification run of the full profile that fails names the seed it needs,
+    /// in its log and in its row.
+    func testAFailedVerificationRunNamesTheSeedItNeeds() async throws {
+        let (lines, detail) = try await failVerificationRun(selected: "sold-out")
+        XCTAssertTrue(lines.contains("[travel-runner] \(ServiceCatalog.verificationSeedHint)"), lines.joined(separator: "\n"))
+        XCTAssertTrue(detail?.hasSuffix(ServiceCatalog.verificationSeedHint) ?? false, detail ?? "no detail")
+    }
+
+    /// Negative control: with the seed chosen there is no hint.
+    func testAFailedVerificationRunWithItsSeedHasNoHint() async throws {
+        let (lines, detail) = try await failVerificationRun(selected: ServiceCatalog.verificationSeedScenarioID)
+        XCTAssertFalse(lines.contains { $0.contains(ServiceCatalog.verificationSeedHint) }, lines.joined(separator: "\n"))
+        XCTAssertFalse(detail?.contains(ServiceCatalog.verificationSeedHint) ?? false, detail ?? "")
+    }
+
+    /// Start All of the full profile with a verification run that fails. Returns its
+    /// log and the detail of its row once the failure is recorded.
+    private func failVerificationRun(selected: String) async throws -> (lines: [String], detail: String?) {
+        _ = fakeTheOutsideOfStartAll()
+        supervisor.dbSeedScenarios = [
+            DbSeedScenario(id: ServiceCatalog.verificationSeedScenarioID, name: "Redis cache integration",
+                           description: "", fileSummary: "", variables: []),
+            DbSeedScenario(id: "sold-out", name: "Sold out", description: "", fileSummary: "", variables: []),
+        ]
+        supervisor.selectedDbSeedScenarioID = selected
+        let overflow = ServiceDefinition(
+            id: "capacity-overflow", name: "Capacity Overflow E2E", cmd: ["sh", "-c", "echo overflow-ran; exit 1"],
+            cwd: workDir.path, probe: nil, type: .oneshot, restart: .never, dependsOn: [], env: nil,
+            phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([daemon("web", webServer), overflow], profile: .full)
+
+        supervisor.startAll()
+
+        let recorded = await waitUntil(40) {
+            self.state("capacity-overflow").phase == .failed && self.state("capacity-overflow").condition != nil
+        }
+        XCTAssertTrue(recorded, "overflow is \(state("capacity-overflow").phase.rawValue)")
+        return (await logLines("capacity-overflow"), state("capacity-overflow").condition?.detail)
     }
 
     /// QStash without its CLI is skipped with the fix, and starts once the CLI is there.
@@ -3332,6 +3411,35 @@ final class SupervisorLifecycleTests: XCTestCase {
         }
         XCTAssertTrue(lines.contains("qstash-start"), lines.joined(separator: "\n"))
         XCTAssertNotEqual(state(ServiceCatalog.qstashID).phase, .skipped)
+    }
+
+    /// A QStash start that ends in a skip freed its port first, and so stopped
+    /// whatever listened there. Now the skip comes before the port cleanup.
+    func testQStashWithoutItsCliLeavesItsPortAlone() async throws {
+        let held = try Self.listeningSocket()
+        defer { close(held.fd) }
+        XCTAssertEqual(listen(held.fd, 128), 0)
+        let calls = PortToolCalls()
+        supervisor.portTools = PortTools(
+            listeners: { _ in [PortOwner.Listener(pid: 4242, command: "other-app")] },
+            kill: { calls.addKill($0) },
+            killCommands: { calls.addPattern($0) }
+        )
+        let qstash = ServiceDefinition(
+            id: ServiceCatalog.qstashID, name: "Local QStash", cmd: ["sh", "-c", "echo qstash-start; sleep 30"],
+            cwd: workDir.path,
+            probe: ProbeConfig(type: .tcp, port: held.port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5),
+            type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try load(qstash)
+
+        supervisor.restartService(ServiceCatalog.qstashID)
+        let skipped = await waitUntil(10) {
+            self.state(ServiceCatalog.qstashID).phase == .skipped && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(skipped, "qstash is \(state(ServiceCatalog.qstashID).phase.rawValue)")
+        XCTAssertEqual(calls.kills, [])
+        XCTAssertEqual(calls.patterns, [])
     }
 
     /// The install of the stream services ran on each start. It runs only when the

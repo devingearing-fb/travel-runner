@@ -254,22 +254,25 @@ final class PreflightRunnerTests: XCTestCase {
             // An app of the fork that an old checkout lacks is skipped at its start.
             service(forkApp, cwd: workDir.appendingPathComponent("mono/apps/not-in-this-checkout").path, port: 3010),
             // So is a service of an optional repo that is not there.
-            service("stream-services", cwd: workDir.appendingPathComponent("no-stream-services").path),
+            // Its port is not checked either.
+            service("stream-services", cwd: workDir.appendingPathComponent("no-stream-services").path, port: 3005),
             service("capacity-overflow", cwd: workDir.appendingPathComponent("no-load-test").path),
+            // A service of an optional repo that is there keeps its port check.
+            service("cache-apply-transport", cwd: monorepo, port: 3007),
         ]
 
         let checks = PreflightRunner().allChecks(for: services)
 
         XCTAssertEqual(checks.map(\.id), [
             "docker", "node-version", "stripe-auth", "env-diff-travel-portal", "env-diff-partner-portal",
-            "port-3002", "port-3003", "port-3010", "port-54322",
+            "port-3002", "port-3003", "port-3007", "port-3010", "port-54322",
             "dir-mono", "dir-booking-portal", "dir-partner-portal",
         ])
         XCTAssertEqual(checks.first { $0.id == "node-version" }?.metadata["cwd"], booking)
         XCTAssertEqual(checks.first { $0.id == "stripe-auth" }?.metadata["cwd"], booking)
         // /api/preflight runs only the checks that change nothing.
         XCTAssertEqual(PreflightRunner().readOnlyChecks(for: services).map(\.id), [
-            "node-version", "port-3002", "port-3003", "port-3010", "port-54322",
+            "node-version", "port-3002", "port-3003", "port-3007", "port-3010", "port-54322",
             "dir-mono", "dir-booking-portal", "dir-partner-portal",
         ])
         // Without a portal Node is asked in the first folder of the stack.

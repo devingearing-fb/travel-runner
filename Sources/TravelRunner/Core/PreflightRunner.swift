@@ -75,7 +75,8 @@ struct PreflightRunner: Sendable {
             ))
         }
 
-        let ports = Set(services.compactMap { $0.probe?.port })
+        // A service of an optional repo that is not there is skipped: its port is free to be busy.
+        let ports = Set(services.filter { ServiceCatalog.missingOptionalRepo($0) == nil }.compactMap { $0.probe?.port })
         for port in ports.sorted() {
             checks.append(PreflightCheck(id: "port-\(port)", name: "Port \(port) available"))
         }

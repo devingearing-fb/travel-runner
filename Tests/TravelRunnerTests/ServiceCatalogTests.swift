@@ -70,8 +70,10 @@ final class ServiceCatalogTests: XCTestCase {
         XCTAssertLessThan(try level("cache-apply-transport"), try level("capacity-contention"))
         XCTAssertLessThan(try level("capacity-contention"), try level("capacity-block-edit-race"))
         XCTAssertLessThan(try level("capacity-block-edit-race"), try level("capacity-overflow"))
-        // The CDC setup does not wait for the verification chain (decision 16).
-        XCTAssertFalse(byID["stream-db-setup"]?.dependsOn.contains("capacity-overflow") ?? true)
+        // The CDC setup anchors its slot after the verification runs. The edge only sets
+        // the order: a skipped verification run does not skip the CDC setup (decision 16).
+        XCTAssertLessThan(try level("capacity-overflow"), try level("stream-db-setup"))
+        XCTAssertEqual(ServiceCatalog.orderingOnlyDependencies["stream-db-setup"], ["capacity-overflow"])
         XCTAssertLessThan(try level("stream-qstash"), try level("stream-services"))
         XCTAssertLessThan(try level("stream-services"), try level("stream-qstash-wire"))
         XCTAssertLessThan(try level("stream-qstash-wire"), try level("stream-sequin"))
@@ -144,7 +146,11 @@ final class ServiceCatalogTests: XCTestCase {
     }
 
     func testABranchChangeKeepsSequin() {
-        XCTAssertEqual(EnvironmentSupervisor.keptOnBranchChange, [ServiceCatalog.sequinID])
+        let changed: Set<String> = [ServiceCatalog.sequinID, "travel-portal", "partner-portal"]
+        let phases: [String: ServicePhase] = [
+            ServiceCatalog.sequinID: .running, "travel-portal": .running, "partner-portal": .stopped,
+        ]
+        XCTAssertEqual(EnvironmentSupervisor.branchChangeRestarts(changed, phases: phases), ["travel-portal"])
         XCTAssertEqual(
             EnvironmentSupervisor.sequinBranchChangeLine,
             "[travel-runner] Branch changed — Sequin keeps running; restart it if scripts/local-cdc changed."

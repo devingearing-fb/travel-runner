@@ -120,6 +120,13 @@ enum ServiceCatalog {
         return repoNotFound(role, path: path)
     }
 
+    /// Edges that only set the order. The CDC setup anchors its slot after the
+    /// verification runs, so their fixture churn does not reach Sequin. A skipped
+    /// verification run does not skip the CDC setup.
+    static let orderingOnlyDependencies: [String: Set<String>] = [
+        "stream-db-setup": ["capacity-overflow"],
+    ]
+
     static func repoNotFound(_ role: RepoDetector.RepoRole, path: String) -> String {
         "\(role.rawValue) repo not found at \(path.isEmpty ? "(no path set)" : path) — set it in Settings > Paths."
     }
@@ -215,7 +222,7 @@ enum ServiceCatalog {
                     probe: tcp(8080, timeout: 120), restart: .onFailure, phase: "stream", dependsOn: ["supabase"]),
             service("stream-db-setup", "Stream CDC Database Setup", ["./scripts/local-cdc/runner-db-setup.sh"],
                     cwd: booking, type: .oneshot, restart: .never, phase: "stream",
-                    dependsOn: ["supabase"],
+                    dependsOn: ["supabase", "capacity-overflow"],
                     env: ["STREAM_SERVICES_DIR": stream]),
             service("stream-services", "Stream Services", ["npm", "run", "dev", "--", "-p", "3003"], cwd: stream,
                     probe: tcp(3003, timeout: 180), restart: .onFailure, phase: "stream",

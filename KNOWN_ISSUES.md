@@ -8,11 +8,12 @@
 
 **Resolved:** S4, 2026-11.
 
-The full profile ran a folder check for each repo in the preflight. Without the stream-services or the load-test repo the preflight failed, and nothing started. The CDC setup also waited for the whole verification chain, and QStash crash-looped without its CLI.
+The full profile ran a folder check for each repo in the preflight. Without the stream-services or the load-test repo the preflight failed, and nothing started. A skipped verification run would also have skipped the CDC setup, and QStash crash-looped without its CLI.
 
 **Fix:**
 - The services of an optional repo are skipped: "Stream Services repo not found at <path> — set it in Settings > Paths." The row has an Open Settings button. The portals start normally.
-- A service whose dependency is skipped is skipped too: "Skipped: <dependency> is not available." A dependency outside the profile counts as met. `stream-db-setup` no longer depends on `capacity-overflow`.
+- A service whose dependency is skipped is skipped too: "Skipped: <dependency> is not available." The row names the reason of the dependency. A dependency outside the profile counts as met. `stream-db-setup` still starts after `capacity-overflow`, so the fixture churn of the verification runs does not reach the CDC slot, but that edge only sets the order: a skipped `capacity-overflow` does not skip it.
+- The preflight skips the folder and port checks of an optional repo that is not there.
 - QStash without `node_modules/.bin/qstash` is skipped: "QStash CLI missing — run pnpm install at the monorepo root."
 - `stream-services-install` runs only when the packages are missing or changed.
 - A branch change leaves Sequin running: "[travel-runner] Branch changed — Sequin keeps running; restart it if scripts/local-cdc changed."
