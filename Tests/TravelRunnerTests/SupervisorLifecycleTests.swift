@@ -3024,7 +3024,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(supervisor.completedPhases.contains("PREFLIGHT"))
         XCTAssertEqual(
             supervisor.preflightChecks.map(\.id),
-            ["docker", "node-version", "stripe-auth", "port-\(port)", "dir-\(workDir.lastPathComponent)"]
+            ["node", "docker", "port-\(port)", "dir-\(workDir.lastPathComponent)"]
         )
         XCTAssertFalse(supervisor.preflightChecks.contains { $0.result.isFailed })
         XCTAssertTrue(shell.commands.contains("node --version"), "\(shell.commands)")
@@ -3055,10 +3055,29 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         let failed = await waitUntil(10) { self.supervisor.health == .degraded }
         XCTAssertTrue(failed)
-        XCTAssertEqual(supervisor.lastError, "Preflight failed — Node.js \u{2265} 22: Node.js not found")
+        XCTAssertEqual(supervisor.lastError, "Preflight failed — Node.js 22+: Node.js not found")
         XCTAssertEqual(supervisor.currentPhase, .idle)
         XCTAssertNil(state("web").lastStarted)
         XCTAssertEqual(Self.listeners(on: port), [])
+    }
+
+    /// Finding: the wizard said "need 22+" while the preflight let Node 20 start,
+    /// and the full check was only in the wizard. Now the preflight runs the Node
+    /// row of Health: Health and the Status banner show what the start found.
+    func testThePreflightFillsTheHealthRowAndTheBanner() async throws {
+        _ = fakeTheOutsideOfStartAll(node: "v20.11.1\n")
+        try supervisor.loadServices([daemon("web", webServer)])
+        XCTAssertEqual(supervisor.setupItemsNeedingAttention.map(\.id), [], "nothing ran yet")
+
+        supervisor.startAll()
+
+        let failed = await waitUntil(10) { self.supervisor.health == .degraded }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(supervisor.lastError, "Preflight failed — Node.js 22+: v20.11.1 — need 22+")
+        let row = supervisor.healthChecker?.checks.first { $0.id == "node" }
+        XCTAssertEqual(row?.status, .failing("v20.11.1 — need 22+"))
+        XCTAssertEqual(supervisor.setupItemsNeedingAttention.map(\.id), ["node"])
+        XCTAssertNil(state("web").lastStarted)
     }
 
     /// After the GROUND phase Start All asks the fake database. A database with
@@ -4064,7 +4083,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         let preflight = try await get("/api/preflight")
         XCTAssertEqual(preflight["configured"] as? Bool, false)
         let checks = try XCTUnwrap(preflight["checks"] as? [[String: String]])
-        XCTAssertEqual(checks.map { $0["id"] }, ["node-version"], "only checks that change nothing, and no service has a port yet")
+        XCTAssertEqual(checks.map { $0["id"] }, ["node"], "only checks that change nothing, and no service has a port yet")
         XCTAssertEqual(checks.first?["status"], "failed")
         XCTAssertEqual(checks.first?["detail"], "Node.js not found")
         XCTAssertEqual(shell.commands, ["node --version"], "no container runtime and no Stripe is asked")
@@ -4532,7 +4551,10 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(ended)
         XCTAssertFalse(asked.pids.isEmpty, "the start went on")
         XCTAssertFalse(supervisor.preflightOnlyRunning)
-        XCTAssertFalse(shell.commands.contains { $0.contains("which stripe") }, "the cancelled run stopped: \(shell.commands)")
+        let node = supervisor.preflightChecks.first { $0.id == "node" }
+        guard case .pending = node?.result else {
+            return XCTFail("the cancelled run kept a result: \(String(describing: node?.result))")
+        }
     }
 }
 

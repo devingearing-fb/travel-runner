@@ -220,6 +220,7 @@ final class HackathonFlavorTests: XCTestCase {
         XCTAssertEqual(ServiceCatalog.forkAppPorts(of: ServiceCatalog.services(paths: paths, flavor: .standard)), [])
     }
 
+    @MainActor
     func testAnOldCheckoutWithoutAForkAppStillPassesPreflight() {
         // The folder of a fork app is not a preflight condition: the app is skipped at its start.
         let hackathon = ServiceCatalog.services(paths: paths, flavor: .hackathon)

@@ -4,8 +4,6 @@ import AppKit
 struct WorkshopDiagnosticsView: View {
     @Environment(EnvironmentSupervisor.self) var supervisor
     @State private var diagnosticCopied = false
-    /// Nil while the first read runs.
-    @State private var toolReports: [ToolReport]?
 
     var body: some View {
         ScrollView {
@@ -45,7 +43,7 @@ struct WorkshopDiagnosticsView: View {
 
                 Divider()
 
-                toolsSection
+                ToolsSection()
 
                 Divider()
 
@@ -82,7 +80,6 @@ struct WorkshopDiagnosticsView: View {
             }
             .padding(20)
         }
-        .task { await loadTools() }
     }
 
     /// The start checks with each reason and fix, and a button that runs them now.
@@ -123,11 +120,44 @@ struct WorkshopDiagnosticsView: View {
         }
     }
 
-    /// Where each tool is and which version the services get.
+    private func sectionHeader(_ title: String) -> some View {
+        Text(title.uppercased())
+            .font(.system(size: 10, weight: .bold, design: .monospaced))
+            .foregroundStyle(.secondary)
+    }
+
+    private func copyDiagnosticBundle() async {
+        let json = await supervisor.diagnosticsBundleJSON()
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(json, forType: .string)
+        diagnosticCopied = true
+        Task {
+            try? await Task.sleep(for: .seconds(2))
+            diagnosticCopied = false
+        }
+    }
+}
+
+/// Where each tool is and which version the services get. Diagnostics and Health
+/// show it.
+struct ToolsSection: View {
+    @Environment(EnvironmentSupervisor.self) var supervisor
+    /// Nil while the first read runs.
+    @State private var toolReports: [ToolReport]?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            rows
+        }
+        .task { await loadTools() }
+    }
+
     @ViewBuilder
-    private var toolsSection: some View {
+    private var rows: some View {
         HStack {
-            sectionHeader("Tools")
+            Text("TOOLS")
+                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .foregroundStyle(.secondary)
             Spacer()
             Button("Look Again") {
                 Task {
@@ -185,20 +215,4 @@ struct WorkshopDiagnosticsView: View {
         return path
     }
 
-    private func sectionHeader(_ title: String) -> some View {
-        Text(title.uppercased())
-            .font(.system(size: 10, weight: .bold, design: .monospaced))
-            .foregroundStyle(.secondary)
-    }
-
-    private func copyDiagnosticBundle() async {
-        let json = await supervisor.diagnosticsBundleJSON()
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(json, forType: .string)
-        diagnosticCopied = true
-        Task {
-            try? await Task.sleep(for: .seconds(2))
-            diagnosticCopied = false
-        }
-    }
 }

@@ -32,6 +32,14 @@ final class HealthCheck: Identifiable {
     nonisolated let checkCommand: String
     nonisolated let checkDescription: String
     nonisolated let checkPath: String?
+    /// The preflight of a start runs only the fast checks (see `CheckRegistry`).
+    nonisolated let cost: CheckCost
+    /// What a failure stops: the start, a part of the stack, or an optional part.
+    nonisolated let severity: CheckSeverity
+    /// What does not work when the check fails, for example "both portals will not run".
+    nonisolated let impact: String?
+    /// The profiles the check applies to. Nil: every profile.
+    nonisolated let profiles: Set<RunProfile>?
     var status: CheckStatus = .pending
 
     nonisolated init(
@@ -48,6 +56,14 @@ final class HealthCheck: Identifiable {
         self.checkCommand = checkCommand
         self.checkDescription = checkDescription
         self.checkPath = checkPath
+        self.cost = CheckRegistry.cost(of: id)
+        self.severity = CheckRegistry.severity(of: id, isRequired: isRequired)
+        self.impact = CheckRegistry.impact(of: id)
+        self.profiles = CheckRegistry.profiles(of: id)
+    }
+
+    nonisolated func applies(to profile: RunProfile) -> Bool {
+        profiles?.contains(profile) ?? true
     }
 }
 
@@ -145,27 +161,11 @@ final class EnvironmentChecker {
         }
     }
 
-    /// What does not work when a required check fails. Shown before "Continue anyway".
-    nonisolated static func impact(of checkID: String) -> String? {
-        switch checkID {
-        case "docker": "the local database will not start"
-        case "node": "the portals and the login will not run"
-        case "pnpm": "installs and both portals will not run"
-        case "python-jwt": "the database setup of this checkout stops at its first step"
-        case "registry-auth": "pnpm install cannot download the @fastbreak-amateur packages"
-        case "workspace-modules": "both portals will not run"
-        case "login-modules": "the login will not run"
-        case "login-env": "sign-in on localhost will not work"
-        case "booking-env": "the first reset cannot download the hotels"
-        default: nil
-        }
-    }
-
     /// One line per failing required check, for example "pnpm 10 — installs and both portals will not run".
     /// A check without a result says so: "Docker (check not finished) — if it fails, the local database will not start".
     static func impactLines(for checks: [HealthCheck]) -> [String] {
         checks.map { check in
-            let impact = impact(of: check.id)
+            let impact = check.impact
             switch check.status {
             case .pending, .fixing:
                 let name = "\(check.name) (check not finished)"
@@ -274,16 +274,19 @@ final class EnvironmentChecker {
         let runtime = ContainerRuntime.detect()
         let pnpmPin = Self.pnpmPin(monorepo: monorepoPath)
         let pnpmMajor = pnpmPin.flatMap(Self.major(of:)) ?? Self.defaultPnpmMajor
+        let nodeMajor = NodeRequirement.minimumMajor(monorepo: monorepoPath)
+        let nodeRange = NodeRequirement.engines(monorepo: monorepoPath).map { "Node \($0) (engines.node of the monorepo)" }
+            ?? "Node \(nodeMajor) or later"
         checks = [
             // Prerequisites
             HealthCheck(id: "docker", name: runtime.displayName, section: .prerequisites,
                         fixLabel: "Open \(runtime.appName)",
                         checkCommand: "docker ps",
                         checkDescription: "Verifies \(runtime.displayName) is running and accepting connections"),
-            HealthCheck(id: "node", name: "Node.js 22+", section: .prerequisites,
+            HealthCheck(id: "node", name: "Node.js \(nodeMajor)+", section: .prerequisites,
                         fixLabel: "How to install",
                         checkCommand: "node --version",
-                        checkDescription: "Next.js 16 requires Node.js 22 or higher"),
+                        checkDescription: "The portals need \(nodeRange). The check runs in the monorepo, where its .nvmrc picks the Node."),
             HealthCheck(id: "pnpm", name: "pnpm \(pnpmMajor)", section: .prerequisites,
                         fixLabel: "Install pnpm \(pnpmMajor)",
                         checkCommand: "pnpm --version",
@@ -359,6 +362,8 @@ final class EnvironmentChecker {
             checks.removeAll { $0.id == "python-jwt" }
         }
         if flavor.runsAgent { checks += agentChecks() }
+        // Without a checkout only the tools can be checked.
+        if monorepoPath.isEmpty { checks.removeAll { $0.section != .prerequisites } }
     }
 
     /// The agent app of the hackathon fork. A failure here does not stop the portals.
@@ -441,7 +446,27 @@ final class EnvironmentChecker {
         return seconds >= 60 && seconds % 60 == 0 ? "\(seconds / 60) min" : "\(seconds) s"
     }
 
+    /// When every check last ran. Nil before the first run: Health then runs them.
+    private(set) var lastRunAt: Date?
+
+    /// The checks that the preflight of a start runs for this profile.
+    func preflightSubset(profile: RunProfile) -> [HealthCheck] {
+        CheckRegistry.preflightSubset(of: checks, profile: profile)
+    }
+
+    /// Runs one check for the preflight of a start: each of its commands stops
+    /// after `CheckRegistry.preflightLimit`. Its Health row shows the result too.
+    func runForPreflight(_ id: String) async -> PreflightResult {
+        guard let check = checks.first(where: { $0.id == id }) else { return .warning(message: "Not checked") }
+        let status = await CheckRegistry.$commandLimit.withValue(CheckRegistry.preflightLimit) {
+            await runCheck(id)
+        }
+        check.status = status
+        return CheckRegistry.preflightResult(status, severity: check.severity, fixLabel: check.fixLabel)
+    }
+
     func runAllChecks() async {
+        lastRunAt = clock.date()
         for check in checks {
             check.status = .pending
         }
@@ -556,7 +581,7 @@ final class EnvironmentChecker {
     }
 
     nonisolated static func timedOutStatus(label: String, isRequired: Bool) -> CheckStatus {
-        let text = Shell.timeoutText(label, after: checkTimeout)
+        let text = Shell.timeoutText(label, after: CheckRegistry.commandLimit)
         return isRequired ? .failing(text) : .warning(text)
     }
 
@@ -569,13 +594,7 @@ final class EnvironmentChecker {
 
         case "node":
             let result = try await check("node --version", label: "node --version")
-            let (output, ok) = (result.stdout, result.succeeded)
-            if !ok { return .failing("Node.js not found") }
-            let version = output.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "v", with: "")
-            if let major = Int(version.split(separator: ".").first ?? "0"), major >= 22 {
-                return .passing("v\(version)")
-            }
-            return .failing("v\(version) — need 22+")
+            return NodeRequirement.status(result, minimum: NodeRequirement.minimumMajor(monorepo: monorepoPath))
 
         case "pnpm":
             let result = try await check(Self.pnpmCheckCommand(monorepo: monorepoPath), label: "pnpm --version")
@@ -1226,8 +1245,8 @@ final class EnvironmentChecker {
 
     /// One command of a check. The checks and the fixes get the PATH that the
     /// services get (see `ToolEnvironment`).
-    private func runCommand(_ command: String, timeout: Duration = EnvironmentChecker.checkTimeout) async -> CommandResult {
-        await commandRunner.run(command, cwd: commandCwd, timeout: timeout)
+    private func runCommand(_ command: String, timeout: Duration? = nil) async -> CommandResult {
+        await commandRunner.run(command, cwd: commandCwd, timeout: timeout ?? CheckRegistry.commandLimit)
     }
 
     /// The command of a check. It throws when the command was killed after the timeout.

@@ -97,8 +97,14 @@ final class EnvironmentSupervisor {
     var onActionFeedback: ((String, Bool) -> Void)? {
         { [weak self] message, success in self?.showFeedback(message, success ? .success : .error) }
     }
-    /// Opens the page that shows where each tool was found (the "Open Health" button).
+    /// Opens Health: every setup check, and where each tool was found (the "Open Health" button).
     var onOpenHealth: (() -> Void)?
+    /// The setup checks of Health. The preflight of a start runs the fast ones
+    /// (see `CheckRegistry`), so Health, the preflight and the Status banner show
+    /// the same results. Built at each config load.
+    private(set) var healthChecker: EnvironmentChecker?
+    /// The paths that `healthChecker` was built for.
+    @ObservationIgnored private var healthCheckerPaths: RepoPaths?
     var gitBranches: [String: String] = [:]
     var gitBehindCounts: [String: Int] = [:]
     var behindBannerDismissed = false
@@ -223,8 +229,10 @@ final class EnvironmentSupervisor {
     /// Where the config and the control server come from.
     @ObservationIgnored var configHost = ConfigHost()
     /// The preflight checks run their commands in the shell of the supervisor and
-    /// wait on its clock.
-    private var preflightRunner: PreflightRunner { PreflightRunner(shell: shell, clock: clock) }
+    /// wait on its clock. The checks of the registry come from Health.
+    private var preflightRunner: PreflightRunner {
+        PreflightRunner(shell: shell, clock: clock, environment: resolvedHealthChecker(), profile: profile)
+    }
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
     private var sleepWakeObserver: SleepWakeObserver?
@@ -422,8 +430,9 @@ final class EnvironmentSupervisor {
     struct ConfigHost {
         var load: () throws -> ServiceConfig = { try ConfigLoader.load() }
         var controlServer: () -> ControlServer = { ControlServer() }
-        /// False: the load starts no git and no npm watcher on the service folders.
-        /// Tests set it, so no test runs the git of this Mac.
+        /// False: the load starts no git and no npm watcher on the service folders,
+        /// and runs no setup check of Health. Tests set it, so no test runs the git
+        /// of this Mac or asks the network.
         var startsWatchers = true
     }
 
@@ -444,6 +453,10 @@ final class EnvironmentSupervisor {
         bootstrapOnce()
         do {
             try applyConfig()
+            // Every setup check runs once at launch, so the Status banner is current.
+            if configHost.startsWatchers, let checker = healthChecker {
+                Task { await checker.runAllChecks() }
+            }
         } catch ConfigLoader.ConfigError.noConfig {
             // First run — setup wizard will handle this
         } catch ConfigLoader.ConfigError.monorepoNotFound {
@@ -582,6 +595,7 @@ final class EnvironmentSupervisor {
             serviceStates[service.id] = ServiceState(definition: service)
         }
         reconfigurePending = false
+        resolvedHealthChecker()
 
         reloadDbSeedScenarios()
         // Another checkout can name another minimum runner version.
@@ -673,6 +687,7 @@ final class EnvironmentSupervisor {
         for service in services {
             serviceStates[service.id] = ServiceState(definition: service)
         }
+        resolvedHealthChecker()
     }
 
     // MARK: - Start / Stop
@@ -722,19 +737,19 @@ final class EnvironmentSupervisor {
             if !skipPreflight {
                 self.currentPhase = .preflight
                 let profileServices = self.loadedServices.filter { self.isInProfile($0.id) }
-                let checks = self.preflightRunner.allChecks(for: profileServices)
+                let runner = self.preflightRunner
+                let checks = runner.allChecks(for: profileServices)
                 await MainActor.run { self.preflightChecks = checks }
 
-                var allPassed = true
+                // The checks run in parallel; each command of a check has a short limit.
+                await runner.runAll(checks)
                 var failedDetails: [String] = []
                 for check in checks {
-                    let result = await self.preflightRunner.run(check: check)
-                    await MainActor.run { check.result = result }
-                    if case .failed(let message, _) = result {
-                        allPassed = false
+                    if case .failed(let message, _) = check.result {
                         failedDetails.append("\(check.name): \(message)")
                     }
                 }
+                let allPassed = failedDetails.isEmpty
 
                 _ = await MainActor.run { self.completedPhases.insert("PREFLIGHT") }
 
@@ -985,13 +1000,7 @@ final class EnvironmentSupervisor {
         preflightOnlyRunning = true
         preflightRequestsRunning += 1
         // A start cancels the run: it runs the same checks itself.
-        let task = Task {
-            for check in checks {
-                let result = await runner.run(check: check)
-                if Task.isCancelled { return }
-                check.result = result
-            }
-        }
+        let task = Task { await runner.runAll(checks) }
         preflightOnlyTask = task
         await task.value
         preflightOnlyTask = nil
@@ -1020,10 +1029,12 @@ final class EnvironmentSupervisor {
         preflightRequestsRunning += 1
         defer { preflightRequestsRunning -= 1 }
         let runner = preflightRunner
+        let checks = runner.readOnlyChecks(for: loadedServices)
+        await runner.runAll(checks)
         var rows: [[String: String]] = []
-        for check in runner.readOnlyChecks(for: loadedServices) {
+        for check in checks {
             var row = ["id": check.id, "name": check.name]
-            switch await runner.run(check: check) {
+            switch check.result {
             case .pending: row["status"] = "pending"
             case .passed(let detail):
                 row["status"] = "passed"
@@ -1043,6 +1054,34 @@ final class EnvironmentSupervisor {
             return String(decoding: data, as: UTF8.self)
         }
         return "{}"
+    }
+
+    /// The checker of Health for the paths of the config. A new config builds a
+    /// new one. Without a config only the checks of the tools apply. Its commands
+    /// run in the shell that the supervisor has at that moment.
+    @discardableResult
+    func resolvedHealthChecker() -> EnvironmentChecker {
+        let paths = config?.paths
+        if let healthChecker, healthCheckerPaths == paths { return healthChecker }
+        let current: @Sendable () async -> any CommandRunning = { [weak self] in
+            await self?.shell ?? LoginShell()
+        }
+        let checker = EnvironmentChecker(
+            monorepoPath: paths?.monorepo.map(ServiceCatalog.expand) ?? "",
+            loginPath: paths?.universalLogin.map(ServiceCatalog.expand) ?? "",
+            streamServicesPath: paths?.streamServices.map(ServiceCatalog.expand) ?? "",
+            shell: CurrentShell(current: current), tools: tools, clock: clock
+        )
+        checker.buildChecks()
+        healthChecker = checker
+        healthCheckerPaths = paths
+        return checker
+    }
+
+    /// The setup checks of the profile that fail, or that the setup needs and warn.
+    var setupItemsNeedingAttention: [HealthCheck] {
+        guard let healthChecker else { return [] }
+        return CheckRegistry.needsAttention(healthChecker.checks, profile: profile)
     }
 
     private func startControlServer() {

@@ -40,36 +40,38 @@ struct PreflightRunner: Sendable {
     /// False when the checks must change nothing: a container runtime that does
     /// not answer fails its check and is not opened.
     var opensContainerRuntime = true
+    /// The checks of the registry for the preflight. Nil: only the steps of the stack.
+    var environment: EnvironmentChecker?
+    /// The profile whose checks of the registry run.
+    var profile: RunProfile = .both
     /// A check command that hangs fails after this time and does not hold the start.
-    static let checkTimeout: Duration = .seconds(15)
+    static let checkTimeout: Duration = CheckRegistry.preflightLimit
+    /// The metadata key of a check that comes from the registry.
+    static let registryKey = "registry"
 
+    /// The checks of a start: the fast checks of the registry for the profile
+    /// (see `CheckRegistry.preflightSubset`), then the steps that need the
+    /// services: the container runtime, the backend clone, the ports and the folders.
+    @MainActor
     func allChecks(for services: [ServiceDefinition]) -> [PreflightCheck] {
+        registryChecks() + stackChecks(for: services)
+    }
+
+    @MainActor
+    private func registryChecks() -> [PreflightCheck] {
+        (environment?.preflightSubset(profile: profile) ?? []).map {
+            PreflightCheck(id: $0.id, name: $0.name, metadata: [Self.registryKey: "1"])
+        }
+    }
+
+    private func stackChecks(for services: [ServiceDefinition]) -> [PreflightCheck] {
         var checks: [PreflightCheck] = [
             PreflightCheck(id: "docker", name: ContainerRuntime.detect().displayName),
-            // The cwd of a portal: the Node of its `.nvmrc` is the one the services get.
-            PreflightCheck(
-                id: "node-version", name: "Node.js \u{2265} 22",
-                metadata: (nodeCwd(for: services)).map { ["cwd": $0] } ?? [:]
-            ),
-            // The booking portal: the CLI uses the test key of its env.
-            PreflightCheck(
-                id: "stripe-auth", name: "Stripe CLI Auth",
-                metadata: services.first(where: { $0.id == "travel-portal" })?.resolvedCwd.map { ["cwd": $0] } ?? [:]
-            ),
         ]
 
         // `pnpm db:start` clones the backend baseline when there is no checkout of it.
         if let root = services.first(where: { $0.id == "supabase" })?.resolvedCwd, BackendBaseline.applies(root: root) {
             checks.append(PreflightCheck(id: "backend-baseline", name: "Backend migration baseline", metadata: ["root": root]))
-        }
-
-        for (serviceID, label) in [("travel-portal", "Booking"), ("partner-portal", "Partner")] {
-            guard let cwd = services.first(where: { $0.id == serviceID })?.resolvedCwd else { continue }
-            checks.append(PreflightCheck(
-                id: "env-diff-\(serviceID)",
-                name: "\(label) env variables",
-                metadata: ["cwd": cwd]
-            ))
         }
 
         let ports = Set(services.compactMap { $0.probe?.port })
@@ -102,19 +104,33 @@ struct PreflightRunner: Sendable {
         return checks
     }
 
-    /// The checks that only read: Node, the ports and the folders. The others can
-    /// start a container runtime or ask Stripe.
+    /// The checks that only read: the checks of the registry, the ports and the
+    /// folders. The container runtime step can open an app, and the backend step
+    /// asks the network.
+    @MainActor
     func readOnlyChecks(for services: [ServiceDefinition]) -> [PreflightCheck] {
         allChecks(for: services).filter {
-            $0.id == "node-version" || $0.id.hasPrefix("port-") || $0.id.hasPrefix("dir-")
+            $0.metadata[Self.registryKey] != nil || $0.id.hasPrefix("port-") || $0.id.hasPrefix("dir-")
         }
     }
 
-    private func nodeCwd(for services: [ServiceDefinition]) -> String? {
-        services.first(where: { $0.id == "travel-portal" })?.resolvedCwd ?? services.compactMap(\.resolvedCwd).first
+    /// Runs the checks in parallel. A result that comes after a cancel is dropped.
+    func runAll(_ checks: [PreflightCheck]) async {
+        await withTaskGroup(of: Void.self) { group in
+            for check in checks {
+                group.addTask {
+                    let result = await self.run(check: check)
+                    if Task.isCancelled { return }
+                    await MainActor.run { check.result = result }
+                }
+            }
+        }
     }
 
     func run(check: PreflightCheck) async -> PreflightResult {
+        if check.metadata[Self.registryKey] != nil, let environment {
+            return await environment.runForPreflight(check.id)
+        }
         switch check.id {
         case "docker":
             let runtime = ContainerRuntime.detect()
@@ -126,77 +142,8 @@ struct PreflightRunner: Sendable {
             }
             return .failed(message: "\(runtime.displayName) not responding", fix: "Open \(runtime.appName) manually")
 
-        case "node-version":
-            let result = await run("node --version", cwd: check.metadata["cwd"])
-            if result.timedOut {
-                return .failed(
-                    message: Shell.timeoutText("node --version", after: Self.checkTimeout),
-                    fix: "Run node --version in a terminal to see what it waits for"
-                )
-            }
-            // A login profile can print lines first ("Now using node v22.3.0"): the
-            // version is the last line that is only a version.
-            guard let number = ToolVersion.parse(result.stdout) else {
-                let printed = result.trimmedOutput
-                if printed.isEmpty || result.exitCode == 127 {
-                    return .failed(message: "Node.js not found", fix: "Install Node 22 via nvm or brew")
-                }
-                // Something answered (nvm: "N/A version is not installed"): show what it said.
-                let lastLine = printed.components(separatedBy: .newlines).last ?? printed
-                return .failed(
-                    message: "node --version printed no version: \(lastLine)",
-                    fix: "Run node --version in the portal folder"
-                )
-            }
-            let version = "v\(number)"
-            let major = EnvironmentChecker.major(of: number) ?? 0
-            if major >= 22 {
-                return .passed(detail: version)
-            } else if major >= 18 {
-                return .warning(message: "\(version) — recommend v22+")
-            } else {
-                return .failed(message: "\(version) — require v18+", fix: "Install Node 22 via nvm or brew")
-            }
-
-        case "stripe-auth":
-            let hasStripe = await run("which stripe >/dev/null 2>&1").succeeded
-            if !hasStripe { return .warning(message: "Not installed — Stripe will be skipped") }
-            let key = StripeLauncher.resolve(bookingPortal: check.metadata["cwd"])
-            let auth = await shell.run(
-                StripeLauncher.authCheckCommand, environment: key.environment, timeout: Self.checkTimeout
-            )
-            if auth.timedOut {
-                return .warning(
-                    message: "\(Shell.timeoutText("stripe balance retrieve", after: Self.checkTimeout)) — Stripe will be skipped"
-                )
-            }
-            switch key.mode {
-            case .testKey(let source):
-                return auth.succeeded
-                    ? .passed(detail: "Test key from \(source)")
-                    : .warning(message: "Stripe did not accept STRIPE_SECRET_KEY from \(source), or there is no network — Stripe will be skipped; import a current .env")
-            case .login:
-                return auth.succeeded
-                    ? .passed(detail: "Authenticated")
-                    : .warning(message: "Session invalid or expired — Stripe will be skipped; run: stripe login")
-            }
-
         case "backend-baseline":
             return await backendBaseline(root: check.metadata["root"] ?? "")
-
-        case let id where id.hasPrefix("env-diff"):
-            // The monolith's scripts/env-check.mjs checks the app's shared .env (a teammate's
-            // copy or pnpm env:pull) and the blank .env.local keys that would hide it. A missing
-            // or stale file warns: local mode still runs, and remote mode refuses to switch.
-            let cwd = check.metadata["cwd"] ?? ""
-            let app: SharedEnvFiles.App = id == "env-diff-partner-portal" ? .partner : .booking
-            let monorepo = ((cwd as NSString).deletingLastPathComponent as NSString).deletingLastPathComponent
-            let output = await shellOutput(SharedEnvFiles.command(monorepo: monorepo, app: app), cwd: monorepo)
-            switch SharedEnvFiles.status(SharedEnvFiles.decode(output, app: app)) {
-            case .passing(let detail): return .passed(detail: detail)
-            case .warning(let message), .failing(let message): return .warning(message: message)
-            case .pending, .fixing: return .warning(message: "Not checked")
-            }
 
         default:
             if check.id.hasPrefix("port-") {

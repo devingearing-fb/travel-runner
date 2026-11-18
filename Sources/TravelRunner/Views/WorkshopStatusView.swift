@@ -24,6 +24,13 @@ struct WorkshopStatusView: View {
                     noticesSection
                 }
 
+                let setupItems = supervisor.setupItemsNeedingAttention.count
+                if setupItems > 0 {
+                    HealthAttentionBanner(count: setupItems) {
+                        WorkshopPanel.shared.open(section: .health)
+                    }
+                }
+
                 ForEach(failedServices) { state in
                     TriageCard(
                         state: state,

@@ -144,7 +144,7 @@ final class HotelCatalogTests: XCTestCase {
         // Controls: a cached dump, or the keys in place, keep the warning.
         XCTAssertEqual(EnvironmentChecker.bookingEnvStatus(missing, required: false, hotelKeysPresent: false), missing)
         XCTAssertEqual(EnvironmentChecker.bookingEnvStatus(missing, required: true, hotelKeysPresent: true), missing)
-        XCTAssertEqual(EnvironmentChecker.impact(of: "booking-env"), "the first reset cannot download the hotels")
+        XCTAssertEqual(CheckRegistry.impact(of: "booking-env"), "the first reset cannot download the hotels")
     }
 
     /// A checkout with the hotel scripts. The fake shell answers the env check and the

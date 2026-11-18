@@ -14,9 +14,10 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 
 - **One-click startup**: Starts the selected profile in dependency order — `booking` (Supabase, Universal Login, Stripe, booking portal on :3002), `partner` (Supabase, Universal Login, partner portal on :3006), `both` (default), or `full` (adds cache verification, stream-services, QStash, and Sequin; experimental)
 - **Health monitoring**: Color-coded status dot in the menu bar (green/amber/red/gray)
+- **Health section**: every setup check of the first-run wizard, with its Fix and Import… buttons, and where each tool was found. The preflight of a start runs the fast checks in parallel, 3 s each; Node must match `engines.node` of the monorepo. Status says "N setup items need attention — Open Health" while a check fails
 - **Stripe secret injection**: Captures `whsec_` from Stripe CLI stdout, writes to the runner block in `apps/booking-portal/.env.local` + serves via HTTP registry
 - **Stripe without a login**: `stripe listen` uses the `sk_test_` `STRIPE_SECRET_KEY` of `apps/booking-portal/.env` (or `.env.local`), passed as `STRIPE_API_KEY` in its environment. Without a test key it uses your own `stripe login`. The Stripe row says which. A live key is never used.
-- **Env management**: each app's shared dev values live in the monolith at `apps/<app>/.env` (a teammate's copy, brought in with **Import…** on the Environment Check step (Settings → Reconfigure Repos…), or `pnpm env:pull` with Doppler access); the runner never holds them. `pnpm env:check` in the monolith says whether a copy is complete. The runner owns a marked block at the end of each app's `.env.local` (`# >>> travel-runner: managed block, ...` to `# <<< travel-runner`) with local Supabase, URL and login overrides
+- **Env management**: each app's shared dev values live in the monolith at `apps/<app>/.env` (a teammate's copy, brought in with **Import…** in Health, or `pnpm env:pull` with Doppler access); the runner never holds them. `pnpm env:check` in the monolith says whether a copy is complete. The runner owns a marked block at the end of each app's `.env.local` (`# >>> travel-runner: managed block, ...` to `# <<< travel-runner`) with local Supabase, URL and login overrides
 - **Migration detection**: Sets up an empty database by itself (`scripts/db/manifest.json` `reset` profile). A database with data is never reset without asking: when it lacks migrations or has versions the branch does not have, a banner offers **Apply migrations** (the `migrate` profile, which never resets; hidden when the manifest has no such profile) and **Reset and reseed…**. A failed apply changes nothing more and leaves both choices. Settings → "Reset the database when migrations change" (off by default) brings back the automatic reset, but never for a database that another checkout built
 - **Shared code**: `packages/travel-data` hot-reloads into both apps — nothing to build or link
 - **Console tabs**: Live logs for Stripe, Booking Portal, and Universal Login with Pino JSON formatting
@@ -66,7 +67,7 @@ When running, travel-runner exposes an HTTP API on `http://localhost:19900` (it 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/api/status` | All service statuses, health, LAN mode, profile, DB mode, git branches, `app` (`standard` or `hackathon`), and `configured` (false until a `services.json` loads) |
-| `GET` | `/api/preflight` | Runs the start checks that change nothing (Node, ports, folders) and gives each result |
+| `GET` | `/api/preflight` | Runs the start checks that change nothing (the fast setup checks of Health, ports, folders) and gives each result |
 | `GET` | `/api/logs/{serviceId}?lines=N` | Last N log lines (default 50) |
 | `POST` | `/api/restart/{serviceId}` | Restart a service |
 | `POST` | `/api/restart-cascade/{serviceId}` | Restart a service and its dependents |

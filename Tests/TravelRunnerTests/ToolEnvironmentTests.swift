@@ -602,22 +602,17 @@ final class ToolEnvironmentTests: XCTestCase {
         XCTAssertEqual(missing.trimmingCharacters(in: .whitespacesAndNewlines), "")
     }
 
-    /// A check command that hangs held the start for ever. Now it fails by name.
+    /// A check command that hangs held the start for ever. Now it fails by name,
+    /// after the limit of the preflight.
     func testAPreflightCheckThatTimesOutFailsAndSaysSo() async {
-        let runner = FakeCommandRunner { call in
-            call.command.hasPrefix("which stripe") ? FakeCommandRunner.ok() : FakeCommandRunner.timedOut
-        }
-        let preflight = PreflightRunner(shell: runner)
+        let runner = FakeCommandRunner { _ in FakeCommandRunner.timedOut }
+        let preflight = await registryPreflight(runner)
 
-        let node = await preflight.run(check: PreflightCheck(id: "node-version", name: "Node"))
+        let node = await preflight.run(check: PreflightCheck(id: "node", name: "Node", metadata: [PreflightRunner.registryKey: "1"]))
         guard case .failed(let message, _) = node else { return XCTFail("\(node)") }
-        XCTAssertEqual(message, "node --version did not answer in 15 s")
+        XCTAssertEqual(message, "node --version did not answer in 3 s")
 
-        let stripe = await preflight.run(check: PreflightCheck(id: "stripe-auth", name: "Stripe"))
-        guard case .warning(let warning) = stripe else { return XCTFail("\(stripe)") }
-        XCTAssertEqual(warning, "stripe balance retrieve did not answer in 15 s — Stripe will be skipped")
-
-        XCTAssertTrue(runner.calls.allSatisfy { $0.timeout == .seconds(15) }, "each check command has a timeout")
+        XCTAssertTrue(runner.calls.allSatisfy { $0.timeout == .seconds(3) }, "each check command has a timeout")
     }
 
     /// The wait for a container runtime that does not come up (10 checks, 2 s
@@ -642,25 +637,20 @@ final class ToolEnvironmentTests: XCTestCase {
 
     /// Negative control: a Node that answers passes, so the timeout branch is not the only path.
     func testAPreflightNodeCheckThatAnswersPasses() async {
-        let preflight = PreflightRunner(shell: FakeCommandRunner { _ in FakeCommandRunner.ok("v22.11.0\n") })
-        let node = await preflight.run(check: PreflightCheck(id: "node-version", name: "Node"))
+        let preflight = await registryPreflight(FakeCommandRunner { _ in FakeCommandRunner.ok("v22.11.0\n") })
+        let node = await preflight.run(check: PreflightCheck(id: "node", name: "Node", metadata: [PreflightRunner.registryKey: "1"]))
         XCTAssertTrue(node.isPassed, "\(node)")
     }
 
-    /// The Node check of the preflight asks in the cwd of a portal, so it gets the
-    /// Node that the services get.
-    func testTheNodeCheckOfThePreflightCarriesTheCwdOfThePortal() {
-        func service(_ id: String, cwd: String) -> ServiceDefinition {
-            ServiceDefinition(
-                id: id, name: id, cmd: ["true"], cwd: cwd, probe: nil, type: .daemon, restart: .never,
-                dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
-            )
-        }
-        let services = [service("supabase", cwd: "/mono"), service("travel-portal", cwd: "/mono/apps/booking-portal")]
-
-        let checks = PreflightRunner().allChecks(for: services)
-
-        XCTAssertEqual(checks.first { $0.id == "node-version" }?.metadata["cwd"], "/mono/apps/booking-portal")
+    /// A preflight whose Node check is the Node row of Health, without a checkout.
+    @MainActor
+    private func registryPreflight(_ runner: FakeCommandRunner) -> PreflightRunner {
+        let checker = EnvironmentChecker(
+            monorepoPath: "/nonexistent/mono", loginPath: "", streamServicesPath: "",
+            flavor: .standard, shell: runner, tools: ToolEnvironment(home: "/nonexistent/home")
+        )
+        checker.buildChecks()
+        return PreflightRunner(shell: runner, environment: checker)
     }
 
     func testOnlyABareCommandNameIsATool() {
