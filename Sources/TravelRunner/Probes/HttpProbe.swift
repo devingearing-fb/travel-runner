@@ -4,6 +4,9 @@ struct HttpProbe: Probe {
     let url: String
     /// The limit of one request: 60 s while a service starts, 5 s for a liveness check.
     var requestTimeout: TimeInterval = 60
+    /// A page check, not a health route: a 4xx other than 404 (a 401 of a login
+    /// page) is a server that serves pages, so it counts as ready.
+    var acceptsClientErrors = false
     /// Sends one request and does not follow a redirect. Tests give a fake.
     var send: @Sendable (URLRequest) async throws -> HTTPURLResponse = HttpProbe.sendWithoutRedirects
 
@@ -15,6 +18,7 @@ struct HttpProbe: Probe {
         } catch {
             return .from(urlError: error)
         }
+        if acceptsClientErrors, (400..<500).contains(response.statusCode), response.statusCode != 404 { return .ok }
         let first = ProbeOutcome.from(status: response.statusCode, location: response.value(forHTTPHeaderField: "Location"))
         // A 404 on a health route: the branch may not have that route. Then any
         // answer below 500 on / counts. A 404 there too is the zombie server that

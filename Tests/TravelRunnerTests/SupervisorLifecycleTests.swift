@@ -140,12 +140,12 @@ final class SupervisorLifecycleTests: XCTestCase {
 
     /// A second daemon that counts as running, so the environment never looks
     /// stopped while the service under test restarts.
-    private func load(_ service: ServiceDefinition) throws {
+    private func load(_ services: ServiceDefinition...) throws {
         let anchor = ServiceDefinition(
             id: "anchor", name: nil, cmd: ["sleep", "1"], cwd: nil, probe: nil, type: .daemon, restart: .never,
             dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
         )
-        try supervisor.loadServices([service, anchor])
+        try supervisor.loadServices(services + [anchor])
         supervisor.serviceStates["anchor"]?.phase = .running
         supervisor.health = .healthy
     }
@@ -1025,6 +1025,215 @@ final class SupervisorLifecycleTests: XCTestCase {
         let lines = await logLines("web")
         XCTAssertTrue(lines.contains("[travel-runner] web was down before the wake — starting it again"), lines.joined(separator: "\n"))
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
+    /// Review of L5: the start of a Restart is an action in flight for its whole
+    /// slow start. Its buttons must still work, and Restart replaces the process.
+    func testASlowStartOffersItsButtonsWhileItsStartRunsAndRestartReplacesTheProcess() async throws {
+        try load(daemon("slow", ["sh", "-c", "sleep 120"], probeTimeout: 2))
+
+        supervisor.restartService("slow")
+        let slow = await waitUntil(15) { self.state("slow").condition?.kind == .slowStart }
+        XCTAssertTrue(slow, "slow is \(state("slow").phase.rawValue)")
+        XCTAssertTrue(supervisor.actionsInFlight.contains("slow"), "the start of the restart still runs")
+        XCTAssertFalse(supervisor.inlineActionsBusy("slow"))
+        XCTAssertTrue(supervisor.canPerform(.keepWaiting, for: "slow"))
+        XCTAssertTrue(supervisor.canPerform(.restart, for: "slow"))
+        let pid = try XCTUnwrap(state("slow").pid)
+
+        supervisor.perform(.restart, for: "slow")
+        let replaced = await waitUntil(15) { self.state("slow").pid.map { $0 != pid } ?? false }
+        XCTAssertTrue(replaced, "slow is \(state("slow").phase.rawValue)")
+        XCTAssertEqual(state("slow").phase, .starting)
+        // Negative control: the new start is no slow start yet, so its row waits.
+        XCTAssertNil(state("slow").condition)
+        XCTAssertTrue(supervisor.inlineActionsBusy("slow"))
+        let stopped = await waitUntil(10) { kill(pid, 0) != 0 }
+        XCTAssertTrue(stopped, "the waiting process must be stopped")
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
+    /// Runs liveness checks until `condition` holds. The first may come while the
+    /// wake check still ends, and then checks nothing.
+    private func livenessPasses(until condition: @MainActor () -> Bool) async -> Bool {
+        for _ in 0..<20 {
+            await supervisor.runLivenessPass()
+            if condition() { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return condition()
+    }
+
+    /// Finding "wake check kills a portal on any 5xx": a server that answers 500
+    /// through both passes runs. It keeps its process and is marked unhealthy, as the
+    /// liveness checks do. The wake check reset the failure series; a passed check
+    /// still clears the mark.
+    func testAWakeCheckMarksAServerThatAnswers500UnhealthyAndDoesNotRestartIt() async throws {
+        let server = try statusServer()
+        try load(httpDaemon("web", server.cmd))
+        supervisor.restartService("web")
+        let ran = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ran, "web is \(state("web").phase.rawValue)")
+        let pid = state("web").pid
+
+        try "500".write(to: server.status, atomically: true, encoding: .utf8)
+        supervisor.handleWake()
+        let done = await waitUntil(30) { self.supervisor.lastWakeSummary != nil }
+        XCTAssertTrue(done)
+        XCTAssertEqual(supervisor.lastWakeSummary, "[travel-runner] Wake check: 1 checked, 0 restarted")
+        let condition = try XCTUnwrap(state("web").condition)
+        XCTAssertEqual(condition.kind, .unhealthy)
+        XCTAssertTrue(condition.headline.hasPrefix("web answers 500 on /api/health since "), condition.headline)
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertEqual(state("web").pid, pid)
+        XCTAssertEqual(state("web").restartCount, 0)
+
+        try "200".write(to: server.status, atomically: true, encoding: .utf8)
+        let cleared = await livenessPasses { self.state("web").condition == nil }
+        XCTAssertTrue(cleared, state("web").condition?.headline ?? "")
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("[travel-runner] web answers again"), lines.joined(separator: "\n"))
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
+    /// Review of L5: a wake check resets the failure series. A service marked
+    /// unhealthy that answers after the wake loses the mark.
+    func testAWakeCheckClearsTheUnhealthyMarkOfAServiceThatAnswers() async throws {
+        let server = try statusServer()
+        try load(httpDaemon("web", server.cmd))
+        supervisor.restartService("web")
+        let ran = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ran, "web is \(state("web").phase.rawValue)")
+
+        try "500".write(to: server.status, atomically: true, encoding: .utf8)
+        for _ in 0..<3 { await supervisor.runLivenessPass() }
+        XCTAssertEqual(state("web").condition?.kind, .unhealthy)
+
+        try "200".write(to: server.status, atomically: true, encoding: .utf8)
+        supervisor.handleWake()
+        let done = await waitUntil(30) { self.supervisor.lastWakeSummary != nil }
+        XCTAssertTrue(done)
+        XCTAssertEqual(supervisor.lastWakeSummary, "[travel-runner] Wake check: 1 checked, 0 restarted")
+        XCTAssertNil(state("web").condition)
+        XCTAssertEqual(state("web").phase, .running)
+    }
+
+    /// A liveness probe for each service that the test sets, recording the checks.
+    private final class ScriptedProbe: Probe, @unchecked Sendable {
+        let id: String
+        let answer: ProbeOutcome
+        let record: @Sendable (String) -> Void
+        init(_ id: String, _ answer: ProbeOutcome, record: @escaping @Sendable (String) -> Void) {
+            self.id = id
+            self.answer = answer
+            self.record = record
+        }
+        func outcome() async -> ProbeOutcome {
+            record(id)
+            return answer
+        }
+    }
+
+    private final class CheckLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var ids: [String] = []
+        func add(_ id: String) { lock.withLock { ids.append(id) } }
+        /// The checks in order, each run of one service as one entry.
+        var runs: [String] {
+            lock.withLock { ids.reduce(into: []) { if $0.last != $1 { $0.append($1) } } }
+        }
+    }
+
+    /// Review of L5: the wake check asks Supabase first, then the rest in start
+    /// order, in both passes. Supabase is never restarted by itself; a service that
+    /// does not answer is. The summary and the debug event say so.
+    func testAWakeCheckAsksSupabaseFirstAndRestartsOnlyTheOtherService() async throws {
+        let tracker = captureIssues()
+        // "api" sorts before "supabase" in the start order.
+        try load(daemon("api", webServer), daemon("supabase", ["sleep", "60"], reuse: true))
+        state("api").phase = .running
+        state("api").lastStarted = Date().addingTimeInterval(-3600)
+        state("supabase").phase = .running
+        let checks = CheckLog()
+        supervisor.livenessProbeOverride = { id in
+            ["api", "supabase"].contains(id) ? ScriptedProbe(id, .refused, record: { checks.add($0) }) : nil
+        }
+
+        supervisor.handleWake()
+        let done = await waitUntil(30) { self.supervisor.lastWakeSummary != nil }
+        XCTAssertTrue(done)
+
+        XCTAssertEqual(checks.runs, ["supabase", "api", "supabase", "api"])
+        XCTAssertEqual(supervisor.lastWakeSummary, "[travel-runner] Wake check: 2 checked, 1 restarted (api)")
+        XCTAssertEqual(state("supabase").phase, .failed)
+        XCTAssertNil(state("supabase").pid, "Supabase is not restarted by itself")
+        let back = await waitUntil(30) { self.settled("api") }
+        XCTAssertTrue(back, "api is \(state("api").phase.rawValue)")
+        XCTAssertEqual(state("api").restartCount, 1)
+        let lines = await logLines("api")
+        XCTAssertTrue(lines.contains("[travel-runner] Wake check: 2 checked, 1 restarted (api)"), lines.joined(separator: "\n"))
+        let wakeEvents = await events("wake_check", in: tracker)
+        XCTAssertEqual(wakeEvents.map(\.message), ["[travel-runner] Wake check: 2 checked, 1 restarted (api)"])
+    }
+
+    /// Review of L5: a service that needs Supabase is not restarted while Supabase
+    /// failed its wake check. A new process would fail the same way.
+    func testAWakeCheckLeavesTheDependentsOfADownSupabase() async throws {
+        let web = ServiceDefinition(
+            id: "web", name: "web", cmd: webServer, cwd: workDir.path,
+            probe: ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30),
+            type: .daemon, restart: .onFailure, dependsOn: ["supabase"], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try load(web, daemon("supabase", ["sleep", "60"], reuse: true))
+        state("web").phase = .running
+        state("supabase").phase = .running
+        supervisor.livenessProbeOverride = { id in
+            ["web", "supabase"].contains(id) ? ScriptedProbe(id, .refused, record: { _ in }) : nil
+        }
+
+        supervisor.handleWake()
+        let done = await waitUntil(30) { self.supervisor.lastWakeSummary != nil }
+        XCTAssertTrue(done)
+
+        XCTAssertEqual(supervisor.lastWakeSummary, "[travel-runner] Wake check: 2 checked, 0 restarted")
+        XCTAssertEqual(state("supabase").phase, .failed)
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertNil(state("web").pid, "no process was started")
+        XCTAssertEqual(state("web").restartCount, 0)
+        let lines = await logLines("web")
+        XCTAssertTrue(
+            lines.contains("[travel-runner] web did not answer after wake — Supabase is down, so it is not restarted"),
+            lines.joined(separator: "\n")
+        )
+    }
+
+    /// Review of L5: a service that waits for its container runtime, and a skip for
+    /// a missing setup, are not started on wake. Nothing during sleep changed them.
+    func testAWakeCheckLeavesARuntimeWaitAndASetupSkip() async throws {
+        try load(daemon("db", webServer), daemon("core", webServer))
+        state("db").phase = .failed
+        state("db").haltReason = .runtimeDown(runtime: "OrbStack", waiting: true)
+        state("core").phase = .skipped
+        state("core").condition = ServiceCondition(
+            kind: .optionalOff, headline: "Platform core is skipped.", detail: "Run pnpm install.",
+            actions: [.startService], since: Date()
+        )
+        supervisor.health = .degraded
+
+        supervisor.handleWake()
+        let done = await waitUntil(30) { self.supervisor.lastWakeSummary != nil }
+        XCTAssertTrue(done)
+        XCTAssertEqual(supervisor.lastWakeSummary, "[travel-runner] Wake check: 0 checked, 0 restarted")
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(state("db").phase, .failed)
+        XCTAssertNil(state("db").pid)
+        XCTAssertEqual(state("core").phase, .skipped)
+        XCTAssertNil(state("core").pid)
+        for id in ["db", "core"] {
+            let lines = await logLines(id)
+            XCTAssertFalse(lines.contains { $0.contains("was down before the wake") }, lines.joined(separator: "\n"))
+        }
     }
 
     /// A daemon that crashes once while it starts and then hangs has two waiters: the

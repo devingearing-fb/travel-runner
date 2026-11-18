@@ -68,6 +68,17 @@ final class ProbeTests: XCTestCase {
         XCTAssertEqual(monitor.record("web", .http(status: 404), at: start), .unhealthy(since: start))
     }
 
+    /// A wake check marks a server that answers with an error unhealthy and restarts
+    /// one that does not answer, or answers 404 everywhere.
+    func testAnErrorAnswerIsAServerThatRuns() {
+        for outcome: ProbeOutcome in [.http(status: 500), .http(status: 401), .notFoundThenRoot(.http(status: 502))] {
+            XCTAssertTrue(HealthMonitor.isErrorAnswer(outcome), outcome.summary)
+        }
+        for outcome: ProbeOutcome in [.http(status: 404), .refused, .timedOut, .ok, .other("reset")] {
+            XCTAssertFalse(HealthMonitor.isErrorAnswer(outcome), outcome.summary)
+        }
+    }
+
     // MARK: - Texts
 
     func testTheUnhealthyHeadlineSaysWhatItAnswersAndSince() {

@@ -118,6 +118,29 @@ final class ProbeOutcomeTests: XCTestCase {
         XCTAssertEqual(root.paths, ["/"])
     }
 
+    /// The page check of a web service: a login page that answers 401 serves pages,
+    /// as the old curl check said. A 404 and a 5xx still fail.
+    func testAPageCheckCountsAClientErrorAsReady() async {
+        func pageCheck(_ statuses: [String: Int]) -> HttpProbe {
+            let server = FakeServer(statuses)
+            return HttpProbe(
+                url: "http://127.0.0.1:3000/frontdoor", requestTimeout: 5, acceptsClientErrors: true,
+                send: { try server.send($0) }
+            )
+        }
+        let unauthorized = await pageCheck(["/frontdoor": 401]).outcome()
+        XCTAssertEqual(unauthorized, .ok)
+        let forbidden = await pageCheck(["/frontdoor": 403]).outcome()
+        XCTAssertEqual(forbidden, .ok)
+        let broken = await pageCheck(["/frontdoor": 500]).outcome()
+        XCTAssertEqual(broken, .http(status: 500))
+        let zombie = await pageCheck(["/frontdoor": 404, "/": 404]).outcome()
+        XCTAssertEqual(zombie, .http(status: 404))
+        // Negative control: a health route check does not take a 401.
+        let health = await probe(FakeServer(["/api/health": 401])).outcome()
+        XCTAssertEqual(health, .http(status: 401))
+    }
+
     func testAFailedRequestSaysWhy() async {
         let outcome = await probe(FakeServer([:])).outcome()
         XCTAssertEqual(outcome, .refused)

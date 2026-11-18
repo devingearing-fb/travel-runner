@@ -190,7 +190,7 @@ struct ServiceRow: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.mini)
-                        .disabled(isActionInFlight)
+                        .disabled(supervisor.inlineActionsBusy(state.id))
                     }
                     if let halt = state.haltReason, rowCondition == nil {
                         Text("\(halt.label) — auto-restart stopped")

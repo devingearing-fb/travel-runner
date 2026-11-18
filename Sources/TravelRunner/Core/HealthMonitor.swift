@@ -70,6 +70,16 @@ struct HealthMonitor {
         outcome == .http(status: 404)
     }
 
+    /// True when the server answered with an HTTP error, a 500 for one. It runs, so a
+    /// restart does not help: the row says so and offers Restart. The zombie
+    /// signature is not one.
+    static func isErrorAnswer(_ outcome: ProbeOutcome) -> Bool {
+        switch outcome {
+        case .http, .notFoundThenRoot: !isZombie(outcome)
+        default: false
+        }
+    }
+
     /// "Booking Portal answers 500 on /api/health since 14:02."
     static func unhealthyHeadline(
         name: String, outcome: ProbeOutcome, path: String?, port: Int?, since: Date, timeZone: TimeZone = .current

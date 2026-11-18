@@ -289,6 +289,8 @@ final class EnvironmentSupervisor {
     private var healthMonitor = HealthMonitor()
     /// How often the running daemons are checked. Nil: never (tests).
     @ObservationIgnored var livenessInterval: Duration? = HealthMonitor.interval
+    /// The liveness probe of each service. Tests set it; nil builds it from the config.
+    @ObservationIgnored var livenessProbeOverride: ((String) -> Probe?)?
     private var livenessLoopStarted = false
     /// How long a start may run while its process lives. Tests make it short.
     @ObservationIgnored var startHardCap: Duration = HealthMonitor.startHardCap
@@ -1848,6 +1850,13 @@ final class EnvironmentSupervisor {
         case .openHealth: onOpenHealth != nil
         default: false
         }
+    }
+
+    /// True while the buttons in a service's row must wait for an action of the
+    /// service. The buttons of a slow start never wait: the action is that start, and
+    /// "Keep waiting" and "Restart" are the way out of it.
+    func inlineActionsBusy(_ serviceID: String) -> Bool {
+        actionsInFlight.contains(serviceID) && serviceStates[serviceID]?.condition?.kind != .slowStart
     }
 
     /// Runs the button of a condition.
@@ -4525,20 +4534,29 @@ final class EnvironmentSupervisor {
         // request after a wake, and the network can take a while.
         var failing: [String] = []
         for serviceID in checks {
-            guard serviceStates[serviceID]?.phase == .running, let (probe, _) = livenessProbe(serviceID) else { continue }
+            guard let state = serviceStates[serviceID], state.phase == .running,
+                  let (probe, _) = livenessProbe(serviceID) else { continue }
             checked += 1
             let window = isSupabaseStack(serviceID) ? timing.supabaseWindow : timing.window
             let outcome = try? await waitForProbe(probe, timeout: window, interval: timing.interval, clock: clock)
-            if outcome?.isReady != true { failing.append(serviceID) }
+            if outcome?.isReady == true {
+                if state.phase == .running { await clearUnhealthy(state) }
+            } else {
+                failing.append(serviceID)
+            }
         }
         if !failing.isEmpty { try? await clock.sleep(for: timing.passGap) }
         for serviceID in failing {
             guard let state = serviceStates[serviceID], state.phase == .running,
-                  let (probe, _) = livenessProbe(serviceID) else { continue }
+                  let (probe, path) = livenessProbe(serviceID) else { continue }
             let window = isSupabaseStack(serviceID) ? timing.supabaseWindow : timing.window
             let outcome = try? await waitForProbe(probe, timeout: window, interval: timing.interval, clock: clock)
             // A restart or a stop can start while the probe runs; it owns the state then.
-            guard state.phase == .running, outcome?.isReady != true else { continue }
+            guard state.phase == .running else { continue }
+            if outcome?.isReady == true {
+                await clearUnhealthy(state)
+                continue
+            }
             let name = state.definition.displayName
             state.lastProbe = outcome
             if isSupabaseStack(serviceID) {
@@ -4548,13 +4566,22 @@ final class EnvironmentSupervisor {
                 state.phase = .failed
                 recordFailure(serviceID, kind: .wakeCheck(lastProbe: outcome))
                 recalculateHealth()
+            } else if needsDownSupabase(serviceID) {
+                // A new process would fail the same way while Supabase is down.
+                await logStore.append(serviceID: serviceID, entry: LogEntry(
+                    stream: .stderr, text: "[travel-runner] \(name) did not answer after wake — Supabase is down, so it is not restarted"
+                ))
+                continue
+            } else if let outcome, HealthMonitor.isErrorAnswer(outcome) {
+                // The server answers, so it runs: a restart does not fix a 500.
+                await markUnhealthy(state, outcome: outcome, path: path, since: clock.date())
             } else {
                 let last = outcome.map { " (last check: \($0.summary))" } ?? ""
-                await restartUnanswering(
+                let didRestart = await restartUnanswering(
                     serviceID, kind: .wakeCheck(lastProbe: outcome),
                     line: "\(name) did not answer after wake\(last) — stopping it and restarting"
                 )
-                restarted.append(serviceID)
+                if didRestart { restarted.append(serviceID) }
             }
             Task { await self.captureDebugIssue(
                 trigger: "probe_timeout",
@@ -4617,7 +4644,8 @@ final class EnvironmentSupervisor {
 
     /// A failed or skipped service that a wake check starts again: a daemon that the
     /// runner would start, with no restart, wait or action of its own. Supabase is
-    /// never restarted by itself, and a deliberate skip stays.
+    /// never restarted by itself. Of the skips, only Stripe's can end during sleep
+    /// (the network came back); a skip for missing packages or env stays.
     private func retriesAfterWake(_ state: ServiceState) -> Bool {
         guard state.definition.resolvedType != .oneshot, !isSupabaseStack(state.id),
               pendingRestarts[state.id] == nil, !actionsInFlight.contains(state.id),
@@ -4627,7 +4655,8 @@ final class EnvironmentSupervisor {
             if case .runtimeDown(_, true)? = state.haltReason { return false }
             return true
         case .skipped:
-            return state.condition?.kind == .optionalOff && state.condition?.actions.contains(.startService) == true
+            return state.id == "stripe" && state.condition?.kind == .optionalOff
+                && state.condition?.actions.contains(.startService) == true
         default:
             return false
         }
@@ -4637,12 +4666,13 @@ final class EnvironmentSupervisor {
     /// per request, or an HTTP check of a route that must answer for a web
     /// service with a TCP probe. A stdout probe cannot check a running process.
     private func livenessProbe(_ serviceID: String) -> (probe: Probe, path: String?)? {
+        if let livenessProbeOverride { return livenessProbeOverride(serviceID).map { ($0, nil) } }
         guard let state = serviceStates[serviceID], state.definition.resolvedType != .oneshot,
               let config = lanAwareDefinition(for: state.definition, serviceID: serviceID).probe ?? state.definition.probe,
               config.type != .stdoutRegex else { return nil }
         if config.type == .tcp, let path = Self.wakeHealthPaths[serviceID], let port = config.port {
             let url = "http://\(config.host ?? "127.0.0.1"):\(port)\(path)"
-            return (HttpProbe(url: url, requestTimeout: HealthMonitor.requestTimeout), path)
+            return (HttpProbe(url: url, requestTimeout: HealthMonitor.requestTimeout, acceptsClientErrors: true), path)
         }
         guard let probe = try? ProbeFactory.makeProbe(for: config, requestTimeout: HealthMonitor.requestTimeout) else {
             return nil
@@ -4653,11 +4683,14 @@ final class EnvironmentSupervisor {
 
     /// A service that runs but does not answer: mark it failed, stop its process and
     /// whatever holds its port (an orphaned dev server), and let the automatic
-    /// restart start it again.
-    private func restartUnanswering(_ serviceID: String, kind: FailureAdvisor.Kind, line: String) async {
-        guard let state = serviceStates[serviceID] else { return }
+    /// restart start it again. False when a stop or a restart got there first and
+    /// this did nothing.
+    @discardableResult
+    private func restartUnanswering(_ serviceID: String, kind: FailureAdvisor.Kind, line: String) async -> Bool {
+        guard let state = serviceStates[serviceID], state.phase == .running else { return false }
         await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(line)"))
-        guard state.phase == .running else { return }
+        // The log write lets other work run first.
+        guard state.phase == .running else { return false }
         noteFailure(state, stableFor: state.readyAt.map { clock.date().timeIntervalSince($0) }, countsTowardBreaker: false)
         state.phase = .failed
         recordFailure(serviceID, kind: kind)
@@ -4667,6 +4700,44 @@ final class EnvironmentSupervisor {
             if let port = state.definition.probe?.port { await killPortOccupants(port) }
         }
         scheduleRestart(serviceID: serviceID)
+        return true
+    }
+
+    /// True when the service needs Supabase and Supabase is down: a restart of the
+    /// service cannot help then.
+    private func needsDownSupabase(_ serviceID: String) -> Bool {
+        guard isSupabaseStack("supabase"), serviceStates["supabase"]?.phase != .running,
+              let graph else { return false }
+        return graph.dependents(of: "supabase").contains(serviceID)
+    }
+
+    /// A running service that answers with an error: the row says what it answers
+    /// and since when, and offers Restart. The time of an earlier mark stays.
+    private func markUnhealthy(_ state: ServiceState, outcome: ProbeOutcome, path: String?, since: Date) async {
+        let isNew = state.condition?.kind != .unhealthy
+        let since = isNew ? since : (state.condition?.since ?? since)
+        let headline = HealthMonitor.unhealthyHeadline(
+            name: state.definition.displayName, outcome: outcome, path: path,
+            port: state.definition.probe?.port, since: since
+        )
+        state.condition = ServiceCondition(
+            kind: .unhealthy, headline: headline, detail: "It still runs. Restart it if it does not recover.",
+            actions: [.restart, .openLog], since: since
+        )
+        if isNew {
+            await logStore.append(serviceID: state.id, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(headline)"))
+            await recordDebugEvent(kind: "unhealthy", serviceID: state.id, message: headline)
+        }
+    }
+
+    /// A service marked unhealthy passed a check: the mark goes. It does not need
+    /// the failure series, which a wake check or an action resets.
+    private func clearUnhealthy(_ state: ServiceState) async {
+        guard state.condition?.kind == .unhealthy else { return }
+        state.clearCondition()
+        await logStore.append(serviceID: state.id, entry: LogEntry(
+            stream: .stdout, text: "[travel-runner] \(state.definition.displayName) answers again"
+        ))
     }
 
     /// Checks the running daemons every `livenessInterval` while the app runs.
@@ -4704,26 +4775,13 @@ final class EnvironmentSupervisor {
             if state.lastProbe != outcome { state.lastProbe = outcome }
             let name = state.definition.displayName
             switch healthMonitor.record(serviceID, outcome, at: clock.date()) {
-            case .answering(recovered: true):
-                if state.condition?.kind == .unhealthy { state.clearCondition() }
-                await logStore.append(serviceID: serviceID, entry: LogEntry(
-                    stream: .stdout, text: "[travel-runner] \(name) answers again"
-                ))
-            case .answering, .failing:
+            case .answering:
+                // The series may be gone (a wake check, an action), the mark is not.
+                await clearUnhealthy(state)
+            case .failing:
                 break
             case .unhealthy(let since):
-                let headline = HealthMonitor.unhealthyHeadline(
-                    name: name, outcome: outcome, path: path, port: state.definition.probe?.port, since: since
-                )
-                let isNew = state.condition?.kind != .unhealthy
-                state.condition = ServiceCondition(
-                    kind: .unhealthy, headline: headline, detail: "It still runs. Restart it if it does not recover.",
-                    actions: [.restart, .openLog], since: since
-                )
-                if isNew {
-                    await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(headline)"))
-                    await recordDebugEvent(kind: "unhealthy", serviceID: serviceID, message: headline)
-                }
+                await markUnhealthy(state, outcome: outcome, path: path, since: since)
             case .zombie:
                 await restartUnanswering(
                     serviceID, kind: .message("\(name) answered 404 on every route — it was restarted."),
