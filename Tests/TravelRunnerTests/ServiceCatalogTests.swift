@@ -38,6 +38,22 @@ final class ServiceCatalogTests: XCTestCase {
         XCTAssertEqual(partner.probe?.port, 3006)
     }
 
+    /// The login names its port: without one, `next dev` moves to the next free port
+    /// when 3000 is taken, and a TCP probe passes against the process on 3000.
+    func testTheLoginNamesItsPortAndIsProbedAtItsFrontDoor() throws {
+        let login = try XCTUnwrap(byID["universal-login"])
+        XCTAssertEqual(login.cmd, ["npm", "run", "dev", "--", "-p", "3000"])
+        XCTAssertEqual(login.probe?.type, .http)
+        XCTAssertEqual(login.probe?.url, "http://127.0.0.1:3000/frontdoor")
+        XCTAssertEqual(login.probe?.port, 3000)
+        XCTAssertEqual(EnvironmentSupervisor.wakeHealthPaths["universal-login"], "/frontdoor")
+        // In LAN mode the host flag goes after the port, behind the one separator.
+        XCTAssertEqual(
+            EnvironmentSupervisor.lanCommand(login.cmd, ip: "10.0.0.5"),
+            ["npm", "run", "dev", "--", "-p", "3000", "--hostname", "10.0.0.5"]
+        )
+    }
+
     func testPathsWithSpacesAreAbsoluteAndOneArgument() throws {
         let contention = try XCTUnwrap(byID["capacity-contention"])
         let envFile = "--env-file=/work/TRAVEL BOOKING/fb-travel-monolith/apps/booking-portal/.env.local"

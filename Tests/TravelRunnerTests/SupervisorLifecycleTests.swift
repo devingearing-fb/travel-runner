@@ -32,10 +32,14 @@ final class SupervisorLifecycleTests: XCTestCase {
         // The port cleanup of a test kills only a process that the test started. A
         // stranger can take the free port after `freePort` lets it go.
         let ownedDirectory = workDir.lastPathComponent
+        // The ownership rules read the processes of the test: their folder is the
+        // test's folder, the folder of its services. They stop nothing.
         supervisor.portTools = PortTools(
             listeners: PortTools.live.listeners,
             kill: { pid in if Self.process(pid, runsIn: ownedDirectory) { PortTools.live.kill(pid) } },
-            killCommands: { _ in }
+            killCommands: { _ in },
+            facts: PortTools.live.facts,
+            ancestors: PortTools.live.ancestors
         )
         supervisor.onServiceCrash = { [weak self] name, code in
             self?.crashes.append((name, code))
@@ -2666,10 +2670,14 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         let calls = PortToolCalls()
         let commands = [inProfile.port: "node", outside.port: "node", container.port: "OrbStack Helper"]
+        // Each listener runs in the folder of the services: the runner's own. The
+        // system gives a folder with its links resolved.
+        let folder = PortOwner.realPath(workDir.path)
         supervisor.portTools = PortTools(
             listeners: { port in commands[port].map { [PortOwner.Listener(pid: pid_t(port), command: $0)] } ?? [] },
             kill: { calls.addKill($0) },
-            killCommands: { calls.addPattern($0) }
+            killCommands: { calls.addPattern($0) },
+            facts: { ProcessFacts(pid: $0, startTime: 1, cwd: folder) }
         )
 
         // The booking profile: the partner portal is outside it.
@@ -2768,6 +2776,261 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertFalse(lines.contains("held-start"), "the process must not start")
         XCTAssertEqual(calls.kills, [])
         XCTAssertEqual(state("held").restartCount, 0)
+    }
+
+    // MARK: - Process ownership (L2)
+
+    /// A process that the runner did not start holds the port. The start does not
+    /// kill it: the row names it, and its button stops it and starts again.
+    func testAServiceDoesNotStartOnAPortThatAStrangerHolds() async throws {
+        let held = try Self.listeningSocket()
+        XCTAssertEqual(listen(held.fd, 128), 0)
+        port = held.port
+        let socket = OwnedSocket(held.fd)
+        defer { socket.close() }
+        let calls = PortToolCalls()
+        let stopped = OrderLog()
+        let otherApp = PortOwner.realPath(NSHomeDirectory()) + "/code/other-app"
+        supervisor.portTools = PortTools(
+            listeners: { _ in socket.isOpen ? [PortOwner.Listener(pid: 4242, command: "node")] : [] },
+            kill: { calls.addKill($0) },
+            killCommands: { calls.addPattern($0) },
+            facts: { $0 == 4242 ? ProcessFacts(pid: 4242, startTime: 1, cwd: otherApp) : nil },
+            stopTree: { pid in
+                stopped.add("stop \(pid)")
+                socket.close()
+            }
+        )
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+
+        let failed = await waitUntil(30) { self.state("web").phase == .failed && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(failed, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(
+            supervisor.lastError,
+            "Port \(port) is in use by node (PID 4242, ~/code/other-app), which Travel Runner did not start. web was not started."
+        )
+        let action = try XCTUnwrap(state("web").condition?.action)
+        XCTAssertEqual(action, .stopProcessAndRetry(pid: 4242))
+        XCTAssertEqual(action.title(), "Stop PID 4242 and retry")
+        XCTAssertEqual(calls.kills, [], "a stranger is not killed without a click")
+        XCTAssertNil(state("web").pid, "the process must not start")
+
+        supervisor.perform(action, for: "web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue): \(supervisor.lastError ?? "")")
+        XCTAssertEqual(stopped.entries, ["stop 4242"])
+        XCTAssertEqual(calls.kills, [])
+    }
+
+    /// The sweeps of a start, a stop and a wake kill the runner's own listeners: a
+    /// process in a folder of the repos, or one of the ledger. A stranger stays.
+    func testTheSweepsKillOnlyTheRunnersOwnListeners() async throws {
+        let own = try Self.listeningSocket()
+        let stranger = try Self.listeningSocket()
+        let ledgered = try Self.listeningSocket()
+        defer { for socket in [own, stranger, ledgered] { close(socket.fd) } }
+        func service(_ id: String, port: Int) -> ServiceDefinition {
+            ServiceDefinition(
+                id: id, name: id, cmd: ["sleep", "1"], cwd: workDir.path,
+                probe: ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30),
+                type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+            )
+        }
+        let folder = PortOwner.realPath(workDir.path)
+        // The listener of `ledgered` runs elsewhere, but its parent (900) is in the
+        // ledger of an earlier session.
+        let cwds: [pid_t: String] = [
+            pid_t(own.port): folder + "/apps/booking-portal",
+            pid_t(stranger.port): "/Users/someone/elsewhere",
+            pid_t(ledgered.port): "/Users/someone/elsewhere",
+            900: folder,
+        ]
+        let parents: [pid_t: pid_t] = [pid_t(ledgered.port): 900, 900: 1]
+        let calls = PortToolCalls()
+        let facts: @Sendable (pid_t) -> ProcessFacts? = { pid in cwds[pid].map { ProcessFacts(pid: pid, startTime: 7, cwd: $0) } }
+        supervisor.portTools = PortTools(
+            listeners: { [PortOwner.Listener(pid: pid_t($0), command: "node")] },
+            kill: { calls.addKill($0) },
+            killCommands: { calls.addPattern($0) },
+            facts: facts,
+            ancestors: { ProcessTree.ancestors(of: $0, parents: parents) }
+        )
+        let earlier = workDir.appendingPathComponent("config/launches.json").path
+        LaunchLedger(path: earlier).record(serviceID: "universal-login", pid: 900, cwd: folder, command: ["npm", "run", "dev"], facts: facts)
+        supervisor.ledger = LaunchLedger(path: earlier)
+        try supervisor.loadServices([
+            service("travel-portal", port: own.port),
+            service("partner-portal", port: stranger.port),
+            service("universal-login", port: ledgered.port),
+        ], profile: .both)
+        let expected = [pid_t(own.port), pid_t(ledgered.port)].sorted()
+
+        await supervisor.cleanupStaleProcesses()
+        XCTAssertEqual(calls.kills.sorted(), expected)
+        let lines = await logLines("partner-portal")
+        XCTAssertTrue(lines.contains(
+            "[travel-runner] Port \(stranger.port) is in use by node (PID \(stranger.port)), which Travel Runner did not start. Not killed."
+        ), lines.joined(separator: "\n"))
+
+        calls.reset()
+        supervisor.health = .healthy
+        supervisor.stopAll()
+        let stoppedAll = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stoppedAll)
+        XCTAssertEqual(calls.kills.sorted(), expected)
+
+        calls.reset()
+        await supervisor.killWebServicePorts()
+        XCTAssertEqual(calls.kills.sorted(), expected)
+
+        // Negative control: a click on "Free port and restart" stops the stranger too.
+        calls.reset()
+        supervisor.perform(.stopForeignAndRetry(port: stranger.port), for: "partner-portal")
+        let clicked = await waitUntil(10) { calls.kills.contains(pid_t(stranger.port)) }
+        XCTAssertTrue(clicked, "\(calls.kills)")
+    }
+
+    /// At launch the runner says what the last session left running. Start stops
+    /// those processes before its checks look at the ports. A pid that went to a
+    /// new process is not stopped and is not reported.
+    func testTheLastSessionsProcessesAreReportedAndStartStopsThemFirst() async throws {
+        let order = OrderLog()
+        let shell = FakeCommandRunner { call in
+            if call.command == "node --version" {
+                order.add("preflight")
+                return FakeCommandRunner.ok("v22.3.0\n")
+            }
+            return FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        supervisor.siblingActiveServices = { [] }
+        supervisor.secretRegistryPorts = 0...0
+        let starts: [pid_t: Int64] = [777: 5, 778: 6, 779: 7]
+        let facts: @Sendable (pid_t) -> ProcessFacts? = { pid in starts[pid].map { ProcessFacts(pid: pid, startTime: $0) } }
+        let path = workDir.appendingPathComponent("config/launches.json").path
+        let earlier = LaunchLedger(path: path)
+        earlier.record(serviceID: "web", pid: 777, cwd: workDir.path, command: webServer, facts: facts)
+        earlier.record(serviceID: "worker", pid: 778, cwd: workDir.path, command: ["sleep", "60"], facts: facts)
+        // The system gave pid 779 to another process since: another start time.
+        earlier.record(serviceID: "web", pid: 779, cwd: workDir.path, command: webServer, facts: { ProcessFacts(pid: $0, startTime: 1) })
+        supervisor.ledger = LaunchLedger(path: path)
+        supervisor.portTools = PortTools(
+            listeners: { _ in [] }, kill: { _ in }, killCommands: { _ in },
+            facts: facts,
+            stopTree: { order.add("stop \($0)") }
+        )
+        let worker = ServiceDefinition(
+            id: "worker", name: "worker", cmd: ["sleep", "60"], cwd: workDir.path, probe: nil, type: .daemon,
+            restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([daemon("web", webServer), worker])
+
+        supervisor.reconcileLeftovers()
+
+        XCTAssertEqual(
+            supervisor.leftoverNotice,
+            "2 services from the last session are still running (web :\(port), worker)."
+        )
+        XCTAssertEqual(supervisor.ledger.entries.map(\.pid), [777, 778], "the reused pid is forgotten")
+
+        supervisor.startAll()
+
+        let healthy = await waitUntil(40) { self.supervisor.health == .healthy }
+        XCTAssertTrue(healthy, "health is \(supervisor.health), error: \(supervisor.lastError ?? "none")")
+        XCTAssertEqual(Array(order.entries.prefix(3)), ["stop 777", "stop 778", "preflight"])
+        XCTAssertFalse(order.entries.contains("stop 779"))
+        XCTAssertNil(supervisor.leftoverNotice)
+        XCTAssertEqual(LaunchLedger(path: path).entries.filter { [777, 778].contains($0.pid) }, [])
+        let lines = await logLines("worker")
+        XCTAssertTrue(lines.contains("[travel-runner] Stopped worker (PID 778) from the last session."), lines.joined(separator: "\n"))
+    }
+
+    /// Each launch is in the ledger, with the command of the service and no
+    /// environment, until its process ends.
+    func testTheLedgerHoldsALaunchUntilItEnds() async throws {
+        let path = workDir.appendingPathComponent("config/launches.json").path
+        supervisor.ledger = LaunchLedger(path: path)
+        let secret = "sk_test_lifecycle_\(UUID().uuidString)"
+        let web = ServiceDefinition(
+            id: "web", name: "web", cmd: webServer, cwd: workDir.path,
+            probe: ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30),
+            type: .daemon, restart: .onFailure, dependsOn: [], env: ["STRIPE_API_KEY": secret], phase: nil, reuseIfRunning: nil
+        )
+        try load(web)
+
+        supervisor.restartService("web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        let pid = try XCTUnwrap(state("web").pid)
+        let entry = try XCTUnwrap(supervisor.ledger.entries.first)
+        XCTAssertEqual(supervisor.ledger.entries.count, 1)
+        XCTAssertEqual(entry.serviceID, "web")
+        XCTAssertEqual(entry.pid, pid)
+        XCTAssertEqual(entry.command, webServer)
+        XCTAssertEqual(entry.cwd, workDir.path)
+        XCTAssertEqual(entry.startTime, ProcessTree.facts(of: pid)?.startTime)
+        XCTAssertEqual(supervisor.ledger.sessionPIDs, [pid])
+        let text = try String(contentsOfFile: path, encoding: .utf8)
+        XCTAssertFalse(text.contains(secret))
+        // The listener is the runner's own launch.
+        let occupants = await supervisor.portOccupants(port)
+        XCTAssertEqual(occupants.map(\.owner), [.ownLaunch(serviceID: "web")])
+
+        supervisor.stopAll()
+
+        let forgotten = await waitUntil(15) { self.supervisor.ledger.entries.isEmpty }
+        XCTAssertTrue(forgotten, "\(supervisor.ledger.entries)")
+        XCTAssertEqual(LaunchLedger(path: path).entries, [])
+    }
+
+    /// A `next dev` that the person started in the folder of a service: Next allows
+    /// one per folder, so the service would fail in a loop. The row says so and
+    /// offers to stop it. A `next dev` of the runner does not count.
+    func testAServiceDoesNotStartBesideAnotherNextDevInItsFolder() async throws {
+        let folder = PortOwner.realPath(workDir.path)
+        let parent = ProcessFacts(pid: 57752, startTime: 1, cwd: folder, arguments: ["node", "/x/node_modules/next/dist/bin/next", "dev"])
+        let child = ProcessFacts(pid: 57753, startTime: 2, cwd: folder, arguments: ["next-server (v16.2.6)"])
+        let own = ProcessFacts(pid: 600, startTime: 3, cwd: folder, arguments: ["next-server (v16.2.6)"])
+        let all = [parent, child, own]
+        let parents: [pid_t: pid_t] = [57753: 57752, 57752: 1, 600: 1]
+        let running = OwnedSocket(-1)
+        let stopped = OrderLog()
+        supervisor.portTools = PortTools(
+            listeners: { _ in [] }, kill: { _ in }, killCommands: { _ in },
+            facts: { pid in all.first { $0.pid == pid } },
+            ancestors: { ProcessTree.ancestors(of: $0, parents: parents) },
+            processesIn: { _ in running.isOpen ? [parent, child, own] : [own] },
+            listeningPorts: { $0 == 57752 ? [3006] : [] },
+            stopTree: { pid in
+                stopped.add("stop \(pid)")
+                running.close()
+            }
+        )
+        supervisor.ledger.record(serviceID: "other", pid: 600, cwd: folder, command: ["pnpm", "dev"], facts: { pid in all.first { $0.pid == pid } })
+        try load(daemon("web", webServer))
+
+        supervisor.restartService("web")
+
+        let failed = await waitUntil(30) { self.state("web").phase == .failed && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(failed, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(
+            supervisor.lastError,
+            "Another next dev (PID 57752, port 3006) is running in \(workDir.lastPathComponent). Next allows one dev server per folder."
+        )
+        let action = try XCTUnwrap(state("web").condition?.action)
+        XCTAssertEqual(action, .stopProcessAndRetry(pid: 57752, sameFolder: true))
+        XCTAssertEqual(action.title(), "Stop it and retry")
+        XCTAssertTrue(Self.listeners(on: port).isEmpty, "the process must not start")
+
+        supervisor.perform(action, for: "web")
+
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue): \(supervisor.lastError ?? "")")
+        XCTAssertEqual(stopped.entries, ["stop 57752"])
     }
 
     /// A socket of the test that listens on a free loopback port.
@@ -4086,6 +4349,32 @@ private final class ConfigLoads {
 }
 
 /// What the fake port tools were asked to kill.
+/// Events of a test in the order they came.
+private final class OrderLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: [String] = []
+    var entries: [String] { lock.withLock { stored } }
+    func add(_ entry: String) { lock.withLock { stored.append(entry) } }
+}
+
+/// A socket of a test that a fake tool closes, as a stop would end its process.
+/// A negative descriptor stands for a process with no socket.
+private final class OwnedSocket: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fd: Int32?
+
+    init(_ fd: Int32) { self.fd = fd }
+
+    var isOpen: Bool { lock.withLock { fd != nil } }
+
+    func close() {
+        lock.withLock {
+            if let fd, fd >= 0 { Darwin.close(fd) }
+            fd = nil
+        }
+    }
+}
+
 private final class PortToolCalls: @unchecked Sendable {
     private let lock = NSLock()
     private var killed: [pid_t] = []

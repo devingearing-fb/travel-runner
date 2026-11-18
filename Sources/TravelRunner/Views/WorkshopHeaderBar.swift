@@ -173,6 +173,16 @@ struct WorkshopHeaderBar: View {
                     onDismiss: { supervisor.dismissMisplacedCopyNotice() }
                 )
             }
+            if let notice = supervisor.leftoverNotice {
+                alertBanner(
+                    icon: "exclamationmark.triangle.fill",
+                    color: .orange,
+                    text: notice,
+                    subtitle: "Start stops them too.",
+                    action: ("Stop them", { supervisor.stopLeftoversFromBanner() }),
+                    onDismiss: { supervisor.leftoverNotice = nil }
+                )
+            }
             if let notice = supervisor.compatibilityNotice {
                 // No dismiss: it stays while the resets are blocked.
                 alertBanner(

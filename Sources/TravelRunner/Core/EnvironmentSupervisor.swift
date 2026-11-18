@@ -22,6 +22,9 @@ final class EnvironmentSupervisor {
     /// Set while the checkout needs a newer runner. No reset and no DB step runs
     /// while it is set; the services still start.
     var compatibilityNotice: Compatibility.Notice? = nil
+    /// Set at launch while processes of the last session still run, until they are
+    /// stopped or Start stops them.
+    var leftoverNotice: String? = nil
     var startupBeganAt: Date? = nil
     /// Migrations the local database has not applied (from the last check).
     var pendingMigrations: [String] = []
@@ -175,6 +178,9 @@ final class EnvironmentSupervisor {
     @ObservationIgnored var shell: any CommandRunning
     /// The port cleanup reads listeners and kills through these tools.
     @ObservationIgnored var portTools = PortTools.live
+    /// The processes that the runner started. The app gives it the file; without
+    /// one it stays in memory.
+    @ObservationIgnored var ledger = LaunchLedger(path: nil)
     /// The check that the Stripe CLI is installed and can call Stripe, with the test
     /// key or the login. Tests set it; nil runs the CLI.
     @ObservationIgnored var stripeAvailability: (@Sendable () async -> Bool)?
@@ -191,7 +197,11 @@ final class EnvironmentSupervisor {
     @ObservationIgnored var configHost = ConfigHost()
     /// The preflight checks run their commands in the shell of the supervisor and
     /// wait on its clock.
-    private var preflightRunner: PreflightRunner { PreflightRunner(shell: shell, clock: clock) }
+    private var preflightRunner: PreflightRunner {
+        PreflightRunner(shell: shell, clock: clock, inspectPort: { [weak self] port in
+            await self?.portOccupants(port) ?? []
+        })
+    }
     private var registry: LiveSecretRegistry?
     private var controlServer: ControlServer?
     private var sleepWakeObserver: SleepWakeObserver?
@@ -356,6 +366,10 @@ final class EnvironmentSupervisor {
         case folderUnset(name: String)
         /// The packages were missing and their install failed. `why` comes from `installFailure`.
         case installFailed(name: String, command: String, why: String)
+        /// A process that the runner did not start listens on the port of the service.
+        case portHeldByProcess(name: String, port: Int, occupant: PortOwner.Occupant)
+        /// A `next dev` that the runner did not start runs in the folder of the service.
+        case otherNextDev(pid: pid_t, port: Int?, folder: String)
 
         var description: String {
             switch self {
@@ -378,6 +392,10 @@ final class EnvironmentSupervisor {
                 "\(name) cannot start: no folder is set — open Settings → Reconfigure Repos"
             case .installFailed(let name, let command, let why):
                 "\(name) cannot start: its packages are not installed and \(command) \(why)"
+            case .portHeldByProcess(let name, let port, let occupant):
+                PortOwner.foreignText(port: port, occupant: occupant, service: name)
+            case .otherNextDev(let pid, let port, let folder):
+                PortOwner.otherNextDevText(pid: pid, port: port, folder: folder)
             }
         }
     }
@@ -419,6 +437,7 @@ final class EnvironmentSupervisor {
             lastError = "Config load failed: \(error)"
             print("[Supervisor] \(lastError!)")
         }
+        reconcileLeftovers()
     }
 
     /// Loads the config that Settings saved. While the stack runs it changes
@@ -677,6 +696,11 @@ final class EnvironmentSupervisor {
                 return
             }
 
+            // The processes of the last session hold the ports and the folders. They
+            // are the runner's own: stop them before the checks look at the ports.
+            await self.stopLeftovers()
+            await self.cleanupStaleProcesses()
+
             // Preflight
             if !skipPreflight {
                 self.currentPhase = .preflight
@@ -712,9 +736,6 @@ final class EnvironmentSupervisor {
                     return
                 }
             }
-
-            // Cleanup stale processes from previous sessions
-            await self.cleanupStaleProcesses()
 
             // Start registry
             self.registry = LiveSecretRegistry(secretStore: self.secretStore, portRange: self.secretRegistryPorts)
@@ -1419,7 +1440,7 @@ final class EnvironmentSupervisor {
     /// steps and the checks.
     func canPerform(_ action: RecoveryAction, for serviceID: String) -> Bool {
         switch action {
-        case .restart, .startService, .stopForeignAndRetry, .openContainerRuntime: true
+        case .restart, .startService, .stopForeignAndRetry, .stopProcessAndRetry, .openContainerRuntime: true
         case .clearCacheAndRestart: Self.cacheClearingServices.contains(serviceID)
         case .installDependencies: serviceCwd(serviceID) != nil
         case .openLog: logStore.revealTarget(for: serviceID) != nil
@@ -1441,7 +1462,14 @@ final class EnvironmentSupervisor {
             // The port can be another port of the app (the HMR port); the start
             // frees only the port of the probe.
             Task {
-                await freePort(port)
+                await freePort(port, includingForeign: true)
+                restartService(serviceID)
+            }
+        case .stopProcessAndRetry(let pid, _):
+            // The person pressed the button: the process need not be the runner's.
+            let tools = portTools
+            Task {
+                await tools.stopTree(pid)
                 restartService(serviceID)
             }
         case .clearCacheAndRestart:
@@ -1682,6 +1710,10 @@ final class EnvironmentSupervisor {
             return .cannotRun(finding)
         case .installFailed:
             return .installFailed(serviceError.description)
+        case .portHeldByProcess(_, _, let occupant):
+            return .blocked(serviceError.description, action: .stopProcessAndRetry(pid: occupant.listener.pid))
+        case .otherNextDev(let pid, _, _):
+            return .blocked(serviceError.description, action: .stopProcessAndRetry(pid: pid, sameFolder: true))
         default:
             return .message(serviceError.description)
         }
@@ -2939,16 +2971,23 @@ final class EnvironmentSupervisor {
             // new one for the port. Callers stop it first; this covers one that did not.
             await processRunner.stop(serviceID: serviceID)
 
-            // Kill any stale occupant on the port
+            // A stale process of the runner on the port is stopped. A process that
+            // the runner did not start is not: the row asks first.
             if let port = definition.probe?.port, definition.resolvedType == .daemon, isPortBound(port) {
+                if let foreign = await portOccupants(port).first(where: { $0.owner == .foreign }) {
+                    throw ServiceError.portHeldByProcess(name: definition.displayName, port: port, occupant: foreign)
+                }
                 await freePort(port)
                 // A container still has the port: the service would fail with
                 // EADDRINUSE while its TCP probe passes against the container.
                 if isPortBound(port),
-                   let owner = await portTools.listeners(port).first(where: { PortOwner.isContainerRuntime($0.command) }) {
-                    throw ServiceError.portHeldByContainer(name: definition.displayName, port: port, owner: owner.command)
+                   let owner = await portOccupants(port).first(where: { $0.owner == .containerRuntime }) {
+                    throw ServiceError.portHeldByContainer(
+                        name: definition.displayName, port: port, owner: owner.listener.command
+                    )
                 }
             }
+            try await checkOtherNextDev(definition)
         }
 
         // A Node service without its packages cannot run: install them first, in its
@@ -3069,11 +3108,13 @@ final class EnvironmentSupervisor {
                     }
                 }
             },
-            onTermination: { [weak self] termination in
+            onTermination: { [weak self, ledger = self.ledger] termination in
+                ledger.remove(pids: [termination.pid])
                 Task { @MainActor in self?.handleTermination(serviceID: sid, termination: termination) }
             }
         )
 
+        recordLaunch(sid, pid: pid, definition: definition)
         state.pid = pid
         await logStore.markStart(serviceID: sid, name: definition.displayName, pid: pid)
         return ServiceLaunch(
@@ -4392,6 +4433,8 @@ final class EnvironmentSupervisor {
 
     private func isPortBound(_ port: Int) -> Bool {
         if isPortBoundOnAddress(port, address: UInt32(INADDR_LOOPBACK).bigEndian) { return true }
+        // Node binds `localhost` to ::1 only: an IPv4 connect does not see it.
+        if isPortBoundOnIPv6Loopback(port) { return true }
         if let ip = localIP {
             var lanAddr = in_addr()
             if inet_pton(AF_INET, ip, &lanAddr) == 1 {
@@ -4399,6 +4442,23 @@ final class EnvironmentSupervisor {
             }
         }
         return false
+    }
+
+    private func isPortBoundOnIPv6Loopback(_ port: Int) -> Bool {
+        guard let portNumber = UInt16(exactly: port) else { return false }
+        let sock = Darwin.socket(AF_INET6, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+        defer { Darwin.close(sock) }
+        var addr = sockaddr_in6()
+        addr.sin6_family = sa_family_t(AF_INET6)
+        addr.sin6_port = portNumber.bigEndian
+        addr.sin6_addr = in6addr_loopback
+        let result = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+            }
+        }
+        return result == 0
     }
 
     private func isPortBoundOnAddress(_ port: Int, address: UInt32) -> Bool {
@@ -4423,9 +4483,10 @@ final class EnvironmentSupervisor {
 
     /// Kills the listeners of the port and waits up to five seconds for it to free.
     /// The port frees only when a listener was killed. With none killed (a container
-    /// holds it) there is nothing to wait for.
-    private func freePort(_ port: Int) async {
-        guard await killPortOccupants(port) else { return }
+    /// holds it) there is nothing to wait for. `includingForeign` is for a button
+    /// that the person pressed.
+    private func freePort(_ port: Int, includingForeign: Bool = false) async {
+        guard await killPortOccupants(port, includingForeign: includingForeign) else { return }
         for _ in 0..<10 {
             try? await clock.sleep(for: .milliseconds(500))
             if !isPortBound(port) { break }
@@ -4436,24 +4497,145 @@ final class EnvironmentSupervisor {
     /// the clients of the port (a browser tab, the Stripe CLI that forwards to the
     /// portal, another dev server), and those must stay alive.
     /// A container runtime is never killed: its port helper serves every container.
+    /// A process that the runner did not start is killed only with `includingForeign`.
     /// True when it killed a listener.
     @discardableResult
-    private func killPortOccupants(_ port: Int) async -> Bool {
+    private func killPortOccupants(_ port: Int, includingForeign: Bool = false) async -> Bool {
         var killed = false
-        for listener in await portTools.listeners(port) {
-            if PortOwner.isContainerRuntime(listener.command) {
-                if let serviceID = sortedServiceIDs.first(where: { serviceStates[$0]?.definition.probe?.port == port }) {
-                    await logStore.append(
-                        serviceID: serviceID,
-                        entry: LogEntry(stream: .stderr, text: "[travel-runner] Port \(port) is published by \(listener.command) (a container). Not killed.")
-                    )
-                }
+        for occupant in await portOccupants(port) {
+            let listener = occupant.listener
+            switch occupant.owner {
+            case .containerRuntime:
+                await logPortLine(port, "Port \(port) is published by \(listener.command) (a container). Not killed.")
                 continue
+            case .foreign where !includingForeign:
+                await logPortLine(
+                    port, "Port \(port) is in use by \(listener.command) (PID \(listener.pid)), which \(Flavor.current.displayName) did not start. Not killed."
+                )
+                continue
+            case .ownLaunch, .ownLeftover, .foreign:
+                break
             }
             portTools.kill(listener.pid)
             killed = true
         }
         return killed
+    }
+
+    /// A line in the log of the service of the port.
+    private func logPortLine(_ port: Int, _ text: String) async {
+        guard let serviceID = sortedServiceIDs.first(where: { serviceStates[$0]?.definition.probe?.port == port }) else { return }
+        await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(text)"))
+    }
+
+    // MARK: - Process ownership
+
+    /// What the ownership rules know now: the live ledger entries, and the folders
+    /// of the services (decision 15).
+    private func ownershipKnowledge() -> PortOwner.Knowledge {
+        let tools = portTools
+        return PortOwner.Knowledge(
+            ledger: ledger.live(facts: tools.facts),
+            sessionPIDs: ledger.sessionPIDs,
+            roots: PortOwner.roots(serviceStates.values.compactMap { $0.definition.resolvedCwd }),
+            facts: tools.facts,
+            ancestors: tools.ancestors
+        )
+    }
+
+    /// Who listens on the port. Empty: the port is free.
+    func portOccupants(_ port: Int) async -> [PortOwner.Occupant] {
+        let listeners = await portTools.listeners(port)
+        return PortOwner.classify(listeners, ownershipKnowledge())
+    }
+
+    /// Records a process that this run started.
+    private func recordLaunch(_ serviceID: String, pid: pid_t, definition: ServiceDefinition) {
+        // The command of the service, never its environment.
+        ledger.record(
+            serviceID: serviceID, pid: pid, cwd: definition.resolvedCwd, command: definition.cmd, facts: portTools.facts
+        )
+    }
+
+    /// At launch, also after a relaunch for an update: the processes of the last
+    /// session that still run. The ledger forgets the ones that are gone.
+    func reconcileLeftovers() {
+        let facts = portTools.facts
+        ledger.prune(facts: facts)
+        leftoverNotice = Self.leftoverText(ledger.leftovers(facts: facts).map(\.serviceID), states: serviceStates)
+    }
+
+    /// "3 services from the last session are still running (Travel Portal :3002, …)."
+    static func leftoverText(_ serviceIDs: [String], states: [String: ServiceState]) -> String? {
+        var ids: [String] = []
+        for id in serviceIDs where !ids.contains(id) { ids.append(id) }
+        guard !ids.isEmpty else { return nil }
+        let names = ids.map { id -> String in
+            let definition = states[id]?.definition
+            let name = definition?.displayName ?? id
+            return definition?.probe?.port.map { "\(name) :\($0)" } ?? name
+        }
+        let one = ids.count == 1
+        return "\(ids.count) service\(one ? "" : "s") from the last session \(one ? "is" : "are") still running (\(names.joined(separator: ", ")))."
+    }
+
+    /// Stops the processes of the last session with their children. Start does it
+    /// first, without asking: they are the runner's own.
+    func stopLeftovers() async {
+        let leftovers = ledger.leftovers(facts: portTools.facts)
+        for entry in leftovers {
+            await portTools.stopTree(entry.pid)
+            let name = serviceStates[entry.serviceID]?.definition.displayName ?? entry.serviceID
+            await logStore.append(serviceID: entry.serviceID, entry: LogEntry(
+                stream: .stdout, text: "[travel-runner] Stopped \(name) (PID \(entry.pid)) from the last session."
+            ))
+        }
+        ledger.remove(pids: leftovers.map(\.pid))
+        leftoverNotice = nil
+    }
+
+    /// The "Stop them" button of the banner.
+    func stopLeftoversFromBanner() {
+        Task {
+            await stopLeftovers()
+            onActionFeedback?("Stopped the services of the last session", true)
+        }
+    }
+
+    /// The processes that the quit stops: each live ledger entry with its children.
+    /// The tree is read before the first signal.
+    func ledgerTreesForQuit() -> [pid_t] {
+        ledger.live(facts: portTools.facts).flatMap { ProcessTree.tree(of: $0.pid) }
+    }
+
+    /// The listeners of the ports that the runner owns, for the quit. A process of
+    /// a stranger and a container runtime stay alive.
+    func ownListenersNow(on ports: [Int]) -> [pid_t] {
+        let knowledge = ownershipKnowledge()
+        return ports.flatMap { port in
+            PortOwner.classify(PortOwner.listenersNow(on: port), knowledge)
+                .filter { $0.owner.isOwn }.map(\.listener.pid)
+        }
+    }
+
+    /// The quit stopped the processes of the ledger: the next launch has nothing to report.
+    func forgetLaunches() {
+        ledger.remove(pids: ledger.entries.map(\.pid))
+    }
+
+    /// A `next dev` of the person in the folder of the service. Next allows one dev
+    /// server per folder, so the start would fail in a loop. The runner's own (in
+    /// the ledger) do not count: the port cleanup and Start stop those.
+    private func checkOtherNextDev(_ definition: ServiceDefinition) async throws {
+        guard definition.resolvedType == .daemon, let cwd = definition.resolvedCwd, !cwd.isEmpty else { return }
+        let tools = portTools
+        let processes = await Task.detached { tools.processesIn(cwd) }.value
+        guard !processes.isEmpty else { return }
+        let knowledge = ownershipKnowledge()
+        guard let other = PortOwner.otherNextDevs(processes, knowledge).first else { return }
+        let port = await tools.listeningPorts(other.pid).first
+        let folder = PortOwner.folderName(cwd, roots: knowledge.roots)
+        throw ServiceError.otherNextDev(pid: other.pid, port: port, folder: folder)
     }
 
     /// Services whose port the cleanup may clear: in the profile, and not a

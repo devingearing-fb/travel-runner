@@ -42,6 +42,10 @@ enum RecoveryAction: Equatable, Hashable, Sendable {
     /// Stop the processes that listen on `port` (the port of the EADDRINUSE line),
     /// then start again. With no port, the start frees the port of the probe.
     case stopForeignAndRetry(port: Int?)
+    /// Stop this process and its children, then start again. The runner did not
+    /// start it, so only a button does this. `sameFolder`: a `next dev` in the
+    /// folder of the service, not on its port.
+    case stopProcessAndRetry(pid: Int32, sameFolder: Bool = false)
     case openContainerRuntime
     case installDependencies
     case clearCacheAndRestart
@@ -62,6 +66,7 @@ enum RecoveryAction: Equatable, Hashable, Sendable {
         case .restart: "Restart"
         case .startService: "Start"
         case .stopForeignAndRetry: "Free port and restart"
+        case .stopProcessAndRetry(let pid, let sameFolder): sameFolder ? "Stop it and retry" : "Stop PID \(pid) and retry"
         case .openContainerRuntime: "Open \(runtime)"
         case .installDependencies: "Install dependencies"
         case .clearCacheAndRestart: "Clear cache and restart"

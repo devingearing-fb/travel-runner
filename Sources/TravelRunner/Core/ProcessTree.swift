@@ -78,6 +78,97 @@ enum ProcessTree {
         }
     }
 
+    /// The parents of `pid`, nearest first, up to launchd.
+    static func ancestors(of pid: pid_t) -> [pid_t] {
+        ancestors(of: pid, parents: parentTable())
+    }
+
+    /// The same walk over a given table of pid to parent pid.
+    static func ancestors(of pid: pid_t, parents: [pid_t: pid_t]) -> [pid_t] {
+        var result: [pid_t] = []
+        var seen: Set<pid_t> = [pid]
+        var current = pid
+        while let parent = parents[current], parent > 0, seen.insert(parent).inserted {
+            result.append(parent)
+            current = parent
+        }
+        return result
+    }
+
+    /// What the system says about one process. Nil when it has no such process,
+    /// or does not show it to this user.
+    static func facts(of pid: pid_t) -> ProcessFacts? {
+        guard let startTime = startTime(of: pid) else { return nil }
+        return ProcessFacts(pid: pid, startTime: startTime, cwd: cwd(of: pid), arguments: arguments(of: pid))
+    }
+
+    /// The processes of this user whose working directory is `folder`.
+    static func processes(in folder: String) -> [ProcessFacts] {
+        let count = proc_listpids(UInt32(PROC_UID_ONLY), UInt32(getuid()), nil, 0)
+        guard count > 0 else { return [] }
+        // New processes can start between the two calls.
+        var pids = [pid_t](repeating: 0, count: Int(count) / MemoryLayout<pid_t>.stride + 32)
+        let bytes = proc_listpids(
+            UInt32(PROC_UID_ONLY), UInt32(getuid()), &pids, Int32(pids.count * MemoryLayout<pid_t>.stride)
+        )
+        guard bytes > 0 else { return [] }
+        let folder = PortOwner.realPath(folder)
+        return pids.prefix(Int(bytes) / MemoryLayout<pid_t>.stride)
+            .filter { $0 > 0 && cwd(of: $0) == folder }
+            .compactMap { facts(of: $0) }
+    }
+
+    /// The start of the process in microseconds since 1970.
+    private static func startTime(of pid: pid_t) -> Int64? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&name, UInt32(name.count), &info, &size, nil, 0) == 0, size > 0,
+              info.kp_proc.p_pid == pid else { return nil }
+        let start = info.kp_proc.p_un.__p_starttime
+        return Int64(start.tv_sec) * 1_000_000 + Int64(start.tv_usec)
+    }
+
+    private static func cwd(of pid: pid_t) -> String? {
+        var info = proc_vnodepathinfo()
+        let size = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, size) == size else { return nil }
+        let path = withUnsafePointer(to: &info.pvi_cdir.vip_path) {
+            $0.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) { String(cString: $0) }
+        }
+        return path.isEmpty ? nil : path
+    }
+
+    /// The arguments of the process, from `KERN_PROCARGS2`. A process can change
+    /// them (`next-server` does). Empty when the system does not give them.
+    private static func arguments(of pid: pid_t) -> [String] {
+        var name: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&name, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return [] }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&name, 3, &buffer, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return [] }
+        return parseArguments(Array(buffer.prefix(size)))
+    }
+
+    /// Reads a `KERN_PROCARGS2` buffer: the argument count, the path of the
+    /// executable, padding, then the arguments, each ended by a zero byte.
+    static func parseArguments(_ buffer: [UInt8]) -> [String] {
+        guard buffer.count > 4 else { return [] }
+        let argc = buffer.prefix(4).withUnsafeBytes { Int($0.loadUnaligned(as: Int32.self)) }
+        var index = 4
+        // The executable path, then the zero bytes after it.
+        while index < buffer.count, buffer[index] != 0 { index += 1 }
+        while index < buffer.count, buffer[index] == 0 { index += 1 }
+        var arguments: [String] = []
+        while arguments.count < argc, index < buffer.count {
+            let start = index
+            while index < buffer.count, buffer[index] != 0 { index += 1 }
+            arguments.append(String(decoding: buffer[start..<index], as: UTF8.self))
+            index += 1
+        }
+        return arguments
+    }
+
     /// The parent of each process. Empty when the system does not give the table.
     private static func parentTable() -> [pid_t: pid_t] {
         var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_ALL]

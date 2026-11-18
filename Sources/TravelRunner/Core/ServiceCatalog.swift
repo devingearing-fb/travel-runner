@@ -141,8 +141,12 @@ enum ServiceCatalog {
             service("supabase", "Supabase", ["pnpm", "db:start"], cwd: monorepo,
                     probe: tcp(54322, timeout: 300), restart: .onFailure, phase: "ground",
                     env: BackendBaseline.noPromptEnvironment, reuse: true),
-            service("universal-login", "Universal Login", ["npm", "run", "dev"], cwd: login,
-                    probe: tcp(3000), restart: .onFailure, phase: "gateway", dependsOn: ["supabase"]),
+            // An explicit port: without one, `next dev` takes the next free port when
+            // 3000 is taken, and the probe passes against the process on 3000. The app
+            // lives at /frontdoor; / answers 404.
+            service("universal-login", "Universal Login", ["npm", "run", "dev", "--", "-p", "3000"], cwd: login,
+                    probe: http("http://127.0.0.1:3000/frontdoor", port: 3000, timeout: 120),
+                    restart: .onFailure, phase: "gateway", dependsOn: ["supabase"]),
             service("stripe", "Stripe CLI",
                     StripeLauncher.command,
                     probe: ProbeConfig(type: .stdoutRegex, port: nil, host: nil, url: nil,
