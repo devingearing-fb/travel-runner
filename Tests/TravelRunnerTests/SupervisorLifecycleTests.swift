@@ -5945,11 +5945,15 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// Decision 21: `/api/debug/issues` keeps its array, which is empty both when
     /// capture is off and when no issue is open. `/api/debug/status` tells them apart.
     func testTheDebugStatusTellsCaptureOffFromNoIssues() async throws {
+        let issues = workDir.appendingPathComponent("issues").path
         supervisor.debugTracker = nil
+        supervisor.makeIssueTracker = { DebugTracker(baseDir: issues) }
         var json = await supervisor.debugStatusJSON()
         var status = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
         XCTAssertEqual(status["enabled"] as? Bool, false)
         XCTAssertEqual(status["open_issues"] as? Int, 0)
+        // The folder is there also while capture is off.
+        XCTAssertEqual(status["folder"] as? String, DiagnosticsSnapshot.tilde(issues, home: NSHomeDirectory()))
 
         let tracker = captureIssues()
         // One open issue is one folder in `open/`.

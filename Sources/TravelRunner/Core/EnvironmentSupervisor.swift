@@ -1501,15 +1501,12 @@ final class EnvironmentSupervisor {
     /// open, and the issue folder. `/api/debug/issues` stays an array, which is
     /// also empty while capture is off: this route tells the two apart.
     func debugStatusJSON() async -> String {
-        let tracker = debugTracker ?? issueTracker
-        var dict: [String: Any] = [
+        let folder = await currentIssueTracker().folderPath
+        return Self.jsonString([
             "enabled": debugTracker != nil,
             "open_issues": await debugTracker?.openIssueCount() ?? 0,
-        ]
-        if let folder = await tracker?.folderPath {
-            dict["folder"] = DiagnosticsSnapshot.tilde(folder, home: NSHomeDirectory())
-        }
-        return Self.jsonString(dict)
+            "folder": DiagnosticsSnapshot.tilde(folder, home: NSHomeDirectory()),
+        ])
     }
 
     /// The log ids: each service, then each id with lines in the store (DB steps).
@@ -1532,7 +1529,7 @@ final class EnvironmentSupervisor {
         let rows = entries.map {
             ["stream": $0.stream == .stdout ? "stdout" : "stderr", "text": redactor.redact($0.text)]
         }
-        guard let data = try? JSONSerialization.data(withJSONObject: rows, options: []) else { return .json("[]") }
+        guard let data = try? JSONSerialization.data(withJSONObject: rows, options: [.sortedKeys]) else { return .json("[]") }
         return .json(String(decoding: data, as: UTF8.self))
     }
 
@@ -3250,7 +3247,7 @@ final class EnvironmentSupervisor {
 
     /// DB setups that wait for a start, a stop or another operation.
     private(set) var dbSetupsWaiting = 0
-    nonisolated static let dbSetupAlreadyWaitsText = "A database setup already waits for the running start or step."
+    nonisolated static let dbSetupAlreadyWaitsText = "A database setup already waits for the running start or step. Wait for it to run, or POST /api/stop-all to drop it."
 
     /// What became of a DB setup that a person asked for.
     enum DbSetupQueueOutcome: Equatable, Sendable {
