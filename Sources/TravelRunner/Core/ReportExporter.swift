@@ -66,7 +66,7 @@ struct ReportExporter: Sendable {
             case .zipFailed(let reason):
                 "the zip could not be made (\(reason)). Press Report again. If it fails again, use Copy Diagnostics Bundle under Diagnostics and paste that in Slack."
             case .notPermitted:
-                "Travel Runner may not save to Downloads. Allow it in System Settings > Privacy & Security > Files and Folders, then press Report again."
+                ReportExporter.notPermittedMessage()
             }
         }
     }
@@ -76,7 +76,14 @@ struct ReportExporter: Sendable {
     /// The toast after a report was saved.
     static let savedMessage = "Report saved to Downloads and summary copied. Attach the zip in Slack for Devin."
     /// The toast after a report was saved outside Downloads.
-    static let fallbackSavedMessage = "Travel Runner may not save to Downloads, so the report is in Application Support (shown in Finder). Summary copied. Attach the zip in Slack for Devin."
+    static var fallbackSavedMessage: String { fallbackSavedMessage() }
+    static func fallbackSavedMessage(appName: String = Flavor.current.displayName) -> String {
+        "\(appName) may not save to Downloads, so the report is in Application Support (shown in Finder). Summary copied. Attach the zip in Slack for Devin."
+    }
+    /// The error when no folder worked. It names the app as Files and Folders lists it.
+    static func notPermittedMessage(appName: String = Flavor.current.displayName) -> String {
+        "\(appName) may not save to Downloads. Allow it in System Settings > Privacy & Security > Files and Folders, then press Report again."
+    }
     /// The sheet before the first report.
     static let privacyNotice = "This report contains logs from your local services. Secrets are masked. Review the folder before sharing."
 

@@ -21,12 +21,13 @@ final class DbSetupRunnerTests: XCTestCase {
     private static let plainShell = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
 
     private func runner(
-        shell: FakeCommandRunner = FakeCommandRunner(), clock: RunnerClock = .awake
+        shell: FakeCommandRunner = FakeCommandRunner(), clock: RunnerClock = .awake,
+        killGrace: Duration = ProcessTree.defaultGrace
     ) -> DbSetupRunner {
         DbSetupRunner(
             portalCwd: cwd.path, logStore: LogStore(), seedScenarioID: "standard", profile: "reset",
             tools: ToolEnvironment(home: cwd.appendingPathComponent("home").path), shell: shell,
-            launcher: Self.plainShell, clock: clock
+            launcher: Self.plainShell, clock: clock, killGrace: killGrace
         )
     }
 
@@ -53,7 +54,8 @@ final class DbSetupRunnerTests: XCTestCase {
             }
             try await Task.sleep(for: .milliseconds(20))
         }
-        throw XCTSkip("the step did not start its child in time")
+        // A step that never starts is a failure, not a skip.
+        return try XCTUnwrap(nil as pid_t?, "the step did not start its child in time")
     }
 
     private func isAlive(_ pid: pid_t) -> Bool {
@@ -61,8 +63,11 @@ final class DbSetupRunnerTests: XCTestCase {
     }
 
     /// Ends a child that a failed test left, so no test leaves a process behind.
+    /// Only a process in the test's folder: the pid may belong to another process by now.
     private func reap(_ pid: pid_t) {
-        if isAlive(pid) { kill(pid, SIGKILL) }
+        if isAlive(pid), SupervisorLifecycleTests.process(pid, runsIn: cwd.lastPathComponent) {
+            kill(pid, SIGKILL)
+        }
     }
 
     // MARK: - Whole-tree stop and the cancelled state
@@ -219,8 +224,9 @@ final class DbSetupRunnerTests: XCTestCase {
     }
 
     /// A child that ignores SIGTERM keeps the pipe open after the root has died.
-    /// The SIGKILL comes two seconds after the SIGTERM.
+    /// The tests give the stop a long wait before SIGKILL and end the child themselves.
     private var parentWithTermIgnoringChild: String { "(trap '' TERM; exec sleep 60) & echo $! > child; wait" }
+    private static let longKillGrace: Duration = .seconds(30)
 
     /// Waits until the root of the step is gone, then past the pipe grace.
     private func waitPastTheRootAndTheGrace(_ root: pid_t) async throws {
@@ -232,7 +238,7 @@ final class DbSetupRunnerTests: XCTestCase {
     /// The step ends only when its stop has ended the whole tree, so the DB
     /// controls do not unlock while a child of the step still runs.
     func testACancelEndsTheStepOnlyWhenAChildThatHandlesSigtermIsGone() async throws {
-        let runner = runner()
+        let runner = runner(killGrace: Self.longKillGrace)
         let step = makeStep(parentWithTermIgnoringChild)
         let run = Task { await runner.executeStepPublic(step) }
         let child = try await childPid()
@@ -246,6 +252,7 @@ final class DbSetupRunnerTests: XCTestCase {
         XCTAssertTrue(isAlive(child), "the child did not outlive SIGTERM")
         XCTAssertEqual(step.status, .running, "the step ended before its tree")
 
+        reap(child)
         await cancel.value
         XCTAssertFalse(isAlive(child))
         let passed = await run.value
@@ -257,7 +264,7 @@ final class DbSetupRunnerTests: XCTestCase {
     /// The same for a stop that the watchdog starts.
     func testATimedOutStepEndsOnlyWhenAChildThatHandlesSigtermIsGone() async throws {
         let gate = Gate()
-        let runner = runner(clock: heldClock(gate))
+        let runner = runner(clock: heldClock(gate), killGrace: Self.longKillGrace)
         let step = makeStep(parentWithTermIgnoringChild, id: "verify-data", timeoutSeconds: 2)
         let run = Task { await runner.executeStepPublic(step) }
         let child = try await childPid()
@@ -270,6 +277,7 @@ final class DbSetupRunnerTests: XCTestCase {
         XCTAssertTrue(isAlive(child), "the child did not outlive SIGTERM")
         XCTAssertEqual(step.status, .running, "the step ended before its tree")
 
+        reap(child)
         let passed = await run.value
         XCTAssertFalse(passed)
         XCTAssertEqual(step.status, .timedOut)
@@ -303,11 +311,10 @@ final class DbSetupRunnerTests: XCTestCase {
         }
         XCTAssertEqual(cap("start-supabase", 300), 900)
         XCTAssertEqual(cap("reset-database", 180), 900)
-        XCTAssertEqual(cap("load-hotels", 600), 900)
+        XCTAssertEqual(cap("load-hotels", 600), 2700, "a load may download the dump again first")
         XCTAssertEqual(cap("fetch-hotels", 1200), 1800)
         XCTAssertEqual(cap("verify-data", 30), 30, "a step with no hard cap keeps the manifest's limit")
-        XCTAssertEqual(cap("load-hotels", 3600), 3600)
-    }
+        XCTAssertEqual(cap("load-hotels", 3600), 3600)    }
 
     func testTheManifestGivesTheIdleLimit() throws {
         let manifest = cwd.appendingPathComponent("manifest.json")

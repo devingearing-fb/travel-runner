@@ -36,10 +36,13 @@ enum ProcessTree {
         kill(pid, 0) == 0 || errno == EPERM
     }
 
+    /// The wait between SIGTERM and SIGKILL of a stop.
+    static let defaultGrace: Duration = .seconds(2)
+
     /// Sends SIGTERM, then SIGKILL to what is still alive after `grace`. It returns
     /// when the processes are gone, so the caller can start them again. A cancelled
     /// task does not cut the wait short: a stop must finish.
-    static func terminate(_ pids: [pid_t], grace: Duration = .seconds(2)) async {
+    static func terminate(_ pids: [pid_t], grace: Duration = defaultGrace) async {
         guard !pids.isEmpty else { return }
         for pid in pids { kill(pid, SIGTERM) }
         if await waitUntilGone(pids, timeout: grace) { return }

@@ -159,6 +159,24 @@ enum UpdatePolicy {
             && !state.fixRunning && !state.reconfigureRunning && !state.otherWorkRunning
     }
 
+    /// What the quit does besides stopping the runner's own processes.
+    struct QuitCleanup: Equatable, Sendable {
+        /// Point the apps' env files back at local Supabase.
+        var resetsEnv: Bool
+        /// Kill what still listens on the stack's ports.
+        var sweepsPorts: Bool
+    }
+
+    /// A quit the person asks for cleans up the stack's env files and ports. The idle
+    /// restart for an update found the runner holding no process, so whatever listens
+    /// on a stack port then is someone else's (a `pnpm dev` run by hand), and the env
+    /// files hold their choice: it leaves both alone. While the other runner app runs
+    /// a stack, the env files and the ports are its.
+    static func quitCleanup(unattendedUpdate: Bool, siblingRunsStack: Bool) -> QuitCleanup {
+        let cleans = !unattendedUpdate && !siblingRunsStack
+        return QuitCleanup(resetsEnv: cleans, sweepsPorts: cleans)
+    }
+
     /// The idle restart needs a downloaded update and Sparkle's handler that installs it.
     static func canInstallUnattended(_ pending: PendingUpdate?, hasInstallHandler: Bool) -> Bool {
         guard case .ready = pending else { return false }

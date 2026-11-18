@@ -169,6 +169,8 @@ actor DbSetupRunner {
     private let launcher: StepLauncher
     /// The clock of the step limits. It stops while the Mac sleeps.
     private let clock: RunnerClock
+    /// How long a stop waits after SIGTERM before it sends SIGKILL.
+    private let killGrace: Duration
 
     /// A health check that hangs fails after this time.
     static let healthCheckTimeout: Duration = .seconds(30)
@@ -178,7 +180,8 @@ actor DbSetupRunner {
     init(
         portalCwd: String, logStore: LogStore, seedScenarioID: String, profile: String? = nil,
         tools: ToolEnvironment = .shared, shell: (any CommandRunning)? = nil,
-        launcher: StepLauncher = .loginShell, clock: RunnerClock = .awake
+        launcher: StepLauncher = .loginShell, clock: RunnerClock = .awake,
+        killGrace: Duration = ProcessTree.defaultGrace
     ) {
         self.portalCwd = portalCwd
         self.logStore = logStore
@@ -188,6 +191,7 @@ actor DbSetupRunner {
         self.shell = shell ?? LoginShell(tools: tools)
         self.launcher = launcher
         self.clock = clock
+        self.killGrace = killGrace
     }
 
     /// The pid of the step process that runs now, or nil. The app stops its tree
@@ -296,7 +300,7 @@ actor DbSetupRunner {
         } else if let pid = running.pid {
             runningOutput?.hold()
             let tree = ProcessTree.tree(of: pid)
-            let stop = Task.detached { await ProcessTree.terminate(tree) }
+            let stop = Task.detached { [killGrace] in await ProcessTree.terminate(tree, grace: killGrace) }
             self.stop = stop
             await stop.value
         }
@@ -480,9 +484,11 @@ actor DbSetupRunner {
         let logStore = self.logStore
         let consumer = Task.detached { await Self.record(lines, step: step, logStore: logStore) }
         let (idle, cap) = (step.idleTimeoutSeconds, step.hardCapSeconds)
+        let killGrace = self.killGrace
         let watchdog = Task.detached {
             await Self.watch(
-                pid: pid, watch: watch, output: reader, idleSeconds: idle, capSeconds: cap, clock: clock
+                pid: pid, watch: watch, output: reader, idleSeconds: idle, capSeconds: cap, clock: clock,
+                killGrace: killGrace
             )
         }
 
@@ -507,7 +513,7 @@ actor DbSetupRunner {
     /// runs to its end.
     private static func watch(
         pid: pid_t, watch: StepWatch, output: PipeLineReader, idleSeconds: Int, capSeconds: Int,
-        clock: RunnerClock
+        clock: RunnerClock, killGrace: Duration
     ) async {
         while true {
             do { try await clock.wait(watchInterval) } catch { return }
@@ -517,7 +523,7 @@ actor DbSetupRunner {
             ) else { continue }
             watch.timeout = timeout
             output.hold()
-            await ProcessTree.terminate(ProcessTree.tree(of: pid))
+            await ProcessTree.terminate(ProcessTree.tree(of: pid), grace: killGrace)
             return
         }
     }

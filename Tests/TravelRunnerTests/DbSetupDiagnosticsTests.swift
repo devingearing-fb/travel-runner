@@ -98,6 +98,25 @@ final class DbSetupDiagnosticsTests: XCTestCase {
         XCTAssertEqual(unknown.guidance, DbSetupDiagnostics.retryGuidance)
     }
 
+    /// Review of D5: `pnpm db:stop` keeps the data volume, so a stop and start is no
+    /// clean slate. The guidance names the real next steps, and each ends in a retry.
+    func testTheMigrationAndPortGuidanceNamesWhatHelps() {
+        let exists = DbSetupDiagnostics.diagnose(
+            stepID: "reset-database",
+            output: ["Applying migration 0150_blocks.sql...", "ERROR: relation \"blocks\" already exists"],
+            exitCode: 1, scriptMessage: nil
+        )
+        XCTAssertEqual(exists.message, "Migration 0150_blocks.sql: object already exists")
+        XCTAssertFalse(exists.guidance.contains("clean slate"), exists.guidance)
+        XCTAssertTrue(exists.guidance.contains("pnpm db:stop -- --no-backup"), exists.guidance)
+
+        let port = DbSetupDiagnostics.diagnose(
+            stepID: "start-supabase", output: ["Error: port 54322 already in use"], exitCode: 1, scriptMessage: nil
+        )
+        XCTAssertEqual(port.message, "Port already in use")
+        XCTAssertTrue(port.guidance.hasSuffix("then retry the step."), port.guidance)
+    }
+
     func testTheRulesOfOneStepAndOfEveryStep() {
         let migration = DbSetupDiagnostics.diagnose(
             stepID: "reset-database",

@@ -201,6 +201,26 @@ final class UpdatePolicyTests: XCTestCase {
         }
     }
 
+    /// Review of T5: the idle restart quits the app, and a quit killed whatever
+    /// listened on a stack port and rewrote the env files. A `pnpm dev` run by hand
+    /// after Stop died with no warning. The unattended quit now does neither.
+    func testAnUnattendedQuitSweepsNoPortAndLeavesTheEnvFiles() {
+        XCTAssertEqual(
+            UpdatePolicy.quitCleanup(unattendedUpdate: true, siblingRunsStack: false),
+            UpdatePolicy.QuitCleanup(resetsEnv: false, sweepsPorts: false)
+        )
+        // Negative control: a quit the person asks for still cleans up.
+        XCTAssertEqual(
+            UpdatePolicy.quitCleanup(unattendedUpdate: false, siblingRunsStack: false),
+            UpdatePolicy.QuitCleanup(resetsEnv: true, sweepsPorts: true)
+        )
+        // The other runner app's stack is never touched.
+        XCTAssertEqual(
+            UpdatePolicy.quitCleanup(unattendedUpdate: false, siblingRunsStack: true),
+            UpdatePolicy.QuitCleanup(resetsEnv: false, sweepsPorts: false)
+        )
+    }
+
     /// The idle restart needs a downloaded update and Sparkle's install handler.
     func testOnlyADownloadedUpdateWithAHandlerInstallsByItself() {
         XCTAssertTrue(UpdatePolicy.canInstallUnattended(.ready(version: "0.13.7"), hasInstallHandler: true))

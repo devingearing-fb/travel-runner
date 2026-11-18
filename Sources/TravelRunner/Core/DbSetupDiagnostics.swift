@@ -131,14 +131,14 @@ enum DbSetupDiagnostics {
         Rule(steps: ["reset-database"], migration: ["already exists"]) { failure in
             Diagnosis(
                 message: "Migration \(migrationFile(failure)): object already exists",
-                guidance: "Run pnpm db:stop && pnpm db:start at the monorepo root for a clean slate, then retry.",
+                guidance: "A migration creates an object that an earlier one already made. Pull the latest monorepo and fb-amateur-backend, then retry. If it fails again, run pnpm db:stop -- --no-backup at the monorepo root (it deletes the local data), then run all steps.",
                 action: .retryFromStep
             )
         },
         Rule(steps: ["start-supabase"], all: ["port", "already in use"]) { _ in
             Diagnosis(
                 message: "Port already in use",
-                guidance: "Another Supabase instance may be running. Stop it (old checkouts: npx supabase stop; monorepo: pnpm db:stop) first.",
+                guidance: "Another Supabase instance may be running. Stop it (old checkouts: npx supabase stop; monorepo: pnpm db:stop), then retry the step.",
                 action: .retryFromStep
             )
         },

@@ -22,6 +22,9 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
     @ObservationIgnored var restartState: (@MainActor () async -> UpdatePolicy.RestartState)?
     /// The same state read at once, right before the install. Without it the app never restarts by itself.
     @ObservationIgnored var restartStateNow: (@MainActor () -> UpdatePolicy.RestartState)?
+    /// True from the idle restart's install until the app quits, or the install fails.
+    /// The quit then leaves the env files and the stack's ports alone.
+    @ObservationIgnored private(set) var quitsForUnattendedUpdate = false
     @ObservationIgnored private var idleTicks = 0
     @ObservationIgnored private var tickTask: Task<Void, Never>?
     @ObservationIgnored private let build: BuildInfo
@@ -90,6 +93,7 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
             return
         }
         idleTicks = 0
+        quitsForUnattendedUpdate = true
         installHandler()
     }
 
@@ -132,6 +136,7 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
             checkForUpdates()
             return
         }
+        quitsForUnattendedUpdate = false
         installHandler()
     }
 
@@ -192,6 +197,8 @@ final class UpdateController: NSObject, SPUUpdaterDelegate, @preconcurrency SPUS
 
     /// The cycle failed, for example the installer is gone. Sparkle's install handler is dead now.
     func updater(_ updater: SPUUpdater, didAbortWithError error: Error) {
+        // The app did not quit: a later quit is the person's own.
+        quitsForUnattendedUpdate = false
         endCycle()
     }
 

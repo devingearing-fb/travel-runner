@@ -384,10 +384,12 @@ enum DbManifestLoader {
         let requiredKeys: Set<String> = [
             "version", "id", "name", "description", "order", "default", "extends", "settings",
         ]
-        guard Set(descriptor.keys) == requiredKeys else {
+        // A key this runner does not know is ignored: the monorepo may add one, and
+        // teammates run older runners.
+        guard requiredKeys.isSubset(of: descriptor.keys) else {
             throw invalidDescriptor(
                 scenarioID,
-                "scenario.json must contain exactly version, id, name, description, order, default, extends, and settings"
+                "scenario.json must contain version, id, name, description, order, default, extends, and settings"
             )
         }
         guard integer(descriptor["version"]) == 1 else {
@@ -426,12 +428,6 @@ enum DbManifestLoader {
         }
         guard let settings = descriptor["settings"] as? [String: Any] else {
             throw invalidDescriptor(scenarioID, "settings must be an object")
-        }
-        guard Set(settings.keys).isSubset(of: ["variables", "dynamicVariables"]) else {
-            throw invalidDescriptor(
-                scenarioID,
-                "settings may contain only variables and dynamicVariables"
-            )
         }
         let variables = try parseStaticVariables(settings["variables"], scenarioID: scenarioID)
         let dynamicVariables = try parseDynamicVariables(

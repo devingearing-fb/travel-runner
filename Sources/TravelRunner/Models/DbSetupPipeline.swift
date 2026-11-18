@@ -49,11 +49,12 @@ final class DbSetupStep: Identifiable {
 
     /// The least time that the slow steps get, whatever the manifest says. A cold
     /// machine pulls images and loads about 200,000 hotels; the idle limit catches a
-    /// step that hangs long before this.
+    /// step that hangs long before this. The load downloads the dump again when the
+    /// cached one has stale columns, so it gets the download's cap plus its own.
     nonisolated static let hardCapSeconds: [String: Int] = [
         "start-supabase": 900,
         "reset-database": 900,
-        "load-hotels": 900,
+        "load-hotels": 1800 + 900,
         "fetch-hotels": 1800,
     ]
 

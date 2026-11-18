@@ -78,7 +78,7 @@ When running, travel-runner exposes an HTTP API on `http://localhost:19900` (it 
 | `GET` | `/api/profile` | Active profile, its services, available profiles |
 | `POST` | `/api/profile/{booking\|partner\|both\|full}` | Set the run profile (400 on unknown) |
 | `POST` | `/api/db-reset` | Reset the DB (manifest `reset` profile, selected seed scenario) |
-| `POST` | `/api/db-setup` | Run the DB setup pipeline; optional body `{"profile": "full\|reset\|fast"}` |
+| `POST` | `/api/db-setup` | Run the DB setup pipeline; optional body `{"profile": "full\|reset\|fast\|migrate"}` (`migrate` never resets) |
 | `POST` | `/api/db-setup/retry/{stepId}` | Re-run the pipeline from a step |
 | `POST` | `/api/db-setup/step/{stepId}` | Run a single step |
 | `POST` | `/api/db-setup/cancel` | Cancel a running pipeline |

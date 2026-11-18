@@ -258,7 +258,7 @@ Resets the database by running the manifest `reset` profile (see `/api/db-setup`
 curl -s -X POST http://localhost:19900/api/db-reset
 ```
 
-The runner also resets automatically with the same `reset` profile on first run, when pending migrations change or a new fb-amateur-backend baseline commit lands, when the DB is empty, and on a branch switch.
+The runner sets up the database by itself only when it is empty (with the `reset` profile). Missing or extra migrations show a banner with **Apply migrations** (the `migrate` profile, never resets) and **Reset and reseed…** (asks first). A branch switch does not reset. The Settings option "Reset the database when migrations change" (off by default) turns on a reset when migrations change, and even then it never resets a database another checkout built.
 
 ### POST /api/db-setup
 
@@ -277,9 +277,14 @@ curl -s -X POST http://localhost:19900/api/db-setup \
 curl -s -X POST http://localhost:19900/api/db-setup \
   -H "Content-Type: application/json" \
   -d '{"profile": "fast"}'
+
+# Migrate: apply the missing migrations to the data there is, never resets
+curl -s -X POST http://localhost:19900/api/db-setup \
+  -H "Content-Type: application/json" \
+  -d '{"profile": "migrate"}'
 ```
 
-**Profiles:** `full` (all 6 steps), `reset` (skip event contracts), `fast` (skip hotels + contracts)
+**Profiles:** `full` (all steps), `reset` (skip event contracts), `fast` (skip hotels + contracts), `migrate` (apply migrations only, never resets). A profile the branch's manifest does not define runs nothing.
 
 ### POST /api/db-setup/retry/{stepId}
 

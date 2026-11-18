@@ -271,6 +271,8 @@ final class EnvironmentSupervisor {
     var dbPipelineFactory: ((_ cwd: String, _ profile: String) -> DbSetupPipeline?)?
     /// How a DB step command starts. Tests give a shell that reads no startup files.
     var dbStepLauncher: StepLauncher = .loginShell
+    /// How long the stop of a DB step waits after SIGTERM before SIGKILL. Tests make it long.
+    var dbStepKillGrace: Duration = ProcessTree.defaultGrace
     /// Where the app keeps the hotel dump. Tests give their own folder.
     @ObservationIgnored var hotelDumpPath = DbSetupRunner.hotelDumpPath()
     /// The version that the checkout's `runner.minVersion` is compared with. Nil is
@@ -1996,10 +1998,14 @@ final class EnvironmentSupervisor {
 
     /// "Load hotels": the load step on its own. It downloads the dump first when no
     /// valid one is cached, and never resets.
+    /// With no valid cached dump, the download runs first as its own step, under its
+    /// own time limit: a load that downloads itself would get only the load's limit.
     func loadHotels() {
+        var leading: [String] = []
+        if case .cached = hotelDump {} else { leading = [HotelCatalog.fetchStepID] }
         guard let run = beginDbSetup(
-            cwd: supabaseCwd, profile: "reset", reason: nil, origin: .singleStep, from: "load-hotels",
-            singleStep: true, reusePipeline: false
+            cwd: supabaseCwd, profile: "reset", reason: nil, origin: .singleStep, from: HotelCatalog.loadStepID,
+            singleStep: true, reusePipeline: false, leadingSteps: leading
         ) else { return }
         Task { await completeDbSetup(run) }
     }
@@ -2082,7 +2088,7 @@ final class EnvironmentSupervisor {
         let reason: String?
         let origin: DbSetupOrigin
         let stepId: String?
-        /// Runs only the step `stepId`, not the steps after it.
+        /// Runs only the steps of the pipeline from DB Tools, never a reset.
         let singleStep: Bool
         /// Nil when a test replaces the run with `dbResetAction`.
         let pipeline: DbSetupPipeline?
@@ -2114,9 +2120,12 @@ final class EnvironmentSupervisor {
     /// A single step gets a pipeline of that step alone, so its Retry and Run All
     /// never reach a reset. `stepArguments` go after the command of the step `stepId`
     /// ("Re-download hotels": `--force`); only that one-step pipeline holds them.
+    /// `leadingSteps` of the profile run before the single step, in the profile's
+    /// order; one the profile lacks is left out.
     private func beginDbSetup(
         cwd: String?, profile: String, reason: String?, origin: DbSetupOrigin, from stepId: String?,
-        singleStep: Bool = false, reusePipeline: Bool = true, stepArguments: String? = nil
+        singleStep: Bool = false, reusePipeline: Bool = true, stepArguments: String? = nil,
+        leadingSteps: [String] = []
     ) -> DbSetupRun? {
         guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return nil }
         guard let cwd else {
@@ -2128,6 +2137,7 @@ final class EnvironmentSupervisor {
         var pipeline: DbSetupPipeline?
         var runner: DbSetupRunner?
         var singleStep = singleStep
+        var stepId = stepId
         if dbResetAction == nil {
             // A Retry or Run All of a shown pipeline reuses it. A step from DB Tools
             // does not reuse a one-step pipeline: that holds the arguments of its action.
@@ -2140,8 +2150,11 @@ final class EnvironmentSupervisor {
                 guard let newPipeline = makeDbSetupPipeline(cwd: cwd, profile: profile) else { return nil }
                 if singleStep {
                     guard let step = newPipeline.steps.first(where: { $0.id == stepId }) else { return nil }
-                    newPipeline.steps = [stepArguments.map { step.appending(arguments: $0) } ?? step]
+                    let leading = newPipeline.steps.filter { leadingSteps.contains($0.id) && $0.id != step.id }
+                    newPipeline.steps = leading + [stepArguments.map { step.appending(arguments: $0) } ?? step]
                     newPipeline.isSingleStep = true
+                    // The run starts at the first step of this pipeline.
+                    stepId = newPipeline.steps.first?.id
                 }
                 dbSetupPipeline = newPipeline
                 pipeline = newPipeline
@@ -2175,7 +2188,9 @@ final class EnvironmentSupervisor {
         let ok: Bool
         var failed: DbSetupStep?
         if let pipeline = run.pipeline, let runner = run.runner {
-            if run.singleStep, let step = pipeline.steps.first(where: { $0.id == run.stepId }) {
+            // A pipeline from DB Tools with more than one step runs from the step on,
+            // like a Retry; it holds no reset.
+            if run.singleStep, pipeline.steps.count == 1, let step = pipeline.steps.first(where: { $0.id == run.stepId }) {
                 ok = await runner.executeStepPublic(step)
                 if !ok, step.status != .cancelled { failed = step }
             } else {
@@ -4361,7 +4376,8 @@ final class EnvironmentSupervisor {
     private func makeDbSetupRunner(cwd: String, pipeline: DbSetupPipeline) -> DbSetupRunner {
         DbSetupRunner(
             portalCwd: cwd, logStore: logStore, seedScenarioID: pipeline.seedScenario.id,
-            profile: pipeline.profile, tools: tools, shell: shell, launcher: dbStepLauncher
+            profile: pipeline.profile, tools: tools, shell: shell, launcher: dbStepLauncher,
+            killGrace: dbStepKillGrace
         )
     }
 

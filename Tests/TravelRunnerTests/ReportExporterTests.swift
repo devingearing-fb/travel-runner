@@ -215,10 +215,14 @@ final class ReportExporterTests: XCTestCase {
             XCTFail("the export should fail")
         } catch let error as ReportExporter.ExportError {
             XCTAssertEqual(error, .notPermitted)
+            XCTAssertEqual(error.localizedDescription, ReportExporter.notPermittedMessage())
             XCTAssertEqual(
-                error.localizedDescription,
+                ReportExporter.notPermittedMessage(appName: "Travel Runner"),
                 "Travel Runner may not save to Downloads. Allow it in System Settings > Privacy & Security > Files and Folders, then press Report again."
             )
+            // The hackathon app is listed under its own name in Files and Folders.
+            XCTAssertTrue(ReportExporter.notPermittedMessage(appName: "Travel Runner Hackathon").hasPrefix("Travel Runner Hackathon may not"))
+            XCTAssertTrue(ReportExporter.fallbackSavedMessage(appName: "Travel Runner Hackathon").hasPrefix("Travel Runner Hackathon may not"))
         }
     }
 

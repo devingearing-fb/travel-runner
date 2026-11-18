@@ -104,8 +104,7 @@ final class DbSeedScenarioTests: XCTestCase {
             ("negative-order", { changing($0, "order", -1) }, "nonnegative integer"),
             ("fractional-order", { changing($0, "order", 1.5) }, "nonnegative integer"),
             ("nonbool-default", { changing($0, "default", 1) }, "must be a boolean"),
-            ("missing-extends", { removing($0, "extends") }, "contain exactly"),
-            ("stale-sql-paths", { changing($0, "sqlPaths", ["old.sql"]) }, "contain exactly"),
+            ("missing-extends", { removing($0, "extends") }, "must contain version"),
         ]
         for (folder, mutation, message) in cases {
             let fixture = try makeRepository()
@@ -118,6 +117,27 @@ final class DbSeedScenarioTests: XCTestCase {
             )
             assertLoadFails(fixture, containing: message)
         }
+    }
+
+    /// Review of D5: the monorepo may add a key to scenario.json or its settings.
+    /// An older runner ignores it; the catalog still loads.
+    func testAScenarioWithAKeyTheRunnerDoesNotKnowStillLoads() throws {
+        let fixture = try makeRepository()
+        defer { try? FileManager.default.removeItem(at: fixture.container) }
+        try writeFolderManifest(fixture)
+        var scenario = descriptor(
+            id: "standard", order: 10, isDefault: true,
+            settings: ["variables": ["team": "a"], "futureSetting": true]
+        )
+        scenario["tags"] = ["demo"]
+        try writeScenario(scenario, fixture)
+        let catalog = try DbManifestLoader.loadSeedScenarios(from: fixture.manifest.path)
+        XCTAssertEqual(catalog.defaultID, "standard")
+
+        // Negative control: a needed key is still required.
+        scenario.removeValue(forKey: "settings")
+        try writeScenario(scenario, fixture)
+        assertLoadFails(fixture, containing: "must contain version")
     }
 
     func testScenarioFolderNameMustBeLowercaseKebabCase() throws {

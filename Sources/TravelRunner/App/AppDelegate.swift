@@ -107,8 +107,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let monitor = localHotkeyMonitor { NSEvent.removeMonitor(monitor) }
         iconTimer?.invalidate()
         // While the other runner app runs a stack, the login's env and the ports are its.
+        // An idle restart for an update leaves them alone too: see `quitCleanup`.
         let siblingRunsStack = !SiblingRunner.activeServicesNow().isEmpty
-        if !siblingRunsStack { supervisor.resetEnvToLocalhost() }
+        let cleanup = UpdatePolicy.quitCleanup(
+            unattendedUpdate: updateController?.quitsForUnattendedUpdate == true,
+            siblingRunsStack: siblingRunsStack
+        )
+        if cleanup.resetsEnv { supervisor.resetEnvToLocalhost() }
 
         // Phase 1: Collect the full process tree BEFORE sending signals.
         // Killing a parent reparents its children to launchd.
@@ -130,7 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // clears: the services of the profile and those this session started, never a
         // reuse_if_running service (Supabase persists between sessions).
         defer { supervisor.markCleanExit() }
-        guard !siblingRunsStack else { return }
+        guard cleanup.sweepsPorts else { return }
         killProcessesOnPorts(supervisor.sweepPorts)
     }
 

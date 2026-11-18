@@ -89,7 +89,7 @@ final class SupervisorLifecycleTests: XCTestCase {
 
     /// True when the working directory of the process is the test's own folder. Each
     /// service of a test starts there, and the folder has a new name for each test.
-    private nonisolated static func process(_ pid: pid_t, runsIn directory: String) -> Bool {
+    nonisolated static func process(_ pid: pid_t, runsIn directory: String) -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
         process.arguments = ["-a", "-p", "\(pid)", "-d", "cwd", "-Fn"]
@@ -113,6 +113,15 @@ final class SupervisorLifecycleTests: XCTestCase {
         process.waitUntilExit()
         let text = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
         return text.split(separator: "\n").compactMap { pid_t($0) }
+    }
+
+    /// The process of this test that listens on the test's port. A test signals
+    /// only this one: a stranger can take the port after `freePort()` released it.
+    private func ownListener() throws -> pid_t {
+        try XCTUnwrap(
+            Self.listeners(on: port).first { Self.process($0, runsIn: workDir.lastPathComponent) },
+            "no process of this test listens on the port"
+        )
     }
 
     private func daemon(_ id: String, _ cmd: [String], probeTimeout: Int = 30, reuse: Bool? = nil) -> ServiceDefinition {
@@ -390,7 +399,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         let ready = await waitUntil(30) { self.settled("flaky") }
         XCTAssertTrue(ready, "flaky is \(state("flaky").phase.rawValue)")
         XCTAssertFalse(state("flaky").isCircuitBroken)
-        let before = try XCTUnwrap(Self.listeners(on: port).first)
+        let before = try ownListener()
 
         kill(before, SIGTERM)
 
@@ -408,7 +417,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.restartService("web")
         let ready = await waitUntil(30) { self.settled("web") }
         XCTAssertTrue(ready)
-        let before = try XCTUnwrap(Self.listeners(on: port).first)
+        let before = try ownListener()
 
         kill(before, SIGTERM)
 
@@ -1728,7 +1737,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
         let lines = await logLines("web")
         XCTAssertTrue(lines.contains(line), lines.joined(separator: "\n"))
-        let pid = try XCTUnwrap(Self.listeners(on: port).first)
+        let pid = try ownListener()
 
         kill(pid, SIGTERM)
 
@@ -1750,7 +1759,7 @@ final class SupervisorLifecycleTests: XCTestCase {
                 self.settled("web") && Self.listeners(on: self.port).first.map { $0 != last } == true
             }
             XCTAssertTrue(up, "kill \(kill): web is \(state("web").phase.rawValue)")
-            last = try XCTUnwrap(Self.listeners(on: port).first)
+            last = try ownListener()
             Darwin.kill(last, SIGTERM)
         }
 
@@ -3146,6 +3155,78 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(supervisor.hotelCatalogNotice)
     }
 
+    /// Review of D3/D5: with no valid cached dump, "Load hotels" downloads first as its
+    /// own step with the download's time limit, then loads. It never resets. With a
+    /// cached dump it runs the load alone.
+    func testLoadHotelsWithNoCachedDumpDownloadsFirstInItsOwnStep() async throws {
+        try loadSupabase()
+        supervisor.shell = FakeCommandRunner()
+        supervisor.hotelDumpPath = workDir.appendingPathComponent("hotels/travel_organizations.sql").path
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let marker = workDir.appendingPathComponent("reset-ran")
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([
+                self.step("check-prerequisites", "true"),
+                self.step(HotelCatalog.fetchStepID, "echo fetch"),
+                self.step("reset-database", "touch '\(marker.path)'"),
+                self.step(HotelCatalog.loadStepID, "echo load"),
+            ], profile: profile)
+        }
+
+        supervisor.hotelDump = .missing
+        supervisor.loadHotels()
+        var done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+        var pipeline = try XCTUnwrap(supervisor.dbSetupPipeline)
+        XCTAssertEqual(pipeline.steps.map(\.id), [HotelCatalog.fetchStepID, HotelCatalog.loadStepID])
+        XCTAssertEqual(pipeline.steps.map(\.status), [.passed, .passed])
+        XCTAssertEqual(pipeline.steps.first?.hardCapSeconds, 1800, "the download has its own cap")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path), "nothing was reset")
+        XCTAssertNil(supervisor.lastError)
+
+        // Control: a valid cached dump loads at once.
+        supervisor.hotelDump = .cached("209823 hotels")
+        supervisor.loadHotels()
+        done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+        pipeline = try XCTUnwrap(supervisor.dbSetupPipeline)
+        XCTAssertEqual(pipeline.steps.map(\.id), [HotelCatalog.loadStepID])
+        XCTAssertEqual(pipeline.steps.first?.status, .passed)
+    }
+
+    /// A failed load after the download: Retry runs the load again, not the download.
+    func testRetryOfAFailedLoadAfterTheDownloadSkipsTheDownload() async throws {
+        try loadSupabase()
+        supervisor.shell = FakeCommandRunner()
+        supervisor.hotelDumpPath = workDir.appendingPathComponent("hotels/travel_organizations.sql").path
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let fetches = workDir.appendingPathComponent("fetches")
+        let loadOK = workDir.appendingPathComponent("load-ok")
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([
+                self.step(HotelCatalog.fetchStepID, "echo x >> '\(fetches.path)'"),
+                self.step(HotelCatalog.loadStepID, "test -f '\(loadOK.path)'"),
+            ], profile: profile)
+        }
+
+        supervisor.hotelDump = .missing
+        supervisor.loadHotels()
+        var done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+        XCTAssertEqual(supervisor.dbSetupPipeline?.firstFailed?.id, HotelCatalog.loadStepID)
+
+        FileManager.default.createFile(atPath: loadOK.path, contents: nil)
+        supervisor.runDbSetup(from: HotelCatalog.loadStepID)
+        done = await waitUntil(30) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(done)
+        let pipeline = try XCTUnwrap(supervisor.dbSetupPipeline)
+        XCTAssertEqual(pipeline.steps.map(\.status), [.passed, .passed])
+        let runs = try String(contentsOf: fetches, encoding: .utf8).split(separator: "\n").count
+        XCTAssertEqual(runs, 1, "the retry did not download again")
+    }
+
     /// Positive control of the guard against the loader's fallback to `reset`: a
     /// manifest with a `migrate` profile runs only the migrate steps, with no seed
     /// scenario selected.
@@ -3506,13 +3587,19 @@ final class SupervisorLifecycleTests: XCTestCase {
         return (running, try XCTUnwrap(child, "the step did not start its child"))
     }
 
+    /// Ends a child of `runChildStep` that is still there. Only a process in the
+    /// test's folder: the pid may belong to another process by now.
+    private func reapChild(_ pid: pid_t) {
+        if kill(pid, 0) == 0, Self.process(pid, runsIn: workDir.lastPathComponent) { kill(pid, SIGKILL) }
+    }
+
     /// Findings "Cancel reported as failure; UI unlocks early" and "Timeout and
     /// Cancel kill only the wrapper": Cancel ends the step's tree, the DB controls
     /// stay locked until it is gone, and a cancel sets no error and files no issue.
     func testCancelEndsTheStepTreeAndIsNotAFailure() async throws {
         let tracker = captureIssues()
         let (step, child) = try await runChildStep()
-        defer { if kill(child, 0) == 0 { kill(child, SIGKILL) } }
+        defer { reapChild(child) }
 
         supervisor.cancelDbSetup()
         XCTAssertTrue(supervisor.dbResetRunning, "the controls unlock only when the processes are gone")
@@ -3530,20 +3617,23 @@ final class SupervisorLifecycleTests: XCTestCase {
     }
 
     /// The root of the step dies on SIGTERM, but its child ignores it and keeps the
-    /// pipe open until the SIGKILL two seconds later. The controls stay locked and
-    /// the pipeline runs until the child is gone.
+    /// pipe open until the SIGKILL. The controls stay locked and the pipeline runs
+    /// until the child is gone. The stop waits 30 s before SIGKILL here, and the
+    /// test ends the child itself, so no timing decides the result.
     func testCancelKeepsTheControlsLockedWhileAChildHandlesSigterm() async throws {
+        supervisor.dbStepKillGrace = .seconds(30)
         let (step, child) = try await runChildStep("(trap '' TERM; exec sleep 60) & echo $! > child; wait")
-        defer { if kill(child, 0) == 0 { kill(child, SIGKILL) } }
+        defer { reapChild(child) }
 
         supervisor.cancelDbSetup()
-        // Past the pipe grace of 1 s, before the SIGKILL.
+        // Past the pipe grace of 1 s.
         try await Task.sleep(for: .milliseconds(1_500))
         XCTAssertEqual(kill(child, 0), 0, "the child did not outlive SIGTERM")
         XCTAssertTrue(supervisor.dbResetRunning, "the controls unlocked while the child runs")
         XCTAssertEqual(supervisor.dbSetupPipeline?.isRunning, true)
         XCTAssertEqual(step.status, .running)
 
+        reapChild(child)
         let unlocked = await waitUntil(10) { !self.supervisor.dbResetRunning }
         XCTAssertTrue(unlocked)
         XCTAssertNotEqual(kill(child, 0), 0, "the controls unlocked while the child runs")
@@ -3555,7 +3645,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// Stop All ends a DB step that runs, with its child processes.
     func testStopAllEndsTheRunningDbStep() async throws {
         let (step, child) = try await runChildStep()
-        defer { if kill(child, 0) == 0 { kill(child, SIGKILL) } }
+        defer { reapChild(child) }
 
         supervisor.stopAll()
         let stopped = await waitUntil(15) { self.supervisor.health == .stopped && step.status == .cancelled }
