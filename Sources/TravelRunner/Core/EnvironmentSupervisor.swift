@@ -3141,9 +3141,16 @@ final class EnvironmentSupervisor {
     /// A confirmed branch change. Only a change of the packages, the lockfile, the
     /// Next config or the env files restarts the running services of the repo;
     /// other files hot-reload. The database check runs for any change. A stopped
-    /// stack restarts nothing: the next start reads the new branch.
+    /// stack restarts nothing: the next start reads the new branch. The runner
+    /// version banner follows the new branch at once.
     func applyBranchChanges(_ changes: [GitBranchWatcher.Change]) async {
-        guard health != .stopped else { return }
+        guard health != .stopped else {
+            let monorepo = changes.contains { $0.serviceIDs.contains("supabase") || $0.serviceIDs.contains("travel-portal") }
+            if monorepo, let cwd = serviceCwd("supabase") ?? serviceCwd("travel-portal") {
+                refreshCompatibility(cwd: cwd)
+            }
+            return
+        }
         var changed: Set<String> = []
         var restarts: Set<String> = []
         for change in changes {

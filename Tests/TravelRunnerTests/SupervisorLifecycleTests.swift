@@ -6178,6 +6178,58 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains(EnvironmentSupervisor.branchRestartLine("feature", "web")), "\(lines)")
     }
 
+    /// A branch change on a stopped stack starts nothing and asks the database
+    /// nothing, but the runner version banner reads the new branch at once, not
+    /// at the next start.
+    func testABranchChangeOnAStoppedStackRefreshesTheRunnerVersionBanner() async throws {
+        try load(daemon("supabase", ["sleep", "60"]), daemon("web", webServer))
+        supervisor.serviceStates["anchor"]?.phase = .stopped
+        supervisor.health = .stopped
+        supervisor.runnerVersion = "0.13.4"
+        try writeManifest(minVersion: "0.14.0")
+        // A migrations folder makes the normal path ask the database.
+        let migrations = workDir.appendingPathComponent(".backend-baseline/supabase/migrations")
+        try FileManager.default.createDirectory(at: migrations, withIntermediateDirectories: true)
+        try Data().write(to: migrations.appendingPathComponent("20260101000000_init.sql"))
+        var queries = 0
+        supervisor.databaseQuery = { _, _ in
+            queries += 1
+            return DbQueryResult(exitCode: 1, stdout: "", stderr: "")
+        }
+        XCTAssertNil(supervisor.compatibilityNotice, "negative control: nothing read the new branch yet")
+        let change = GitBranchWatcher.Change(
+            serviceIDs: ["supabase", "web"], branch: "feature", changedFiles: ["package.json"]
+        )
+
+        await supervisor.applyBranchChanges([change])
+
+        XCTAssertEqual(supervisor.compatibilityNotice?.text, Self.tooOldText)
+        XCTAssertEqual(queries, 0)
+        // Every service is stopped, so the normal path would start nothing either:
+        // these guard against a regression only. The query count and the control
+        // below test the stopped-stack guard.
+        XCTAssertNil(state("supabase").pid)
+        XCTAssertNil(state("web").pid)
+        XCTAssertNil(state("web").lastStarted)
+        XCTAssertEqual(supervisor.health, .stopped)
+
+        // Control: on a running stack the same change asks the database and
+        // restarts the running service.
+        supervisor.health = .healthy
+        supervisor.restartService("web")
+        let up = await waitUntil(20) { self.settled("web") }
+        XCTAssertTrue(up)
+        let pid = try XCTUnwrap(state("web").pid)
+
+        await supervisor.applyBranchChanges([change])
+
+        XCTAssertGreaterThan(queries, 0)
+        let restarted = await waitUntil(20) { self.settled("web") && self.state("web").pid != pid }
+        XCTAssertTrue(restarted)
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains(EnvironmentSupervisor.branchRestartLine("feature", "web")), "\(lines)")
+    }
+
     /// The DB setup runs the pipeline that the test gives: no manifest, no seed
     /// scenario. The health check of a step runs in the shell of the supervisor.
     func testADbSetupRunsThePipelineOfTheFactory() async throws {
