@@ -28,11 +28,11 @@ struct DatabaseModeControl: View {
             }
     }
 
-    /// A switch to dev asks first. A refused switch goes straight through, so its
-    /// notice says why.
+    /// A switch to dev asks first. A refused switch, such as one without the hosted
+    /// dev values, goes straight through, so its notice says why.
     private func choose(_ mode: EnvironmentSupervisor.DatabaseMode) {
         guard mode != supervisor.dbMode else { return }
-        if mode == .remote && supervisor.databaseModeRefusal == nil {
+        if mode == .remote && supervisor.databaseModeRefusal(for: .remote) == nil {
             confirmingDev = true
         } else {
             supervisor.setDatabaseMode(mode)

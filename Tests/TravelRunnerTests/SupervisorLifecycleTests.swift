@@ -4180,10 +4180,12 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.serviceStates["travel-portal"]?.phase = .stopped
         supervisor.recalculateHealth()
         XCTAssertEqual(supervisor.health, .degraded)
-        XCTAssertNil(supervisor.databaseModeRefusal)
+        XCTAssertNil(supervisor.databaseModeRefusal(for: .remote))
+        // The question names only the apps that restart; the stopped one uses dev later.
         XCTAssertEqual(
             supervisor.devDatabaseConfirmation,
-            "travel-portal and universal-login will restart and will read and write the shared hosted dev data."
+            "universal-login will restart and will read and write the shared hosted dev data."
+                + " travel-portal will use it at the next start."
         )
 
         supervisor.setDatabaseMode(.remote)
@@ -4204,10 +4206,16 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(loginEnv.contains("AMATEUR_SUPABASE_URL=https://hosted.example.test"), loginEnv)
     }
 
-    /// The only refusal is a start in progress, with the text that says what to do.
-    func testTheDatabaseSwitchIsRefusedOnlyWhileTheStackStarts() async throws {
+    /// A start in progress refuses the switch, with the text that says what to do.
+    func testTheDatabaseSwitchIsRefusedWhileTheStackStarts() async throws {
         try loadDatabaseModeApps()
-        supervisor.health = .starting
+        // The start waits for the other app's answer until the test opens the gate.
+        let gate = Gate()
+        supervisor.siblingActiveServices = {
+            await gate.wait()
+            return ["supabase"]
+        }
+        supervisor.startAll(skipPreflight: true)
 
         supervisor.setDatabaseMode(.remote)
 
@@ -4217,11 +4225,54 @@ final class SupervisorLifecycleTests: XCTestCase {
             "A start is in progress — wait for it to finish, or stop the stack, then switch."
         )
 
-        // Negative control: the same switch on a healthy stack goes through.
-        supervisor.health = .healthy
+        // Negative control: after the start the same switch goes through.
+        await gate.open()
+        let ended = await waitUntil(10) { self.supervisor.databaseModeRefusal(for: .remote) == nil }
+        XCTAssertTrue(ended, "refusal: \(supervisor.databaseModeRefusal(for: .remote) ?? "none")")
         supervisor.setDatabaseMode(.remote)
         XCTAssertEqual(supervisor.dbMode, .remote)
         XCTAssertNil(supervisor.notices.notice(.dbMode), "the switch resolves the refusal")
+    }
+
+    /// The restart of one service shows the stack as starting, but no start runs.
+    /// The switch goes through: it waits for the service's lock.
+    func testTheRestartOfOneServiceDoesNotRefuseTheDatabaseSwitch() async throws {
+        try loadDatabaseModeApps()
+        supervisor.health = .starting
+
+        XCTAssertNil(supervisor.databaseModeRefusal(for: .remote))
+        supervisor.setDatabaseMode(.remote)
+        XCTAssertEqual(supervisor.dbMode, .remote, "error: \(supervisor.lastError ?? "none")")
+        XCTAssertNil(supervisor.notices.notice(.dbMode))
+    }
+
+    /// Finding: a switch during Stop All was taken, and the end of the stop set the
+    /// mode back to local without a word. Now it is refused until the stack stops.
+    func testTheDatabaseSwitchIsRefusedWhileTheStackStops() async throws {
+        try loadDatabaseModeApps()
+        supervisor.health = .healthy
+        supervisor.restartService("universal-login")
+        let up = await waitUntil(20) { self.settled("universal-login") }
+        XCTAssertTrue(up, "universal-login is \(state("universal-login").phase.rawValue)")
+
+        // The stop runs in a task; until it ends the stack still looks up.
+        supervisor.stopAll()
+        supervisor.setDatabaseMode(.remote)
+
+        XCTAssertEqual(supervisor.dbMode, .local)
+        XCTAssertEqual(
+            supervisor.notices.text(.dbMode),
+            "The stack is stopping — wait for it to stop, then switch."
+        )
+        XCTAssertFalse(supervisor.actionsInFlight.contains("db-mode"), "no restart was started")
+
+        // Negative control: after the stop the switch goes through and stays.
+        let stopped = await waitUntil(10) { self.supervisor.databaseModeRefusal(for: .remote) == nil }
+        XCTAssertTrue(stopped, "refusal: \(supervisor.databaseModeRefusal(for: .remote) ?? "none")")
+        XCTAssertEqual(supervisor.health, .stopped)
+        supervisor.setDatabaseMode(.remote)
+        XCTAssertEqual(supervisor.dbMode, .remote)
+        XCTAssertNil(supervisor.notices.notice(.dbMode))
     }
 
     /// A stopped stack switches and restarts nothing; the apps use the mode at the
@@ -4253,10 +4304,15 @@ final class SupervisorLifecycleTests: XCTestCase {
         try FileManager.default.removeItem(at: workDir.appendingPathComponent(".env"))
         supervisor.health = .healthy
 
+        // The control asks this before the question, so it shows the notice instead.
+        let refusal = supervisor.databaseModeRefusal(for: .remote)
+        XCTAssertEqual(refusal?.hasPrefix("Hosted dev values are missing from apps/booking-portal/.env"), true)
+        XCTAssertNil(supervisor.databaseModeRefusal(for: .local), "local needs no hosted values")
+
         supervisor.setDatabaseMode(.remote)
 
         XCTAssertEqual(supervisor.dbMode, .local)
-        XCTAssertEqual(supervisor.notices.text(.dbMode)?.hasPrefix("Hosted dev values are missing from apps/booking-portal/.env"), true)
+        XCTAssertEqual(supervisor.notices.text(.dbMode), refusal)
     }
 }
 

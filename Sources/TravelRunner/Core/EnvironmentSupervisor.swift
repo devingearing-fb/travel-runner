@@ -1268,6 +1268,7 @@ final class EnvironmentSupervisor {
     static let dbModeStartingRefusal =
         "A start is in progress — wait for it to finish, or stop the stack, then switch."
     static let dbModeSwitchingRefusal = "A database switch is in progress — wait for it to finish."
+    static let dbModeStoppingRefusal = "The stack is stopping — wait for it to stop, then switch."
     static let devDatabaseConfirmationTitle = "Use the shared dev database?"
     static let switchToDevTitle = "Switch to Dev"
     static let dbToolsDevCaption = "Acts on the local database only. The portals currently use dev."
@@ -1277,48 +1278,72 @@ final class EnvironmentSupervisor {
         ["travel-portal", "partner-portal", "universal-login"].filter { graph?.nodes[$0] != nil && isInProfile($0) }
     }
 
-    /// Why the database mode cannot change now, or nil when it can. A switch is
-    /// allowed when the stack is stopped, healthy or degraded.
-    var databaseModeRefusal: String? {
-        if startTask != nil || health == .starting { return Self.dbModeStartingRefusal }
+    /// The apps that a switch restarts now. A stopped stack restarts none. A service
+    /// that the person stopped, that waits or that was skipped stays as it is; a
+    /// failed one starts with the new env.
+    private var databaseModeRestarts: [String] {
+        guard health != .stopped else { return [] }
+        return databaseModeServices.filter { serviceID in
+            guard let phase = serviceStates[serviceID]?.phase else { return false }
+            return phase != .stopped && phase != .pending && phase != .skipped
+        }
+    }
+
+    /// Why the database mode cannot change to `target` now, or nil when it can. A
+    /// switch is allowed when the stack is stopped, healthy or degraded. The restart
+    /// of one service does not block it: the switch waits for the service's lock.
+    func databaseModeRefusal(for target: DatabaseMode) -> String? {
+        if startTask != nil { return Self.dbModeStartingRefusal }
+        // Stop All resets the env to local when it ends, so a switch now would be lost.
+        if isShuttingDown { return Self.dbModeStoppingRefusal }
         if actionsInFlight.contains("db-mode") { return Self.dbModeSwitchingRefusal }
+        if target == .remote, let missing = missingHostedDevValues { return missing }
         return nil
     }
 
-    /// The text under "Use the shared dev database?": which apps restart and use the dev data.
+    /// The notice when a shared .env lacks the hosted dev values, or nil. Hosted dev
+    /// comes from each app's shared .env; the runner block then stops overriding Supabase.
+    private var missingHostedDevValues: String? {
+        let apps = ["travel-portal"] + (isInProfile("partner-portal") ? ["partner-portal"] : [])
+        let lacking = apps.filter { serviceID in
+            guard let shared = sharedEnvPath(serviceID),
+                  let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: shared) else { return true }
+            return url.isEmpty
+        }
+        guard !lacking.isEmpty else { return nil }
+        let files = lacking.map { $0 == "travel-portal" ? "apps/booking-portal/.env" : "apps/partner-portal/.env" }
+        return "Hosted dev values are missing from \(files.joined(separator: " and ")) — import the shared file (Settings → Reconfigure Repos… → Environment Check), then switch again"
+    }
+
+    /// The text under "Use the shared dev database?": which apps restart now and
+    /// which use the dev data at the next start.
     var devDatabaseConfirmation: String {
-        let names = databaseModeServices.map(displayName)
-        let list = names.count > 1
-            ? names.dropLast().joined(separator: ", ") + " and " + names[names.count - 1]
-            : names.first ?? "The portals"
-        return health == .stopped
-            ? "\(list) will read and write the shared hosted dev data at the next start."
-            : "\(list) will restart and will read and write the shared hosted dev data."
+        let restarts = databaseModeRestarts
+        let later = databaseModeServices.filter { !restarts.contains($0) }
+        guard !restarts.isEmpty else {
+            return "\(namesList(later)) will read and write the shared hosted dev data at the next start."
+        }
+        let now = "\(namesList(restarts)) will restart and will read and write the shared hosted dev data."
+        return later.isEmpty ? now : now + " \(namesList(later)) will use it at the next start."
+    }
+
+    /// "A", "A and B", "A, B and C" with display names; "The portals" for none.
+    private func namesList(_ serviceIDs: [String]) -> String {
+        let names = serviceIDs.map(displayName)
+        guard let last = names.last else { return "The portals" }
+        return names.count > 1 ? names.dropLast().joined(separator: ", ") + " and " + last : last
     }
 
     /// Switches the database of the apps. A running stack restarts the apps that
     /// read it. Ask the person before a switch to dev: the dev data is shared.
     func setDatabaseMode(_ target: DatabaseMode) {
         guard target != dbMode else { return }
-        if let refusal = databaseModeRefusal {
+        if let refusal = databaseModeRefusal(for: target) {
             postNotice(.dbMode, refusal)
             return
         }
 
         if target == .remote {
-            // Hosted dev comes from each app's shared .env; the runner block then stops
-            // overriding Supabase.
-            let apps = ["travel-portal"] + (isInProfile("partner-portal") ? ["partner-portal"] : [])
-            let lacking = apps.filter { serviceID in
-                guard let shared = sharedEnvPath(serviceID),
-                      let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: shared) else { return true }
-                return url.isEmpty
-            }
-            guard lacking.isEmpty else {
-                let files = lacking.map { $0 == "travel-portal" ? "apps/booking-portal/.env" : "apps/partner-portal/.env" }
-                postNotice(.dbMode, "Hosted dev values are missing from \(files.joined(separator: " and ")) — import the shared file (Settings → Reconfigure Repos… → Environment Check), then switch again")
-                return
-            }
             // The reset of a config load that still waits must not undo this choice.
             envResetAfterLoad?.cancel()
             notices.resolve(.dbMode)
@@ -1331,12 +1356,8 @@ final class EnvironmentSupervisor {
 
         guard health != .stopped else { return }
 
-        // A degraded stack switches too. A service that the person stopped, or that
-        // was skipped, stays as it is; a failed one starts with the new env.
-        let servicesToRestart = databaseModeServices.filter { serviceID in
-            guard let phase = serviceStates[serviceID]?.phase else { return false }
-            return phase != .stopped && phase != .pending && phase != .skipped
-        }
+        // A degraded stack switches too. The question named the same apps.
+        let servicesToRestart = databaseModeRestarts
         beginAction("db-mode")
         Task {
             defer { endAction("db-mode") }
