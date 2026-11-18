@@ -81,8 +81,11 @@ struct PreflightRunner: Sendable {
         }
 
         // An app of the hackathon fork that an old checkout does not have is skipped
-        // at its start. Its folder is not a condition for the rest of the stack.
-        let cwds = Set(services.filter { !ServiceCatalog.forkAppIDs.contains($0.id) }.compactMap { $0.resolvedCwd })
+        // at its start, and so is a service of an optional repo (stream services, load
+        // test). Their folders are not a condition for the rest of the stack.
+        let cwds = Set(services.filter {
+            !ServiceCatalog.forkAppIDs.contains($0.id) && ServiceCatalog.optionalRepoServices[$0.id] == nil
+        }.compactMap { $0.resolvedCwd })
         for cwd in cwds.sorted() {
             // A repo whose path services.json does not set.
             if cwd.isEmpty {

@@ -253,6 +253,9 @@ final class PreflightRunnerTests: XCTestCase {
             service("stripe", cwd: monorepo),
             // An app of the fork that an old checkout lacks is skipped at its start.
             service(forkApp, cwd: workDir.appendingPathComponent("mono/apps/not-in-this-checkout").path, port: 3010),
+            // So is a service of an optional repo that is not there.
+            service("stream-services", cwd: workDir.appendingPathComponent("no-stream-services").path),
+            service("capacity-overflow", cwd: workDir.appendingPathComponent("no-load-test").path),
         ]
 
         let checks = PreflightRunner().allChecks(for: services)

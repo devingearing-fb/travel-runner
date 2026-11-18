@@ -4,6 +4,22 @@
 
 ## Resolved
 
+### A missing optional repo blocked the whole stack
+
+**Resolved:** S4, 2026-11.
+
+The full profile ran a folder check for each repo in the preflight. Without the stream-services or the load-test repo the preflight failed, and nothing started. The CDC setup also waited for the whole verification chain, and QStash crash-looped without its CLI.
+
+**Fix:**
+- The services of an optional repo are skipped: "Stream Services repo not found at <path> — set it in Settings > Paths." The row has an Open Settings button. The portals start normally.
+- A service whose dependency is skipped is skipped too: "Skipped: <dependency> is not available." A dependency outside the profile counts as met. `stream-db-setup` no longer depends on `capacity-overflow`.
+- QStash without `node_modules/.bin/qstash` is skipped: "QStash CLI missing — run pnpm install at the monorepo root."
+- `stream-services-install` runs only when the packages are missing or changed.
+- A branch change leaves Sequin running: "[travel-runner] Branch changed — Sequin keeps running; restart it if scripts/local-cdc changed."
+- A verification service of the full profile without the 'Redis cache integration' seed says so in its log and its failure.
+
+**Still open:** QStash uses the fixed port 8080. The Sequin image is `sequin/sequin:latest` in the monolith and is not pinned yet.
+
 ### Two requests for one service started two processes (EADDRINUSE)
 
 **Resolved:** 2026-11-10

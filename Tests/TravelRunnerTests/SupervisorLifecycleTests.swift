@@ -3260,6 +3260,114 @@ final class SupervisorLifecycleTests: XCTestCase {
         return shell
     }
 
+    /// A missing stream-services repo blocked the whole stack in the preflight. Now its
+    /// services are skipped with the reason, the services that need them say why, and
+    /// the rest of the stack starts.
+    func testAMissingOptionalRepoSkipsItsServicesAndTheSiblingRuns() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        let missing = workDir.appendingPathComponent("fb-amateur-stream-services").path
+        let stream = ServiceDefinition(
+            id: "stream-services", name: "Stream Services", cmd: ["sh", "-c", "echo stream-start; sleep 30"],
+            cwd: missing, probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil,
+            phase: nil, reuseIfRunning: nil
+        )
+        let wire = ServiceDefinition(
+            id: "stream-qstash-wire", name: "QStash Worker Wiring", cmd: ["sh", "-c", "echo wire-start"],
+            cwd: workDir.path, probe: nil, type: .oneshot, restart: .never, dependsOn: ["stream-services"],
+            env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([daemon("web", webServer), stream, wire])
+
+        supervisor.startAll()
+
+        let healthy = await waitUntil(40) { self.supervisor.health == .healthy }
+        XCTAssertTrue(healthy, "health is \(supervisor.health), error: \(supervisor.lastError ?? "none")")
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertEqual(Self.listeners(on: port).count, 1)
+
+        XCTAssertEqual(state("stream-services").phase, .skipped)
+        XCTAssertEqual(state("stream-services").condition?.kind, .optionalOff)
+        let reason = "Stream Services repo not found at \(missing) — set it in Settings > Paths."
+        XCTAssertEqual(state("stream-services").condition?.headline, reason)
+        XCTAssertEqual(state("stream-services").condition?.action, .openSettingsPaths)
+        XCTAssertEqual(EnvironmentSupervisor.statusFields(state("stream-services"))["skip_reason"], reason)
+
+        XCTAssertEqual(state("stream-qstash-wire").phase, .skipped)
+        XCTAssertEqual(state("stream-qstash-wire").condition?.headline, "Skipped: Stream Services is not available.")
+        let streamLines = await logLines("stream-services")
+        let wireLines = await logLines("stream-qstash-wire")
+        XCTAssertFalse(streamLines.contains("stream-start"))
+        XCTAssertFalse(wireLines.contains("wire-start"))
+        XCTAssertTrue(streamLines.contains("[travel-runner] \(reason)"))
+    }
+
+    /// QStash without its CLI is skipped with the fix, and starts once the CLI is there.
+    func testQStashWithoutItsCliIsSkippedWithTheFix() async throws {
+        let qstash = ServiceDefinition(
+            id: ServiceCatalog.qstashID, name: "Local QStash", cmd: ["sh", "-c", "echo qstash-start; sleep 30"],
+            cwd: workDir.path, probe: nil, type: .daemon, restart: .onFailure, dependsOn: [], env: nil,
+            phase: nil, reuseIfRunning: nil
+        )
+        try load(qstash)
+
+        supervisor.restartService(ServiceCatalog.qstashID)
+        let skipped = await waitUntil(10) {
+            self.state(ServiceCatalog.qstashID).phase == .skipped && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(skipped, "qstash is \(state(ServiceCatalog.qstashID).phase.rawValue)")
+        XCTAssertEqual(state(ServiceCatalog.qstashID).condition?.headline, "QStash CLI missing — run pnpm install at the monorepo root.")
+        XCTAssertEqual(state(ServiceCatalog.qstashID).condition?.action, .installDependencies)
+        var lines = await logLines(ServiceCatalog.qstashID)
+        XCTAssertFalse(lines.contains("qstash-start"))
+
+        // Negative control: with the CLI the service starts.
+        let bin = workDir.appendingPathComponent("node_modules/.bin")
+        try FileManager.default.createDirectory(at: bin, withIntermediateDirectories: true)
+        let cli = bin.appendingPathComponent("qstash").path
+        FileManager.default.createFile(atPath: cli, contents: Data("#!/bin/sh\n".utf8), attributes: [.posixPermissions: 0o755])
+        supervisor.restartService(ServiceCatalog.qstashID)
+        for _ in 0..<200 where !lines.contains("qstash-start") {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines(ServiceCatalog.qstashID)
+        }
+        XCTAssertTrue(lines.contains("qstash-start"), lines.joined(separator: "\n"))
+        XCTAssertNotEqual(state(ServiceCatalog.qstashID).phase, .skipped)
+    }
+
+    /// The install of the stream services ran on each start. It runs only when the
+    /// packages are missing or changed.
+    func testTheStreamInstallRunsOnlyWhenThePackagesChanged() async throws {
+        let install = ServiceDefinition(
+            id: ServiceCatalog.streamInstallID, name: "Stream Services Install", cmd: ["sh", "-c", "echo install-ran"],
+            cwd: workDir.path, probe: nil, type: .oneshot, restart: .never, dependsOn: [], env: nil,
+            phase: nil, reuseIfRunning: nil
+        )
+        try load(install)
+        let fm = FileManager.default
+        try Data("{}".utf8).write(to: workDir.appendingPathComponent("package.json"))
+        let modules = workDir.appendingPathComponent("node_modules")
+        try fm.createDirectory(at: modules, withIntermediateDirectories: true)
+        fm.createFile(atPath: modules.appendingPathComponent(".package-lock.json").path, contents: Data("{}".utf8))
+
+        supervisor.restartService(ServiceCatalog.streamInstallID)
+        let done = await waitUntil(10) {
+            self.state(ServiceCatalog.streamInstallID).phase == .completed && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(done, "install is \(state(ServiceCatalog.streamInstallID).phase.rawValue)")
+        var lines = await logLines(ServiceCatalog.streamInstallID)
+        XCTAssertFalse(lines.contains("install-ran"))
+        XCTAssertTrue(lines.contains("[travel-runner] Stream Services packages are current — npm install skipped."))
+
+        // Negative control: without the packages the install runs.
+        try fm.removeItem(at: modules)
+        supervisor.restartService(ServiceCatalog.streamInstallID)
+        for _ in 0..<200 where !lines.contains("install-ran") {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines(ServiceCatalog.streamInstallID)
+        }
+        XCTAssertTrue(lines.contains("install-ran"), lines.joined(separator: "\n"))
+    }
+
     /// Start All needs only a loaded graph: no services.json.
     func testStartAllStartsALoadedGraph() async throws {
         let shell = fakeTheOutsideOfStartAll()

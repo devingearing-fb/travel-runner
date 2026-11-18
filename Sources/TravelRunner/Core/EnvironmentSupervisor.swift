@@ -85,6 +85,8 @@ final class EnvironmentSupervisor {
     var onActionFeedback: ((String, Bool) -> Void)?
     /// Opens the page that shows where each tool was found (the "Open Health" button).
     var onOpenHealth: (() -> Void)?
+    /// Opens Settings, where the paths of the repos are set.
+    var onOpenSettings: (() -> Void)?
     var gitBranches: [String: String] = [:]
     var gitBehindCounts: [String: Int] = [:]
     var behindBannerDismissed = false
@@ -843,6 +845,9 @@ final class EnvironmentSupervisor {
             await awaitReplacingLaunch(serviceID)
         } catch {
             recordFailure(serviceID, error: error, lastError: "\(error)")
+            if let hint = verificationSeedHint(serviceID), let condition = serviceStates[serviceID]?.condition {
+                serviceStates[serviceID]?.condition?.detail = [condition.detail, hint].compactMap { $0 }.joined(separator: " ")
+            }
             recalculateHealth()
         }
         finishStartAllService(inPhase: phase.rawValue)
@@ -1512,6 +1517,7 @@ final class EnvironmentSupervisor {
         case .installDependencies: serviceCwd(serviceID) != nil
         case .openLog: logStore.revealTarget(for: serviceID) != nil
         case .openHealth: onOpenHealth != nil
+        case .openSettingsPaths: onOpenSettings != nil
         case .installStripe, .updateStripe, .stripeLogin, .importSharedEnv: serviceID == "stripe"
         default: false
         }
@@ -1542,6 +1548,8 @@ final class EnvironmentSupervisor {
             installDependenciesAndRestart(serviceID)
         case .openHealth:
             onOpenHealth?()
+        case .openSettingsPaths:
+            onOpenSettings?()
         case .openLog:
             switch logStore.revealTarget(for: serviceID) {
             case .file(let file): NSWorkspace.shared.activateFileViewerSelecting([file])
@@ -1671,6 +1679,11 @@ final class EnvironmentSupervisor {
         let record = dependencyRecord
         return await Task.detached { DependencyWatcher.state(of: cwd, record: record) }.value
     }
+
+    /// The services that a branch change does not restart.
+    nonisolated static let keptOnBranchChange: Set<String> = [ServiceCatalog.sequinID]
+    nonisolated static let sequinBranchChangeLine =
+        "[travel-runner] Branch changed — Sequin keeps running; restart it if scripts/local-cdc changed."
 
     /// A branch change restarts the running services of the repo. When their packages
     /// are not fresh (the new branch changed the lockfile), the install runs first: the
@@ -1834,6 +1847,43 @@ final class EnvironmentSupervisor {
         state.condition = ServiceCondition(kind: kind, headline: headline, detail: detail, actions: actions, since: clock.date())
     }
 
+    /// Skips a service that cannot run here, with the reason in its row and its log.
+    private func skipOptional(_ state: ServiceState, _ headline: String, actions: [RecoveryAction]) async {
+        state.phase = .skipped
+        state.pid = nil
+        noteSkip(state, .optionalOff, headline, actions: actions)
+        await logStore.append(serviceID: state.id, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(headline)"))
+    }
+
+    /// The first dependency of the profile that was skipped because it cannot run.
+    /// A dependency outside the profile counts as met.
+    private func unavailableDependency(of definition: ServiceDefinition) -> String? {
+        definition.dependsOn.first { dependency in
+            guard isInProfile(dependency), let state = serviceStates[dependency], state.phase == .skipped else {
+                return false
+            }
+            return state.condition?.kind != .notInProfile
+        }
+    }
+
+    /// True when the stream services have their packages and the lockfile did not change.
+    private func streamPackagesAreCurrent(_ cwd: String) async -> Bool {
+        let record = dependencyRecord
+        return await Task.detached {
+            FileManager.default.fileExists(atPath: (cwd as NSString).appendingPathComponent("package.json"))
+                && DependencyWatcher.state(of: cwd, record: record) == .fresh
+        }.value
+    }
+
+    /// The seed hint for a verification service of the full profile, when the chosen
+    /// seed scenario is not the one it needs. Nil on a branch without that scenario.
+    private func verificationSeedHint(_ serviceID: String) -> String? {
+        guard profile == .full, ServiceCatalog.verificationSeedServices.contains(serviceID),
+              dbSeedScenarios.contains(where: { $0.id == ServiceCatalog.verificationSeedScenarioID }),
+              selectedDbSeedScenarioID != ServiceCatalog.verificationSeedScenarioID else { return nil }
+        return ServiceCatalog.verificationSeedHint
+    }
+
     /// The Next apps: their `.next` cache can be cleared.
     static let cacheClearingServices: Set<String> = ["travel-portal", "partner-portal"]
 
@@ -1991,11 +2041,11 @@ final class EnvironmentSupervisor {
             for serviceID in changed {
                 let branchName = allBranches[serviceID] ?? "unknown"
                 let displayName = serviceStates[serviceID]?.definition.displayName ?? serviceID
-                await logStore.append(
-                    serviceID: serviceID,
-                    entry: LogEntry(stream: .stdout,
-                        text: "[travel-runner] Branch changed to '\(branchName)' — restarting \(displayName)")
-                )
+                // A restart of Sequin tears down and rebuilds its containers: it keeps running.
+                let text = Self.keptOnBranchChange.contains(serviceID)
+                    ? Self.sequinBranchChangeLine
+                    : "[travel-runner] Branch changed to '\(branchName)' — restarting \(displayName)"
+                await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: text))
             }
 
             if changed.contains("supabase") || changed.contains("travel-portal") {
@@ -2016,7 +2066,9 @@ final class EnvironmentSupervisor {
                 self.behindBannerDismissed = false
             }
 
-            let runningChanged = changed.filter { serviceStates[$0]?.phase == .running }
+            let runningChanged = changed.filter {
+                serviceStates[$0]?.phase == .running && !Self.keptOnBranchChange.contains($0)
+            }
             await restartAfterBranchChange(sortedServiceIDs.filter { runningChanged.contains($0) })
         }
     }
@@ -2846,6 +2898,33 @@ final class EnvironmentSupervisor {
             return nil
         }
 
+        // A service of an optional repo that is not there is skipped. The portals and
+        // the rest of the stack start.
+        if let reason = ServiceCatalog.missingOptionalRepo(definition) {
+            await skipOptional(state, reason, actions: [.openSettingsPaths])
+            return nil
+        }
+
+        // A dependency that is not available skips the services that need it.
+        if let blocker = unavailableDependency(of: definition) {
+            await skipOptional(state, "Skipped: \(displayName(blocker)) is not available.", actions: [.startService])
+            return nil
+        }
+
+        // The install of the stream services runs only when their packages changed.
+        if serviceID == ServiceCatalog.streamInstallID, let cwd = definition.resolvedCwd,
+           await streamPackagesAreCurrent(cwd) {
+            state.phase = .completed
+            state.clearCondition()
+            state.lastStarted = clock.date()
+            state.readyAt = clock.date()
+            state.exitCode = 0
+            await logStore.append(serviceID: serviceID, entry: LogEntry(
+                stream: .stdout, text: "[travel-runner] Stream Services packages are current — npm install skipped."
+            ))
+            return nil
+        }
+
         // A probe with a missing or wrong field: say so, and start nothing.
         if let problem = definition.probe?.problem {
             throw ServiceError.badProbe(name: definition.displayName, reason: problem)
@@ -3036,6 +3115,19 @@ final class EnvironmentSupervisor {
                     why: Self.installFailure(result, folder: DependencyWatcher.installTarget(for: cwd).folder)
                 )
             }
+        }
+
+        // QStash runs the CLI of the booking app's packages. Without it, QStash is
+        // skipped, and the services that need it say so.
+        if serviceID == ServiceCatalog.qstashID, let cwd = definition.resolvedCwd,
+           !FileManager.default.isExecutableFile(atPath: (cwd as NSString).appendingPathComponent(ServiceCatalog.qstashBinary)) {
+            await skipOptional(state, ServiceCatalog.qstashMissing, actions: [.installDependencies])
+            return nil
+        }
+
+        // The verification services fail without their seed: their log says which one.
+        if let hint = verificationSeedHint(serviceID) {
+            await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: "[travel-runner] \(hint)"))
         }
 
         // A start during a read of the shell waits for the new PATH. The wait is

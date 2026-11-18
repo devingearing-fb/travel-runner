@@ -319,7 +319,7 @@ final class EnvironmentChecker {
             HealthCheck(id: "stream-modules", name: "Stream Services node_modules", section: .dependencies,
                         isRequired: false, fixLabel: "npm install",
                         checkCommand: "ls node_modules/",
-                        checkDescription: "Only for the full profile — pinned QStash CLI and stream-services dependencies",
+                        checkDescription: "Only for the full profile — stream-services dependencies",
                         checkPath: (streamServicesPath as NSString).appendingPathComponent("node_modules")),
 
             // Supabase & Database
@@ -615,6 +615,10 @@ final class EnvironmentChecker {
             return exists(path) ? .passing("Installed") : .failing("Run npm install")
 
         case "stream-modules":
+            // The repo is optional: without it the stream services are skipped.
+            guard !streamServicesPath.isEmpty, exists(streamServicesPath) else {
+                return .warning(ServiceCatalog.repoNotFound(.streamServices, path: streamServicesPath))
+            }
             let path = (streamServicesPath as NSString).appendingPathComponent("node_modules")
             return exists(path) ? .passing("Installed") : .warning("Run npm install (full profile only)")
 
