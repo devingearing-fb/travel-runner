@@ -164,11 +164,39 @@ struct ServiceDefinition: Codable, Sendable, Identifiable {
     let env: [String: String]?
     let phase: String?
     let reuseIfRunning: Bool?
+    /// A command that tears the service down (a `compose down`). A stop runs it
+    /// before the signals and before any port sweep.
+    var stopCmd: [String]? = nil
+    /// The wait between SIGTERM and SIGKILL of a stop. Nil is `defaultStopGrace`.
+    var stopGraceSeconds: Int? = nil
+    /// What the row says while the service stops. Not stored in the file.
+    var stopNote: String? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, name, cmd, cwd, probe, type, restart, env, phase
         case dependsOn = "depends_on"
         case reuseIfRunning = "reuse_if_running"
+        case stopCmd = "stop_cmd"
+        case stopGraceSeconds = "stop_grace_seconds"
+    }
+
+    /// Enough for a dev server to close its sockets and write its last lines.
+    static let defaultStopGrace: Duration = .seconds(5)
+
+    var resolvedStopGrace: Duration {
+        stopGraceSeconds.map { .seconds(max($0, 0)) } ?? Self.defaultStopGrace
+    }
+
+    /// The stop command, or nil when the service has none.
+    var resolvedStopCmd: [String]? {
+        guard let stopCmd, !stopCmd.isEmpty else { return nil }
+        return stopCmd
+    }
+
+    /// The row text while the service stops, or nil when it has no stop command.
+    var stoppingText: String? {
+        guard let stopCmd = resolvedStopCmd else { return nil }
+        return "Stopping \(stopNote ?? "\(displayName) (\(stopCmd.joined(separator: " ")))")…"
     }
 
     var shouldReuseIfRunning: Bool { reuseIfRunning ?? false }

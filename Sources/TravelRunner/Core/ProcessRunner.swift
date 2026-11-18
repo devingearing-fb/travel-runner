@@ -35,6 +35,9 @@ actor ProcessRunner {
         let process: Process
         let pid: pid_t
         let stopFlag: StopFlag
+        let service: ServiceDefinition
+        let onStdout: @Sendable ([String]) -> Void
+        let onStderr: @Sendable ([String]) -> Void
     }
 
     private var launches: [String: Launch] = [:]
@@ -44,9 +47,12 @@ actor ProcessRunner {
     private let exitHistoryLimit = 64
     /// The PATH of each service command.
     private let tools: ToolEnvironment
+    /// Runs the stop command of a service. Tests give a fake.
+    private let shell: any CommandRunning
 
-    init(tools: ToolEnvironment = .shared) {
+    init(tools: ToolEnvironment = .shared, shell: (any CommandRunning)? = nil) {
         self.tools = tools
+        self.shell = shell ?? LoginShell(tools: tools)
     }
 
     /// Starts the process of a service. It does not wait for anything before it
@@ -128,35 +134,71 @@ actor ProcessRunner {
 
         // The system can give a new process the pid of an old one.
         forgetExit(of: pid)
-        launches[service.id] = Launch(process: process, pid: pid, stopFlag: stopFlag)
+        launches[service.id] = Launch(
+            process: process, pid: pid, stopFlag: stopFlag, service: service,
+            onStdout: onStdout, onStderr: onStderr
+        )
         return pid
     }
 
+    /// Runs the stop command of the service, then sends SIGTERM, and SIGKILL after
+    /// the grace of the service.
     func stop(serviceID: String) async {
         guard let launch = launches[serviceID] else { return }
         launch.stopFlag.set()
 
         // `tree` reads the whole tree before the first signal.
-        await ProcessTree.terminate(ProcessTree.tree(of: launch.pid))
+        let tree = ProcessTree.tree(of: launch.pid)
+        await runStopCommand(of: launch)
+        await ProcessTree.terminate(tree, grace: launch.service.resolvedStopGrace)
 
         if launches[serviceID]?.pid == launch.pid {
             launches.removeValue(forKey: serviceID)
         }
     }
 
+    /// `stop` for every launch at once. Each one gets its own stop command and grace.
     func stopAll() async {
         let stopping = launches
-        var tree: [pid_t] = []
+        var trees: [(launch: Launch, pids: [pid_t])] = []
         for launch in stopping.values {
             launch.stopFlag.set()
-            tree.append(contentsOf: ProcessTree.tree(of: launch.pid))
+            trees.append((launch, ProcessTree.tree(of: launch.pid)))
         }
 
-        await ProcessTree.terminate(tree)
+        await withTaskGroup(of: Void.self) { group in
+            for (launch, pids) in trees {
+                group.addTask {
+                    await self.runStopCommand(of: launch)
+                    await ProcessTree.terminate(pids, grace: launch.service.resolvedStopGrace)
+                }
+            }
+        }
 
         for (serviceID, launch) in stopping where launches[serviceID]?.pid == launch.pid {
             launches.removeValue(forKey: serviceID)
         }
+    }
+
+    /// Starts the stop command of the service and does not wait for it. The app
+    /// uses it as it quits: the teardown goes on after the app has ended.
+    @discardableResult
+    nonisolated static func startStopCommandDetached(
+        of service: ServiceDefinition, tools: ToolEnvironment = .shared
+    ) -> pid_t? {
+        guard let command = service.resolvedStopCmd else { return nil }
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-l", "-c", tools.wrap(ShellQuote.join(command), cwd: service.resolvedCwd)]
+        if let cwd = service.resolvedCwd {
+            process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        }
+        process.environment = ProcessInfo.processInfo.environment.merging(service.env ?? [:]) { _, new in new }
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return nil }
+        return process.processIdentifier
     }
 
     /// True while a process that this runner started still runs.
@@ -174,6 +216,26 @@ actor ProcessRunner {
     }
 
     // MARK: - Private
+
+    /// Runs the stop command and waits for it, at most for the grace of the service.
+    /// Its output goes to the log of the service.
+    private func runStopCommand(of launch: Launch) async {
+        guard let command = launch.service.resolvedStopCmd else { return }
+        let text = ShellQuote.join(command)
+        let grace = launch.service.resolvedStopGrace
+        launch.onStdout(["[travel-runner] Stopping: \(text)"])
+        let onStdout = launch.onStdout
+        let onStderr = launch.onStderr
+        let result = await shell.run(
+            text, cwd: launch.service.resolvedCwd, environment: launch.service.env ?? [:], timeout: grace,
+            onLine: { line, stream in stream == .stderr ? onStderr([line]) : onStdout([line]) }
+        )
+        if result.timedOut {
+            onStderr(["[travel-runner] \(text) did not finish in \(grace.components.seconds) s and was stopped."])
+        } else if !result.succeeded {
+            onStderr(["[travel-runner] \(text) failed (exit \(result.exitCode))."])
+        }
+    }
 
     private func recordExit(serviceID: String, termination: Termination) {
         if exits[termination.pid] == nil {

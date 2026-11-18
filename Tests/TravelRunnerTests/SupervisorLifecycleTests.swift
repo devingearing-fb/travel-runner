@@ -744,6 +744,51 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(crashes.isEmpty, "\(crashes)")
     }
 
+    /// Findings "SIGKILL after 2 s cuts cleanup" and "2 s grace kills Sequin
+    /// teardown": Stop All runs the stop verb first, waits for a cleanup of three
+    /// seconds, and sweeps the port last. The listener runs outside the service's
+    /// process tree, as a container's port does, so only the sweep stops it.
+    func testStopAllRunsTheStopVerbAndTheCleanupBeforeThePortSweep() async throws {
+        let order = workDir.appendingPathComponent("order")
+        let orderPath = ShellQuote.quote(order.path)
+        let ownedDirectory = workDir.lastPathComponent
+        supervisor.portTools = PortTools(
+            listeners: PortTools.live.listeners,
+            kill: { pid in
+                guard Self.process(pid, runsIn: ownedDirectory) else { return }
+                if let handle = try? FileHandle(forWritingTo: order) {
+                    handle.seekToEndOfFile()
+                    handle.write(Data("sweep\n".utf8))
+                    try? handle.close()
+                }
+                PortTools.live.kill(pid)
+            },
+            killCommands: { _ in }
+        )
+        let script = "(\(webServer.joined(separator: " ")) > /dev/null 2>&1 &); "
+            + "trap 'sleep 3; echo cleanup >> \(orderPath); exit 0' TERM; while true; do sleep 1; done"
+        var service = daemon("sequin", ["sh", "-c", script])
+        service.stopCmd = ["sh", "-c", "echo verb >> \(orderPath)"]
+        service.stopNote = "Sequin (compose down)"
+        try load(service)
+
+        supervisor.restartService("sequin")
+        let started = await waitUntil(30) { self.settled("sequin") }
+        XCTAssertTrue(started, "sequin is \(state("sequin").phase.rawValue)")
+
+        supervisor.stopAll()
+        let stopping = await waitUntil(5) { self.state("sequin").phase == .stopping }
+        XCTAssertTrue(stopping)
+        XCTAssertEqual(state("sequin").definition.stoppingText, "Stopping Sequin (compose down)…")
+        let stopped = await waitUntil(20) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+
+        let lines = ((try? String(contentsOf: order, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+        XCTAssertEqual(lines, ["verb", "cleanup", "sweep"])
+        XCTAssertTrue(Self.listeners(on: port).filter { Self.process($0, runsIn: ownedDirectory) }.isEmpty)
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+    }
+
     /// Finding "startup timeouts create no ticket": a service that never passes its
     /// probe gets an issue that says whether the process still runs.
     func testAStartupProbeTimeoutIsCaptured() async throws {

@@ -189,9 +189,11 @@ enum ServiceCatalog {
             service("stream-qstash-wire", "QStash Worker Wiring", ["./scripts/local-cdc/qstash-wire.sh"], cwd: booking,
                     type: .oneshot, restart: .never, phase: "stream", dependsOn: ["stream-qstash", "stream-services"],
                     env: ["STREAM_SERVICES_PORT": "3003"]),
+            // `compose down` of the Sequin containers takes longer than a plain stop allows.
             service("stream-sequin", "Local Sequin Cache CDC", ["./scripts/local-cdc/run-sequin.sh"], cwd: booking,
                     probe: tcp(7376, timeout: 300), restart: .onFailure, phase: "stream",
-                    dependsOn: ["stream-db-setup", "stream-qstash-wire"]),
+                    dependsOn: ["stream-db-setup", "stream-qstash-wire"],
+                    stop: ["./scripts/local-cdc/run-sequin.sh", "stop"], stopGrace: 20, stopNote: "Sequin (compose down)"),
 
             // Verification oneshots (travel-load-test).
             service("cache-apply-transport", "Cache Apply Transport", ["npm", "run", "test:cache-transport:runner"],
@@ -238,11 +240,15 @@ enum ServiceCatalog {
         phase: String,
         dependsOn: [String] = [],
         env: [String: String]? = nil,
-        reuse: Bool? = nil
+        reuse: Bool? = nil,
+        stop: [String]? = nil,
+        stopGrace: Int? = nil,
+        stopNote: String? = nil
     ) -> ServiceDefinition {
         ServiceDefinition(
             id: id, name: name, cmd: cmd, cwd: cwd, probe: probe, type: type, restart: restart,
-            dependsOn: dependsOn, env: env, phase: phase, reuseIfRunning: reuse
+            dependsOn: dependsOn, env: env, phase: phase, reuseIfRunning: reuse,
+            stopCmd: stop, stopGraceSeconds: stopGrace, stopNote: stopNote
         )
     }
 

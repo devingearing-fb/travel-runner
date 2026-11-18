@@ -15,7 +15,12 @@ struct ServiceRow: View {
 
     private var showSubtitle: Bool {
         state.restartCount > 0 || state.isCircuitBroken || state.capturedArtifact != nil || rowCondition != nil
-            || state.modeNote != nil
+            || state.modeNote != nil || stoppingText != nil
+    }
+
+    /// What a stop with a teardown command does, while it runs.
+    private var stoppingText: String? {
+        state.phase == .stopping ? state.definition.stoppingText : nil
     }
 
     /// Why a skipped, failed or waiting service is in that phase. A running one has none.
@@ -151,6 +156,12 @@ struct ServiceRow: View {
 
             if showSubtitle {
                 HStack(spacing: 8) {
+                    if let stoppingText {
+                        Text(stoppingText)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
                     if let condition = rowCondition {
                         Text(condition.text)
                             .font(.caption2)

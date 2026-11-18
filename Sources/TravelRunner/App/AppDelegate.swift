@@ -122,6 +122,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let pid = state.pid { allPids += ProcessTree.tree(of: pid) }
         }
 
+        // A teardown (Sequin's `compose down`) takes longer than the quit waits.
+        // Its stop command runs on after the app has ended.
+        for (_, state) in supervisor.serviceStates where state.pid != nil {
+            ProcessRunner.startStopCommandDetached(of: state.definition)
+        }
+
         // The holds viewer of the Rooms tab is not a service, so it is not in the loop above.
         if let pid = supervisor.holdsViewer.pid { allPids += ProcessTree.tree(of: pid) }
 

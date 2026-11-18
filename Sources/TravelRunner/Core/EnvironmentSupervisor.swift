@@ -2824,7 +2824,10 @@ final class EnvironmentSupervisor {
             dependsOn: definition.dependsOn,
             env: envOverrides,
             phase: definition.phase,
-            reuseIfRunning: definition.reuseIfRunning
+            reuseIfRunning: definition.reuseIfRunning,
+            stopCmd: definition.stopCmd,
+            stopGraceSeconds: definition.stopGraceSeconds,
+            stopNote: definition.stopNote
         )
     }
 
@@ -2989,7 +2992,10 @@ final class EnvironmentSupervisor {
             dependsOn: definition.dependsOn,
             env: envOverrides,
             phase: definition.phase,
-            reuseIfRunning: definition.reuseIfRunning
+            reuseIfRunning: definition.reuseIfRunning,
+            stopCmd: definition.stopCmd,
+            stopGraceSeconds: definition.stopGraceSeconds,
+            stopNote: definition.stopNote
         )
     }
 

@@ -52,6 +52,40 @@ final class ServiceCatalogTests: XCTestCase {
         }
     }
 
+    /// Ticket "Local Sequin Cache CDC exited with code 9": the SIGKILL after two
+    /// seconds cut the `compose down` of Sequin and left its containers running.
+    func testSequinStopsWithItsStopVerbAndALongGrace() throws {
+        let sequin = try XCTUnwrap(byID["stream-sequin"])
+        XCTAssertEqual(sequin.resolvedStopCmd, ["./scripts/local-cdc/run-sequin.sh", "stop"])
+        XCTAssertEqual(sequin.resolvedStopGrace, .seconds(20))
+        XCTAssertEqual(sequin.stoppingText, "Stopping Sequin (compose down)…")
+        // Every other service has no stop verb and the default grace.
+        for service in services where service.id != "stream-sequin" {
+            XCTAssertNil(service.resolvedStopCmd, service.id)
+            XCTAssertNil(service.stoppingText, service.id)
+            XCTAssertEqual(service.resolvedStopGrace, ServiceDefinition.defaultStopGrace, service.id)
+        }
+        XCTAssertEqual(ServiceDefinition.defaultStopGrace, .seconds(5))
+    }
+
+    /// A custom service of services.json can give its own stop verb and grace.
+    func testACustomServiceReadsItsStopVerbAndGrace() throws {
+        let json = #"{"id": "custom", "cmd": ["./run.sh"], "depends_on": [], "stop_cmd": ["./run.sh", "stop"], "stop_grace_seconds": 12}"#
+        let service = try JSONDecoder().decode(ServiceDefinition.self, from: Data(json.utf8))
+        XCTAssertEqual(service.resolvedStopCmd, ["./run.sh", "stop"])
+        XCTAssertEqual(service.resolvedStopGrace, .seconds(12))
+        XCTAssertEqual(service.stoppingText, "Stopping custom (./run.sh stop)…")
+
+        let encoded = try XCTUnwrap(String(data: JSONEncoder().encode(service), encoding: .utf8))
+        XCTAssertTrue(encoded.contains(#""stop_grace_seconds":12"#), encoded)
+
+        let plain = try JSONDecoder().decode(
+            ServiceDefinition.self, from: Data(#"{"id": "plain", "cmd": ["true"], "depends_on": []}"#.utf8)
+        )
+        XCTAssertNil(plain.resolvedStopCmd)
+        XCTAssertEqual(plain.resolvedStopGrace, .seconds(5))
+    }
+
     func testCacheApplySecretIsSharedAcrossTheChain() {
         let secret = byID["travel-portal"]?.env?["CACHE_APPLY_SECRET_CURRENT"]
         XCTAssertNotNil(secret)
