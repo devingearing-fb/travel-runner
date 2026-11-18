@@ -55,8 +55,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         supervisor.loadConfig()
 
-        supervisor.onServiceCrash = { [weak self] serviceName, exitCode in
-            self?.postCrashNotification(serviceName: serviceName, exitCode: exitCode)
+        supervisor.onServiceCrash = { [weak self] alert in
+            self?.postCrashNotification(alert)
         }
 
         updateController = UpdateController()
@@ -268,6 +268,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         WorkshopPanel.shared.open()
         NSApp.activate(ignoringOtherApps: true)
         supervisor.panelVisible = true
+        // The person can turn them on or off in System Settings at any time.
+        refreshNotificationsOff()
     }
 
     @objc private func quitApp() {
@@ -340,21 +342,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupNotifications() {
         guard canNotify else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        let openAction = UNNotificationAction(identifier: "OPEN_LOGS", title: "Open Logs", options: [.foreground])
+        let center = UNUserNotificationCenter.current()
+        // Without a delegate, "Open Logs" and a click on the notification did nothing.
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { [weak self] _, _ in
+            Task { @MainActor in self?.refreshNotificationsOff() }
+        }
+        let openAction = UNNotificationAction(identifier: Self.openLogsAction, title: "Open Logs", options: [.foreground])
         let category = UNNotificationCategory(identifier: "CRASH", actions: [openAction], intentIdentifiers: [])
-        UNUserNotificationCenter.current().setNotificationCategories([category])
+        center.setNotificationCategories([category])
     }
 
-    private func postCrashNotification(serviceName: String, exitCode: Int32) {
+    nonisolated private static let openLogsAction = "OPEN_LOGS"
+
+    /// Says in the header when the person turned the notifications off.
+    private func refreshNotificationsOff() {
+        guard canNotify, !LaunchEnvironment.isSmoke() else { return }
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let denied = settings.authorizationStatus == .denied
+            Task { @MainActor in self?.supervisor.notificationsOff = denied }
+        }
+    }
+
+    private func postCrashNotification(_ alert: CrashAlert) {
         guard canNotify else { return }
         let content = UNMutableNotificationContent()
-        content.title = "\(serviceName) crashed"
-        content.body = "Exited with code \(exitCode)"
+        content.title = alert.title
+        content.body = alert.body
         content.sound = .default
         content.categoryIdentifier = "CRASH"
+        content.userInfo = [CrashAlert.serviceIDKey: alert.serviceID]
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
+    }
+
+    /// "Open Logs", or a click on the notification: the log of the service that crashed.
+    private func openLog(of serviceID: String?) {
+        if let serviceID { WorkshopPanel.shared.navigation.selectedLogServiceID = serviceID }
+        WorkshopPanel.shared.open(section: .logs)
+        NSApp.activate(ignoringOtherApps: true)
+        supervisor.panelVisible = true
     }
 
     // MARK: - Global Hotkey
@@ -393,5 +420,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.activate(ignoringOtherApps: true)
             supervisor.panelVisible = true
         }
+    }
+}
+
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse
+    ) async {
+        let opens = [Self.openLogsAction, UNNotificationDefaultActionIdentifier].contains(response.actionIdentifier)
+        guard opens else { return }
+        let serviceID = response.notification.request.content.userInfo[CrashAlert.serviceIDKey] as? String
+        await MainActor.run { self.openLog(of: serviceID) }
+    }
+
+    /// The panel can be in front when a service crashes: show the banner there too.
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter, willPresent notification: UNNotification
+    ) async -> UNNotificationPresentationOptions {
+        [.banner, .sound]
     }
 }

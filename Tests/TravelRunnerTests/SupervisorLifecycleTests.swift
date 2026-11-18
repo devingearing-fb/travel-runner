@@ -11,12 +11,14 @@ final class SupervisorLifecycleTests: XCTestCase {
     private var port = 0
     private var workDir: URL!
     private var crashes: [(name: String, code: Int32)] = []
+    private var alerts: [CrashAlert] = []
 
     override func setUp() async throws {
         port = Self.freePort()
         workDir = FileManager.default.temporaryDirectory.appendingPathComponent("SupervisorLifecycleTests-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
         crashes = []
+        alerts = []
         try makeSupervisor(tools: .shared)
     }
 
@@ -37,8 +39,9 @@ final class SupervisorLifecycleTests: XCTestCase {
             kill: { pid in if Self.process(pid, runsIn: ownedDirectory) { PortTools.live.kill(pid) } },
             killCommands: { _ in }
         )
-        supervisor.onServiceCrash = { [weak self] name, code in
-            self?.crashes.append((name, code))
+        supervisor.onServiceCrash = { [weak self] alert in
+            self?.crashes.append((alert.name, alert.exitCode))
+            self?.alerts.append(alert)
         }
         // deps.json of a test is in its own folder, never in ~/.config.
         supervisor.dependencyRecord = DependencyRecord(path: workDir.appendingPathComponent("config/deps.json").path)
@@ -381,6 +384,105 @@ final class SupervisorLifecycleTests: XCTestCase {
         let trips = await events("breaker_trip", in: tracker)
         XCTAssertEqual(trips.map(\.serviceId), ["boom"])
         XCTAssertEqual(trips.first?.message, "boom is crash-looping — auto-restart stopped")
+    }
+
+    // MARK: - Feedback and notifications (E4)
+
+    /// The notification said only "Exited with code 1". It now names the cause from
+    /// the log and the restart that comes, and it carries the service for "Open Logs".
+    func testACrashNotificationNamesTheCauseAndTheRestart() async throws {
+        let marker = workDir.appendingPathComponent("crash-now").path
+        // It runs until the marker is there, then crashes once with EADDRINUSE.
+        let script = "python3 -u -m http.server \(port) --bind 127.0.0.1 & srv=$!; "
+            + "while [ ! -f '\(marker)' ]; do sleep 0.1; done; rm '\(marker)'; kill $srv; wait $srv; "
+            + "echo 'Error: listen EADDRINUSE: address already in use :::3002' >&2; exit 1"
+        try load(daemon("web", ["sh", "-c", script]))
+        supervisor.restartService("web")
+        let ready = await waitUntil(20) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        XCTAssertTrue(alerts.isEmpty, "\(alerts)")
+
+        FileManager.default.createFile(atPath: marker, contents: nil)
+
+        let alerted = await waitUntil(20) { !self.alerts.isEmpty }
+        XCTAssertTrue(alerted, "no crash notification")
+        let alert = try XCTUnwrap(alerts.first)
+        XCTAssertEqual(alert.serviceID, "web")
+        XCTAssertEqual(alert.title, "web crashed")
+        XCTAssertEqual(alert.exitCode, 1)
+        XCTAssertEqual(alert.next, .restarting(attempt: 1))
+        XCTAssertEqual(alert.body, "Port 3002 is already in use by another process. Restarting (attempt 1).")
+        // The crash is in Recent activity, with the service.
+        let entry = try XCTUnwrap(supervisor.recentActivity.entries.first { $0.style == .error })
+        XCTAssertEqual(entry.message, "web crashed: Port 3002 is already in use by another process. Restarting (attempt 1).")
+        XCTAssertEqual(entry.serviceID, "web")
+
+        // The restart comes, and the notification counted it right.
+        let back = await waitUntil(30) { self.settled("web") && self.state("web").restartCount == 1 }
+        XCTAssertTrue(back, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(alerts.count, 1)
+    }
+
+    /// Negative control: a crash with no cause in the log says the exit code.
+    func testACrashNotificationWithoutACauseSaysTheExitCode() async throws {
+        let marker = workDir.appendingPathComponent("crash-now").path
+        let script = "python3 -u -m http.server \(port) --bind 127.0.0.1 & srv=$!; "
+            + "while [ ! -f '\(marker)' ]; do sleep 0.1; done; rm '\(marker)'; kill $srv; wait $srv; exit 3"
+        try load(daemon("web", ["sh", "-c", script]))
+        supervisor.restartService("web")
+        let ready = await waitUntil(20) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+
+        FileManager.default.createFile(atPath: marker, contents: nil)
+
+        let alerted = await waitUntil(20) { !self.alerts.isEmpty }
+        XCTAssertTrue(alerted, "no crash notification")
+        XCTAssertEqual(alerts.first?.body, "Exited with code 3. Restarting (attempt 1).")
+        _ = await waitUntil(30) { self.settled("web") }
+    }
+
+    /// A guard that refused an action did nothing visible. Now it says so with an
+    /// info toast, and the toasts are in Recent activity.
+    func testAGuardThatRefusesAnActionSaysSo() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        try supervisor.loadServices([daemon("web", webServer)])
+        var feedback: [ActionFeedback] = []
+        supervisor.onFeedback = { feedback.append($0) }
+
+        supervisor.startAll(skipPreflight: true)
+        XCTAssertTrue(feedback.isEmpty, "the first start is not refused: \(feedback.map(\.message))")
+        supervisor.startAll(skipPreflight: true)
+        XCTAssertEqual(feedback.map(\.message), ["A start is already in progress."])
+        XCTAssertEqual(feedback.last?.style, .info)
+        let up = await waitUntil(40) { self.settled("web") && self.supervisor.health == .healthy }
+        XCTAssertTrue(up, "web is \(state("web").phase.rawValue)")
+
+        feedback = []
+        supervisor.restartService("web")
+        supervisor.restartService("web")
+        XCTAssertEqual(feedback.map(\.message), ["web is already restarting."])
+        XCTAssertEqual(feedback.first?.style, .info)
+        XCTAssertEqual(feedback.first?.serviceID, "web")
+        let restarted = await waitUntil(30) { feedback.count == 2 }
+        XCTAssertTrue(restarted)
+        XCTAssertEqual(feedback.last?.message, "web restarted")
+        XCTAssertEqual(feedback.last?.style, .success)
+
+        feedback = []
+        supervisor.dbResetRunning = true
+        supervisor.runDbSetup()
+        supervisor.askToResetDatabase()
+        supervisor.dbResetRunning = false
+        XCTAssertEqual(feedback.map(\.message), Array(repeating: "A database setup is already running.", count: 2))
+
+        // Recent activity has them all, the newest first.
+        XCTAssertEqual(
+            supervisor.recentActivity.entries.prefix(5).map(\.message),
+            [
+                "A database setup is already running.", "A database setup is already running.",
+                "web restarted", "web is already restarting.", "A start is already in progress.",
+            ]
+        )
     }
 
     /// A tripped breaker must not outlive a deliberate restart: the next failure of
@@ -2314,7 +2416,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         try load(stripe("echo stripe-start; sleep 30"))
         supervisor.stripeAvailability = { false }
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
 
         supervisor.restartService("stripe")
 
@@ -3869,7 +3971,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
         let loads = fakeConfigHost(services: ["other"])
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
         let needsStop = await supervisor.reconfigure()
         XCTAssertEqual(needsStop, .needsStop)
 
@@ -3893,7 +3995,7 @@ final class SupervisorLifecycleTests: XCTestCase {
     func testReconfigureOfAStoppedStackLoadsTheConfigAndKeepsOneControlServer() async throws {
         let loads = fakeConfigHost(services: ["first"])
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
 
         supervisor.loadConfig()
         XCTAssertEqual(supervisor.sortedServiceIDs, ["first"])
@@ -3982,7 +4084,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.loadConfig()
         let before = state("first")
         var feedback: [(String, Bool)] = []
-        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+        supervisor.onFeedback = { feedback.append(($0.message, $0.style == .success)) }
         loads.error = ConfigLoader.ConfigError.monorepoNotFound
 
         let result = await supervisor.reconfigure()

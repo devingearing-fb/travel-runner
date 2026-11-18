@@ -81,6 +81,10 @@ struct WorkshopStatusView: View {
                         )
                     }
                 }
+
+                if !supervisor.recentActivity.entries.isEmpty {
+                    recentActivitySection
+                }
             }
             .padding(16)
         }
@@ -138,6 +142,37 @@ struct WorkshopStatusView: View {
         .padding(10)
         .background(Color.secondary.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 6))
+    }
+
+    /// The toasts and the crashes of this run: a toast that went by can be read here.
+    private var recentActivitySection: some View {
+        DisclosureGroup("Recent activity") {
+            ForEach(supervisor.recentActivity.entries) { entry in
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: entry.style.icon)
+                        .foregroundStyle(entry.style.color)
+                        .frame(width: 16)
+                    Text(entry.message)
+                        .font(.caption)
+                        .textSelection(.enabled)
+                    Spacer()
+                    Text(entry.at, style: .time)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    if let serviceID = entry.serviceID {
+                        Button {
+                            WorkshopPanel.shared.navigation.selectedLogServiceID = serviceID
+                            WorkshopPanel.shared.open(section: .logs)
+                        } label: {
+                            Image(systemName: "terminal").font(.caption2)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Open the log")
+                    }
+                }
+            }
+        }
+        .font(.caption)
     }
 
     private var preflightSection: some View {

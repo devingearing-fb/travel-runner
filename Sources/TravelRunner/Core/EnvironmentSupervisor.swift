@@ -22,6 +22,11 @@ final class EnvironmentSupervisor {
     var configIssues: [String] = []
     /// Set when a release copy runs outside an Applications folder, until the person closes it.
     var misplacedCopyNotice: InstanceGuard.MisplacedNotice? = nil
+    /// True when macOS denies the notifications: a crash shows only in the menu bar.
+    var notificationsOff = false
+    /// The person closed the "Notifications are off" banner for this run.
+    var notificationsOffDismissed = false
+    static let notificationsOffText = "Notifications are off — crashes show only as the red menu-bar dot."
     /// Set while the checkout needs a newer runner. No reset and no DB step runs
     /// while it is set; the services still start.
     var compatibilityNotice: Compatibility.Notice? = nil
@@ -75,7 +80,8 @@ final class EnvironmentSupervisor {
     var panelVisible = false
     var rootCauseServiceID: String? = nil
     var phaseTimings: [String: TimeInterval] = [:]
-    var onServiceCrash: (@MainActor (String, Int32) -> Void)? = nil
+    /// A crash, with its cause and what happens next: the notification.
+    var onServiceCrash: (@MainActor (CrashAlert) -> Void)? = nil
     var debugTrackingEnabled = false
     var debugOpenIssueCount = 0
     /// True while "Report a problem" saves its zip.
@@ -83,7 +89,14 @@ final class EnvironmentSupervisor {
     /// Makes the exporter of a report. Tests give one with a temporary folder and a fake zip.
     @ObservationIgnored var makeReportExporter: () -> ReportExporter = { .live() }
     var actionsInFlight: Set<String> = []
-    var onActionFeedback: ((String, Bool) -> Void)?
+    /// Shows one feedback as a toast. `showFeedback` also lists it in `recentActivity`.
+    var onFeedback: ((ActionFeedback) -> Void)?
+    /// The last feedback and crashes, the newest first, for Status.
+    private(set) var recentActivity = RecentActivity()
+    /// The short form of `showFeedback`, for an action that only succeeds or fails.
+    var onActionFeedback: ((String, Bool) -> Void)? {
+        { [weak self] message, success in self?.showFeedback(message, success ? .success : .error) }
+    }
     /// Opens the page that shows where each tool was found (the "Open Health" button).
     var onOpenHealth: (() -> Void)?
     var gitBranches: [String: String] = [:]
@@ -661,7 +674,11 @@ final class EnvironmentSupervisor {
     // MARK: - Start / Stop
 
     func startAll(skipPreflight: Bool = false) {
-        guard startTask == nil, let graph else { return }
+        guard startTask == nil else {
+            showFeedback(ActionFeedback.startInProgress, .info)
+            return
+        }
+        guard let graph else { return }
         // A start that a person asks for begins a new failure series for each service.
         for serviceID in serviceStates.keys { clearFailureHistory(serviceID) }
         health = .starting
@@ -1211,7 +1228,10 @@ final class EnvironmentSupervisor {
             postNotice(.service(serviceID), "No cwd found for \(serviceID)")
             return
         }
-        guard queuedCacheClears.insert(serviceID).inserted else { return }
+        guard queuedCacheClears.insert(serviceID).inserted else {
+            showFeedback(ActionFeedback.alreadyRestarting(displayName(serviceID)), .info, serviceID: serviceID)
+            return
+        }
         Task {
             beginAction(serviceID)
             defer { endAction(serviceID) }
@@ -1466,8 +1486,11 @@ final class EnvironmentSupervisor {
     /// the circuit breaker and the backoff start again.
     func restartService(_ serviceID: String) {
         if serviceID == "stripe" { stripeReconnectingSince = nil }
-        guard queuedRestarts.insert(serviceID).inserted else { return }
         let name = serviceStates[serviceID]?.definition.displayName ?? serviceID
+        guard queuedRestarts.insert(serviceID).inserted else {
+            showFeedback(ActionFeedback.alreadyRestarting(name), .info, serviceID: serviceID)
+            return
+        }
         Task {
             beginAction(serviceID)
             defer { endAction(serviceID) }
@@ -1479,13 +1502,13 @@ final class EnvironmentSupervisor {
                 })
                 clearCleanExitError(serviceID)
                 if serviceStates[serviceID]?.phase == .skipped {
-                    onActionFeedback?("\(name) skipped — see its log", false)
+                    showFeedback("\(name) skipped — see its log", .error, serviceID: serviceID)
                 } else {
-                    onActionFeedback?("\(name) restarted", true)
+                    showFeedback("\(name) restarted", .success, serviceID: serviceID)
                 }
             } catch {
                 recordFailure(serviceID, error: error, lastError: "\(error)")
-                onActionFeedback?("\(name) restart failed", false)
+                showFeedback("\(name) restart failed", .error, serviceID: serviceID)
             }
             recalculateHealth()
         }
@@ -1718,6 +1741,48 @@ final class EnvironmentSupervisor {
         recalculateHealth()
     }
 
+    /// Shows a toast and lists it in Recent activity. A guard that refuses an action
+    /// says so with `.info`; before, it did nothing.
+    func showFeedback(_ message: String, _ style: ActionFeedback.Style, serviceID: String? = nil) {
+        let feedback = ActionFeedback(message: message, style: style, serviceID: serviceID, at: clock.date())
+        recentActivity.add(feedback)
+        onFeedback?(feedback)
+    }
+
+    /// Lists the crash in Recent activity and posts its notification. The cause
+    /// comes from the log of this launch, so it reads the log first.
+    private func alertCrash(_ state: ServiceState, code: Int32, next: CrashAlert.Next, cause knownCause: String? = nil) {
+        let definition = state.definition
+        let launched = state.lastStarted ?? .distantPast
+        Task {
+            var cause = knownCause
+            if cause == nil {
+                let tail = await launchLogTail(state.id, since: launched)
+                let probe = definition.probe
+                cause = FailureAdvisor.cause(FailureAdvisor.Context(
+                    name: definition.displayName, port: probe?.port, logTail: tail,
+                    likelyCause: CrashCause.likelyCause(in: tail, serviceID: state.id, redactor: makeRedactor()),
+                    runtime: ContainerRuntime.detect().displayName, command: definition.cmd, cwd: definition.resolvedCwd
+                ))
+            }
+            let alert = CrashAlert(
+                serviceID: state.id, name: definition.displayName, exitCode: code, cause: cause, next: next
+            )
+            recentActivity.add(ActionFeedback(
+                message: "\(alert.title): \(alert.body)", style: .error, serviceID: state.id, at: clock.date()
+            ))
+            onServiceCrash?(alert)
+        }
+    }
+
+    /// The last lines of the service's log since `launched`. The log keeps the lines
+    /// of earlier launches; they are not the cause of this one.
+    private func launchLogTail(_ serviceID: String, since launched: Date) async -> [String] {
+        await logStore.entries(for: serviceID)
+            .filter { $0.timestamp >= launched }
+            .suffix(FailureAdvisor.logWindow).map(\.text)
+    }
+
     /// The banner text for a daemon that ended with code 0.
     nonisolated static func cleanExitMessage(_ name: String) -> String {
         "\(name) exited (code 0) and was not restarted — restart it from its row"
@@ -1783,11 +1848,8 @@ final class EnvironmentSupervisor {
         // The notice of this failure ("exited before it was ready", "crash-looping").
         let banner = notices.text(.service(serviceID))
         Task {
-            // The log keeps the lines of earlier launches; they are not the cause of this one.
-            let tail = await logStore.entries(for: serviceID)
-                .filter { $0.timestamp >= launched }
-                .suffix(FailureAdvisor.logWindow).map(\.text)
-            let likely = CrashCause.likelyCause(in: Array(tail), serviceID: serviceID, redactor: makeRedactor())
+            let tail = await launchLogTail(serviceID, since: launched)
+            let likely = CrashCause.likelyCause(in: tail, serviceID: serviceID, redactor: makeRedactor())
             guard state.failureRecordCount == record, state.phase == .failed else { return }
             let context = FailureAdvisor.Context(
                 name: definition.displayName, port: probe?.port, probePath: probePath, logTail: Array(tail),
@@ -2213,7 +2275,10 @@ final class EnvironmentSupervisor {
         singleStep: Bool = false, reusePipeline: Bool = true, stepArguments: String? = nil,
         leadingSteps: [String] = []
     ) -> DbSetupRun? {
-        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return nil }
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else {
+            showFeedback(ActionFeedback.dbSetupRunning, .info)
+            return nil
+        }
         guard let cwd else {
             postNotice(.dbSetup, "Cannot find supabase service cwd in config")
             return nil
@@ -2385,7 +2450,10 @@ final class EnvironmentSupervisor {
     /// Every reset button asks first. The confirmation names the scenario, what
     /// happens to the hotels, and another checkout that built the database.
     func askToResetDatabase() {
-        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else { return }
+        guard !dbResetRunning, dbSetupPipeline?.isRunning != true else {
+            showFeedback(ActionFeedback.dbSetupRunning, .info)
+            return
+        }
         let scenario = selectedDbSeedScenario?.name ?? "none selected"
         let cwd = supabaseCwd
         Task {
@@ -3470,6 +3538,7 @@ final class EnvironmentSupervisor {
             let record = state.failureRecordCount
             Task {
                 let finding = await commandFinding(forExit: code, pid: termination.pid, of: state)
+                alertCrash(state, code: code, next: .none, cause: CommandDiagnosis.message(finding, name: name))
                 guard finding != unknown else { return }
                 let full = CommandDiagnosis.message(finding, name: name)
                 await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(full)"))
@@ -3479,7 +3548,6 @@ final class EnvironmentSupervisor {
                     recordFailure(serviceID, kind: .cannotRun(finding))
                 }
             }
-            onServiceCrash?(name, code)
             Task { await captureDebugIssue(
                 trigger: "service_crash",
                 serviceID: serviceID,
@@ -3490,8 +3558,8 @@ final class EnvironmentSupervisor {
             state.phase = .failed
             state.lastStopped = clock.date()
             noteFailure(state, stableFor: stableFor)
-            if !state.isCircuitBroken {
-                onServiceCrash?(name, termination.status)
+            let alerts = !state.isCircuitBroken
+            if alerts {
                 Task { await captureDebugIssue(
                     trigger: "service_crash",
                     serviceID: serviceID,
@@ -3500,6 +3568,12 @@ final class EnvironmentSupervisor {
             }
             if restarts {
                 scheduleRestart(serviceID: serviceID, wasEarlyExit: (uptime ?? 0) < 10)
+            }
+            // After the schedule: the notification says whether a restart comes.
+            if alerts {
+                let next: CrashAlert.Next = state.isCircuitBroken ? .autoRestartStopped
+                    : restarts && state.phase == .failed ? .restarting(attempt: state.restartCount + 1) : .none
+                alertCrash(state, code: termination.status, next: next)
             }
             // A tripped breaker recorded its own reason.
             if state.phase == .failed, !state.isCircuitBroken {

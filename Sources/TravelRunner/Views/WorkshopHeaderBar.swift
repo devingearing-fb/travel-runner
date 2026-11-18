@@ -174,6 +174,21 @@ struct WorkshopHeaderBar: View {
                     onDismiss: { supervisor.dismissMisplacedCopyNotice() }
                 )
             }
+            if supervisor.notificationsOff && !supervisor.notificationsOffDismissed {
+                alertBanner(
+                    icon: "bell.slash.fill",
+                    color: .orange,
+                    text: EnvironmentSupervisor.notificationsOffText,
+                    subtitle: nil,
+                    action: ("Open System Settings", {
+                        let id = Bundle.main.bundleIdentifier.map { "?id=\($0)" } ?? ""
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension\(id)") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }),
+                    onDismiss: { supervisor.notificationsOffDismissed = true }
+                )
+            }
             if let notice = supervisor.compatibilityNotice {
                 // No dismiss: it stays while the resets are blocked.
                 alertBanner(

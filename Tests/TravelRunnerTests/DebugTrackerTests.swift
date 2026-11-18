@@ -507,7 +507,7 @@ final class DebugTrackerTests: XCTestCase {
         let folder = root.appendingPathComponent("blocked/issues").path
         supervisor.makeIssueTracker = { DebugTracker(baseDir: folder) }
         var feedback: [String] = []
-        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+        supervisor.onFeedback = { feedback.append($0.message) }
 
         await supervisor.setIssueCaptureEnabled(false)
 

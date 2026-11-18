@@ -70,9 +70,11 @@ final class WorkshopPanel {
     func configure(supervisor: EnvironmentSupervisor, updateController: UpdateController? = nil) {
         self.supervisor = supervisor
         self.updateController = updateController
-        supervisor.onActionFeedback = { [weak toastCenter] message, success in
-            toastCenter?.show(message, style: success ? .success : .error)
+        supervisor.onFeedback = { [weak toastCenter] feedback in
+            toastCenter?.show(feedback)
         }
+        // An error toast opens Status, where the failed service has its triage card.
+        toastCenter.onOpen = { [weak self] _ in self?.open(section: .status) }
         // The Tools block of Diagnostics says where each tool was found.
         supervisor.onOpenHealth = { [weak self] in self?.open(section: .diagnostics) }
     }
