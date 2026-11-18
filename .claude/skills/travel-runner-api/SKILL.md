@@ -436,7 +436,7 @@ Shared code in `packages/travel-data` hot-reloads into both apps; there is nothi
 2. `GET /api/logs/{serviceId}?lines=100` — read the last output before crash
 3. `POST /api/restart/{serviceId}` — attempt restart
 4. If it fails again, check for port conflicts (`lsof -ti TCP:PORT -sTCP:LISTEN`; plain `lsof -ti :PORT` also lists the clients of the port, such as a browser — do not kill those)
-5. A service with "crash-looping" stopped its automatic restarts after 3 failures in 60 seconds. Fix the cause in its log, then `POST /api/restart/{serviceId}`
+5. A service whose reason says "failed 3 times in a minute" or "did not come back after 5 restarts" stopped its automatic restarts. Fix the cause in its log, then `POST /api/restart/{serviceId}`. "Something else keeps stopping …" means another process kills it (SIGKILL often means low memory). "… is not running — waiting for it" means the container runtime is down; the service starts by itself when it is back (the wait lasts 10 minutes)
 
 Requests for one service run one at a time. A restart that arrives while another runs waits for it; a second identical request that would also wait is dropped.
 

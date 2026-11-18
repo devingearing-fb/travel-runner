@@ -2058,8 +2058,11 @@ final class EnvironmentSupervisor {
 
     private func clearFailureHistory(_ serviceID: String) {
         serviceStates[serviceID]?.restartCount = 0
-        serviceStates[serviceID]?.isCircuitBroken = false
+        serviceStates[serviceID]?.haltReason = nil
         serviceStates[serviceID]?.failureTimestamps = []
+        serviceStates[serviceID]?.killTimestamps = []
+        serviceStates[serviceID]?.lastKillSignal = nil
+        serviceStates[serviceID]?.memoryNotified = false
         serviceStates[serviceID]?.cleanExitRestarted = false
     }
 
@@ -2109,7 +2112,7 @@ final class EnvironmentSupervisor {
         let definition = state.definition
         let probe = definition.probe
         let probePath = probe?.type == .http ? probe?.url.flatMap { URL(string: $0)?.path }.flatMap { $0.isEmpty ? nil : $0 } : nil
-        // The banner of this failure ("exited before it was ready", "crash-looping").
+        // The banner of this failure ("exited before it was ready", "failed 3 times in a minute").
         let banner = ownsBanner ? lastError : nil
         Task {
             // The log keeps the lines of earlier launches; they are not the cause of this one.
@@ -4034,17 +4037,31 @@ final class EnvironmentSupervisor {
             // Someone stopped it from outside: `kill`, a script that frees the port.
             // The service did not fail, so there is no crash notification and no
             // debug issue. It still counts toward the circuit breaker: three kills
-            // in a minute mean that something else wants the port.
+            // in a minute mean that something else keeps stopping it.
             state.phase = .failed
             state.lastStopped = clock.date()
             noteFailure(state, stableFor: stableFor)
+            state.killTimestamps.append(clock.date())
+            state.lastKillSignal = signal
             recordFailure(serviceID, kind: .killed(signal: signal), ownsBanner: owns)
+            // SIGKILL (exit 137) is how macOS ends a process when memory runs low.
+            // It gets one notification in each series.
+            if signal == SIGKILL, !state.memoryNotified {
+                state.memoryNotified = true
+                onServiceCrash?(name, 128 + SIGKILL)
+            }
             let action = restarts ? "restarting it" : "it stays stopped"
             let killed = "\(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))) — \(action)"
+            let hint = ServiceTermination.killHint(signal)
             Task {
                 await logStore.append(serviceID: serviceID, entry: LogEntry(
                     stream: .stderr, text: "[travel-runner] \(killed)"
                 ))
+                if let hint {
+                    await logStore.append(serviceID: serviceID, entry: LogEntry(
+                        stream: .stderr, text: "[travel-runner] \(hint)"
+                    ))
+                }
                 await recordDebugEvent(kind: "outside_kill", serviceID: serviceID, message: killed)
             }
             if restarts {
@@ -4118,20 +4135,33 @@ final class EnvironmentSupervisor {
         let name = state.definition.displayName
 
         state.failureTimestamps = AutoRestart.recentFailures(state.failureTimestamps, now: clock.date())
+        state.killTimestamps = AutoRestart.recentFailures(state.killTimestamps, now: clock.date())
         let baseDelay: TimeInterval
-        switch AutoRestart.decide(recentFailureCount: state.failureTimestamps.count, restartCount: state.restartCount) {
+        switch AutoRestart.decide(
+            recentFailureCount: state.failureTimestamps.count, restartCount: state.restartCount,
+            recentKillCount: state.killTimestamps.count
+        ) {
         case .crashLoop:
-            state.isCircuitBroken = true
-            lastError = "\(name) is crash-looping — auto-restart stopped"
+            state.haltReason = .crashLoop
+            let tripped = "\(name) failed \(AutoRestart.failuresToTrip) times in a minute — auto-restart stopped"
+            lastError = tripped
             recordFailure(serviceID, kind: .crashLoop)
-            Task { await recordDebugEvent(
-                kind: "breaker_trip", serviceID: serviceID, message: "\(name) is crash-looping — auto-restart stopped"
-            )}
+            Task { await recordDebugEvent(kind: "breaker_trip", serviceID: serviceID, message: tripped) }
             Task { await captureDebugIssue(
                 trigger: "circuit_breaker",
                 serviceID: serviceID,
-                summary: "\(name) crash-looping — circuit breaker tripped"
+                summary: "\(name) failed \(AutoRestart.failuresToTrip) times in a minute — circuit breaker tripped"
             )}
+            return
+        case .killedRepeatedly:
+            // The service did not crash: something else stops it. No debug issue.
+            let signal = state.lastKillSignal ?? SIGTERM
+            let times = state.killTimestamps.count
+            state.haltReason = .killedRepeatedly(signal: signal, times: times)
+            let tripped = "Something else keeps stopping \(name) (\(ServiceTermination.signalName(signal)) \(times) times) — auto-restart stopped"
+            lastError = tripped
+            recordFailure(serviceID, kind: .killedRepeatedly(signal: signal, times: times))
+            Task { await recordDebugEvent(kind: "breaker_trip", serviceID: serviceID, message: tripped) }
             return
         case .exhausted:
             if serviceID == "stripe" {
@@ -4150,7 +4180,7 @@ final class EnvironmentSupervisor {
                 recalculateHealth()
                 return
             }
-            state.isCircuitBroken = true
+            state.haltReason = .exhausted(restarts: AutoRestart.maxRestarts)
             lastError = "\(name) did not come back after \(AutoRestart.maxRestarts) restarts — auto-restart stopped"
             recordFailure(serviceID, kind: .exhausted(restarts: AutoRestart.maxRestarts))
             Task { await recordDebugEvent(
@@ -4206,20 +4236,21 @@ final class EnvironmentSupervisor {
             // A service that failed because the container runtime is down fails again
             // at once. Start the runtime first; if it does not come up, say so and stop.
             let recentLines = await logStore.entries(for: serviceID).map(\.text)
-            if CrashCause.showsContainerRuntimeDown(recentLines), !(await ContainerRuntime.isResponding()) {
+            if CrashCause.showsContainerRuntimeDown(recentLines), !(await ContainerRuntime.isResponding(shell: shell)) {
                 let runtime = ContainerRuntime.detect()
                 await logStore.append(serviceID: serviceID, entry: LogEntry(
                     stream: .stdout,
                     text: "[travel-runner] \(runtime.displayName) is not running — starting it before the restart of \(name)"
                 ))
-                guard await ContainerRuntime.ensureRunning(clock: clock) else {
-                    state.isCircuitBroken = true
-                    lastError = "\(runtime.displayName) is not running — open \(runtime.appName), then restart \(name)"
-                    recordFailure(serviceID, kind: .runtimeDown)
+                guard await ContainerRuntime.ensureRunning(shell: shell, clock: clock) else {
+                    state.haltReason = .runtimeDown(runtime: runtime.displayName, waiting: true)
+                    lastError = Self.runtimeWaitText(runtime, name)
+                    recordFailure(serviceID, kind: .runtimeDown(waiting: true))
                     await recordDebugEvent(
                         kind: "breaker_trip", serviceID: serviceID,
-                        message: "\(runtime.displayName) is not running — the restart of \(name) stopped"
+                        message: "\(runtime.displayName) is not running — the restart of \(name) waits for it"
                     )
+                    waitForContainerRuntime(serviceID, runtime: runtime)
                     return
                 }
                 guard serviceStates[serviceID]?.phase == .failed else { return }
@@ -4228,6 +4259,47 @@ final class EnvironmentSupervisor {
             // The restart releases it once the phase has changed.
             due = false
             await autoRestart(serviceID)
+        }
+    }
+
+    /// The banner while a service waits for the container runtime.
+    nonisolated static func runtimeWaitText(_ runtime: ContainerRuntime, _ name: String) -> String {
+        "\(runtime.displayName) is not running — waiting for it, then restarting \(name)"
+    }
+
+    /// Asks the container runtime every 5 s for 10 minutes. When it answers, the
+    /// service starts again. A restart, a stop or a new failure ends the wait.
+    private func waitForContainerRuntime(_ serviceID: String, runtime: ContainerRuntime) {
+        guard let state = serviceStates[serviceID] else { return }
+        let name = state.definition.displayName
+        let reason = HaltReason.runtimeDown(runtime: runtime.displayName, waiting: true)
+        let waiting = { () -> Bool in
+            state.haltReason == reason && state.phase == .failed && !self.isShuttingDown && self.health != .stopped
+        }
+        Task {
+            for _ in 0..<AutoRestart.runtimeChecks {
+                try? await clock.sleep(for: AutoRestart.runtimeCheckInterval)
+                guard waiting() else { return }
+                guard await ContainerRuntime.isResponding(shell: shell) else { continue }
+                guard waiting() else { return }
+                await logStore.append(serviceID: serviceID, entry: LogEntry(
+                    stream: .stdout, text: "[travel-runner] \(runtime.displayName) is back — starting \(name)"
+                ))
+                if lastError == Self.runtimeWaitText(runtime, name) { lastError = nil }
+                restartService(serviceID)
+                return
+            }
+            // It did not come back: the row stops saying that it waits.
+            guard waiting() else { return }
+            state.haltReason = .runtimeDown(runtime: runtime.displayName, waiting: false)
+            if lastError == Self.runtimeWaitText(runtime, name) {
+                lastError = "\(runtime.displayName) is not running — open \(runtime.appName), then restart \(name)"
+            }
+            recordFailure(serviceID, kind: .runtimeDown(waiting: false))
+            await logStore.append(serviceID: serviceID, entry: LogEntry(
+                stream: .stderr,
+                text: "[travel-runner] \(runtime.displayName) did not come back in 10 min — open it, then restart \(name)"
+            ))
         }
     }
 

@@ -385,8 +385,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func postCrashNotification(serviceName: String, exitCode: Int32) {
         guard canNotify else { return }
         let content = UNMutableNotificationContent()
-        content.title = "\(serviceName) crashed"
-        content.body = "Exited with code \(exitCode)"
+        if exitCode == 128 + SIGKILL {
+            // SIGKILL: often macOS itself, when the Mac runs low on memory.
+            content.title = "\(serviceName) was stopped (SIGKILL)"
+            content.body = ServiceTermination.memoryHint
+        } else {
+            content.title = "\(serviceName) crashed"
+            content.body = "Exited with code \(exitCode)"
+        }
         content.sound = .default
         content.categoryIdentifier = "CRASH"
         let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)

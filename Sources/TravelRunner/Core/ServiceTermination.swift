@@ -49,6 +49,14 @@ enum ServiceTermination {
         }
     }
 
+    /// macOS ends a process with SIGKILL (exit 137) when the Mac runs out of memory.
+    static let memoryHint = "SIGKILL often means that the Mac ran low on memory — check Activity Monitor and close what you do not need."
+
+    /// The hint for a kill with this signal, or nil.
+    static func killHint(_ signal: Int32) -> String? {
+        signal == SIGKILL ? memoryHint : nil
+    }
+
     /// The text for a crash, as the notification and the debug issue show it.
     static func describe(_ termination: ProcessRunner.Termination) -> String {
         termination.bySignal
@@ -72,15 +80,25 @@ enum AutoRestart {
         case crashLoop
         /// `maxRestarts` restarts in one series did not bring the service back.
         case exhausted
+        /// Each failure inside the window was a kill from outside: something else
+        /// stops the service. It did not crash.
+        case killedRepeatedly
     }
+
+    /// While the container runtime is down, the supervisor asks it again this often,
+    /// this many times (10 minutes), and restarts the service when it answers.
+    static let runtimeCheckInterval: Duration = .seconds(5)
+    static let runtimeChecks = 120
 
     static func recentFailures(_ timestamps: [Date], now: Date) -> [Date] {
         let cutoff = now.addingTimeInterval(-failureWindow)
         return timestamps.filter { $0 >= cutoff }
     }
 
-    static func decide(recentFailureCount: Int, restartCount: Int) -> Decision {
-        if recentFailureCount >= failuresToTrip { return .crashLoop }
+    static func decide(recentFailureCount: Int, restartCount: Int, recentKillCount: Int = 0) -> Decision {
+        if recentFailureCount >= failuresToTrip {
+            return recentKillCount >= recentFailureCount ? .killedRepeatedly : .crashLoop
+        }
         if restartCount >= maxRestarts { return .exhausted }
         return .restart(after: min(2.0 * pow(2.0, Double(restartCount)), 60.0))
     }
@@ -88,6 +106,29 @@ enum AutoRestart {
     /// True when a failure after this uptime starts a new series.
     static func startsNewSeries(uptime: TimeInterval?) -> Bool {
         (uptime ?? 0) >= stableUptime
+    }
+}
+
+/// Why the supervisor stopped the automatic restarts of a service.
+enum HaltReason: Equatable, Sendable {
+    /// `AutoRestart.failuresToTrip` failures in a minute.
+    case crashLoop
+    case exhausted(restarts: Int)
+    /// The container runtime is down. `waiting` while the supervisor still asks it.
+    case runtimeDown(runtime: String, waiting: Bool)
+    /// Something outside the runner stopped it `times` times in a minute.
+    case killedRepeatedly(signal: Int32, times: Int)
+
+    /// The short form for the triage card and a row with no condition.
+    var label: String {
+        switch self {
+        case .crashLoop: "failed \(AutoRestart.failuresToTrip) times in a minute"
+        case .exhausted(let restarts): "did not come back after \(restarts) restarts"
+        case .runtimeDown(let runtime, true): "\(runtime) is not running — waiting for it"
+        case .runtimeDown(let runtime, false): "\(runtime) is not running"
+        case .killedRepeatedly(let signal, let times):
+            "stopped from outside (\(ServiceTermination.signalName(signal)) \(times) times)"
+        }
     }
 }
 

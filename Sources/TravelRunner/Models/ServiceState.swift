@@ -51,7 +51,21 @@ final class ServiceState {
     /// `supabase start` during a cold image pull, or the stop of the stack.
     var progressNote: String? = nil
     var failureTimestamps: [Date] = []
-    var isCircuitBroken: Bool = false
+    /// The failures in `failureTimestamps` that were kills from outside, and the
+    /// signal of the last one. Three kills in a minute are no crash loop.
+    var killTimestamps: [Date] = []
+    var lastKillSignal: Int32? = nil
+    /// The SIGKILL of this series sent its one notification.
+    var memoryNotified = false
+    /// Why the supervisor stopped its automatic restarts. Nil while it restarts.
+    var haltReason: HaltReason? = nil
+    /// The automatic restarts stopped. Setting false clears the reason.
+    var isCircuitBroken: Bool {
+        get { haltReason != nil }
+        set {
+            if !newValue { haltReason = nil } else if haltReason == nil { haltReason = .crashLoop }
+        }
+    }
     /// The daemon ended with code 0 and got its one automatic restart.
     var cleanExitRestarted = false
     /// Why the service is failed or skipped, and the fix. Nil while it starts or runs.

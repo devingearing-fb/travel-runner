@@ -107,9 +107,37 @@ final class FailureAdvisorTests: XCTestCase {
         XCTAssertEqual(condition.actions, [.openContainerRuntime])
         XCTAssertEqual(RecoveryAction.openContainerRuntime.title(runtime: "OrbStack"), "Open OrbStack")
 
-        let halted = advise(.runtimeDown, portal())
-        XCTAssertEqual(halted.headline, "OrbStack is not running.")
+        let halted = advise(.runtimeDown(waiting: true), portal())
+        XCTAssertEqual(halted.headline, "OrbStack is not running — waiting for it.")
+        XCTAssertEqual(halted.detail, "Booking Portal starts when it is back.")
         XCTAssertEqual(halted.kind, .halted(reason: "runtime down"))
+        XCTAssertEqual(halted.actions, [.openContainerRuntime])
+
+        // After 10 minutes the row stops saying that it waits.
+        let gaveUp = advise(.runtimeDown(waiting: false), portal())
+        XCTAssertEqual(gaveUp.text, "OrbStack is not running. Open it, then restart Booking Portal.")
+        XCTAssertEqual(gaveUp.actions, [.openContainerRuntime])
+    }
+
+    /// Kills from outside are not a crash loop: the row says that something else
+    /// stops the service, and a SIGKILL adds the memory hint.
+    func testRepeatedKillsSaySomethingElseStopsTheService() {
+        let killed = advise(.killedRepeatedly(signal: SIGKILL, times: 3), portal())
+        XCTAssertEqual(killed.headline, "Something else keeps stopping Booking Portal (SIGKILL 3 times).")
+        XCTAssertEqual(killed.detail, ServiceTermination.memoryHint)
+        XCTAssertEqual(killed.kind, .halted(reason: "killed repeatedly"))
+        XCTAssertEqual(killed.actions, [.restart, .openLog])
+
+        let terminated = advise(.killedRepeatedly(signal: SIGTERM, times: 3), portal())
+        XCTAssertEqual(terminated.text, "Something else keeps stopping Booking Portal (SIGTERM 3 times).")
+    }
+
+    /// Exit 137 is SIGKILL: often macOS when memory runs low. A SIGTERM has no hint.
+    func testASigkillAddsTheMemoryHint() {
+        let oom = advise(.killed(signal: SIGKILL), portal())
+        XCTAssertEqual(oom.headline, "Booking Portal was stopped from outside Travel Runner (SIGKILL).")
+        XCTAssertEqual(oom.detail, ServiceTermination.memoryHint)
+        XCTAssertNil(advise(.killed(signal: SIGTERM), portal()).detail)
     }
 
     func testAMissingModuleOffersAnInstall() {
@@ -124,17 +152,17 @@ final class FailureAdvisorTests: XCTestCase {
     func testTheBreakerSaysItStoppedAndWhy() {
         let condition = advise(.crashLoop, portal(likelyCause: "TypeError: x is not a function"))
         XCTAssertEqual(
-            condition.text, "Stopped retrying after 3 crashes in a minute. Cause: TypeError: x is not a function."
+            condition.text, "Booking Portal failed 3 times in a minute: TypeError: x is not a function."
         )
         XCTAssertEqual(condition.kind, .halted(reason: "crash loop"))
         XCTAssertEqual(condition.action, .restart)
 
         // A cause with one fix in the log is the cause of the loop.
         let busy = advise(.crashLoop, portal(log: ["Error: listen EADDRINUSE: address already in use :::3002"]))
-        XCTAssertEqual(busy.detail, "Cause: Port 3002 is already in use by another process.")
+        XCTAssertEqual(busy.headline, "Booking Portal failed 3 times in a minute: Port 3002 is already in use by another process.")
 
         let unknown = advise(.crashLoop, portal())
-        XCTAssertEqual(unknown.detail, "Cause: not clear from the log.")
+        XCTAssertEqual(unknown.text, "Booking Portal failed 3 times in a minute: no clear cause in the log.")
 
         let exhausted = advise(.exhausted(restarts: 5), portal())
         XCTAssertEqual(exhausted.headline, "Booking Portal did not come back after 5 restarts.")

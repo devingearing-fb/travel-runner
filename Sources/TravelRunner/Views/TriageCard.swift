@@ -31,8 +31,8 @@ struct TriageCard: View {
 
                 Spacer()
 
-                if state.isCircuitBroken {
-                    Text("crash-looping")
+                if let halt = state.haltReason {
+                    Text(halt.label)
                         .font(.caption2)
                         .foregroundStyle(.red)
                 } else if let stopped = state.lastStopped {

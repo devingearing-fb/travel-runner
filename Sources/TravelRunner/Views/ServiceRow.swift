@@ -174,8 +174,8 @@ struct ServiceRow: View {
                             .lineLimit(2)
                             .help(condition.text)
                     }
-                    if state.isCircuitBroken, rowCondition == nil {
-                        Text("crash-looping — auto-restart stopped")
+                    if let halt = state.haltReason, rowCondition == nil {
+                        Text("\(halt.label) — auto-restart stopped")
                             .font(.caption2)
                             .foregroundStyle(.red)
                     } else if state.restartCount > 0 {

@@ -238,11 +238,13 @@ final class CommandDiagnosisTests: XCTestCase {
         XCTAssertEqual(condition.actions, [.installDependencies, .openLog])
 
         // The breaker that stops the restarts keeps the fix: a restart alone fails the same way.
-        for kind in [FailureAdvisor.Kind.crashLoop, .exhausted(restarts: 5)] {
-            let halted = FailureAdvisor.advise(kind, context, now: Date())
-            XCTAssertEqual(halted.detail, "Cause: Booking Portal cannot start: its packages are not installed in \(dir.path).")
-            XCTAssertEqual(halted.actions, [.installDependencies, .openLog, .restart])
-        }
+        let cause = "Booking Portal cannot start: its packages are not installed in \(dir.path)."
+        let loop = FailureAdvisor.advise(.crashLoop, context, now: Date())
+        XCTAssertEqual(loop.headline, "Booking Portal failed 3 times in a minute: \(cause)")
+        XCTAssertEqual(loop.actions, [.installDependencies, .openLog, .restart])
+        let exhausted = FailureAdvisor.advise(.exhausted(restarts: 5), context, now: Date())
+        XCTAssertEqual(exhausted.detail, "Cause: \(cause)")
+        XCTAssertEqual(exhausted.actions, [.installDependencies, .openLog, .restart])
         XCTAssertEqual(FailureAdvisor.commandFinding(context), .dependenciesMissing(repo: dir.path))
 
         let cannotRun = FailureAdvisor.advise(.cannotRun(.notExecutable(file: "./run.sh")), context, now: Date())

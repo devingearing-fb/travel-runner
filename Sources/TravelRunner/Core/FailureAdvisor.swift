@@ -17,8 +17,11 @@ enum FailureAdvisor {
         case crashLoop
         /// `restarts` automatic restarts did not bring it back.
         case exhausted(restarts: Int)
-        /// The container runtime did not come up, so the restart stopped.
-        case runtimeDown
+        /// The container runtime did not come up, so the restart stopped. `waiting`
+        /// while the supervisor still waits for it to come back.
+        case runtimeDown(waiting: Bool)
+        /// Something outside the runner stopped it `times` times in a minute.
+        case killedRepeatedly(signal: Int32, times: Int)
         /// The probe after a wake failed.
         case wakeCheck(lastProbe: ProbeOutcome?)
         /// The shell could not run the command (exit 126 or 127); `CommandDiagnosis` says what is missing.
@@ -66,10 +69,15 @@ enum FailureAdvisor {
 
         switch kind {
         case .crashLoop:
-            let because = cause?.headline ?? context.likelyCause ?? "not clear from the log"
+            let because = cause?.headline ?? context.likelyCause ?? "no clear cause in the log"
             return condition(
-                "Stopped retrying after \(AutoRestart.failuresToTrip) crashes in a minute.", "Cause: \(sentence(because))",
+                "\(name) failed \(AutoRestart.failuresToTrip) times in a minute: \(sentence(because))", nil,
                 haltedActions(cause), kind: .halted(reason: "crash loop")
+            )
+        case .killedRepeatedly(let signal, let times):
+            return condition(
+                "Something else keeps stopping \(name) (\(ServiceTermination.signalName(signal)) \(times) times).",
+                ServiceTermination.killHint(signal), [.restart, .openLog], kind: .halted(reason: "killed repeatedly")
             )
         case .exhausted(let restarts):
             let because = cause?.headline ?? context.likelyCause ?? "not clear from the log"
@@ -77,9 +85,11 @@ enum FailureAdvisor {
                 "\(name) did not come back after \(restarts) restarts.", "Cause: \(sentence(because))",
                 haltedActions(cause), kind: .halted(reason: "exhausted")
             )
-        case .runtimeDown:
+        case .runtimeDown(let waiting):
             return condition(
-                "\(context.runtime) is not running.", nil, [.openContainerRuntime], kind: .halted(reason: "runtime down")
+                waiting ? "\(context.runtime) is not running — waiting for it." : "\(context.runtime) is not running.",
+                waiting ? "\(name) starts when it is back." : "Open it, then restart \(name).",
+                [.openContainerRuntime], kind: .halted(reason: "runtime down")
             )
         case .cannotRun(let finding):
             return condition(CommandDiagnosis.message(finding, name: name), nil, CommandDiagnosis.actions(finding))
@@ -93,8 +103,8 @@ enum FailureAdvisor {
         // earlier in the launch (a page that did not compile) does not explain it.
         case .killed(let signal):
             return condition(
-                "\(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))).", nil,
-                [.restart, .openLog]
+                "\(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))).",
+                ServiceTermination.killHint(signal), [.restart, .openLog]
             )
         case .wakeCheck(let lastProbe):
             let detail = lastProbe.map { "Last check: \($0.summary)." }

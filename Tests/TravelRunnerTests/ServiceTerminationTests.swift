@@ -63,6 +63,35 @@ final class ServiceTerminationTests: XCTestCase {
         XCTAssertEqual(AutoRestart.decide(recentFailureCount: 3, restartCount: 0), .crashLoop)
     }
 
+    /// Finding "breaker says crash-looping": three kills from outside in a minute
+    /// are no crash. One crash among them makes it a crash loop.
+    func testThreeKillsInTheWindowAreNotACrashLoop() {
+        XCTAssertEqual(AutoRestart.decide(recentFailureCount: 3, restartCount: 2, recentKillCount: 3), .killedRepeatedly)
+        XCTAssertEqual(AutoRestart.decide(recentFailureCount: 3, restartCount: 2, recentKillCount: 2), .crashLoop)
+        XCTAssertEqual(AutoRestart.decide(recentFailureCount: 2, restartCount: 1, recentKillCount: 2), .restart(after: 4))
+    }
+
+    /// The short form of each halt, for the triage card and the row.
+    func testEachHaltReasonSaysWhyInItsOwnWords() {
+        XCTAssertEqual(HaltReason.crashLoop.label, "failed 3 times in a minute")
+        XCTAssertEqual(HaltReason.exhausted(restarts: 5).label, "did not come back after 5 restarts")
+        XCTAssertEqual(
+            HaltReason.runtimeDown(runtime: "OrbStack", waiting: true).label, "OrbStack is not running — waiting for it"
+        )
+        XCTAssertEqual(HaltReason.runtimeDown(runtime: "OrbStack", waiting: false).label, "OrbStack is not running")
+        XCTAssertEqual(
+            HaltReason.killedRepeatedly(signal: SIGKILL, times: 3).label, "stopped from outside (SIGKILL 3 times)"
+        )
+    }
+
+    /// Exit 137 (SIGKILL) gets the memory hint; the other stop signals do not.
+    func testOnlySigkillGetsTheMemoryHint() {
+        XCTAssertEqual(ServiceTermination.killHint(SIGKILL), ServiceTermination.memoryHint)
+        for signal in [SIGTERM, SIGINT, SIGHUP, SIGQUIT] {
+            XCTAssertNil(ServiceTermination.killHint(signal), "\(signal)")
+        }
+    }
+
     func testSlowFailuresStopAfterTheMaximum() {
         XCTAssertEqual(AutoRestart.decide(recentFailureCount: 1, restartCount: AutoRestart.maxRestarts), .exhausted)
     }

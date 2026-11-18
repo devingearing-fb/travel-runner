@@ -380,7 +380,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         // The trip is in the event log, once.
         let trips = await events("breaker_trip", in: tracker)
         XCTAssertEqual(trips.map(\.serviceId), ["boom"])
-        XCTAssertEqual(trips.first?.message, "boom is crash-looping — auto-restart stopped")
+        XCTAssertEqual(trips.first?.message, "boom failed 3 times in a minute — auto-restart stopped")
+        XCTAssertEqual(state("boom").haltReason, .crashLoop)
     }
 
     /// A tripped breaker must not outlive a deliberate restart: the next failure of
@@ -627,7 +628,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(halted, state("web").condition?.text ?? "no condition")
         XCTAssertEqual(state("web").exitCode, 1)
         let condition = try XCTUnwrap(state("web").condition)
-        XCTAssertEqual(condition.detail, "Cause: \(expected)")
+        XCTAssertEqual(condition.headline, "web failed 3 times in a minute: \(expected)")
         XCTAssertEqual(condition.actions, [.installDependencies, .openLog, .restart])
         let said = await waitUntil(10) { self.supervisor.lastError == expected }
         XCTAssertTrue(said, supervisor.lastError ?? "nil")
@@ -1763,7 +1764,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         try await Task.sleep(for: .seconds(1))
         let condition = try XCTUnwrap(state("boom").condition)
         XCTAssertEqual(condition.kind, .halted(reason: "crash loop"))
-        XCTAssertEqual(condition.text, "Stopped retrying after 3 crashes in a minute. Cause: not clear from the log.")
+        XCTAssertEqual(condition.text, "boom failed 3 times in a minute: no clear cause in the log.")
         XCTAssertEqual(condition.action, .restart)
     }
 
@@ -1793,9 +1794,11 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(condition.actions, [.restart, .openLog])
     }
 
-    /// Kills from outside until the breaker trips: the reason is the crash loop. The
-    /// kill records its reason first, and the breaker's reason replaces it.
-    func testOutsideKillsThatTripTheBreakerSayItStoppedRetrying() async throws {
+    /// Finding "breaker says crash-looping": kills from outside until the breaker
+    /// trips are no crash loop. The row says that something else keeps stopping
+    /// the service. The kill records its reason first, and the breaker's replaces it.
+    func testOutsideKillsThatTripTheBreakerSaySomethingElseStopsIt() async throws {
+        let tracker = captureIssues()
         try load(daemon("web", webServer))
         supervisor.restartService("web")
         var last: pid_t = 0
@@ -1809,15 +1812,125 @@ final class SupervisorLifecycleTests: XCTestCase {
         }
 
         let tripped = await waitUntil(20) {
-            self.state("web").isCircuitBroken && self.state("web").condition?.kind == .halted(reason: "crash loop")
+            self.state("web").isCircuitBroken && self.state("web").condition?.kind == .halted(reason: "killed repeatedly")
         }
         XCTAssertTrue(tripped, "web: \(state("web").condition?.text ?? "no condition")")
         // A late record of the last kill does not replace it.
         try await Task.sleep(for: .seconds(1))
         let condition = try XCTUnwrap(state("web").condition)
-        XCTAssertEqual(condition.text, "Stopped retrying after 3 crashes in a minute. Cause: not clear from the log.")
+        XCTAssertEqual(condition.text, "Something else keeps stopping web (SIGTERM 3 times).")
         XCTAssertEqual(condition.action, .restart)
         XCTAssertEqual(state("web").phase, .failed)
+        XCTAssertEqual(state("web").haltReason, .killedRepeatedly(signal: SIGTERM, times: 3))
+        XCTAssertEqual(supervisor.lastError, "Something else keeps stopping web (SIGTERM 3 times) — auto-restart stopped")
+        // An outside kill is no crash: no notification and no debug issue.
+        XCTAssertTrue(crashes.isEmpty, "\(crashes)")
+        let trips = await events("breaker_trip", in: tracker)
+        XCTAssertEqual(trips.map(\.message), ["Something else keeps stopping web (SIGTERM 3 times) — auto-restart stopped"])
+        let issues = await tracker.listIssues(status: "open")
+        XCTAssertTrue(issues.isEmpty, "\(issues.map(\.summary))")
+    }
+
+    /// Finding "OOM misreported": exit 137 is a SIGKILL, often from macOS when
+    /// memory runs low. The row and the log give the memory hint, and the series
+    /// sends one notification however often it happens.
+    func testASigkillGivesTheMemoryHintAndOneNotification() async throws {
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        var last: pid_t = 0
+        for kill in 1...2 {
+            let up = await waitUntil(40) {
+                self.settled("web") && Self.listeners(on: self.port).first.map { $0 != last } == true
+            }
+            XCTAssertTrue(up, "kill \(kill): web is \(state("web").phase.rawValue)")
+            last = try ownListener()
+            Darwin.kill(last, SIGKILL)
+            let said = await waitUntil(10) { self.state("web").condition?.detail == ServiceTermination.memoryHint }
+            XCTAssertTrue(said, "kill \(kill): \(state("web").condition?.text ?? "no condition")")
+        }
+
+        XCTAssertEqual(crashes.map(\.name), ["web"])
+        XCTAssertEqual(crashes.map(\.code), [137])
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("[travel-runner] \(ServiceTermination.memoryHint)"), lines.joined(separator: "\n"))
+    }
+
+    /// Finding "breaker never self-clears": a service that failed because the
+    /// container runtime was down waits for it, and starts by itself when it is back.
+    func testAServiceThatWaitsForTheContainerRuntimeStartsWhenItIsBack() async throws {
+        let marker = workDir.appendingPathComponent("runtime-up").path
+        let down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+        let script = "if [ -f '\(marker)' ]; then exec \(webServer.joined(separator: " ")); else echo '\(down)'; exit 1; fi"
+        try load(daemon("db", ["sh", "-c", script], probeTimeout: 60))
+        // `docker ps` fails until the test brings the runtime back. No real docker runs.
+        let runtimeUp = OSAllocatedUnfairLock(initialState: false)
+        let shell = FakeCommandRunner { call in
+            guard call.command.hasPrefix("docker ps") else { return FakeCommandRunner.ok() }
+            return runtimeUp.withLock { $0 } ? FakeCommandRunner.ok() : FakeCommandRunner.failed(1)
+        }
+        supervisor.shell = shell
+        // Each wait of the supervisor takes 20 ms: the 2 s restart delay, the start of
+        // the runtime and the 5 s checks. The deadlines stay real.
+        supervisor.clock = RunnerClock(
+            date: RunnerClock.live.date, uptime: RunnerClock.live.uptime,
+            wait: { _ in try await Task.sleep(for: .milliseconds(20)) }
+        )
+
+        supervisor.restartService("db")
+
+        let waiting = await waitUntil(40) {
+            guard case .runtimeDown(_, true)? = self.state("db").haltReason else { return false }
+            // The record of the crash before it reads the log too; the halt's record replaces it.
+            return self.state("db").condition?.kind == .halted(reason: "runtime down")
+        }
+        XCTAssertTrue(waiting, "db: \(state("db").condition?.text ?? "no condition")")
+        let condition = try XCTUnwrap(state("db").condition)
+        XCTAssertEqual(condition.kind, .halted(reason: "runtime down"))
+        XCTAssertTrue(condition.headline.hasSuffix("is not running — waiting for it."), condition.headline)
+        XCTAssertEqual(condition.action, .openContainerRuntime)
+        XCTAssertEqual(state("db").phase, .failed)
+
+        // The runtime comes back.
+        FileManager.default.createFile(atPath: marker, contents: nil)
+        runtimeUp.withLock { $0 = true }
+
+        let back = await waitUntil(40) { self.settled("db") }
+        XCTAssertTrue(back, "db is \(state("db").phase.rawValue): \(state("db").condition?.text ?? "")")
+        XCTAssertNil(state("db").haltReason)
+        XCTAssertNil(supervisor.lastError)
+        let lines = await logLines("db")
+        XCTAssertTrue(lines.contains { $0.hasPrefix("[travel-runner] ") && $0.hasSuffix(" is back — starting db") }, lines.joined(separator: "\n"))
+    }
+
+    /// The runtime does not come back in 10 minutes: the row stops saying that it
+    /// waits, and nothing restarts.
+    func testAServiceStopsWaitingForTheContainerRuntimeAfterTenMinutes() async throws {
+        let down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+        try load(daemon("db", ["sh", "-c", "echo db-start; echo '\(down)'; exit 1"], probeTimeout: 60))
+        let shell = FakeCommandRunner { call in
+            call.command.hasPrefix("docker ps") ? FakeCommandRunner.failed(1) : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        supervisor.clock = RunnerClock(
+            date: RunnerClock.live.date, uptime: RunnerClock.live.uptime,
+            wait: { _ in try await Task.sleep(for: .milliseconds(5)) }
+        )
+
+        supervisor.restartService("db")
+
+        let gaveUp = await waitUntil(40) {
+            if case .runtimeDown(_, false)? = self.state("db").haltReason { return true }
+            return false
+        }
+        XCTAssertTrue(gaveUp, "db: \(String(describing: state("db").haltReason))")
+        let said = await waitUntil(10) { self.state("db").condition?.detail == "Open it, then restart db." }
+        XCTAssertTrue(said, state("db").condition?.text ?? "no condition")
+        XCTAssertEqual(state("db").phase, .failed)
+        let starts = await logLines("db").filter { $0 == "db-start" }.count
+        XCTAssertEqual(starts, 1)
+        // The checks of the wait: 120 of them, after the 10 checks of the start.
+        let checks = shell.commands.filter { $0.hasPrefix("docker ps") }.count
+        XCTAssertEqual(checks, 1 + 1 + 10 + AutoRestart.runtimeChecks)
     }
 
     /// A service outside the profile is skipped, and `/api/status` says why.
