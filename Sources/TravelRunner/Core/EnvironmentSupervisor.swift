@@ -3544,13 +3544,6 @@ final class EnvironmentSupervisor {
             // The run ended with no failed step: it was cancelled between two steps.
             postNotice(.dbSetup, Self.dbResetCancelledMessage)
         }
-        // A step asked for services to restart (`##db:restart:`): Sequin reads a
-        // slot that the reset dropped. Only after the run passed, and not after a cancel.
-        if ok, let pipeline = run.pipeline {
-            let cancelled: Bool
-            if let runner = run.runner { cancelled = await runner.wasCancelled } else { cancelled = false }
-            if !cancelled { await restartAfterReset(pipeline.steps.flatMap(\.restartRequests)) }
-        }
         // The automatic callers read the database again themselves.
         if !run.origin.isAutomatic {
             await refreshPendingMigrations(cwd: run.cwd)
@@ -3560,6 +3553,20 @@ final class EnvironmentSupervisor {
         let dumpSteps: Set<String> = [HotelCatalog.fetchStepID, HotelCatalog.loadStepID]
         if run.pipeline?.steps.contains(where: { dumpSteps.contains($0.id) && $0.status != .pending }) == true {
             await refreshHotelDump()
+        }
+        // A step asked for services to restart (`##db:restart:`): Sequin reads a
+        // slot that the reset dropped. Only after the run passed, and not after a
+        // cancel. Last, so the DB setup's own results do not wait for the restarts.
+        if ok, let pipeline = run.pipeline {
+            let cancelled: Bool
+            if let runner = run.runner { cancelled = await runner.wasCancelled } else { cancelled = false }
+            if !cancelled {
+                let requests = pipeline.steps.flatMap(\.restartRequests)
+                // Done once: a Retry of a later step keeps the passed steps before
+                // it, and must not restart the services again.
+                for step in pipeline.steps { step.restartRequests = [] }
+                await restartAfterReset(requests)
+            }
         }
         return ok
     }
@@ -3571,7 +3578,10 @@ final class EnvironmentSupervisor {
     /// or does not run is left alone. A failed restart is a failure of that service;
     /// the DB setup stays passed (`scripts/db/README.md`, "After a reset").
     func restartAfterReset(_ requests: [DbRestartRequest]) async {
+        // Which services restart is decided before the first restart: that one can
+        // stop the next (`stream-db-setup` stops Sequin), and the next still restarts.
         var seen: Set<String> = []
+        var plan: [(id: String, reason: String)] = []
         for request in requests {
             for serviceID in request.serviceIDs where seen.insert(serviceID).inserted {
                 guard let state = serviceStates[serviceID] else {
@@ -3580,25 +3590,39 @@ final class EnvironmentSupervisor {
                     ))
                     continue
                 }
-                guard !isShuttingDown, isInProfile(serviceID),
-                      state.phase == .running || state.phase == .completed else { continue }
-                let name = displayName(serviceID)
-                await logStore.append(serviceID: serviceID, entry: LogEntry(
-                    stream: .stdout, text: Self.restartAfterResetLine(name, reason: request.reason)
-                ))
-                beginAction(serviceID)
-                do {
-                    let outcome = try await replaceProcess(serviceID)
-                    if let why = notRestarted(serviceID, outcome) {
-                        postNotice(.service(serviceID), "\(name) did not restart after the database reset: \(why)")
-                    }
-                } catch {
-                    recordFailure(serviceID, error: error, lastError: "\(name) did not restart after the database reset: \(error)")
-                }
-                endAction(serviceID)
+                guard isInProfile(serviceID), state.phase == .running || state.phase == .completed else { continue }
+                plan.append((serviceID, request.reason))
             }
         }
-        if !seen.isEmpty { recalculateHealth() }
+        guard !plan.isEmpty, !isShuttingDown else { return }
+        for item in plan { beginAction(item.id) }
+        defer { for item in plan { endAction(item.id) } }
+        // The later services stop first, the last one first. An earlier restart may
+        // stop them, and the runner must not take that for a crash and start one
+        // again before the services ahead of it are ready.
+        for item in plan.dropFirst().reversed() {
+            await lifecycle.withLock(item.id) {
+                serviceStates[item.id]?.phase = .stopping
+                await processRunner.stop(serviceID: item.id)
+                serviceStates[item.id]?.phase = .stopped
+            }
+        }
+        for item in plan {
+            if isShuttingDown { break }
+            let name = displayName(item.id)
+            await logStore.append(serviceID: item.id, entry: LogEntry(
+                stream: .stdout, text: Self.restartAfterResetLine(name, reason: item.reason)
+            ))
+            do {
+                let outcome = try await replaceProcess(item.id)
+                if let why = notRestarted(item.id, outcome) {
+                    postNotice(.service(item.id), "\(name) did not restart after the database reset: \(why)")
+                }
+            } catch {
+                recordFailure(item.id, error: error, lastError: "\(name) did not restart after the database reset: \(error)")
+            }
+        }
+        recalculateHealth()
     }
 
     nonisolated static func restartAfterResetLine(_ name: String, reason: String) -> String {
