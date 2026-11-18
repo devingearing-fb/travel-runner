@@ -97,7 +97,7 @@ final class EnvironmentChecker {
     /// How long the runner waits for `stripe login` in Terminal.
     nonisolated static let stripeLoginWait: Duration = .seconds(3 * 60)
     /// How long the runner waits for the container app to accept connections.
-    nonisolated static let containerRuntimeWait: Duration = .seconds(60)
+    nonisolated static let containerRuntimeWait: Duration = ContainerRuntime.startTimeout
 
     init(
         monorepoPath: String, loginPath: String, streamServicesPath: String, flavor: Flavor = .current,
@@ -563,9 +563,11 @@ final class EnvironmentChecker {
     private func status(of id: String) async throws -> CheckStatus {
         switch id {
         case "docker":
-            let runtime = ContainerRuntime.detect()
-            let result = try await check("docker ps >/dev/null 2>&1", label: "docker ps")
-            return result.succeeded ? .passing(runtime.displayName) : .failing("\(runtime.displayName) not responding")
+            let probe = await ContainerRuntime.probe(shell: commandRunner, timeout: Self.checkTimeout)
+            if case .daemonDown(let context) = probe, context.timedOut {
+                throw CheckTimedOut(label: "docker ps")
+            }
+            return probe.failureText(waited: nil).map(CheckStatus.failing) ?? .passing(probe.runtime.displayName)
 
         case "node":
             let result = try await check("node --version", label: "node --version")

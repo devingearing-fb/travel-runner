@@ -7,6 +7,8 @@ final class PreflightCheck: Identifiable {
     nonisolated let name: String
     nonisolated let metadata: [String: String]
     var result: PreflightResult = .pending
+    /// A line of a check that waits, such as the wait for the container runtime.
+    var progress: String?
 
     nonisolated init(id: String, name: String, metadata: [String: String] = [:]) {
         self.id = id
@@ -121,14 +123,21 @@ struct PreflightRunner: Sendable {
     func run(check: PreflightCheck) async -> PreflightResult {
         switch check.id {
         case "docker":
-            let runtime = ContainerRuntime.detect()
-            if await ContainerRuntime.isResponding(shell: shell) {
-                return .passed(detail: runtime.displayName)
+            let probe = await ContainerRuntime.ensureRunning(shell: shell, clock: clock) { line in
+                Task { @MainActor in check.progress = line }
             }
-            if await ContainerRuntime.ensureRunning(shell: shell, clock: clock) {
-                return .passed(detail: "\(runtime.displayName) — auto-started")
+            await MainActor.run { check.progress = nil }
+            let runtime = probe.runtime
+            switch probe {
+            case .running(let context):
+                return .passed(detail: context.opened ? "\(runtime.displayName) — auto-started" : runtime.displayName)
+            case .cliMissing:
+                return .failed(message: ContainerRuntimeProbe.cliMissingText, fix: "Install OrbStack or Docker Desktop, then press Retry")
+            case .permissionDenied:
+                return .failed(message: probe.failureText(waited: nil) ?? "", fix: "Quit and reopen \(runtime.appName)")
+            case .daemonDown:
+                return .failed(message: probe.failureText(waited: ContainerRuntime.startTimeout) ?? "", fix: "Open \(runtime.appName)")
             }
-            return .failed(message: "\(runtime.displayName) not responding", fix: "Open \(runtime.appName) manually")
 
         case "node-version":
             let result = await run("node --version", cwd: check.metadata["cwd"])

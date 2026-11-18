@@ -157,7 +157,7 @@ final class StartAllTests: XCTestCase {
              "Preflight failed — Node.js \u{2265} 22: v16.20.2 — require v18+"),
             ("a container runtime that does not come up",
              Setup(dockerAnswers: false),
-             "Preflight failed — \(runtime.displayName): \(runtime.displayName) not responding"),
+             "Preflight failed — \(runtime.displayName): \(runtime.displayName) did not answer after 120 s — open it, then press Retry"),
             ("a service folder that is not there",
              Setup(webFolder: "web-moved"),
              "Preflight failed — web-moved exists: Directory not found — open Settings → Reconfigure Repos"),

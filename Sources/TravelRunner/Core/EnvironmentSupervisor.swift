@@ -3572,19 +3572,24 @@ final class EnvironmentSupervisor {
             // A service that failed because the container runtime is down fails again
             // at once. Start the runtime first; if it does not come up, say so and stop.
             let recentLines = await logStore.entries(for: serviceID).map(\.text)
-            if CrashCause.showsContainerRuntimeDown(recentLines), !(await ContainerRuntime.isResponding()) {
-                let runtime = ContainerRuntime.detect()
-                await logStore.append(serviceID: serviceID, entry: LogEntry(
-                    stream: .stdout,
-                    text: "[travel-runner] \(runtime.displayName) is not running — starting it before the restart of \(name)"
-                ))
-                guard await ContainerRuntime.ensureRunning(clock: clock) else {
+            if CrashCause.showsContainerRuntimeDown(recentLines) {
+                let logStore = logStore
+                let probe = await ContainerRuntime.ensureRunning(shell: shell, clock: clock) { line in
+                    Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
+                        stream: .stdout, text: "[travel-runner] \(line) before the restart of \(name)"
+                    )) }
+                }
+                if let reason = probe.failureText(waited: ContainerRuntime.startTimeout) {
                     state.isCircuitBroken = true
-                    lastError = "\(runtime.displayName) is not running — open \(runtime.appName), then restart \(name)"
-                    recordFailure(serviceID, kind: .runtimeDown)
+                    lastError = reason
+                    if case .daemonDown = probe {
+                        recordFailure(serviceID, kind: .runtimeDown)
+                    } else {
+                        recordFailure(serviceID, kind: .message(reason))
+                    }
                     await recordDebugEvent(
                         kind: "breaker_trip", serviceID: serviceID,
-                        message: "\(runtime.displayName) is not running — the restart of \(name) stopped"
+                        message: "\(reason) — the restart of \(name) stopped"
                     )
                     return
                 }

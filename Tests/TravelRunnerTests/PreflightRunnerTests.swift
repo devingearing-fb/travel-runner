@@ -108,7 +108,7 @@ final class PreflightRunnerTests: XCTestCase {
             ("the runtime comes up after the runner opens it", [false, false, false, true],
              "passed: \(runtime.displayName) — auto-started", 1),
             ("the runtime never comes up", [false],
-             "failed: \(runtime.displayName) not responding | fix: Open \(runtime.appName) manually", 1),
+             "failed: \(runtime.displayName) did not answer after 120 s — open it, then press Retry | fix: Open \(runtime.appName)", 1),
         ]
         for row in rows {
             let answers = AnswerQueue(row.answers)
