@@ -382,6 +382,9 @@ final class ControlServerTests: XCTestCase {
             ("GET", "/api/db-reset"),
             ("POST", "/api/status"),
             ("GET", "/api/restart/travel-portal"),
+            ("POST", "/api/restart/"),
+            ("POST", "/api/clear-cache-restart/"),
+            ("POST", "/api/db-setup/retry/"),
             ("POST", "/api/unknown"),
             ("GET", "/"),
         ]

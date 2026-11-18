@@ -11,6 +11,8 @@ final class ModeSwitchTests: XCTestCase {
     private var root: URL!
     private var supervisor: EnvironmentSupervisor!
     private var feedback: [(text: String, ok: Bool)] = []
+    /// The defaults suites of the test, removed in tearDown.
+    private var suites: [String] = []
 
     /// What the fake `local-db.sh status -o env` prints. Test values, not keys.
     private nonisolated static let statusEnv = "ANON_KEY=anon-test\nSERVICE_ROLE_KEY=service-test\nJWT_SECRET=secret-test\n"
@@ -22,14 +24,15 @@ final class ModeSwitchTests: XCTestCase {
             try FileManager.default.createDirectory(at: folder(name), withIntermediateDirectories: true)
         }
         feedback = []
+        suites = []
     }
 
     override func tearDown() async throws {
         if let supervisor {
-            supervisor.stopAll()
-            _ = await waitUntil(10) { supervisor.health == .stopped }
+            await stop(supervisor)
         }
         try? FileManager.default.removeItem(at: root)
+        for suite in suites { UserDefaults.standard.removePersistentDomain(forName: suite) }
     }
 
     // MARK: - Helpers
@@ -57,7 +60,9 @@ final class ModeSwitchTests: XCTestCase {
     /// running and the stack healthy, with no process: a switch then starts the
     /// processes it restarts.
     private func makeSupervisor(profile: RunProfile = .both, running: Bool) throws {
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "ModeSwitchTests-\(UUID().uuidString)"))
+        let suite = "ModeSwitchTests-\(UUID().uuidString)"
+        suites.append(suite)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         supervisor = EnvironmentSupervisor(
             userDefaults: defaults, tools: .shared,
             logSink: LogFileSink(directory: root.appendingPathComponent("logs"), version: "9.9.9")
@@ -92,6 +97,28 @@ final class ModeSwitchTests: XCTestCase {
             try? await Task.sleep(for: .milliseconds(50))
         }
         return condition()
+    }
+
+    /// Stops the stack and waits for the stop to end. The stop task sets health to
+    /// stopped and then writes the env files in the same turn, so health is moved off
+    /// stopped first: seeing it stopped again means that write is done.
+    private func stop(_ supervisor: EnvironmentSupervisor) async {
+        supervisor.health = .degraded
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { supervisor.health == .stopped }
+        XCTAssertTrue(stopped, "stop did not end")
+    }
+
+    /// Waits a short time for a switch that should start nothing, then checks that it
+    /// did not: its task runs only after the call returns.
+    private func assertNothingStarted(_ name: String) async {
+        let started = await waitUntil(1) {
+            !self.restarted.isEmpty || !self.feedback.isEmpty || !self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertFalse(started, name)
+        XCTAssertEqual(restarted, [], name)
+        XCTAssertTrue(feedback.isEmpty, name)
+        XCTAssertTrue(supervisor.actionsInFlight.isEmpty, name)
     }
 
     /// The services a switch started a process for.
@@ -146,9 +173,7 @@ final class ModeSwitchTests: XCTestCase {
             XCTAssertEqual(supervisor.lastError, row.error, row.name)
             XCTAssertEqual(envLocal("booking"), "", row.name)
             XCTAssertEqual(envLocal("login"), "", row.name)
-            XCTAssertTrue(supervisor.actionsInFlight.isEmpty, row.name)
-            XCTAssertEqual(restarted, [], row.name)
-            XCTAssertTrue(feedback.isEmpty, row.name)
+            await assertNothingStarted(row.name)
             supervisor.health = .stopped
         }
     }
@@ -168,9 +193,7 @@ final class ModeSwitchTests: XCTestCase {
         XCTAssertFalse(booking.contains("NEXT_PUBLIC_LOCAL_DEV"), booking)
         XCTAssertTrue(booking.contains("LOGIN_URL=https://login.example.test/login/init"), "booking borrows partner's login")
         XCTAssertTrue(envLocal("login").contains("AMATEUR_SUPABASE_URL=https://hosted.example.test"))
-        XCTAssertTrue(supervisor.actionsInFlight.isEmpty)
-        XCTAssertEqual(restarted, [])
-        XCTAssertTrue(feedback.isEmpty)
+        await assertNothingStarted("to dev")
         XCTAssertEqual(supervisor.health, .stopped)
 
         // And back: the local block returns, still with no start.
@@ -180,7 +203,8 @@ final class ModeSwitchTests: XCTestCase {
         let local = envLocal("booking")
         XCTAssertTrue(local.contains("NEXT_PUBLIC_LOCAL_DEV=true"), local)
         XCTAssertTrue(local.contains("LOGIN_URL=http://localhost:3000/login/init"), local)
-        XCTAssertEqual(restarted, [])
+        await assertNothingStarted("to local")
+        XCTAssertEqual(supervisor.health, .stopped)
     }
 
     /// Running: each switch restarts the apps that read the database, and only them.
@@ -215,8 +239,7 @@ final class ModeSwitchTests: XCTestCase {
                 // The portal does not start without the local stack's keys; the switch read them.
                 XCTAssertTrue(envLocal("booking").contains("LOCAL_SUPABASE_ANON_KEY=anon-test"), row.name)
             }
-            supervisor.stopAll()
-            _ = await waitUntil(10) { self.supervisor.health == .stopped }
+            await stop(supervisor)
             feedback = []
         }
     }
