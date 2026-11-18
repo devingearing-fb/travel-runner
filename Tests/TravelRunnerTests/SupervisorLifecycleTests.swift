@@ -4416,6 +4416,124 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(supervisor.dbMode, .local)
         XCTAssertEqual(supervisor.notices.text(.dbMode), refusal)
     }
+
+    // MARK: - Run Checks Now
+
+    private static func checkedService(_ id: String, port: Int? = nil) -> ServiceDefinition {
+        ServiceDefinition(
+            id: id, name: nil, cmd: ["true"], cwd: nil,
+            probe: port.map { ProbeConfig(type: .tcp, port: $0, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5) },
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+    }
+
+    private func checkIDs() -> [String] { supervisor.preflightChecks.map(\.id) }
+
+    /// Finding: with any service live, Run Checks Now dropped every port check,
+    /// so a stray process on the port of a failed portal never showed. Only the
+    /// port of a service that runs is left out.
+    func testRunChecksNowChecksThePortOfAFailedServiceWhileAnotherRuns() async throws {
+        supervisor.shell = FakeCommandRunner()
+        let livePort = Self.freePort()
+        let failedPort = Self.freePort()
+        try supervisor.loadServices([
+            Self.checkedService("db", port: livePort),
+            Self.checkedService("portal", port: failedPort),
+        ])
+
+        // The control: a stopped stack checks every port.
+        XCTAssertEqual(supervisor.preflightPortsLeftOut, [])
+        await supervisor.runPreflightOnly()
+        XCTAssertTrue(checkIDs().contains("port-\(livePort)"), "\(checkIDs())")
+        XCTAssertTrue(checkIDs().contains("port-\(failedPort)"), "\(checkIDs())")
+
+        supervisor.serviceStates["db"]?.phase = .running
+        supervisor.serviceStates["portal"]?.phase = .failed
+        XCTAssertEqual(supervisor.preflightPortsLeftOut, [livePort])
+        await supervisor.runPreflightOnly()
+
+        XCTAssertFalse(checkIDs().contains("port-\(livePort)"), "the running service holds its port")
+        let failed = try XCTUnwrap(supervisor.preflightChecks.first { $0.id == "port-\(failedPort)" })
+        XCTAssertTrue(failed.result.isPassed, "\(failed.result)")
+    }
+
+    /// The checks open no app: a container runtime that does not answer fails
+    /// its check with the fix to open it.
+    func testRunChecksNowDoesNotOpenTheContainerRuntime() async throws {
+        let shell = FakeCommandRunner { call in
+            call.command.contains("docker ps") ? FakeCommandRunner.failed() : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        try supervisor.loadServices([Self.checkedService("api")])
+
+        await supervisor.runPreflightOnly()
+
+        let docker = try XCTUnwrap(supervisor.preflightChecks.first { $0.id == "docker" })
+        guard case .failed(_, let fix) = docker.result else { return XCTFail("the runtime check is \(docker.result)") }
+        XCTAssertEqual(fix?.hasPrefix("Open "), true)
+        XCTAssertFalse(shell.commands.contains { $0.hasPrefix("open ") }, "\(shell.commands)")
+    }
+
+    /// Finding: during a start the button did nothing and said nothing. Now it
+    /// is disabled while a start runs, and a refused call says why.
+    func testRunChecksNowDuringAStartSaysWhy() async throws {
+        let gate = Gate()
+        supervisor.siblingActiveServices = {
+            await gate.wait()
+            return ["supabase"]
+        }
+        let shell = FakeCommandRunner()
+        supervisor.shell = shell
+        try supervisor.loadServices([Self.checkedService("api")])
+        supervisor.startAll()
+        XCTAssertTrue(supervisor.startRunning)
+
+        await supervisor.runPreflightOnly()
+
+        XCTAssertEqual(supervisor.recentActivity.entries.first?.message, ActionFeedback.checksDuringStart)
+        XCTAssertFalse(supervisor.preflightOnlyRunning)
+        XCTAssertTrue(shell.commands.isEmpty, "no check ran: \(shell.commands)")
+        await gate.open()
+        let ended = await waitUntil(5) { !self.supervisor.startRunning }
+        XCTAssertTrue(ended)
+    }
+
+    /// Finding: a start during Run Checks Now ran the same checks twice at once.
+    /// The start stops the check-only run and waits for it.
+    func testAStartStopsTheChecksOfRunChecksNow() async throws {
+        let gate = Gate()
+        let shell = FakeCommandRunner { call in
+            if call.command.contains("node --version") {
+                await gate.wait()
+                return FakeCommandRunner.ok("v22.11.0")
+            }
+            return FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        // The start ends at the question to the other app, before its own checks.
+        let asked = LockedPids()
+        supervisor.siblingActiveServices = {
+            asked.set([1])
+            return ["supabase"]
+        }
+        try supervisor.loadServices([Self.checkedService("api")])
+
+        let checks = Task { await supervisor.runPreflightOnly() }
+        let held = await waitUntil(5) { shell.commands.contains { $0.contains("node --version") } }
+        XCTAssertTrue(held)
+        supervisor.startAll()
+        try await Task.sleep(for: .milliseconds(200))
+        XCTAssertTrue(asked.pids.isEmpty, "the start waits for the check-only run")
+
+        await gate.open()
+        await checks.value
+
+        let ended = await waitUntil(5) { !self.supervisor.startRunning }
+        XCTAssertTrue(ended)
+        XCTAssertFalse(asked.pids.isEmpty, "the start went on")
+        XCTAssertFalse(supervisor.preflightOnlyRunning)
+        XCTAssertFalse(shell.commands.contains { $0.contains("which stripe") }, "the cancelled run stopped: \(shell.commands)")
+    }
 }
 
 /// The database mode at each ask of the other app.

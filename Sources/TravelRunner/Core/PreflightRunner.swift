@@ -37,6 +37,9 @@ struct PreflightRunner: Sendable {
     var shell: any CommandRunning = LoginShell()
     /// The time of the wait for a container runtime that starts.
     var clock = RunnerClock.live
+    /// False when the checks must change nothing: a container runtime that does
+    /// not answer fails its check and is not opened.
+    var opensContainerRuntime = true
     /// A check command that hangs fails after this time and does not hold the start.
     static let checkTimeout: Duration = .seconds(15)
 
@@ -118,7 +121,7 @@ struct PreflightRunner: Sendable {
             if await ContainerRuntime.isResponding(shell: shell) {
                 return .passed(detail: runtime.displayName)
             }
-            if await ContainerRuntime.ensureRunning(shell: shell, clock: clock) {
+            if opensContainerRuntime, await ContainerRuntime.ensureRunning(shell: shell, clock: clock) {
                 return .passed(detail: "\(runtime.displayName) — auto-started")
             }
             return .failed(message: "\(runtime.displayName) not responding", fix: "Open \(runtime.appName) manually")

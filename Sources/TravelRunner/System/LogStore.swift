@@ -50,6 +50,23 @@ struct LogEntry: Sendable, Identifiable {
     }
 }
 
+extension LogEntry {
+    /// A formatter of the time of a report line, in `format` (for example `HH:mm:ss.SSS`).
+    static func timeFormatter(_ format: String, timeZone: TimeZone = .current) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = timeZone
+        formatter.dateFormat = format
+        return formatter
+    }
+
+    /// The entry as one line of a report or bundle: `<time> [out|err] <text>`, redacted.
+    func reportLine(time: DateFormatter, redactor: Redactor) -> String {
+        "\(time.string(from: timestamp)) [\(stream == .stdout ? "out" : "err")] \(redactor.redact(text))"
+    }
+}
+
 struct LogCounts: Sendable {
     var error: Int = 0
     var warning: Int = 0

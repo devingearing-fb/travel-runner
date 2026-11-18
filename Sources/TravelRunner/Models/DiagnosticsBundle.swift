@@ -48,18 +48,11 @@ struct DiagnosticsBundle: Codable, Sendable, Equatable {
         configIssues: [String] = [],
         timeZone: TimeZone = .current
     ) -> DiagnosticsBundle {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.timeZone = timeZone
-        formatter.dateFormat = "HH:mm:ss.SSS"
-
+        let formatter = LogEntry.timeFormatter("HH:mm:ss.SSS", timeZone: timeZone)
         var tails: [String: [String]] = [:]
         for id in failedLogIDs(in: snapshot) {
             guard let entries = logs[id], !entries.isEmpty else { continue }
-            tails[id] = entries.suffix(maxLogLines).map { entry in
-                "\(formatter.string(from: entry.timestamp)) [\(entry.stream == .stdout ? "out" : "err")] \(redactor.redact(entry.text))"
-            }
+            tails[id] = entries.suffix(maxLogLines).map { $0.reportLine(time: formatter, redactor: redactor) }
         }
         return DiagnosticsBundle(
             snapshot: snapshot.redacted(by: redactor),

@@ -116,6 +116,8 @@ final class EnvironmentSupervisor {
     private var preflightRequestsRunning = 0
     /// True while "Run Checks Now" runs the checks.
     private(set) var preflightOnlyRunning = false
+    /// The checks of "Run Checks Now". A start cancels it and waits for it.
+    @ObservationIgnored private var preflightOnlyTask: Task<Void, Never>?
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
@@ -688,6 +690,9 @@ final class EnvironmentSupervisor {
         dbSetupFailedAtStart = false
         startupBeganAt = clock.date()
         phaseTimings = [:]
+        // The start runs the checks of "Run Checks Now" itself.
+        let checksOnly = preflightOnlyTask
+        checksOnly?.cancel()
 
         startTask = Task { [weak self] in
             guard let self else { return }
@@ -698,6 +703,7 @@ final class EnvironmentSupervisor {
                 }
             }
 
+            await checksOnly?.value
             await self.waitForEnvResetOfLoad()
 
             // The other runner app uses the same ports, and this start stops what it
@@ -957,29 +963,55 @@ final class EnvironmentSupervisor {
 
     /// "Run Checks Now": the checks of a start for the profile, run without a
     /// start. The results replace `preflightChecks`, so Diagnostics and Status
-    /// show each reason and fix. While the stack runs, its own processes hold
-    /// its ports, so the port checks are left out. A start that runs has its own
-    /// checks: this does nothing then.
+    /// show each reason and fix. The checks change nothing: a container runtime
+    /// that does not answer fails its check and is not opened. The ports of
+    /// services that run are left out (`preflightPortsLeftOut`). A start that
+    /// runs has its own checks: this is refused then, and says why.
     func runPreflightOnly() async {
-        guard startTask == nil, !preflightOnlyRunning else { return }
+        guard startTask == nil else {
+            showFeedback(ActionFeedback.checksDuringStart, .info)
+            return
+        }
+        if let running = preflightOnlyTask {
+            await running.value
+            return
+        }
+        var runner = preflightRunner
+        runner.opensContainerRuntime = false
+        let leftOut = Set(preflightPortsLeftOut.map { "port-\($0)" })
+        let checks = runner.allChecks(for: loadedServices.filter { isInProfile($0.id) })
+            .filter { !leftOut.contains($0.id) }
+        preflightChecks = checks
         preflightOnlyRunning = true
         preflightRequestsRunning += 1
-        defer {
-            preflightOnlyRunning = false
-            preflightRequestsRunning -= 1
+        // A start cancels the run: it runs the same checks itself.
+        let task = Task {
+            for check in checks {
+                let result = await runner.run(check: check)
+                if Task.isCancelled { return }
+                check.result = result
+            }
         }
-        let runner = preflightRunner
-        let leaveOutPorts = preflightLeavesOutPorts
-        let checks = runner.allChecks(for: loadedServices.filter { isInProfile($0.id) })
-            .filter { !(leaveOutPorts && $0.id.hasPrefix("port-")) }
-        preflightChecks = checks
-        for check in checks {
-            check.result = await runner.run(check: check)
-        }
+        preflightOnlyTask = task
+        await task.value
+        preflightOnlyTask = nil
+        preflightOnlyRunning = false
+        preflightRequestsRunning -= 1
     }
 
-    /// True while the stack holds a process: "Run Checks Now" leaves out the port checks.
-    var preflightLeavesOutPorts: Bool { holdsLiveStackNow() }
+    /// The ports that "Run Checks Now" leaves out: the probe port of each service
+    /// that starts, runs or stops. Its own process holds it. The ports of failed,
+    /// stopped and skipped services are checked.
+    var preflightPortsLeftOut: [Int] {
+        let livePhases: Set<ServicePhase> = [.starting, .running, .stopping]
+        let ports = serviceStates.values
+            .filter { livePhases.contains($0.phase) }
+            .compactMap { $0.definition.probe?.port }
+        return Set(ports).sorted()
+    }
+
+    /// True while a start runs. "Run Checks Now" is refused then.
+    var startRunning: Bool { startTask != nil }
 
     /// The answer of `/api/preflight`: the checks of a start that change nothing
     /// (Node, the ports, the folders), run now. Each check has a time limit, so

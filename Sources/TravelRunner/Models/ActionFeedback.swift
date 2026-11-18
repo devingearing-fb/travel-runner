@@ -20,6 +20,7 @@ struct ActionFeedback: Identifiable, Equatable, Sendable {
     /// The text of a guard that refused an action, because the same one runs.
     static let startInProgress = "A start is already in progress."
     static let dbSetupRunning = "A database setup is already running."
+    static let checksDuringStart = "A start is running. Its own checks show here."
     static func alreadyRestarting(_ name: String) -> String {
         "\(name) is already restarting."
     }

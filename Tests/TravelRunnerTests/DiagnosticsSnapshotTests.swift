@@ -364,23 +364,6 @@ final class DiagnosticsSnapshotTests: XCTestCase {
         XCTAssertEqual(supervisor.health, .stopped)
         XCTAssertEqual(supervisor.serviceStates["api"]?.phase, phaseBefore)
     }
-
-    /// While the stack runs, its own processes hold its ports: the port checks are
-    /// left out. The port is never bound.
-    @MainActor
-    func testRunChecksNowLeavesOutThePortChecksWhileTheStackRuns() async throws {
-        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DiagnosticsSnapshotTests-\(UUID().uuidString)"))
-        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
-        supervisor.shell = FakeCommandRunner()
-        try supervisor.loadServices([Self.definition("api", port: 65_000)])
-        supervisor.serviceStates["api"]?.phase = .running
-
-        XCTAssertTrue(supervisor.preflightLeavesOutPorts)
-        await supervisor.runPreflightOnly()
-
-        XCTAssertFalse(supervisor.preflightChecks.isEmpty)
-        XCTAssertFalse(supervisor.preflightChecks.contains { $0.id.hasPrefix("port-") })
-    }
 }
 
 private final class ReadCounter: @unchecked Sendable {

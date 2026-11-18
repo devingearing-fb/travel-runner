@@ -102,7 +102,8 @@ struct WorkshopDiagnosticsView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.mini)
-            .disabled(supervisor.preflightOnlyRunning || supervisor.health == .starting)
+            .disabled(supervisor.preflightOnlyRunning || supervisor.startRunning)
+            .help(supervisor.startRunning ? ActionFeedback.checksDuringStart : "Runs the checks without a start. Opens no app.")
         }
 
         if supervisor.preflightChecks.isEmpty {
@@ -114,8 +115,9 @@ struct WorkshopDiagnosticsView: View {
                 PreflightCheckRow(check: check)
             }
         }
-        if supervisor.preflightLeavesOutPorts {
-            Text("While the stack runs, the port checks are left out: the stack holds those ports.")
+        let leftOut = supervisor.preflightPortsLeftOut
+        if !leftOut.isEmpty {
+            Text("Run Checks Now leaves out the ports of running services (\(leftOut.map(String.init).joined(separator: ", "))): those services hold them.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
