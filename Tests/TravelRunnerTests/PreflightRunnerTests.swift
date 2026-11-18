@@ -143,8 +143,10 @@ final class PreflightRunnerTests: XCTestCase {
             ("no network", withKey, true, FakeCommandRunner.failed(1, stderr: "dial tcp: lookup api.stripe.com: no such host"),
              "warning: No network, or Stripe did not answer — Stripe reconnects when the network is back"),
             ("no key, and the login works", withoutKey, true, FakeCommandRunner.ok(), "passed: Authenticated"),
-            ("no key, and the login expired", withoutKey, true, FakeCommandRunner.failed(1),
+            ("no key, and the login expired", withoutKey, true, FakeCommandRunner.failed(1, stderr: "error: api_key_expired"),
              "warning: Session invalid or expired — \(skipped); run: stripe login"),
+            ("a failure with no known line", withKey, true, FakeCommandRunner.failed(1, stderr: "Request failed, status=503"),
+             "warning: Stripe could not be checked — the runner tries again after the start"),
             ("Stripe does not answer", withKey, true, FakeCommandRunner.timedOut,
              "warning: No network, or Stripe did not answer — Stripe reconnects when the network is back"),
         ]

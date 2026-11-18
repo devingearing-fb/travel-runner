@@ -218,7 +218,7 @@ final class StripeSupportTests: XCTestCase {
 
     func testTheAuthRowWithALiveKeyAsksForTheLoginAndSaysWhy() async throws {
         try write(".env", "STRIPE_SECRET_KEY=sk_live_madeUpLiveKey789\n")
-        let checker = makeChecker(FakeCommandRunner { _ in FakeCommandRunner.failed() })
+        let checker = makeChecker(FakeCommandRunner { _ in FakeCommandRunner.failed(stderr: "Request failed, status=401") })
 
         await checker.runAllChecks()
 
@@ -319,7 +319,8 @@ final class StripeSupportTests: XCTestCase {
     func testPreflightWithARejectedTestKeyDoesNotAskForALogin() async throws {
         try write(".env", "STRIPE_SECRET_KEY=\(testKey)\n")
         let runner = FakeCommandRunner { call in
-            call.command == StripeLauncher.authCheckCommand ? FakeCommandRunner.failed() : FakeCommandRunner.ok()
+            call.command == StripeLauncher.authCheckCommand
+                ? FakeCommandRunner.failed(stderr: "Request failed, status=401") : FakeCommandRunner.ok()
         }
 
         let result = await preflightStatus(runner)
@@ -364,6 +365,9 @@ final class StripeSupportTests: XCTestCase {
             (["dial tcp: lookup api.stripe.com: no such host"], .network),
             (["Get \"https://api.stripe.com\": dial tcp 1.2.3.4:443: connect: network is unreachable"], .network),
             (["lookup api.stripe.com: no such host"], .network),
+            (["Post \"https://api.stripe.com/v1/balance\": net/http: TLS handshake timeout"], .network),
+            (["dial: i/o timeout"], .network),
+            (["read tcp 10.0.0.2:51234->34.1.2.3:443: read: connection reset by peer"], .network),
             (["panic: runtime error: invalid memory address", "goroutine 1 [running]:"], .cliCrash),
             (["Ready! Your webhook signing secret is whsec_x", "some other line"], .unknown),
             ([], .unknown),
@@ -388,8 +392,15 @@ final class StripeSupportTests: XCTestCase {
         XCTAssertEqual(classify(FakeCommandRunner.failed(stderr: "Request failed, status=401, body=...")), .notAuthenticated)
         XCTAssertEqual(classify(FakeCommandRunner.failed(stderr: "dial tcp: lookup api.stripe.com: no such host")), .offline)
         XCTAssertEqual(classify(CommandResult(exitCode: 1, stdout: "Invalid API Key provided: sk_test_****abcd", stderr: "")), .notAuthenticated)
-        // A failure that says nothing counts as a rejected key, as before.
-        XCTAssertEqual(classify(FakeCommandRunner.failed()), .notAuthenticated)
+        // Only an auth line blames the key. A failure that says nothing, a 5xx or a
+        // crash of the CLI could not be checked.
+        XCTAssertEqual(classify(FakeCommandRunner.failed()), .unverified)
+        XCTAssertEqual(classify(FakeCommandRunner.failed(stderr: "Request failed, status=503, body=upstream error")), .unverified)
+        XCTAssertEqual(classify(FakeCommandRunner.failed(stderr: "panic: runtime error: index out of range")), .unverified)
+        XCTAssertEqual(classify(FakeCommandRunner.failed(stderr: "net/http: TLS handshake timeout")), .offline)
+        XCTAssertEqual(StripeOffReason.unavailable(.unverified, mode: mode), .unverified)
+        XCTAssertFalse(StripeOffReason.unverified.headline.contains("STRIPE_SECRET_KEY"))
+        XCTAssertTrue(StripeOffReason.unverified.retries)
     }
 
     func testTheCLIProbeSaysWhyStripeCannotRun() async {
@@ -399,6 +410,12 @@ final class StripeSupportTests: XCTestCase {
         let notInstalled = await StripeCLI(shell: missing).availability(key)
         XCTAssertEqual(notInstalled, .notInstalled)
         XCTAssertEqual(missing.commands, [StripeLauncher.installedCommand], "no auth check without the CLI")
+
+        // A hung PATH lookup is not the network.
+        let hung = FakeCommandRunner { $0.command == StripeLauncher.installedCommand ? FakeCommandRunner.timedOut : FakeCommandRunner.ok() }
+        let unchecked = await StripeCLI(shell: hung).availability(key)
+        XCTAssertEqual(unchecked, .unverified)
+        XCTAssertEqual(hung.commands, [StripeLauncher.installedCommand])
 
         let offline = FakeCommandRunner { call in
             call.command == StripeLauncher.authCheckCommand
@@ -475,6 +492,7 @@ final class StripeSupportTests: XCTestCase {
              "Stripe rejected STRIPE_SECRET_KEY from apps/booking-portal/.env — import a current .env.", [.importSharedEnv], false),
             (.offline, "No network — Stripe reconnects when the network is back.", [], true),
             (.afterWake, "Reconnecting Stripe after wake…", [], true),
+            (.unverified, "Stripe could not be checked — the runner tries again.", [], true),
             (.didNotConnect(seconds: 25), "Stripe did not connect within 25s — webhooks are off.", [.startService], false),
             (.crashedTwice, "Stripe CLI crashed twice (see log) — webhooks are off.", [.startService, .openLog], false),
         ]

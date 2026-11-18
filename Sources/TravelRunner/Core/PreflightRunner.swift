@@ -252,8 +252,6 @@ struct PreflightRunner: Sendable {
         }
     }
 
-    /// One check command. A cwd that does not exist is left out: the check of
-    /// the folders reports it.
     /// The row of the Stripe check. Stripe is optional: it never fails the start.
     static func stripeResult(_ availability: StripeAvailability, mode: StripeMode) -> PreflightResult {
         let skipped = "Stripe will be skipped"
@@ -273,9 +271,13 @@ struct PreflightRunner: Sendable {
             return .warning(message: "Session invalid or expired — \(skipped); run: stripe login")
         case .outdated(let version):
             return .warning(message: "Stripe CLI \(version) is too old — \(skipped); run: \(StripeLauncher.updateCommand)")
+        case .unverified:
+            return .warning(message: "Stripe could not be checked — the runner tries again after the start")
         }
     }
 
+    /// One check command. A cwd that does not exist is left out: the check of
+    /// the folders reports it.
     private func run(_ command: String, cwd: String? = nil) async -> CommandResult {
         var isDirectory: ObjCBool = false
         let folder = cwd.flatMap {

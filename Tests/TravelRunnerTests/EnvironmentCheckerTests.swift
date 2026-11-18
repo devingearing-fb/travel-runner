@@ -350,11 +350,23 @@ final class EnvironmentCheckerTests: XCTestCase {
 
         XCTAssertEqual(status("node", in: checker), .failing("Node.js not found"))
         XCTAssertEqual(status("stripe-cli", in: checker), .warning("Not installed — webhooks won't work"))
-        XCTAssertEqual(status("stripe-auth", in: checker), .warning("Session invalid or expired — run: stripe login"))
+        // A failure with no known line is not an expired login.
+        XCTAssertEqual(status("stripe-auth", in: checker), .warning("Stripe could not be checked — see: stripe balance retrieve"))
         for check in checker.checks {
             if case .failing(let text) = check.status { XCTAssertFalse(text.contains("did not answer"), "\(check.id): \(text)") }
             if case .warning(let text) = check.status { XCTAssertFalse(text.contains("did not answer"), "\(check.id): \(text)") }
         }
+    }
+
+    /// Control: a 401 from Stripe is an expired login.
+    func testAStripeAuthCheckWithA401SaysTheLoginExpired() async {
+        let checker = makeChecker(FakeCommandRunner { call in
+            call.command.hasPrefix("stripe balance retrieve") ? FakeCommandRunner.failed(stderr: "Request failed, status=401") : FakeCommandRunner.ok()
+        })
+
+        await checker.runAllChecks()
+
+        XCTAssertEqual(status("stripe-auth", in: checker), .warning("Session invalid or expired — run: stripe login"))
     }
 
     func testTheAgentNodeCheckSaysWhenNodeDidNotAnswer() async {

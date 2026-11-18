@@ -182,6 +182,8 @@ final class EnvironmentSupervisor {
     @ObservationIgnored var stripeNetworkUp: (@Sendable () async -> Bool)?
     /// The waits of the Stripe retries. Tests make them short.
     @ObservationIgnored var stripeRetryPolicy = StripeRetryPolicy()
+    /// Runs in the wake reconnect before it stops the stale CLI. Tests let the CLI exit there.
+    @ObservationIgnored var stripeBeforeWakeStop: (@MainActor () async -> Void)?
     /// The time of every wait, deadline and time stamp of the supervisor. Tests
     /// set a fake.
     @ObservationIgnored var clock = RunnerClock.live
@@ -264,6 +266,8 @@ final class EnvironmentSupervisor {
     private var stripeCrashRestarts = 0
     /// The reconnect after a wake runs. A wait for the network says so on the row.
     private var stripeReconnectingAfterWake = false
+    /// The CLI that the wake reconnect replaces. Its own exit is part of the reconnect.
+    private var stripeWakeStalePID: Int32?
     /// Why Stripe waits, as the log last said it. The retries do not say it again.
     private var stripeWaitAnnounced: String?
     /// The stop and start of one service run one at a time (see `KeyedLock`).
@@ -669,6 +673,8 @@ final class EnvironmentSupervisor {
         guard startTask == nil, let graph else { return }
         // A start that a person asks for begins a new failure series for each service.
         for serviceID in serviceStates.keys { clearFailureHistory(serviceID) }
+        // Stripe keeps its own retry counts. The preflight fills the probe cache after this.
+        resetStripeRetries(keepingAvailability: true)
         health = .starting
         lastError = nil
         dbSetupFailedAtStart = false
@@ -4100,22 +4106,24 @@ final class EnvironmentSupervisor {
     }
 
     /// A start by a person: the probe asks again, and the retries start over.
-    private func resetStripeRetries() {
+    /// Start All keeps the probe answer that its preflight or `/api/preflight` got.
+    private func resetStripeRetries(keepingAvailability: Bool = false) {
         stripeGeneration += 1
         stripeNetworkAttempts = 0
         stripeCrashRestarts = 0
         stripeReconnectingAfterWake = false
+        stripeWakeStalePID = nil
         stripeWaitAnnounced = nil
-        stripeAvailabilityCache.invalidate()
+        if !keepingAvailability { stripeAvailabilityCache.invalidate() }
     }
 
     /// Stripe is off, or waits for the network. The row, the log and `events.jsonl`
-    /// say why; no issue is filed. A wait for the network tries again by itself.
+    /// say why; no issue is filed. A wait for the network, or a check that gave no
+    /// answer, tries again by itself.
     private func stripeOff(_ state: ServiceState, _ reason: StripeOffReason, cause: String) async {
         stripeGeneration += 1
         let generation = stripeGeneration
-        let waitsForNetwork = reason == .offline
-        let shown = waitsForNetwork && stripeReconnectingAfterWake ? StripeOffReason.afterWake : reason
+        let shown = reason == .offline && stripeReconnectingAfterWake ? StripeOffReason.afterWake : reason
         // A retry that finds the same cause again says nothing new.
         let repeated = shown.retries && stripeWaitAnnounced == shown.headline
         stripeWaitAnnounced = shown.retries ? shown.headline : nil
@@ -4129,7 +4137,7 @@ final class EnvironmentSupervisor {
             await logStore.append(serviceID: "stripe", entry: LogEntry(stream: .stderr, text: Self.stripeStoppedLine(cause)))
             await recordDebugEvent(kind: "stripe_skip", serviceID: "stripe", message: cause)
         }
-        if waitsForNetwork {
+        if reason.retries {
             scheduleStripeReconnect(generation)
         } else {
             stripeReconnectingAfterWake = false
@@ -4155,6 +4163,20 @@ final class EnvironmentSupervisor {
         stripeGeneration += 1
         let generation = stripeGeneration
         let exit = "the Stripe CLI \(ServiceTermination.describe(termination))"
+        // The stale CLI exited before the wake reconnect stopped it. That is part of
+        // the reconnect, not a crash: start it again, or wait for the network.
+        if stripeReconnectingAfterWake, termination.pid == stripeWakeStalePID {
+            stripeWakeStalePID = nil
+            Task {
+                if await isStripeNetworkUp() {
+                    await retryStripe(generation)
+                } else if stripeGeneration == generation {
+                    await stripeOff(state, .offline, cause: "\(exit) after wake — no network; Stripe reconnects when the network is back")
+                }
+            }
+            recalculateHealth()
+            return
+        }
         // The log keeps the lines of earlier launches. An old 401 is not the cause of this exit.
         let launched = state.lastStarted ?? .distantPast
         let mode = stripeMode
@@ -4257,9 +4279,11 @@ final class EnvironmentSupervisor {
         let generation = stripeGeneration
         stripeNetworkAttempts = 0
         stripeReconnectingAfterWake = true
+        stripeWakeStalePID = state.pid
         stripeAvailabilityCache.invalidate()
         noteSkip(state, StripeOffReason.afterWake.kind, StripeOffReason.afterWake.headline)
         await logStore.append(serviceID: "stripe", entry: LogEntry(stream: .stdout, text: "[travel-runner] Reconnecting Stripe after wake"))
+        await stripeBeforeWakeStop?()
         do {
             try await replaceProcess("stripe", stoppedPhase: .pending, keepsFailureHistory: true, onlyIf: {
                 self.stripeGeneration == generation && !self.isShuttingDown && self.health != .stopped
@@ -4303,13 +4327,23 @@ final class EnvironmentSupervisor {
     /// The "Import…" button of the Stripe row: the shared `.env` of the booking
     /// portal, then a start of Stripe on its key.
     func importSharedEnvForStripe() {
-        guard let monorepo = supabaseCwd ?? monorepoPath else { return }
+        guard let monorepo = supabaseCwd ?? monorepoPath else {
+            onActionFeedback?("No monorepo path — set it in Settings > Paths, then import the .env again", false)
+            return
+        }
         let checker = EnvironmentChecker(
             monorepoPath: monorepo, loginPath: "", streamServicesPath: "", shell: shell, tools: tools
         )
         Task {
-            guard await checker.importSharedEnv(.booking) == true else { return }
-            restartService("stripe")
+            // Nil is a cancel: the person chose not to import.
+            switch await checker.importSharedEnv(.booking) {
+            case true?:
+                restartService("stripe")
+            case false?:
+                onActionFeedback?("The .env was not imported — check the file and that apps/booking-portal can be written, then try again", false)
+            case nil:
+                break
+            }
         }
     }
 

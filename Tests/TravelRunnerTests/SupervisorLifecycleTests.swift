@@ -2456,6 +2456,95 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(crashes.isEmpty, "a stop by the runner is no crash: \(crashes)")
     }
 
+    /// A crash series ended "crashed twice". After Stop All and Start All the CLI
+    /// gets its two restarts again, not none.
+    func testStartAllGivesACrashingStripeItsTwoRestartsAgain() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        supervisor.stripeTooling = FakeStripeTooling.available
+        try supervisor.loadServices([stripe("echo stripe-start; sleep 1; exit 1")])
+        supervisor.health = .healthy
+        supervisor.restartService("stripe")
+        let first = await waitUntil(30) { self.state("stripe").condition?.headline == StripeOffReason.crashedTwice.headline }
+        XCTAssertTrue(first, "stripe: \(state("stripe").condition?.text ?? "no condition")")
+
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        supervisor.startAll(skipPreflight: true)
+
+        var lines: [String] = []
+        for _ in 0..<300 where lines.filter({ $0 == "stripe-start" }).count < 6 {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines("stripe")
+        }
+        let again = await waitUntil(15) { self.state("stripe").condition?.headline == StripeOffReason.crashedTwice.headline }
+        XCTAssertTrue(again, "stripe: \(state("stripe").condition?.text ?? "no condition")")
+        lines = await logLines("stripe")
+        XCTAssertEqual(lines.filter { $0 == "stripe-start" }.count, 6, "two runs, each with two restarts: \(lines.joined(separator: "\n"))")
+        XCTAssertEqual(lines.filter { $0.hasSuffix("— restarting it (1 of 2)") }.count, 2)
+        XCTAssertEqual(lines.filter { $0.hasSuffix("— restarting it (2 of 2)") }.count, 2)
+    }
+
+    /// Stripe waited for the network when the session ended. A Start All that is
+    /// offline again says it again: the log line and the `stripe_skip` event.
+    func testStartAllSaysAgainThatStripeWaitsForTheNetwork() async throws {
+        let tracker = captureIssues()
+        _ = fakeTheOutsideOfStartAll()
+        supervisor.stripeNetworkUp = { false }
+        supervisor.stripeTooling = FakeStripeTooling.available
+        try supervisor.loadServices([stripeThatNeedsTheNetwork])
+        supervisor.health = .healthy
+        supervisor.restartService("stripe")
+        let waiting = await waitUntil(15) { self.state("stripe").condition?.headline == StripeOffReason.offline.headline }
+        XCTAssertTrue(waiting, "stripe: \(state("stripe").condition?.text ?? "no condition")")
+
+        supervisor.stopAll()
+        let stopped = await waitUntil(10) { self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        supervisor.startAll(skipPreflight: true)
+
+        let stoppedLine = "[travel-runner] Stripe stopped:"
+        var lines: [String] = []
+        for _ in 0..<300 where lines.filter({ $0.hasPrefix(stoppedLine) }).count < 2 {
+            try await Task.sleep(for: .milliseconds(50))
+            lines = await logLines("stripe")
+        }
+        XCTAssertEqual(lines.filter { $0.hasPrefix(stoppedLine) }.count, 2, lines.joined(separator: "\n"))
+        XCTAssertEqual(state("stripe").condition?.headline, StripeOffReason.offline.headline, "not the text of a wake")
+        let skips = await events("stripe_skip", in: tracker)
+        XCTAssertEqual(skips.count, 2, "\(skips.map(\.message))")
+    }
+
+    /// The stale CLI can exit by itself after the wake reconnect began and before
+    /// it stops the CLI. That exit is part of the reconnect: no crash restart.
+    func testAStaleStripeThatExitsDuringTheWakeReconnectIsNoCrash() async throws {
+        let tracker = captureIssues()
+        supervisor.stripeTooling = FakeStripeTooling.available
+        try load(stripe("echo stripe-start; sleep 30"))
+        supervisor.restartService("stripe")
+        let up = await waitUntil(15) { self.settled("stripe") }
+        XCTAssertTrue(up, "stripe is \(state("stripe").phase.rawValue)")
+        let stale = try XCTUnwrap(state("stripe").pid)
+
+        // The stale CLI exits by itself after the reconnect began, before its stop.
+        supervisor.stripeBeforeWakeStop = { [weak self] in
+            kill(stale, SIGKILL)
+            _ = await self?.waitUntil(10) { self?.state("stripe").pid == nil }
+        }
+        supervisor.handleWake()
+
+        let back = await waitUntil(15) {
+            self.state("stripe").phase == .running && self.state("stripe").pid != nil && self.state("stripe").pid != stale
+        }
+        XCTAssertTrue(back, "stripe: \(state("stripe").phase.rawValue) \(state("stripe").condition?.text ?? "no condition")")
+        try await Task.sleep(for: .seconds(1))
+        let lines = await logLines("stripe")
+        XCTAssertFalse(lines.contains { $0.contains("restarting it (") }, lines.joined(separator: "\n"))
+        XCTAssertEqual(lines.filter { $0.hasPrefix("[travel-runner] Stripe uses") }.count, 2, "one start for the reconnect: \(lines.joined(separator: "\n"))")
+        let issues = await tracker.listIssues(status: "open")
+        XCTAssertTrue(issues.isEmpty, "\(issues.map(\.summary))")
+    }
+
     /// A wake leaves alone a Stripe that is off for a cause that needs a person.
     func testAWakeDoesNotStartAStripeThatIsOffForALogin() async throws {
         supervisor.stripeTooling = FakeStripeTooling.answering(.notAuthenticated)

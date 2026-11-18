@@ -202,21 +202,25 @@ enum StripeAvailability: Equatable, Sendable {
     /// Stripe rejected the test key, or the login expired.
     case notAuthenticated
     case outdated(version: String)
+    /// The check gave no answer that says why: a hung `which stripe`, a 5xx, a crash
+    /// of the CLI. Stripe tries again; the key is not blamed.
+    case unverified
 
     var isOK: Bool {
         if case .ok = self { return true }
         return false
     }
 
-    /// The answer of `stripe balance retrieve`. Its output says why it failed; a
-    /// failure without a known line counts as a rejected key or login.
+    /// The answer of `stripe balance retrieve`. Its output says why it failed. Only
+    /// an auth line blames the key or login; a failure without a known line is unverified.
     static func classify(authCheck result: CommandResult, mode: StripeMode) -> StripeAvailability {
         if result.succeeded { return .ok(mode) }
         if result.timedOut { return .offline }
         let lines = (result.stdout + "\n" + result.stderr).components(separatedBy: .newlines)
         switch StripeExitClassifier.classify(logTail: lines) {
+        case .auth: return .notAuthenticated
         case .network: return .offline
-        case .auth, .cliCrash, .unknown: return .notAuthenticated
+        case .cliCrash, .unknown: return .unverified
         }
     }
 }
@@ -235,7 +239,8 @@ struct StripeCLI: StripeTooling {
 
     func availability(_ resolution: StripeKeyResolution) async -> StripeAvailability {
         let installed = await shell.run(StripeLauncher.installedCommand, timeout: timeout)
-        if !installed.succeeded { return installed.timedOut ? .offline : .notInstalled }
+        // A hung PATH lookup is not the network.
+        if !installed.succeeded { return installed.timedOut ? .unverified : .notInstalled }
         if let minimumVersion {
             let output = await shell.run(StripeLauncher.versionCommand, timeout: timeout)
             if let version = StripeVersion(parsing: output.stdout), version < minimumVersion {
@@ -278,7 +283,8 @@ enum StripeExitClassifier {
 
     static let authMarkers = ["status=401", "Authorization failed", "api_key_expired", "Invalid API Key",
                               "have not configured API keys"]
-    static let networkMarkers = ["no such host", "dial tcp"]
+    static let networkMarkers = ["no such host", "dial tcp", "TLS handshake timeout", "i/o timeout",
+                                 "connection reset", "network is unreachable"]
     static let crashMarkers = ["panic:"]
     /// The lines of the log that count.
     static let window = 40
@@ -335,6 +341,9 @@ struct StripeOffReason: Equatable, Sendable {
         headline: "No network — Stripe reconnects when the network is back.", retries: true
     )
     static let afterWake = StripeOffReason(headline: "Reconnecting Stripe after wake…", retries: true)
+    static let unverified = StripeOffReason(
+        headline: "Stripe could not be checked — the runner tries again.", retries: true
+    )
     static func didNotConnect(seconds: Int) -> StripeOffReason {
         StripeOffReason(headline: "Stripe did not connect within \(seconds)s — webhooks are off.", actions: [.startService])
     }
@@ -366,6 +375,7 @@ struct StripeOffReason: Equatable, Sendable {
         case .offline: offline
         case .notAuthenticated: notAuthenticated(mode)
         case .outdated(let version): outdated(version: version)
+        case .unverified: unverified
         }
     }
 

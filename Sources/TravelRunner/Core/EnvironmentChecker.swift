@@ -598,8 +598,11 @@ final class EnvironmentChecker {
             if mode.isTestKey { return StripeLauncher.authStatus(mode, loggedIn: nil) }
             let result = try await check(StripeLauncher.authCheckCommand, label: "stripe balance retrieve")
             // No network is not an expired login: `stripe login` would not help.
-            if StripeAvailability.classify(authCheck: result, mode: mode) == .offline {
-                return .warning("No network — cannot ask Stripe whether you are logged in")
+            switch StripeAvailability.classify(authCheck: result, mode: mode) {
+            case .offline: return .warning("No network — cannot ask Stripe whether you are logged in")
+            // A 5xx or a crash of the CLI is not an expired login.
+            case .unverified: return .warning("Stripe could not be checked — see: stripe balance retrieve")
+            default: break
             }
             return StripeLauncher.authStatus(mode, loggedIn: result.succeeded)
 

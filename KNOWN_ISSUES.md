@@ -129,9 +129,10 @@ The timeout watchdog task slept for the full step timeout even after the process
 Stripe's WebSocket to api.stripe.com dies during macOS sleep. On wake, the CLI enters a "Session expired, reconnecting..." loop that eventually fails with a DNS resolution error and exits code 1.
 
 **Fix now (S3, `StripeSupport.swift`):**
-- One probe, `StripeCLI`, says `ok`, `notInstalled`, `offline`, `notAuthenticated` or `outdated`. Each command has a timeout, and Start All's preflight and the start of Stripe share one answer for 60 s.
-- `StripeExitClassifier` reads the log of each exit: a 401 never retries; `no such host` or `dial tcp` waits for the network and retries after 5 s, doubling up to 60 s, with no issue and no red state; a crash or an unknown exit gets 2 restarts, then Stripe is off and one issue is filed.
-- On wake the runner stops Stripe itself and starts it again while the portals are probed. With no network the row says "Reconnecting Stripe after wake…" and no issue is filed.
+- One probe, `StripeCLI`, says `ok`, `notInstalled`, `offline`, `notAuthenticated`, `outdated` or `unverified`. Only an auth line in its output blames the key or login; a failure with no known line, or a hung `which stripe`, is `unverified` and Stripe tries again. Each command has a timeout, and Start All's preflight and the start of Stripe share one answer for 60 s.
+- `StripeExitClassifier` reads the log of each exit: a 401 never retries; `no such host`, `dial tcp`, a TLS handshake timeout, an i/o timeout or a reset connection waits for the network and retries after 5 s, doubling up to 60 s, with no issue and no red state; a crash or an unknown exit gets 2 restarts, then Stripe is off and one issue is filed.
+- On wake the runner stops Stripe itself and starts it again while the portals are probed. With no network the row says "Reconnecting Stripe after wake…" and no issue is filed. A stale CLI that exits by itself during the reconnect is part of it, not a crash.
+- Start All starts Stripe's retry counts over, as a restart from its row does.
 - `stripe listen` that prints no webhook secret in 25 s turns Stripe off ("Stripe did not connect within 25s — webhooks are off."), not FAILED.
 - The 2-minute "Session expired, reconnecting" watchdog is gone.
 
