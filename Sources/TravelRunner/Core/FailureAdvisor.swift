@@ -248,15 +248,18 @@ enum FailureAdvisor {
 
     /// The Help list, made from this table: each row is what `advise` says for one
     /// situation, so Help and the service rows never differ.
-    static func helpEntries(runtime: String = ContainerRuntime.detect().displayName, now: Date = .now) -> [HelpEntry] {
+    /// The texts and the buttons name `runtime`, as the service rows of this Mac do.
+    static func helpEntries(runtime: ContainerRuntime = .detect(), now: Date = .now) -> [HelpEntry] {
         let name = "Booking Portal"
         func row(_ situation: String, _ kind: Kind, port: Int? = 3002, log: [String] = [], cache: Bool = true) -> HelpEntry {
-            let context = Context(name: name, port: port, probePath: "/api/health", logTail: log, canClearCache: cache, runtime: runtime)
+            let context = Context(
+                name: name, port: port, probePath: "/api/health", logTail: log, canClearCache: cache,
+                runtime: runtime.displayName
+            )
             let condition = advise(kind, context, now: now)
-            let appName = ContainerRuntime.detect().appName
             return HelpEntry(
                 situation: situation, headline: condition.headline, detail: condition.detail,
-                buttons: condition.actions.map { $0.title(runtime: appName) }
+                buttons: condition.actions.map { $0.title(runtime: runtime.appName) }
             )
         }
         return [

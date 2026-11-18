@@ -232,7 +232,7 @@ final class FailureAdvisorTests: XCTestCase {
     /// says, and names a button.
     func testTheHelpListComesFromTheTable() {
         let now = Date(timeIntervalSince1970: 0)
-        let entries = FailureAdvisor.helpEntries(runtime: "OrbStack", now: now)
+        let entries = FailureAdvisor.helpEntries(runtime: .orbstack, now: now)
         XCTAssertEqual(Set(entries.map(\.situation)).count, entries.count, "one row per situation")
         for entry in entries {
             XCTAssertFalse(entry.headline.isEmpty, entry.situation)
@@ -246,5 +246,17 @@ final class FailureAdvisorTests: XCTestCase {
             now: now
         )
         XCTAssertEqual(entries.first { $0.situation == "It crashes again and again" }?.headline, loop.headline)
+    }
+
+    /// The Help list names the runtime it is given, in the text and on the button,
+    /// whatever this Mac has installed.
+    func testTheHelpListNamesTheGivenRuntime() {
+        let situation = "Docker or OrbStack is not running"
+        let docker = FailureAdvisor.helpEntries(runtime: .docker).first { $0.situation == situation }
+        XCTAssertEqual(docker?.headline, "Docker Desktop is not running.")
+        XCTAssertEqual(docker?.buttons, ["Open Docker"])
+        let orbstack = FailureAdvisor.helpEntries(runtime: .orbstack).first { $0.situation == situation }
+        XCTAssertEqual(orbstack?.headline, "OrbStack is not running.")
+        XCTAssertEqual(orbstack?.buttons, ["Open OrbStack"])
     }
 }

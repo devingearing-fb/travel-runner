@@ -3033,7 +3033,8 @@ final class EnvironmentSupervisor {
         let changed = newProfile != profile
         profile = newProfile
         profileMembers = newProfile.members(of: loadedServices)
-        if health == .stopped, startTask == nil, stopTask == nil {
+        // A stack that stops takes the profile at its next start, as a stopped one does.
+        if stopTask != nil || (health == .stopped && startTask == nil) {
             profileApplyPending = false
             onActionFeedback?("Profile: \(newProfile.displayName)", true)
         } else {
@@ -3044,29 +3045,37 @@ final class EnvironmentSupervisor {
 
     /// "Apply now": stops the services that left the profile, then starts the ones
     /// that joined it ("Retry failed": the services that run stay as they are).
+    /// Pressed during a start, it acts after that start ends. A stack that is
+    /// stopped or stops first takes the profile at its next start.
     func applyProfileNow() {
         profileApplyPending = false
-        let live: Set<ServicePhase> = [.running, .starting, .pending, .waiting, .failed]
-        let leaving = sortedServiceIDs.filter { id in
-            guard !isInProfile(id), let phase = serviceStates[id]?.phase else { return false }
-            return live.contains(phase)
-        }
-        if !leaving.isEmpty {
-            enqueueStackOperation { [self] in
-                // Dependents first: a service stops before what it needs.
-                for id in leaving.reversed() {
-                    await lifecycle.withLock(id) {
-                        serviceStates[id]?.phase = .stopping
-                        await processRunner.stop(serviceID: id)
-                        serviceStates[id]?.phase = .stopped
-                        serviceStates[id]?.clearCondition()
-                    }
-                    notices.resolve(.service(id))
-                }
-                recalculateHealth()
+        guard stopTask == nil, startTask != nil || health != .stopped else { return }
+        let stops = stopAllCount
+        let leave = enqueueStackOperation { [self] in
+            let live: Set<ServicePhase> = [.running, .starting, .pending, .waiting, .failed]
+            let leaving = sortedServiceIDs.filter { id in
+                guard !isInProfile(id), let phase = serviceStates[id]?.phase else { return false }
+                return live.contains(phase)
             }
+            guard !leaving.isEmpty else { return }
+            // Dependents first: a service stops before what it needs.
+            for id in leaving.reversed() {
+                await lifecycle.withLock(id) {
+                    serviceStates[id]?.phase = .stopping
+                    await processRunner.stop(serviceID: id)
+                    serviceStates[id]?.phase = .stopped
+                    serviceStates[id]?.clearCondition()
+                }
+                notices.resolve(.service(id))
+            }
+            recalculateHealth()
         }
-        startAll(mode: .missingOnly)
+        Task { [weak self] in
+            await leave.value
+            // A Stop All since the press ends it: the stack stays stopped.
+            guard let self, self.stopAllCount == stops else { return }
+            self.startAll(mode: .missingOnly)
+        }
     }
 
     private func startDepsWatching(watcher: DependencyWatcher) async {
