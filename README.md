@@ -198,7 +198,7 @@ No test starts two real copies. Check these by hand in a built app before a rele
 - "Quit" in the alert leaves the services and the ports of the first copy up.
 - With `TRAVEL_RUNNER_SMOKE=1`, the second copy shows no alert: it prints the message and exits with code 75.
 
-Releases: see [RELEASING.md](RELEASING.md). A release goes to the canary channel first (`./release.sh <version>`), then to everyone (`./release.sh --promote <version>`). `scripts/smoke.sh <App.app>` starts a built app with an empty home folder and checks that it answers. `scripts/clean-shell-check.sh [monolith]` runs the monolith's first database step with only the tools of the install steps above; `release.sh` refuses to publish unless it and `swift test` pass.
+Releases: see [RELEASING.md](RELEASING.md). A release goes to the canary channel first (`./release.sh <version>`), then to everyone (`./release.sh --promote <version>`). `scripts/smoke.sh <App.app>` starts a built app with an empty home folder and checks that it answers. `scripts/clean-shell-check.sh [monolith]` runs the monolith's first database step, and reads the imports of its Python scripts, with only the tools of the install steps above; `release.sh` refuses to publish unless it and `swift test` pass.
 
 ## Tech Stack
 

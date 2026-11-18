@@ -3,7 +3,8 @@ import XCTest
 
 /// `scripts/clean-shell-check.sh`, which release.sh runs before a build. The tests give
 /// it stub tools and a fake monolith whose check-prerequisites step is a bash script
-/// (the stub `node` runs it), so no real node, docker or python runs.
+/// (the stub `node` runs it) and whose Python scripts the stub `python3` reads, so no
+/// real node, docker or python runs.
 final class CleanShellCheckTests: XCTestCase {
     private var work: URL!
     private var stubs: URL!
@@ -17,7 +18,8 @@ final class CleanShellCheckTests: XCTestCase {
         work = FileManager.default.temporaryDirectory.appendingPathComponent("clean-shell-\(UUID().uuidString)")
         stubs = work.appendingPathComponent("stubs")
         monolith = work.appendingPathComponent("mono with space")
-        for dir in [stubs!, monolith.appendingPathComponent("scripts/db"), monolith.appendingPathComponent("node_modules"),
+        for dir in [stubs!, monolith.appendingPathComponent("scripts/db"), monolith.appendingPathComponent("scripts/setup"),
+                    monolith.appendingPathComponent("node_modules"),
                     work.appendingPathComponent("home")] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
@@ -26,12 +28,25 @@ final class CleanShellCheckTests: XCTestCase {
         try stub("node", #"if [ "$1" = --version ]; then echo v22.23.4; exit 0; fi; exec /bin/bash "$@""#)
         try stub("pnpm", "echo 10.34.5")
         try stub("docker", #"if [ "$1" = context ]; then echo unix:///tmp/fake-docker.sock; else echo "Docker version 29.0.0"; fi"#)
-        // A Python with an extra package: the import works unless site-packages are off (-S).
+        // A Python with an extra package: the import check finds jwt unless site-packages
+        // are off (-S). It records its arguments, and reports each file that imports jwt.
+        let pythonRecord = work.appendingPathComponent("python.txt").path
         try stub("python3", #"""
             for arg in "$@"; do [ "$arg" = -S ] && no_site=1; done
-            if [ "$1" = --version ] || [ "${@: -1}" = --version ]; then echo "Python 3.12.0"; exit 0; fi
-            if [ "${@: -1}" = "import jwt" ] && [ -n "${no_site:-}" ]; then echo "No module named 'jwt'"; exit 1; fi
-            exit 0
+            if [ "${@: -1}" = --version ]; then echo "Python 3.12.0"; exit 0; fi
+            printf '%s\n' "$@" > '\#(pythonRecord)'
+            files=(); after_code=; skip=
+            for arg in "$@"; do
+                if [ -n "$skip" ]; then skip=; after_code=1; continue; fi
+                if [ "$arg" = -c ]; then skip=1; continue; fi
+                [ -n "$after_code" ] && files+=("$arg")
+            done
+            missing=0
+            for file in "${files[@]}"; do
+                line="$(grep -nE '^[[:space:]]*(import|from) jwt' "$file" | head -1 | cut -d: -f1)"
+                [ -n "$line" ] && [ -n "${no_site:-}" ] && { echo "$file:$line: import jwt"; missing=1; }
+            done
+            exit $missing
             """#)
     }
 
@@ -65,20 +80,40 @@ final class CleanShellCheckTests: XCTestCase {
         XCTAssertEqual(Set(lines.filter { !$0.contains("=") }), ["node", "pnpm", "docker", "python3"])
     }
 
-    /// The PyJWT case: a step that imports a package which no README names.
+    /// The PyJWT case: a Python script of the hotel step imports a package that no README
+    /// names. check-prerequisites --verify runs no Python, so only the import check sees it.
     func testAPythonPackageOutsideTheStandardLibraryFailsTheCheck() throws {
-        try write("scripts/db/check-prerequisites.mjs", """
-            python3 -c "import jwt" || { echo "PyJWT: MISSING"; exit 1; }
-            """)
+        try write("scripts/db/check-prerequisites.mjs", "exit 0")
+        try write("scripts/setup/remote_supabase.py", "import json\nimport jwt\n")
+        try write("scripts/setup/dump-travel-organizations.py", "from remote_supabase import find_remote_config\n")
+        try write("scripts/setup/test_dump_travel_organizations.py", "import jwt\n")
 
         let result = try runCheck()
         XCTAssertNotEqual(result.code, 0)
-        XCTAssertTrue(result.output.contains("PyJWT: MISSING"), result.output)
+        XCTAssertTrue(result.output.contains("scripts/setup/remote_supabase.py:2: import jwt"), result.output)
         XCTAssertTrue(result.output.contains("A teammate who followed the README hits this too"), result.output)
 
+        // The check reads the scripts with a stdlib-only python3 and writes no bytecode.
+        // A test file is not run by a step, so it does not count.
+        let args = try String(contentsOfFile: work.appendingPathComponent("python.txt").path, encoding: .utf8)
+            .split(separator: "\n").map(String.init)
+        XCTAssertEqual(Array(args.prefix(3)), ["-s", "-S", "-B"])
+        XCTAssertEqual(Set(args.filter { $0.hasSuffix(".py") }.map { URL(fileURLWithPath: $0).lastPathComponent }),
+                       ["remote_supabase.py", "dump-travel-organizations.py"])
+
         // Control: the same Python, called as the caller's shell does, has the package.
-        let direct = try shell(stubs.appendingPathComponent("python3").path, ["-c", "import jwt"])
+        let file = monolith.appendingPathComponent("scripts/setup/remote_supabase.py").path
+        let direct = try shell(stubs.appendingPathComponent("python3").path, ["-c", "check", file])
         XCTAssertEqual(direct, 0)
+    }
+
+    func testStandardLibraryScriptsPass() throws {
+        try write("scripts/db/check-prerequisites.mjs", "exit 0")
+        try write("scripts/setup/remote_supabase.py", "import json\n")
+
+        let result = try runCheck()
+        XCTAssertEqual(result.code, 0, result.output)
+        XCTAssertTrue(result.output.contains("1 Python scripts import only the standard library"), result.output)
     }
 
     func testANodeOlderThanTheNvmrcFails() throws {

@@ -2807,8 +2807,11 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         supervisor.restartService("web")
 
-        let failed = await waitUntil(30) { self.state("web").phase == .failed && self.supervisor.actionsInFlight.isEmpty }
-        XCTAssertTrue(failed, "web is \(state("web").phase.rawValue)")
+        // recordFailure sets the condition in a task after the phase: wait for both.
+        let failed = await waitUntil(30) {
+            self.state("web").phase == .failed && self.state("web").condition != nil && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(failed, "web is \(state("web").phase.rawValue), condition: \(state("web").condition?.headline ?? "none")")
         XCTAssertEqual(
             supervisor.lastError,
             "Port \(port) is in use by node (PID 4242, ~/code/other-app), which Travel Runner did not start. web was not started."

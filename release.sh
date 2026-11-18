@@ -30,7 +30,8 @@ set -euo pipefail
 # access, GitHub access, a clean tree that is on the remote), then runs the tests and
 # scripts/clean-shell-check.sh: the first database step of the monolith must pass with
 # only the README's tools. The monolith is TR_MONOLITH_DIR, or fb-travel-monolith
-# (fb-travel-monolith-hackathon for the hackathon app) next to this repo.
+# (fb-travel-monolith-hackathon for the hackathon app) next to this repo. It must be at
+# origin/dev (origin/main for the hackathon app; TR_MONOLITH_BRANCH overrides).
 # After the build it runs scripts/smoke.sh on the app: a release that cannot start on
 # a clean Mac stops here, before it is notarized.
 # SKIP_TESTS=1 skips the tests and the clean-shell check, for a --draft only.
@@ -255,10 +256,14 @@ fi
 # The build runs in a separate worktree of that tag. This checkout is not changed.
 SMOKE_SCRIPT="$SCRIPT_DIR/scripts/smoke.sh"
 CLEAN_SHELL_SCRIPT="$SCRIPT_DIR/scripts/clean-shell-check.sh"
+# MONOLITH_BRANCH is the branch that teammates start from: the clean-shell check runs
+# only on a checkout at its tip.
 if [ "$FLAVOR" = "hackathon" ]; then
     MONOLITH_DIR="${TR_MONOLITH_DIR:-$SCRIPT_DIR/../fb-travel-monolith-hackathon}"
+    MONOLITH_BRANCH="${TR_MONOLITH_BRANCH:-main}"
 else
     MONOLITH_DIR="${TR_MONOLITH_DIR:-$SCRIPT_DIR/../fb-travel-monolith}"
+    MONOLITH_BRANCH="${TR_MONOLITH_BRANCH:-dev}"
 fi
 if [ -n "$ROLLBACK_TAG" ]; then
     git rev-parse --verify --quiet "refs/tags/$ROLLBACK_TAG" >/dev/null || fail "There is no tag $ROLLBACK_TAG."
@@ -317,6 +322,21 @@ git branch -r --contains "$RELEASE_COMMIT" | grep -q . \
     || fail "Commit ${RELEASE_COMMIT:0:7} is not on the remote. Push it first."
 
 if [ "${SKIP_TESTS:-0}" != "1" ]; then
+    # The clean-shell check must read the scripts that teammates get: the monolith must
+    # be at the tip of its shared branch, with no local change. Checked before the tests,
+    # which take minutes.
+    git -C "$MONOLITH_DIR" rev-parse --git-dir >/dev/null 2>&1 \
+        || fail "There is no monolith checkout at $MONOLITH_DIR. Clone it there, or set TR_MONOLITH_DIR."
+    git -C "$MONOLITH_DIR" fetch --quiet origin "$MONOLITH_BRANCH" \
+        || fail "Cannot fetch origin/$MONOLITH_BRANCH in $MONOLITH_DIR."
+    MONOLITH_HEAD="$(git -C "$MONOLITH_DIR" rev-parse HEAD)"
+    MONOLITH_ON="$(git -C "$MONOLITH_DIR" rev-parse --abbrev-ref HEAD)"
+    echo "  Monolith: $MONOLITH_DIR on $MONOLITH_ON (${MONOLITH_HEAD:0:9})"
+    [ "$MONOLITH_HEAD" = "$(git -C "$MONOLITH_DIR" rev-parse "origin/$MONOLITH_BRANCH")" ] \
+        || fail "The monolith at $MONOLITH_DIR is on $MONOLITH_ON (${MONOLITH_HEAD:0:9}), not origin/$MONOLITH_BRANCH. Pull $MONOLITH_BRANCH there, or set TR_MONOLITH_DIR."
+    [ -z "$(git -C "$MONOLITH_DIR" status --porcelain --untracked-files=no)" ] \
+        || fail "The monolith at $MONOLITH_DIR has local changes. Teammates do not have them: stash them, or set TR_MONOLITH_DIR."
+
     echo "  Running tests..."
     TEST_LOG=$(mktemp)
     if ! swift test >"$TEST_LOG" 2>&1; then
@@ -326,8 +346,7 @@ if [ "${SKIP_TESTS:-0}" != "1" ]; then
     fi
     rm -f "$TEST_LOG"
 
-    # A teammate's Mac has only the README's tools. Pull dev and run pnpm install in
-    # the monolith first, so the check reads the scripts that teammates get.
+    # A teammate's Mac has only the README's tools.
     echo "  Running the clean-shell check..."
     "$CLEAN_SHELL_SCRIPT" "$MONOLITH_DIR" \
         || fail "The clean-shell check failed. A teammate's first Start fails the same way. Fix it first."

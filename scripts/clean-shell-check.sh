@@ -5,7 +5,7 @@ set -euo pipefail
 # Runs the first database step of the monolith the way a new teammate's Mac
 # would: only the tools that the README asks for, an empty home folder, and a
 # Python with no extra packages. release.sh runs it before a release is built.
-# It would have caught PyJWT: a package that the step needed and no README named.
+# It would have caught PyJWT: a package that a Python script needed and no README named.
 #
 # Usage:
 #   scripts/clean-shell-check.sh [monolith-dir]
@@ -27,6 +27,10 @@ set -euo pipefail
 #      of packageManager.
 #   2. python3 and docker answer --version.
 #   3. node scripts/db/check-prerequisites.mjs --verify passes. It sends no request.
+#   4. Each Python script in scripts/setup and scripts/db (not the tests) imports only
+#      the standard library and the modules beside it. The hotel and event-copy steps
+#      run these with python3; --verify alone runs no Python. The check reads the
+#      imports and runs no script code.
 #
 # It changes nothing in the monolith and starts no service.
 # ────────────────────────────────────────────────────────────────────────────
@@ -110,7 +114,7 @@ major() {
 }
 
 # ── 1. Versions ─────────────────────────────────────────────────────────────
-echo "  clean-shell [1/3] tool versions in $MONOLITH..."
+echo "  clean-shell [1/4] tool versions in $MONOLITH..."
 NODE_VERSION="$(clean node --version 2>&1)" || fail "node does not run in a clean shell: $NODE_VERSION"
 if [ -f "$MONOLITH/.nvmrc" ]; then
     # The runner and the monolith's engines take this major or a newer one.
@@ -128,18 +132,71 @@ fi
 echo "    ✓ node $NODE_VERSION, pnpm $(major "$PNPM_VERSION").x"
 
 # ── 2. Python and Docker ────────────────────────────────────────────────────
-echo "  clean-shell [2/3] python3 and docker..."
+echo "  clean-shell [2/4] python3 and docker..."
 PYTHON_VERSION="$(clean python3 --version 2>&1)" \
     || fail "python3 does not run in a clean shell (the Xcode stub?): $PYTHON_VERSION"
 DOCKER_VERSION="$(clean docker --version 2>&1)" || fail "docker does not run in a clean shell: $DOCKER_VERSION"
 echo "    ✓ $PYTHON_VERSION, $DOCKER_VERSION"
 
 # ── 3. The first database step ──────────────────────────────────────────────
-echo "  clean-shell [3/3] check-prerequisites --verify..."
+echo "  clean-shell [3/4] check-prerequisites --verify..."
 if ! OUTPUT="$(clean node scripts/db/check-prerequisites.mjs --verify 2>&1)"; then
     printf '%s\n' "$OUTPUT" | tail -20 | sed 's/^/      /'
     fail "check-prerequisites failed in a clean shell. A teammate who followed the README hits this too: fix the script or add the tool to both READMEs."
 fi
 echo "    ✓ check-prerequisites passed"
+
+# ── 4. The Python scripts ───────────────────────────────────────────────────
+# The hotel and event-copy steps run scripts/setup/*.py with python3. Each module that
+# they import must be in the standard library or beside the script. The check reads
+# the imports; it runs no script code, so it sends no request. An import in a
+# try/except ImportError is optional and does not count. -B writes no __pycache__.
+echo "  clean-shell [4/4] the imports of the Python scripts..."
+IMPORT_CHECK='import ast, importlib.util, os, sys
+missing = []
+for path in sys.argv[1:]:
+    here = os.path.dirname(path)
+    with open(path, encoding="utf-8") as source:
+        tree = ast.parse(source.read(), path)
+    optional = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Try):
+            continue
+        caught = []
+        for handler in node.handlers:
+            kinds = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+            caught += [kind.id for kind in kinds if isinstance(kind, ast.Name)]
+        if "ImportError" in caught or "ModuleNotFoundError" in caught:
+            optional.update(id(sub) for child in node.body for sub in ast.walk(child))
+    for node in ast.walk(tree):
+        if id(node) in optional:
+            continue
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            names = [node.module]
+        else:
+            continue
+        for name in names:
+            top = name.split(".")[0]
+            if os.path.exists(os.path.join(here, top + ".py")) or os.path.isdir(os.path.join(here, top)):
+                continue
+            if importlib.util.find_spec(top) is None:
+                missing.append("%s:%d: import %s" % (os.path.relpath(path), node.lineno, name))
+print("\n".join(missing))
+sys.exit(1 if missing else 0)'
+PY_SCRIPTS=()
+for script in "$MONOLITH"/scripts/setup/*.py "$MONOLITH"/scripts/db/*.py; do
+    [ -f "$script" ] || continue
+    case "$(basename "$script")" in test_*|*_test.py) continue ;; esac
+    PY_SCRIPTS+=("$script")
+done
+if [ ${#PY_SCRIPTS[@]} -gt 0 ]; then
+    if ! OUTPUT="$(clean python3 -B -c "$IMPORT_CHECK" "${PY_SCRIPTS[@]}" 2>&1)"; then
+        printf '%s\n' "$OUTPUT" | tail -20 | sed 's/^/      /'
+        fail "a Python script imports a module that a python3 with only its standard library does not have. A teammate who followed the README hits this too: use the standard library, or add the package to both READMEs."
+    fi
+fi
+echo "    ✓ ${#PY_SCRIPTS[@]} Python scripts import only the standard library"
 
 echo "  ✓ clean-shell check passed"
