@@ -3074,6 +3074,8 @@ final class EnvironmentSupervisor {
             await leave.value
             // A Stop All since the press ends it: the stack stays stopped.
             guard let self, self.stopAllCount == stops else { return }
+            // A Start pressed since then is queued after this step and takes the profile.
+            guard self.startTask == nil else { return }
             self.startAll(mode: .missingOnly)
         }
     }

@@ -306,6 +306,52 @@ final class StartAllTests: XCTestCase {
         XCTAssertFalse(feedback.contains(ActionFeedback.startInProgress), "\(feedback)")
     }
 
+    /// A Start pressed after "Apply now", before its stop step ends, takes the
+    /// profile: the service that joined starts, and no "start in progress" toast comes.
+    func testAStartAfterApplyNowTakesTheProfile() async throws {
+        let keys = "ANON_KEY=test-anon\nSERVICE_ROLE_KEY=test-service-role\nJWT_SECRET=test-jwt-secret\n"
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: keys), services: twoPortals(), profile: .booking)
+        supervisor.saveProfile = { _ in }
+        var feedback: [String] = []
+        supervisor.onFeedback = { feedback.append($0.message) }
+        func phase(_ id: String) -> ServicePhase? { supervisor.serviceStates[id]?.phase }
+        XCTAssertEqual(phase("travel-portal"), .running, supervisor.lastError ?? "")
+
+        supervisor.setProfile(.both)
+        XCTAssertTrue(supervisor.profileApplyPending)
+        supervisor.applyProfileNow()
+        supervisor.retryStartAll()
+        let joined = await waitUntil(30) {
+            phase("partner-portal") == .running && !supervisor.startRunning && supervisor.currentPhase == .running
+        }
+        XCTAssertTrue(joined, "partner-portal is \(String(describing: phase("partner-portal")))")
+        XCTAssertFalse(feedback.contains(ActionFeedback.startInProgress), "\(feedback)")
+    }
+
+    /// A Stop All right after "Apply now" during a start ends it: the stack
+    /// stays stopped and no start runs after the stop.
+    func testStopAllAfterApplyNowKeepsTheStackStopped() async throws {
+        let keys = "ANON_KEY=test-anon\nSERVICE_ROLE_KEY=test-service-role\nJWT_SECRET=test-jwt-secret\n"
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: keys), services: twoPortals(), profile: .booking)
+        supervisor.saveProfile = { _ in }
+        func phase(_ id: String) -> ServicePhase? { supervisor.serviceStates[id]?.phase }
+        XCTAssertEqual(phase("travel-portal"), .running, supervisor.lastError ?? "")
+
+        supervisor.retryStartAll()
+        XCTAssertTrue(supervisor.startRunning)
+        supervisor.setProfile(.both)
+        supervisor.applyProfileNow()
+        let stopping = supervisor.stopAll()
+        await stopping.value
+        XCTAssertEqual(supervisor.health, .stopped)
+
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertFalse(supervisor.startRunning)
+        XCTAssertEqual(supervisor.health, .stopped)
+        XCTAssertEqual(phase("travel-portal"), .stopped)
+        XCTAssertEqual(phase("partner-portal"), .stopped)
+    }
+
     /// A profile change while the stack stops applies at the next start: no
     /// "Apply now" is left, and pressing it on the stopped stack starts nothing.
     func testAProfileChangeDuringAStopLeavesNoApplyNow() async throws {
