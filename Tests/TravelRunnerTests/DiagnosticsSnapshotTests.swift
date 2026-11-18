@@ -223,6 +223,164 @@ final class DiagnosticsSnapshotTests: XCTestCase {
 
         XCTAssertEqual(reads.value, 2)
     }
+
+    // MARK: - The bundle
+
+    private static func service(_ id: String, phase: String, circuitBroken: Bool = false) -> DiagnosticsSnapshot.Service {
+        DiagnosticsSnapshot.Service(
+            id: id, phase: phase, inProfile: true, pid: nil, exitCode: nil,
+            restartCount: 0, circuitBroken: circuitBroken, uptimeSeconds: nil
+        )
+    }
+
+    private static func entries(_ count: Int, prefix: String = "line") -> [LogEntry] {
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        return (0..<count).map { LogEntry(timestamp: start.addingTimeInterval(Double($0)), stream: .stdout, text: "\(prefix) \($0)") }
+    }
+
+    func testTheBundleTakesTheLogsOfFailedServicesAndSteps() {
+        var snapshot = Self.sample()
+        snapshot.services = [
+            Self.service("supabase", phase: "RUNNING"),
+            Self.service("travel-portal", phase: "FAILED"),
+            Self.service("stripe", phase: "STOPPED", circuitBroken: true),
+        ]
+        snapshot.dbPipeline?.steps = [
+            DiagnosticsSnapshot.DbStep(id: "start-supabase", name: "Start", status: "COMPLETED", optional: false, error: nil),
+            DiagnosticsSnapshot.DbStep(id: "load-hotels", name: "Load hotels", status: "TIMED_OUT", optional: false, error: nil),
+            DiagnosticsSnapshot.DbStep(id: "seed", name: "Seed", status: "FAILED", optional: false, error: "Exit code 1"),
+        ]
+        XCTAssertEqual(
+            DiagnosticsBundle.failedLogIDs(in: snapshot),
+            ["travel-portal", "stripe", "db-setup-load-hotels", "db-setup-seed"]
+        )
+
+        let bundle = DiagnosticsBundle.make(
+            snapshot: snapshot, redactor: .patterns,
+            logs: [
+                "supabase": Self.entries(5),
+                "travel-portal": Self.entries(300),
+                "db-setup-seed": Self.entries(3),
+            ],
+            timeZone: TimeZone(identifier: "UTC")!
+        )
+
+        // A healthy service and a log id with no lines are left out.
+        XCTAssertEqual(bundle.logs.keys.sorted(), ["db-setup-seed", "travel-portal"])
+        let portal = bundle.logs["travel-portal"] ?? []
+        XCTAssertEqual(portal.count, DiagnosticsBundle.maxLogLines)
+        XCTAssertEqual(DiagnosticsBundle.maxLogLines, 200)
+        XCTAssertEqual(portal.first, "\(Self.time(100)) [out] line 100")
+        XCTAssertEqual(portal.last, "\(Self.time(299)) [out] line 299")
+    }
+
+    /// `HH:mm:ss.SSS` in UTC of the sample entry at `offset` seconds.
+    private static func time(_ offset: Int) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter.string(from: Date(timeIntervalSince1970: 1_800_000_000 + Double(offset)))
+    }
+
+    func testTheBundleMasksSecretsInTheLogsAndTheSnapshot() throws {
+        let key = "sk_" + "test_" + "51AbCdEfGhIjKlMn"
+        var snapshot = Self.sample(lastError: "Stripe failed: \(key)")
+        snapshot.services = [Self.service("stripe", phase: "FAILED")]
+        let bundle = DiagnosticsBundle.make(
+            snapshot: snapshot, redactor: .patterns,
+            logs: ["stripe": [LogEntry(stream: .stderr, text: "auth with \(key) failed")]],
+            rootCause: "Stripe key \(key)",
+            configIssues: ["bad key \(key)"]
+        )
+
+        let json = bundle.json()
+        XCTAssertFalse(json.contains(key), json)
+        XCTAssertTrue(bundle.logs["stripe"]?.first?.hasSuffix("[err] auth with ‹redacted:stripe-key› failed") == true)
+        XCTAssertEqual(bundle.snapshot.lastError, "Stripe failed: ‹redacted:stripe-key›")
+
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        for key in ["snapshot", "logs", "root_cause", "config_issues"] {
+            XCTAssertNotNil(object[key], key)
+        }
+        XCTAssertEqual(try JSONDecoder().decode(DiagnosticsBundle.self, from: Data(json.utf8)), bundle)
+    }
+
+    @MainActor
+    func testTheSupervisorBundleHasTheFailedServiceLog() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DiagnosticsSnapshotTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        supervisor.diagnosticsTools = { _ in [] }
+        let failed = Self.definition("travel-portal")
+        let healthy = Self.definition("supabase")
+        try supervisor.loadServices([healthy, failed])
+        supervisor.serviceStates["travel-portal"]?.phase = .failed
+        for entry in Self.entries(250, prefix: "portal") {
+            await supervisor.logStore.append(serviceID: "travel-portal", entry: entry)
+        }
+        await supervisor.logStore.append(serviceID: "supabase", entry: LogEntry(stream: .stdout, text: "ready"))
+
+        let json = await supervisor.diagnosticsBundleJSON(home: "/Users/teammate")
+        let bundle = try JSONDecoder().decode(DiagnosticsBundle.self, from: Data(json.utf8))
+
+        XCTAssertEqual(bundle.logs.keys.sorted(), ["travel-portal"])
+        XCTAssertEqual(bundle.logs["travel-portal"]?.count, 200)
+        XCTAssertTrue(bundle.logs["travel-portal"]?.last?.hasSuffix("portal 249") == true)
+        XCTAssertEqual(bundle.snapshot.services.map(\.id).sorted(), ["supabase", "travel-portal"])
+    }
+
+    // MARK: - Run Checks Now
+
+    private static func definition(_ id: String, cwd: String? = nil, port: Int? = nil) -> ServiceDefinition {
+        ServiceDefinition(
+            id: id, name: nil, cmd: ["true"], cwd: cwd,
+            probe: port.map { ProbeConfig(type: .tcp, port: $0, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 5) },
+            type: .daemon, restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+    }
+
+    /// The checks run and show their reasons; nothing starts.
+    @MainActor
+    func testRunChecksNowRunsTheChecksWithoutAStart() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DiagnosticsSnapshotTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        let shell = FakeCommandRunner { call in
+            call.command.contains("node --version") ? FakeCommandRunner.ok("v22.11.0") : FakeCommandRunner.ok()
+        }
+        supervisor.shell = shell
+        let missing = "/nonexistent-\(UUID().uuidString)"
+        try supervisor.loadServices([Self.definition("api", cwd: missing)])
+        let phaseBefore = supervisor.serviceStates["api"]?.phase
+
+        await supervisor.runPreflightOnly()
+
+        let dir = try XCTUnwrap(supervisor.preflightChecks.first { $0.id.hasPrefix("dir-") })
+        guard case .failed(let message, _) = dir.result else {
+            return XCTFail("the folder check is \(dir.result)")
+        }
+        XCTAssertTrue(message.contains("Directory not found"), message)
+        XCTAssertFalse(supervisor.preflightChecks.contains { if case .pending = $0.result { true } else { false } })
+        XCTAssertFalse(supervisor.preflightOnlyRunning)
+        XCTAssertEqual(supervisor.health, .stopped)
+        XCTAssertEqual(supervisor.serviceStates["api"]?.phase, phaseBefore)
+    }
+
+    /// While the stack runs, its own processes hold its ports: the port checks are
+    /// left out. The port is never bound.
+    @MainActor
+    func testRunChecksNowLeavesOutThePortChecksWhileTheStackRuns() async throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "DiagnosticsSnapshotTests-\(UUID().uuidString)"))
+        let supervisor = EnvironmentSupervisor(userDefaults: defaults)
+        supervisor.shell = FakeCommandRunner()
+        try supervisor.loadServices([Self.definition("api", port: 65_000)])
+        supervisor.serviceStates["api"]?.phase = .running
+
+        XCTAssertTrue(supervisor.preflightLeavesOutPorts)
+        await supervisor.runPreflightOnly()
+
+        XCTAssertFalse(supervisor.preflightChecks.isEmpty)
+        XCTAssertFalse(supervisor.preflightChecks.contains { $0.id.hasPrefix("port-") })
+    }
 }
 
 private final class ReadCounter: @unchecked Sendable {

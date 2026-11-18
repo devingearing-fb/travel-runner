@@ -114,6 +114,8 @@ final class EnvironmentSupervisor {
     private var reconfiguresRunning = 0
     /// `/api/preflight` requests that run their checks now.
     private var preflightRequestsRunning = 0
+    /// True while "Run Checks Now" runs the checks.
+    private(set) var preflightOnlyRunning = false
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
@@ -952,6 +954,32 @@ final class EnvironmentSupervisor {
         if let lastProbe = state.lastProbe { fields["last_probe"] = lastProbe.summary }
         return fields
     }
+
+    /// "Run Checks Now": the checks of a start for the profile, run without a
+    /// start. The results replace `preflightChecks`, so Diagnostics and Status
+    /// show each reason and fix. While the stack runs, its own processes hold
+    /// its ports, so the port checks are left out. A start that runs has its own
+    /// checks: this does nothing then.
+    func runPreflightOnly() async {
+        guard startTask == nil, !preflightOnlyRunning else { return }
+        preflightOnlyRunning = true
+        preflightRequestsRunning += 1
+        defer {
+            preflightOnlyRunning = false
+            preflightRequestsRunning -= 1
+        }
+        let runner = preflightRunner
+        let leaveOutPorts = preflightLeavesOutPorts
+        let checks = runner.allChecks(for: loadedServices.filter { isInProfile($0.id) })
+            .filter { !(leaveOutPorts && $0.id.hasPrefix("port-")) }
+        preflightChecks = checks
+        for check in checks {
+            check.result = await runner.run(check: check)
+        }
+    }
+
+    /// True while the stack holds a process: "Run Checks Now" leaves out the port checks.
+    var preflightLeavesOutPorts: Bool { holdsLiveStackNow() }
 
     /// The answer of `/api/preflight`: the checks of a start that change nothing
     /// (Node, the ports, the folders), run now. Each check has a time limit, so
@@ -4188,6 +4216,25 @@ final class EnvironmentSupervisor {
     func debugIssueFolder(id: String, status: String = "open") async -> String? {
         guard let tracker = debugTracker else { return nil }
         return await tracker.issueFolderPath(id: id, status: status)
+    }
+
+    /// "Copy Diagnostics Bundle": the snapshot and the last
+    /// `DiagnosticsBundle.maxLogLines` lines of each failed service and DB step,
+    /// redacted, as JSON.
+    func diagnosticsBundleJSON(home: String = NSHomeDirectory()) async -> String {
+        let snapshot = await diagnosticsSnapshot(home: home)
+        var logs: [String: [LogEntry]] = [:]
+        for id in DiagnosticsBundle.failedLogIDs(in: snapshot) {
+            logs[id] = await logStore.entries(for: id)
+        }
+        return DiagnosticsBundle.make(
+            snapshot: snapshot,
+            redactor: makeRedactor(),
+            logs: logs,
+            rootCause: rootCauseDescription,
+            controlAPIError: controlAPIError,
+            configIssues: configIssues
+        ).json()
     }
 
     // MARK: - Problem report
