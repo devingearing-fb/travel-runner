@@ -717,10 +717,11 @@ final class EnvironmentSupervisor {
     var stackIsIdle: Bool { stackOperationsQueued == 0 && stopTask == nil }
 
     /// Runs `body` after the stop that runs and after the stack operation before it.
-    /// A stop that comes after the call ends what was asked: `body` does not run then.
-    /// `finally` runs in either case.
+    /// A stop that comes after the call ends what was asked: `body` does not run then,
+    /// and the toast says `dropped`. `finally` runs in either case.
     @discardableResult
     private func enqueueStackOperation(
+        dropped: String? = nil,
         finally: (@MainActor () -> Void)? = nil, _ body: @escaping @MainActor () async -> Void
     ) -> Task<Void, Never> {
         let previous = stackTail
@@ -733,7 +734,10 @@ final class EnvironmentSupervisor {
             }
             await previous?.value
             await self.stopTask?.value
-            guard self.stopAllCount == stops, !Task.isCancelled else { return }
+            guard self.stopAllCount == stops, !Task.isCancelled else {
+                if let dropped, self.stopAllCount != stops { self.onActionFeedback?(dropped, false) }
+                return
+            }
             await body()
         }
         stackTail = task
@@ -752,12 +756,21 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// False while Start All runs and another service failed first: its error is
+    /// the headline, and a later failure does not replace it.
+    private func ownsBanner(_ serviceID: String) -> Bool {
+        guard startupBeganAt != nil, let first = startFailure else { return true }
+        return first == serviceID
+    }
+
     /// The headline of the first failure of a Start All.
     nonisolated static func startFailureHeadline(_ name: String, _ error: Error) -> String {
         "\(name) failed: \(error)"
     }
 
     private func runStartAll(skipPreflight: Bool, mode: StartMode) async {
+        // Each end of the start, also a refusal, ends its time: health reads "stopped" again.
+        defer { startupBeganAt = nil }
         guard let graph else { return }
         do {
             await self.waitForEnvResetOfLoad()
@@ -1318,13 +1331,22 @@ final class EnvironmentSupervisor {
             beginAction(serviceID)
             defer { endAction(serviceID) }
             do {
-                try await replaceProcess(serviceID, prepare: {
+                var heldBy: String?
+                try await replaceProcess(serviceID, onlyIf: {
+                    heldBy = self.dependencyHolding(serviceID)
+                    if heldBy != nil { self.queuedCacheClears.remove(serviceID) }
+                    return heldBy == nil
+                }, prepare: {
                     self.queuedCacheClears.remove(serviceID)
                     let nextCachePath = (cwd as NSString).appendingPathComponent(".next")
                     try? FileManager.default.removeItem(atPath: nextCachePath)
                     await self.logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: "[travel-runner] Cleared .next cache"))
                     try? await self.clock.sleep(for: .seconds(1))
                 })
+                if let heldBy {
+                    onActionFeedback?(keptRunningText(serviceID, heldBy), false)
+                    return
+                }
                 clearCleanExitError(serviceID)
             } catch {
                 recordFailure(serviceID, error: error, lastError: "\(error)")
@@ -1397,10 +1419,7 @@ final class EnvironmentSupervisor {
 
         guard health != .stopped else { return }
 
-        var servicesToRestart = ["travel-portal", "universal-login"]
-        if isInProfile("partner-portal") {
-            servicesToRestart.append("partner-portal")
-        }
+        let servicesToRestart = webServicesInStartOrder
         Task {
             beginAction("db-mode")
             defer { endAction("db-mode") }
@@ -1410,7 +1429,11 @@ final class EnvironmentSupervisor {
             }
             for serviceID in servicesToRestart {
                 do {
-                    try await replaceProcess(serviceID)
+                    let outcome = try await replaceProcess(serviceID)
+                    if let why = notRestarted(serviceID, outcome) {
+                        lastError = "DB mode switch failed for \(displayName(serviceID)): \(why)"
+                        switchFailed = true
+                    }
                 } catch {
                     recordFailure(serviceID, error: error, lastError: "DB mode switch failed for \(displayName(serviceID)): \(error)")
                     switchFailed = true
@@ -1422,6 +1445,23 @@ final class EnvironmentSupervisor {
             } else {
                 onActionFeedback?("Database mode: \(dbMode == .local ? "local" : "dev")", true)
             }
+        }
+    }
+
+    /// The web services that a DB mode switch and the LAN toggle restart, in start
+    /// order: Universal Login is up again before the portals that need it start.
+    private var webServicesInStartOrder: [String] {
+        let web: Set = ["universal-login", "travel-portal", "partner-portal"]
+        return sortedServiceIDs.filter { web.contains($0) && isInProfile($0) }
+    }
+
+    /// Why a restart of a mode switch did not bring the service back, or nil when it did.
+    private func notRestarted(_ serviceID: String, _ outcome: StartOutcome?) -> String? {
+        switch outcome {
+        case .skipped(let why)?: return "skipped — \(why)"
+        case .blocked(let dependency)?: return "not started — waiting for \(dependencyState(of: waitTarget(dependency)))"
+        case .refused(let why)?: return why
+        case .launched?, .reused?, .alreadyHealthy?, nil: return nil
         }
     }
 
@@ -1465,10 +1505,7 @@ final class EnvironmentSupervisor {
             let ip = localIP ?? "127.0.0.1"
             writeAppEnv()
 
-            var servicesToRestart = ["travel-portal", "universal-login"]
-            if isInProfile("partner-portal") {
-                servicesToRestart.append("partner-portal")
-            }
+            let servicesToRestart = webServicesInStartOrder
 
             for serviceID in servicesToRestart {
                 serviceStates[serviceID]?.phase = .stopping
@@ -1477,12 +1514,16 @@ final class EnvironmentSupervisor {
             var restartFailed = false
             for serviceID in servicesToRestart {
                 do {
-                    try await replaceProcess(serviceID, prepare: {
+                    let outcome = try await replaceProcess(serviceID, prepare: {
                         await self.logStore.append(
                             serviceID: serviceID,
                             entry: LogEntry(stream: .stdout, text: "[travel-runner] Network mode \(mode ? "ON — http://\(ip)" : "OFF — localhost only")")
                         )
                     })
+                    if let why = notRestarted(serviceID, outcome) {
+                        lastError = "Network mode restart failed for \(displayName(serviceID)): \(why)"
+                        restartFailed = true
+                    }
                 } catch {
                     recordFailure(
                         serviceID, error: error, lastError: "Network mode restart failed for \(displayName(serviceID)): \(error)"
@@ -1516,10 +1557,19 @@ final class EnvironmentSupervisor {
             defer { endAction(serviceID) }
             await waitForEnvResetOfLoad()
             do {
-                let outcome = try await replaceProcess(serviceID, stoppedPhase: .pending, prepare: {
+                var heldBy: String?
+                let outcome = try await replaceProcess(serviceID, stoppedPhase: .pending, onlyIf: {
+                    heldBy = self.dependencyHolding(serviceID)
+                    if heldBy != nil { self.queuedRestarts.remove(serviceID) }
+                    return heldBy == nil
+                }, prepare: {
                     self.queuedRestarts.remove(serviceID)
                     try? await self.clock.sleep(for: .seconds(1))
                 })
+                if let heldBy {
+                    onActionFeedback?(keptRunningText(serviceID, heldBy), false)
+                    return
+                }
                 // A crash during the start: the automatic restart gives the answer.
                 if case .launched = outcome { await awaitReplacingLaunch(serviceID) }
                 let (text, ok) = restartFeedback(serviceID, outcome)
@@ -1535,6 +1585,19 @@ final class EnvironmentSupervisor {
 
     nonisolated static let stackStoppedRefusal = "Not started — the stack is stopped. Press Start."
 
+    /// A deliberate restart of a service that runs, while a dependency is not up: the
+    /// new process would only wait, so the old one keeps running. The dependency, or nil.
+    private func dependencyHolding(_ serviceID: String) -> String? {
+        guard serviceStates[serviceID]?.phase == .running,
+              case .blocked(let dependency) = dependencyGate(serviceID) else { return nil }
+        return dependency
+    }
+
+    /// The toast of a restart that `dependencyHolding` kept from stopping the service.
+    private func keptRunningText(_ serviceID: String, _ dependency: String) -> String {
+        "\(displayName(serviceID)) not restarted — waiting for \(dependencyState(of: waitTarget(dependency))); it keeps running"
+    }
+
     /// The toast of a restart: what the start did, not only that it ended.
     private func restartFeedback(_ serviceID: String, _ outcome: StartOutcome?) -> (String, Bool) {
         let name = displayName(serviceID)
@@ -1549,7 +1612,7 @@ final class EnvironmentSupervisor {
         case .skipped(let why)?:
             return ("\(name) skipped — \(why)", false)
         case .blocked(let dependency)?:
-            return ("\(name) not started — waiting for \(dependencyState(of: dependency))", false)
+            return ("\(name) not started — waiting for \(dependencyState(of: waitTarget(dependency)))", false)
         case .refused(let why)?:
             return (why, false)
         }
@@ -1606,6 +1669,9 @@ final class EnvironmentSupervisor {
         }
     }
 
+    nonisolated static let installWaitsText = "The install waits for the running start or step to finish"
+    nonisolated static let installDroppedText = "Stop all cancelled the install that waited"
+
     /// `pnpm install --frozen-lockfile` at the root of the pnpm workspace of the
     /// service (`npm install` in a repo without one), with its output in the
     /// service's log, then a restart.
@@ -1614,8 +1680,11 @@ final class EnvironmentSupervisor {
         let name = displayName(serviceID)
         let (folder, command) = DependencyWatcher.installTarget(for: cwd)
         // A stack operation: it waits for a start, a stop or a DB step that runs.
+        if !stackIsIdle { onActionFeedback?(Self.installWaitsText, true) }
         beginAction(serviceID)
-        enqueueStackOperation(finally: { [weak self] in self?.endAction(serviceID) }) { [self] in
+        enqueueStackOperation(
+            dropped: Self.installDroppedText, finally: { [weak self] in self?.endAction(serviceID) }
+        ) { [self] in
             // Nil: a stop-all stopped the install.
             guard let result = await installPackages(
                 serviceID, cwd: cwd, announce: "[travel-runner] Running \(command) in \(folder)"
@@ -1764,9 +1833,19 @@ final class EnvironmentSupervisor {
 
     /// A restart that the supervisor starts by itself after a failure. It keeps the
     /// failure history, so the circuit breaker and the backoff see the whole series.
+    /// It releases the pending restart under the lock, in the step that changes the
+    /// phase: an old waiter never sees a failed service with no restart due.
     private func autoRestart(_ serviceID: String) async {
+        var released = false
+        let release = {
+            guard !released else { return }
+            released = true
+            self.releasePendingRestart(serviceID)
+        }
+        defer { release() }
         do {
             try await replaceProcess(serviceID, stoppedPhase: .pending, keepsFailureHistory: true, onlyIf: {
+                release()
                 // A manual restart or a mode switch can bring the service back first.
                 guard let state = self.serviceStates[serviceID],
                       state.phase == .failed, !state.isCircuitBroken else { return false }
@@ -2151,6 +2230,7 @@ final class EnvironmentSupervisor {
     }
 
     nonisolated static let dbSetupWaitsText = "The database step waits for the running start or step to finish"
+    nonisolated static let dbSetupDroppedText = "Stop all cancelled the database step that waited"
 
     /// A DB setup that a person asked for is a stack operation: it waits for a
     /// start, a stop or another operation that runs. With none it begins at once.
@@ -2160,7 +2240,7 @@ final class EnvironmentSupervisor {
             enqueueStackOperation { [self] in _ = await completeDbSetup(run) }
         } else {
             onActionFeedback?(Self.dbSetupWaitsText, true)
-            enqueueStackOperation { [self] in
+            enqueueStackOperation(dropped: Self.dbSetupDroppedText) { [self] in
                 guard let run = begin() else { return }
                 _ = await completeDbSetup(run)
             }
@@ -2954,18 +3034,36 @@ final class EnvironmentSupervisor {
         case blocked(String)
     }
 
-    /// A dependency is met when it runs, is done, or is not in the profile.
+    /// A dependency is met when it runs, is done, or is not in the profile. Of the
+    /// ones that are not up, a failed one comes first, then one that waits: the row
+    /// names the cause, not a service that still starts.
     private func dependencyGate(_ serviceID: String) -> DependencyGate {
-        var blocked: String?
+        var blocked: (id: String, rank: Int)?
         for dependency in graph?.nodes[serviceID]?.dependsOn ?? [] {
             guard isInProfile(dependency), let state = serviceStates[dependency] else { continue }
+            let rank: Int
             switch state.phase {
             case .running, .completed: continue
             case .skipped: return .unavailable(dependency)
-            default: if blocked == nil { blocked = dependency }
+            case .failed: rank = 0
+            case .waiting: rank = 1
+            default: rank = 2
             }
+            if blocked == nil || rank < blocked!.rank { blocked = (dependency, rank) }
         }
-        return blocked.map { .blocked($0) } ?? .met
+        return blocked.map { .blocked($0.id) } ?? .met
+    }
+
+    /// The service that a wait for `dependency` comes down to: when the dependency
+    /// waits too, the one it waits for, and so on to the root (a failed one, say).
+    private func waitTarget(_ dependency: String) -> String {
+        var current = dependency
+        var seen: Set<String> = [dependency]
+        while let state = serviceStates[current], state.phase == .waiting,
+              case .waitingForDependency(let next)? = state.condition?.kind, seen.insert(next).inserted {
+            current = next
+        }
+        return current
     }
 
     /// "Supabase (failed)": a dependency and its phase, for the row and the toast.
@@ -2978,7 +3076,7 @@ final class EnvironmentSupervisor {
     private func refreshWaitingConditions() {
         for state in serviceStates.values where state.phase == .waiting {
             guard case .waitingForDependency(let dependency)? = state.condition?.kind else { continue }
-            let headline = "Waiting for \(dependencyState(of: dependency))"
+            let headline = "Waiting for \(dependencyState(of: waitTarget(dependency)))"
             guard state.condition?.headline != headline else { continue }
             state.condition = ServiceCondition(
                 kind: .waitingForDependency(dependency), headline: headline, since: state.condition?.since ?? clock.date()
@@ -3007,7 +3105,7 @@ final class EnvironmentSupervisor {
                 do {
                     _ = try await startService(id)
                 } catch {
-                    recordFailure(id, error: error, lastError: "\(error)")
+                    recordFailure(id, error: error, lastError: ownsBanner(id) ? "\(error)" : nil)
                 }
                 recalculateHealth()
             }
@@ -3056,9 +3154,10 @@ final class EnvironmentSupervisor {
             return .skipped("\(displayName(dependency)) is not available")
         case .blocked(let dependency):
             state.phase = .waiting
-            noteSkip(state, .waitingForDependency(dependency), "Waiting for \(dependencyState(of: dependency))")
+            let target = dependencyState(of: waitTarget(dependency))
+            noteSkip(state, .waitingForDependency(dependency), "Waiting for \(target)")
             await logStore.append(serviceID: serviceID, entry: LogEntry(
-                stream: .stdout, text: "[travel-runner] Waiting for \(dependencyState(of: dependency)) before the start"
+                stream: .stdout, text: "[travel-runner] Waiting for \(target) before the start"
             ))
             return .blocked(by: dependency)
         }
@@ -3414,8 +3513,9 @@ final class EnvironmentSupervisor {
                     break
                 }
                 if let exit = await processRunner.exit(of: launch.pid) {
-                    if try await !shouldKeepWaiting(for: state, after: exit) { return }
                     // The automatic restart gives the verdict, not this waiter.
+                    if isReplaced(serviceID, launch) { return }
+                    if try await !shouldKeepWaiting(for: state, after: exit) { return }
                     if isReplaced(serviceID, launch) { return }
                 }
                 try await clock.sleep(for: .seconds(2))
@@ -3527,6 +3627,9 @@ final class EnvironmentSupervisor {
             if state.definition.shouldReuseIfRunning { return true }
             // Stripe degrades to skipped; handleTermination owns its state.
             if state.id == "stripe" { return false }
+            if isShuttingDown || state.phase == .stopping || state.phase == .stopped { return false }
+            // The daemon gets one automatic restart, and that restart gives the verdict.
+            if state.definition.resolvedRestart == .onFailure, !state.cleanExitRestarted { return true }
             throw ServiceError.exitedDuringStartup(name: state.definition.displayName)
         case .commandNotRunnable(let code):
             let finding = await commandFinding(forExit: code, pid: exit.pid, of: state)
@@ -3655,6 +3758,8 @@ final class EnvironmentSupervisor {
         // slow failure (two minutes to give up) does not start a new series each time.
         let stableFor = state.readyAt.map { clock.date().timeIntervalSince($0) }
         let restarts = state.definition.resolvedRestart == .onFailure
+        // While Start All runs, the first failure keeps the banner.
+        let owns = ownsBanner(serviceID)
 
         switch kind {
         case .stoppedByRunner:
@@ -3688,8 +3793,8 @@ final class EnvironmentSupervisor {
             state.phase = .failed
             state.lastStopped = clock.date()
             // The header shows the banner only with a text: say which service ended.
-            lastError = Self.cleanExitMessage(name)
-            recordFailure(serviceID, kind: .cleanExit)
+            if owns { lastError = Self.cleanExitMessage(name) }
+            recordFailure(serviceID, kind: .cleanExit, ownsBanner: owns)
             Task { await logStore.append(serviceID: serviceID, entry: LogEntry(
                 stream: .stderr, text: "[travel-runner] \(name) exited (code 0) — not restarted"
             ))}
@@ -3702,7 +3807,7 @@ final class EnvironmentSupervisor {
             state.phase = .failed
             state.lastStopped = clock.date()
             noteFailure(state, stableFor: stableFor)
-            recordFailure(serviceID, kind: .killed(signal: signal))
+            recordFailure(serviceID, kind: .killed(signal: signal), ownsBanner: owns)
             let action = restarts ? "restarting it" : "it stays stopped"
             let killed = "\(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))) — \(action)"
             Task {
@@ -3722,8 +3827,8 @@ final class EnvironmentSupervisor {
             state.lastStopped = clock.date()
             let unknown = CommandDiagnosis.Finding.unknown(command: state.definition.cmd.first ?? "its command", code: code)
             let plain = CommandDiagnosis.message(unknown, name: name)
-            lastError = plain
-            recordFailure(serviceID, kind: .cannotRun(unknown))
+            if owns { lastError = plain }
+            recordFailure(serviceID, kind: .cannotRun(unknown), ownsBanner: owns)
             let record = state.failureRecordCount
             Task {
                 let finding = await commandFinding(forExit: code, pid: termination.pid, of: state)
@@ -3731,9 +3836,9 @@ final class EnvironmentSupervisor {
                 let full = CommandDiagnosis.message(finding, name: name)
                 await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(full)"))
                 // A newer error stays.
-                if lastError == plain { lastError = full }
+                if owns, lastError == plain { lastError = full }
                 if state.failureRecordCount == record, state.phase == .failed {
-                    recordFailure(serviceID, kind: .cannotRun(finding))
+                    recordFailure(serviceID, kind: .cannotRun(finding), ownsBanner: owns)
                 }
             }
             onServiceCrash?(name, code)
@@ -3760,7 +3865,7 @@ final class EnvironmentSupervisor {
             }
             // A tripped breaker recorded its own reason.
             if state.phase == .failed, !state.isCircuitBroken {
-                recordFailure(serviceID, kind: .exited(code: termination.status))
+                recordFailure(serviceID, kind: .exited(code: termination.status), ownsBanner: owns)
             }
         }
         recalculateHealth()
@@ -3889,8 +3994,8 @@ final class EnvironmentSupervisor {
                 guard serviceStates[serviceID]?.phase == .failed else { return }
             }
 
+            // The restart releases it once the phase has changed.
             due = false
-            releasePendingRestart(serviceID)
             await autoRestart(serviceID)
         }
     }
@@ -3911,7 +4016,7 @@ final class EnvironmentSupervisor {
         // A service that waits for a failed one (a oneshot, say) is a failure too.
         let waitsForFailed = serviceStates.values.contains { state in
             guard state.phase == .waiting, case .waitingForDependency(let id)? = state.condition?.kind else { return false }
-            return serviceStates[id]?.phase == .failed
+            return serviceStates[waitTarget(id)]?.phase == .failed
         }
         // While Start All runs, services that are not started yet do not make it stopped.
         if daemonStates.allSatisfy({ $0 == .stopped || $0 == .pending }) && startupBeganAt == nil && !waitsForFailed {

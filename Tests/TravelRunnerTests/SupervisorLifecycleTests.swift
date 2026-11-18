@@ -2859,6 +2859,9 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(state("web").condition?.kind, .waitingForDependency("base"))
         XCTAssertEqual(state("web").condition?.headline, "Waiting for base (failed)")
         XCTAssertEqual(state("next").phase, .waiting)
+        // It waits for web, and the row names the root cause, not web.
+        XCTAssertEqual(state("next").condition?.kind, .waitingForDependency("web"))
+        XCTAssertEqual(state("next").condition?.headline, "Waiting for base (failed)")
         XCTAssertEqual(Self.listeners(on: port), [])
         XCTAssertEqual(supervisor.health, .degraded)
         XCTAssertEqual(supervisor.lastError, "base failed: base exited with non-zero status", "the first error wins")
@@ -3007,6 +3010,143 @@ final class SupervisorLifecycleTests: XCTestCase {
         let gone = await waitUntil(5) { kill(pid, 0) != 0 }
         XCTAssertTrue(gone, "the process still runs")
         XCTAssertEqual(EnvironmentSupervisor.durationText(.seconds(15 * 60)), "15 min")
+    }
+
+    /// The first error won only for errors that the start threw. A daemon that ends
+    /// with 127 later wrote its own error into the banner from its exit.
+    func testALaterDaemonThatCannotRunKeepsTheFirstHeadline() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        let late = ServiceDefinition(
+            id: "late", name: "late", cmd: ["/bin/sh", "-c", "sleep 2; exit 127"], cwd: workDir.path,
+            probe: ProbeConfig(type: .tcp, port: port, host: nil, url: nil, pattern: nil, artifact: nil, timeout: 30),
+            type: .daemon, restart: .onFailure, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([service("base", "exit 3"), late])
+
+        supervisor.startAll(skipPreflight: true)
+
+        let ended = await startAllEnded()
+        XCTAssertTrue(ended)
+        XCTAssertEqual(state("late").phase, .failed)
+        XCTAssertEqual(state("late").exitCode, 127)
+        // The finding of the exit comes a moment later.
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertEqual(supervisor.lastError, "base failed: base exited with non-zero status", "the first error wins")
+        XCTAssertNotNil(state("late").condition, "the row still says why")
+    }
+
+    /// A daemon with a probe that ends with code 0 while it starts gets its one
+    /// automatic restart. The old waiter failed it first, and the headline stayed
+    /// after the restart came up.
+    func testAProbedDaemonThatExitsCleanlyWhileItStartsGetsItsRestartAndNoHeadline() async throws {
+        _ = fakeTheOutsideOfStartAll()
+        let marker = workDir.appendingPathComponent("first-run").path
+        let script = "if [ -f '\(marker)' ]; then exec \(webServer.joined(separator: " ")); "
+            + "else touch '\(marker)'; sleep 1; exit 0; fi"
+        try supervisor.loadServices([daemon("web", ["sh", "-c", script])])
+
+        supervisor.startAll(skipPreflight: true)
+
+        let ended = await startAllEnded()
+        XCTAssertTrue(ended)
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertNil(supervisor.lastError)
+        XCTAssertNil(supervisor.rootCauseServiceID)
+        XCTAssertEqual(supervisor.health, .healthy)
+        let lines = await logLines("web")
+        XCTAssertTrue(lines.contains("[travel-runner] web exited (code 0) — restarting it once"), lines.joined(separator: "\n"))
+    }
+
+    /// A restart of a service that runs, while its dependency failed, stopped the
+    /// process and left the service waiting. Now the process keeps running.
+    func testARestartWhileTheDependencyFailedKeepsTheRunningProcess() async throws {
+        try supervisor.loadServices([service("base", "true"), webDependingOn(["base"])])
+        supervisor.health = .healthy
+        state("base").phase = .completed
+        supervisor.restartService("web")
+        let up = await waitUntil(40) { self.settled("web") }
+        XCTAssertTrue(up, "web is \(state("web").phase.rawValue)")
+        let pid = try XCTUnwrap(state("web").pid)
+        state("base").phase = .failed
+        var feedback: [(String, Bool)] = []
+        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+
+        supervisor.restartService("web")
+
+        let done = await waitUntil(10) { !feedback.isEmpty && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(done)
+        XCTAssertEqual(feedback.map(\.0), ["web not restarted — waiting for base (failed); it keeps running"])
+        XCTAssertEqual(feedback.map(\.1), [false])
+        XCTAssertEqual(state("web").phase, .running)
+        XCTAssertEqual(state("web").pid, pid)
+        XCTAssertEqual(try ownListener(), pid)
+    }
+
+    /// A DB step that a person asks for during Start All waits for it, and runs
+    /// after. A start that the other runner app refused ends its time too.
+    func testADbStepQueuedBehindStartAllRunsAfterIt() async throws {
+        try loadSupabase()
+        supervisor.shell = FakeCommandRunner()
+        supervisor.secretRegistryPorts = 0...0
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let only = step("first", "true")
+        var asked = 0
+        supervisor.dbPipelineFactory = { _, _ in
+            asked += 1
+            return self.pipeline([only])
+        }
+        let gate = Gate()
+        supervisor.siblingActiveServices = {
+            await gate.wait()
+            return ["other"]
+        }
+        var feedback: [String] = []
+        supervisor.onActionFeedback = { message, _ in feedback.append(message) }
+
+        supervisor.startAll(skipPreflight: true)
+        supervisor.runDbSetup(profile: "reset")
+
+        XCTAssertEqual(feedback, [EnvironmentSupervisor.dbSetupWaitsText])
+        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertEqual(asked, 0, "the step waits for the start")
+        XCTAssertFalse(supervisor.dbResetRunning)
+        XCTAssertNotNil(supervisor.startupBeganAt)
+
+        await gate.open()
+
+        let done = await waitUntil(30) {
+            only.status == .passed && !self.supervisor.dbResetRunning && self.supervisor.stackIsIdle
+        }
+        XCTAssertTrue(done, "step is \(only.status.rawValue)")
+        XCTAssertEqual(asked, 1)
+        XCTAssertNil(supervisor.startupBeganAt, "the refused start ended its time")
+    }
+
+    /// Two stops in a row: the second waits for the first, and the stack ends
+    /// stopped. A DB step that waited is dropped by the second stop, and says so.
+    func testTwoStopsInARowDropTheWaitingDbStepAndSaySo() async throws {
+        try loadSupabase()
+        supervisor.shell = FakeCommandRunner()
+        var asked = 0
+        supervisor.dbPipelineFactory = { _, _ in
+            asked += 1
+            return self.pipeline([self.step("first", "true")])
+        }
+        var feedback: [(String, Bool)] = []
+        supervisor.onActionFeedback = { message, ok in feedback.append((message, ok)) }
+
+        supervisor.stopAll()
+        supervisor.runDbSetup(profile: "reset")
+        supervisor.stopAll()
+
+        let stopped = await waitUntil(20) { self.supervisor.stackIsIdle && self.supervisor.health == .stopped }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(feedback.map(\.0), [EnvironmentSupervisor.dbSetupWaitsText, EnvironmentSupervisor.dbSetupDroppedText])
+        XCTAssertEqual(feedback.map(\.1), [true, false])
+        XCTAssertEqual(asked, 0, "the dropped step did not run")
+        XCTAssertEqual(state("supabase").phase, .stopped)
+        XCTAssertFalse(supervisor.dbResetRunning)
     }
 
     /// Start All needs only a loaded graph: no services.json.
