@@ -5,6 +5,9 @@ struct WorkshopStatusView: View {
     @State private var preflightExpanded = true
     @State private var dbResetHasLogs = false
     @State private var dbResetEntries: [LogEntry] = []
+    /// The triage card that an error toast opened, outlined for a moment.
+    @State private var highlightedServiceID: String?
+    private let navigation = WorkshopPanel.shared.navigation
 
     private var failedServices: [ServiceState] {
         supervisor.sortedServiceIDs
@@ -17,97 +20,121 @@ struct WorkshopStatusView: View {
     }
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 8) {
-                // The header shows the newest few; this lists them all.
-                if supervisor.notices.header.more > 0 {
-                    noticesSection
-                }
-
-                let setupItems = supervisor.setupItemsNeedingAttention.count
-                if setupItems > 0 {
-                    HealthAttentionBanner(count: setupItems) {
-                        WorkshopPanel.shared.open(section: .health)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    // The header shows the newest few; this lists them all.
+                    if supervisor.notices.header.more > 0 {
+                        noticesSection
                     }
-                }
 
-                ForEach(failedServices) { state in
-                    TriageCard(
-                        state: state,
-                        logStore: supervisor.logStore,
-                        onRestart: { supervisor.requestRestart(state.id) },
-                        onCascadeRestart: { supervisor.requestCascadeRestart(state.id) },
-                        onClearCache: ["travel-portal", "partner-portal"].contains(state.id)
-                            ? { supervisor.clearCacheAndRestart(state.id) } : nil
-                    )
-                    .transition(.opacity)
-                }
-                .animation(.easeInOut(duration: 0.15), value: failedServices.map(\.id))
+                    let setupItems = supervisor.setupItemsNeedingAttention.count
+                    if setupItems > 0 {
+                        HealthAttentionBanner(count: setupItems) {
+                            WorkshopPanel.shared.open(section: .health)
+                        }
+                    }
 
-                if !supervisor.preflightChecks.isEmpty && !allPreflightsPassed {
-                    preflightSection
-                }
-
-                if supervisor.health == .starting {
-                    TimelineStrip(
-                        currentPhase: supervisor.currentPhase,
-                        completedPhases: supervisor.completedPhases,
-                        phaseTimings: supervisor.phaseTimings
-                    )
-                    .padding(.horizontal, 4)
-                }
-
-                if let pipeline = supervisor.dbSetupPipeline,
-                   pipeline.isRunning || pipeline.steps.contains(where: { $0.status != .pending }) {
-                    DbSetupPipelineView(
-                        pipeline: pipeline,
-                        isRunning: supervisor.dbResetRunning,
-                        onRetryFrom: { supervisor.runDbSetup(from: $0) },
-                        onCancel: { supervisor.cancelDbSetup() },
-                        onDismiss: { supervisor.dismissDbSetup() },
-                        onReport: { ReportProblem.run(.dbStep(id: $0), supervisor: supervisor) }
-                    )
-                } else if supervisor.dbResetRunning || dbResetHasLogs {
-                    dbResetConsole
-                }
-
-                let failedIDs = Set(failedServices.map(\.id))
-                let groups = supervisor.servicesByPhase()
-                ForEach(groups, id: \.phase) { group in
-                    let healthyServices = group.services.filter { !failedIDs.contains($0.id) }
-                    if !healthyServices.isEmpty {
-                        PhaseSection(
-                            phase: group.phase,
-                            services: healthyServices,
+                    ForEach(failedServices) { state in
+                        TriageCard(
+                            state: state,
                             logStore: supervisor.logStore,
-                            onRestart: { supervisor.requestRestart($0) },
-                            onCascadeRestart: { supervisor.requestCascadeRestart($0) },
-                            dbResetRunning: supervisor.dbResetRunning,
-                            serviceBehindCount: { supervisor.gitBehindCounts[$0] ?? 0 },
-                            isServiceDepsStale: { supervisor.npmStaleServices.contains($0) }
+                            onRestart: { supervisor.requestRestart(state.id) },
+                            onCascadeRestart: { supervisor.requestCascadeRestart(state.id) },
+                            onClearCache: ["travel-portal", "partner-portal"].contains(state.id)
+                                ? { supervisor.clearCacheAndRestart(state.id) } : nil
                         )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6)
+                                .strokeBorder(Color.accentColor, lineWidth: 2)
+                                .opacity(highlightedServiceID == state.id ? 1 : 0)
+                        )
+                        .id(Self.triageAnchor(state.id))
+                        .transition(.opacity)
+                    }
+                    .animation(.easeInOut(duration: 0.15), value: failedServices.map(\.id))
+
+                    if !supervisor.preflightChecks.isEmpty && !allPreflightsPassed {
+                        preflightSection
+                    }
+
+                    if supervisor.health == .starting {
+                        TimelineStrip(
+                            currentPhase: supervisor.currentPhase,
+                            completedPhases: supervisor.completedPhases,
+                            phaseTimings: supervisor.phaseTimings
+                        )
+                        .padding(.horizontal, 4)
+                    }
+
+                    if let pipeline = supervisor.dbSetupPipeline,
+                       pipeline.isRunning || pipeline.steps.contains(where: { $0.status != .pending }) {
+                        DbSetupPipelineView(
+                            pipeline: pipeline,
+                            isRunning: supervisor.dbResetRunning,
+                            onRetryFrom: { supervisor.runDbSetup(from: $0) },
+                            onCancel: { supervisor.cancelDbSetup() },
+                            onDismiss: { supervisor.dismissDbSetup() },
+                            onReport: { ReportProblem.run(.dbStep(id: $0), supervisor: supervisor) }
+                        )
+                    } else if supervisor.dbResetRunning || dbResetHasLogs {
+                        dbResetConsole
+                    }
+
+                    let failedIDs = Set(failedServices.map(\.id))
+                    let groups = supervisor.servicesByPhase()
+                    ForEach(groups, id: \.phase) { group in
+                        let healthyServices = group.services.filter { !failedIDs.contains($0.id) }
+                        if !healthyServices.isEmpty {
+                            PhaseSection(
+                                phase: group.phase,
+                                services: healthyServices,
+                                logStore: supervisor.logStore,
+                                onRestart: { supervisor.requestRestart($0) },
+                                onCascadeRestart: { supervisor.requestCascadeRestart($0) },
+                                dbResetRunning: supervisor.dbResetRunning,
+                                serviceBehindCount: { supervisor.gitBehindCounts[$0] ?? 0 },
+                                isServiceDepsStale: { supervisor.npmStaleServices.contains($0) }
+                            )
+                        }
+                    }
+
+                    if !supervisor.recentActivity.entries.isEmpty {
+                        recentActivitySection
                     }
                 }
-
-                if !supervisor.recentActivity.entries.isEmpty {
-                    recentActivitySection
+                .padding(16)
+            }
+            // A click on an error toast: Status scrolls to the triage card of its service.
+            .onChange(of: navigation.focusedServiceID, initial: true) { _, serviceID in
+                guard let serviceID else { return }
+                navigation.focusedServiceID = nil
+                guard failedServices.contains(where: { $0.id == serviceID }) else { return }
+                withAnimation { proxy.scrollTo(Self.triageAnchor(serviceID), anchor: .top) }
+                highlightedServiceID = serviceID
+                Task {
+                    try? await Task.sleep(for: .seconds(2))
+                    if highlightedServiceID == serviceID {
+                        withAnimation { highlightedServiceID = nil }
+                    }
                 }
             }
-            .padding(16)
-        }
-        .task {
-            while !Task.isCancelled {
-                let dbVersion = await supervisor.logStore.version(for: "db-reset")
-                if dbVersion > 0 {
-                    dbResetHasLogs = true
-                    dbResetEntries = await supervisor.logStore.entries(for: "db-reset")
-                } else if !supervisor.dbResetRunning {
-                    dbResetHasLogs = false
+            .task {
+                while !Task.isCancelled {
+                    let dbVersion = await supervisor.logStore.version(for: "db-reset")
+                    if dbVersion > 0 {
+                        dbResetHasLogs = true
+                        dbResetEntries = await supervisor.logStore.entries(for: "db-reset")
+                    } else if !supervisor.dbResetRunning {
+                        dbResetHasLogs = false
+                    }
+                    try? await Task.sleep(for: .milliseconds(1000))
                 }
-                try? await Task.sleep(for: .milliseconds(1000))
             }
         }
     }
+
+    private static func triageAnchor(_ serviceID: String) -> String { "triage-\(serviceID)" }
 
     private var noticesSection: some View {
         VStack(alignment: .leading, spacing: 6) {

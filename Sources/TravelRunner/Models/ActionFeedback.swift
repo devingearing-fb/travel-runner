@@ -49,6 +49,15 @@ struct CrashAlert: Equatable, Sendable {
         case autoRestartStopped
         /// The service is not restarted by itself.
         case none
+
+        /// What comes after a crash, read after `scheduleRestart`: a tripped breaker
+        /// stops, a scheduled restart keeps the phase failed, and a service that
+        /// `scheduleRestart` skipped does not restart.
+        static func after(circuitBroken: Bool, restarts: Bool, phase: ServicePhase, restartCount: Int) -> Next {
+            if circuitBroken { return .autoRestartStopped }
+            guard restarts, phase == .failed else { return .none }
+            return .restarting(attempt: restartCount + 1)
+        }
     }
 
     let serviceID: String

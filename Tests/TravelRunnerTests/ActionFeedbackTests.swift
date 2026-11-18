@@ -22,6 +22,20 @@ final class ActionFeedbackTests: XCTestCase {
         XCTAssertEqual(alert(cause: "zsh: command not found: pnpm", next: .none).body, "zsh: command not found: pnpm.")
     }
 
+    func testWhatComesAfterACrash() {
+        XCTAssertEqual(
+            CrashAlert.Next.after(circuitBroken: true, restarts: true, phase: .failed, restartCount: 2),
+            .autoRestartStopped
+        )
+        XCTAssertEqual(
+            CrashAlert.Next.after(circuitBroken: false, restarts: true, phase: .failed, restartCount: 1),
+            .restarting(attempt: 2)
+        )
+        // A skipped service (an exhausted Stripe) and a service that does not restart.
+        XCTAssertEqual(CrashAlert.Next.after(circuitBroken: false, restarts: true, phase: .skipped, restartCount: 0), .none)
+        XCTAssertEqual(CrashAlert.Next.after(circuitBroken: false, restarts: false, phase: .failed, restartCount: 0), .none)
+    }
+
     func testAnErrorToastStaysUntilItIsClosed() {
         XCTAssertNil(ToastCenter.duration(for: .error))
         XCTAssertEqual(ToastCenter.duration(for: .success), .seconds(4))

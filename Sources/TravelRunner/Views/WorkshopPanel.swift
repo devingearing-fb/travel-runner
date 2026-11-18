@@ -46,6 +46,8 @@ enum WorkshopSection: String, CaseIterable, Identifiable {
 final class WorkshopNavigation {
     var selectedSection: WorkshopSection? = .status
     var selectedLogServiceID: String? = nil
+    /// The service whose triage card Status scrolls to, set by a click on an error toast.
+    var focusedServiceID: String? = nil
 }
 
 @MainActor
@@ -75,8 +77,11 @@ final class WorkshopPanel {
         supervisor.onFeedback = { [weak toastCenter] feedback in
             toastCenter?.show(feedback)
         }
-        // An error toast opens Status, where the failed service has its triage card.
-        toastCenter.onOpen = { [weak self] _ in self?.open(section: .status) }
+        // An error toast opens Status at the triage card of its service.
+        toastCenter.onOpen = { [weak self] toast in
+            self?.navigation.focusedServiceID = toast.serviceID
+            self?.open(section: .status)
+        }
         // Health lists the setup checks and where each tool was found.
         supervisor.onOpenHealth = { [weak self] in self?.open(section: .health) }
         supervisor.onOpenSettings = { [weak self] in self?.open(section: .settings) }

@@ -2133,13 +2133,15 @@ final class EnvironmentSupervisor {
     /// A restart that a person or the API asks for. It clears the failure history:
     /// the circuit breaker and the backoff start again. With `stopsStack`, a restart
     /// of Supabase stops its containers first; without it, it only starts what is down.
-    func restartService(_ serviceID: String, stopsStack: Bool = false) {
+    /// `announce` is true when a person pressed a button: a restart that is already
+    /// queued then says so. A restart the runner starts by itself stays quiet.
+    func restartService(_ serviceID: String, stopsStack: Bool = false, announce: Bool = false) {
         if serviceID == "stripe" { resetStripeRetries() }
         let stopsStack = stopsStack && isSupabaseStack(serviceID)
         if isSupabaseStack(serviceID) { supabaseRepairUsed = false }
         let name = serviceStates[serviceID]?.definition.displayName ?? serviceID
         guard queuedRestarts.insert(serviceID).inserted else {
-            showFeedback(ActionFeedback.alreadyRestarting(name), .info, serviceID: serviceID)
+            if announce { showFeedback(ActionFeedback.alreadyRestarting(name), .info, serviceID: serviceID) }
             return
         }
         Task {
@@ -2314,7 +2316,7 @@ final class EnvironmentSupervisor {
     /// A restart from the panel. Supabase asks first: its restart stops the containers.
     func requestRestart(_ serviceID: String) {
         guard isSupabaseStack(serviceID), health != .stopped else {
-            restartService(serviceID)
+            restartService(serviceID, announce: true)
             return
         }
         supabaseRestartConfirmation = .service
@@ -2333,7 +2335,7 @@ final class EnvironmentSupervisor {
         guard let request = supabaseRestartConfirmation else { return }
         supabaseRestartConfirmation = nil
         switch request {
-        case .service: restartService("supabase", stopsStack: true)
+        case .service: restartService("supabase", stopsStack: true, announce: true)
         case .withDependents: restartCascade("supabase")
         }
     }
@@ -2405,7 +2407,7 @@ final class EnvironmentSupervisor {
         case .keepWaiting:
             keepWaiting(serviceID)
         case .startService:
-            restartService(serviceID)
+            restartService(serviceID, announce: true)
         case .stopForeignAndRetry(let port):
             // The port can be another port of the app (the HMR port). With no port in
             // the line, the button frees the port of the probe: the start alone
@@ -2413,7 +2415,7 @@ final class EnvironmentSupervisor {
             let target = port ?? serviceStates[serviceID]?.definition.probe?.port
             Task {
                 if let target { await freePort(target, includingForeign: true) }
-                restartService(serviceID)
+                restartService(serviceID, announce: true)
             }
         case .stopProcessAndRetry(let pid, let startTime, let port, _):
             // The person pressed the button: the process need not be the runner's.
@@ -2427,7 +2429,7 @@ final class EnvironmentSupervisor {
                         stream: .stderr, text: "[travel-runner] PID \(pid) is no longer the process that blocked the start. Not stopped."
                     ))
                 }
-                restartService(serviceID)
+                restartService(serviceID, announce: true)
             }
         case .clearCacheAndRestart:
             clearCacheAndRestart(serviceID)
@@ -2485,7 +2487,7 @@ final class EnvironmentSupervisor {
                 onActionFeedback?("\(command) \(why)", false)
                 return
             }
-            restartService(serviceID)
+            restartService(serviceID, announce: true)
         }
     }
 
@@ -3640,7 +3642,7 @@ final class EnvironmentSupervisor {
     /// "Restart portals": each portal that runs restarts on the fresh data.
     func restartPortals() {
         portalRestartNotice = nil
-        for id in runningPortalIDs { restartService(id) }
+        for id in runningPortalIDs { restartService(id, announce: true) }
     }
 
     func dismissPortalRestartNotice() {
@@ -5006,8 +5008,10 @@ final class EnvironmentSupervisor {
             }
             // After the schedule: the notification says whether a restart comes.
             if notifiesKill {
-                let next: CrashAlert.Next = state.isCircuitBroken ? .autoRestartStopped
-                    : restarts && state.phase == .failed ? .restarting(attempt: state.restartCount + 1) : .none
+                let next = CrashAlert.Next.after(
+                    circuitBroken: state.isCircuitBroken, restarts: restarts,
+                    phase: state.phase, restartCount: state.restartCount
+                )
                 alertCrash(state, code: 128 + SIGKILL, next: next)
             }
 
@@ -5056,8 +5060,10 @@ final class EnvironmentSupervisor {
             }
             // After the schedule: the notification says whether a restart comes.
             if alerts {
-                let next: CrashAlert.Next = state.isCircuitBroken ? .autoRestartStopped
-                    : restarts && state.phase == .failed ? .restarting(attempt: state.restartCount + 1) : .none
+                let next = CrashAlert.Next.after(
+                    circuitBroken: state.isCircuitBroken, restarts: restarts,
+                    phase: state.phase, restartCount: state.restartCount
+                )
                 alertCrash(state, code: termination.status, next: next)
             }
             // A tripped breaker recorded its own reason.
@@ -6243,7 +6249,7 @@ final class EnvironmentSupervisor {
             let output = (result.stdout + "\n" + result.stderr).split(whereSeparator: \.isNewline).suffix(20)
             await logStore.appendBatch(serviceID: "stripe", entries: output.map { LogEntry(stream: .stdout, text: String($0)) })
             if result.succeeded {
-                restartService("stripe")
+                restartService("stripe", announce: true)
             } else {
                 onActionFeedback?("\(command) failed — see the Stripe log", false)
             }
@@ -6276,7 +6282,7 @@ final class EnvironmentSupervisor {
             // Nil is a cancel: the person chose not to import.
             switch await checker.importSharedEnv(.booking) {
             case true?:
-                restartService("stripe")
+                restartService("stripe", announce: true)
             case false?:
                 onActionFeedback?("The .env was not imported — check the file and that apps/booking-portal can be written, then try again", false)
             case nil:

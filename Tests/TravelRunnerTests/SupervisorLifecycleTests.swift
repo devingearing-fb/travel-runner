@@ -499,8 +499,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(up, "web is \(state("web").phase.rawValue)")
 
         feedback = []
-        supervisor.restartService("web")
-        supervisor.restartService("web")
+        supervisor.restartService("web", announce: true)
+        supervisor.restartService("web", announce: true)
         XCTAssertEqual(feedback.map(\.message), ["web is already restarting."])
         XCTAssertEqual(feedback.first?.style, .info)
         XCTAssertEqual(feedback.first?.serviceID, "web")
@@ -524,6 +524,55 @@ final class SupervisorLifecycleTests: XCTestCase {
                 "web restarted", "web is already restarting.", "A start is already in progress.",
             ]
         )
+    }
+
+    /// A restart the runner starts by itself (a wake, a new webhook secret) found one
+    /// queued and showed "already restarting" that nobody asked about. Only a restart
+    /// somebody asked for says so. "Clear cache and restart" says so too.
+    func testOnlyARestartSomebodyAskedForSaysItIsAlreadyRestarting() async throws {
+        try load(daemon("web", webServer))
+        var feedback: [ActionFeedback] = []
+        supervisor.onFeedback = { feedback.append($0) }
+
+        supervisor.restartService("web")
+        supervisor.restartService("web")
+        XCTAssertTrue(feedback.isEmpty, "\(feedback.map(\.message))")
+        let ready = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(ready, "web is \(state("web").phase.rawValue)")
+        XCTAssertFalse(feedback.contains { $0.style == .info }, "\(feedback.map(\.message))")
+
+        feedback = []
+        supervisor.clearCacheAndRestart("web")
+        supervisor.clearCacheAndRestart("web")
+        XCTAssertEqual(feedback.map(\.message), ["web is already restarting."])
+        XCTAssertEqual(feedback.first?.style, .info)
+        XCTAssertEqual(feedback.first?.serviceID, "web")
+        let back = await waitUntil(30) { self.settled("web") }
+        XCTAssertTrue(back, "web is \(state("web").phase.rawValue)")
+        XCTAssertEqual(Self.listeners(on: port).count, 1)
+    }
+
+    /// The crash that trips the breaker in `scheduleRestart`: its notification says
+    /// that auto-restart stopped, not that a restart comes.
+    func testTheCrashThatTripsTheBreakerSaysAutoRestartStopped() async throws {
+        // The time stamps stand still, so the three crashes are always inside the
+        // breaker's minute. The waits stay real.
+        supervisor.clock = FakeClock().stampsOnly
+        // It serves for a moment, so each start passes its probe, then crashes.
+        let script = "python3 -u -m http.server \(port) --bind 127.0.0.1 & srv=$!; "
+            + "sleep 2; kill $srv; wait $srv; exit 1"
+        try load(daemon("web", ["sh", "-c", script], probeTimeout: 60))
+        supervisor.restartService("web")
+
+        let tripped = await waitUntil(60) {
+            self.state("web").isCircuitBroken && self.supervisor.actionsInFlight.isEmpty
+        }
+        XCTAssertTrue(tripped, "web is \(state("web").phase.rawValue), \(state("web").failureTimestamps.count) failures")
+        let last = try XCTUnwrap(alerts.last)
+        XCTAssertEqual(last.next, .autoRestartStopped, "\(alerts.map(\.next))")
+        XCTAssertEqual(last.body, "Exited with code 1. Auto-restart stopped.")
+        // Negative control: the crashes before the trip said a restart comes.
+        XCTAssertEqual(alerts.dropLast().map(\.next), [.restarting(attempt: 1), .restarting(attempt: 2)])
     }
 
     /// A tripped breaker must not outlive a deliberate restart: the next failure of
