@@ -218,7 +218,9 @@ enum ContainerRuntimeProbe: Sendable, Equatable {
         }
     }
 
-    static let cliMissingText = "docker was not found on Travel Runner's PATH — install OrbStack or Docker Desktop"
+    static var cliMissingText: String {
+        "docker was not found on \(Flavor.current.displayName)'s PATH — install OrbStack or Docker Desktop"
+    }
 
     /// What a failed probe means. Nil when the runtime runs.
     /// - Parameter waited: The wait for the runtime; nil when the runner did not wait.

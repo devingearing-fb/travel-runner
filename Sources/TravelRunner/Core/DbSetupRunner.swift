@@ -328,6 +328,7 @@ actor DbSetupRunner {
             step.recoveryAction = nil
             step.healthResult = nil
             step.healthFailures = []
+            step.restartRequests = []
             step.progress = nil
             step.progressLabel = nil
             step.exitCode = nil
@@ -585,6 +586,13 @@ actor DbSetupRunner {
                 if !detail.isEmpty { step.healthFailures.append(detail) }
                 step.errorMessage = "Health check: \(step.healthFailures.joined(separator: "; "))"
             }
+
+        case "restart":
+            // The supervisor acts on it once the whole profile has passed.
+            let ids = (parts.count > 1 ? parts[1] : "")
+                .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            guard !ids.isEmpty else { return }
+            step.restartRequests.append(DbRestartRequest(serviceIDs: ids, reason: parts.count > 2 ? parts[2] : ""))
 
         default:
             break

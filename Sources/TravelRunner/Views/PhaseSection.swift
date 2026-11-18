@@ -33,7 +33,7 @@ struct PhaseSection: View {
             .padding(.top, 2)
         } label: {
             HStack(spacing: 4) {
-                Text(phase)
+                Text(EnvironmentSupervisor.StartupPhase(rawValue: phase)?.label ?? phase.capitalized)
                     .font(.system(size: 9, weight: .medium, design: .monospaced))
                     .foregroundStyle(.tertiary)
 

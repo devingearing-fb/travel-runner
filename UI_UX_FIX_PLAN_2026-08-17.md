@@ -1,5 +1,10 @@
 # Travel Runner UI/UX Fix Plan — 2026-08-17
 
+> **Superseded** by the Travel Runner friction plan of 2026-11-16 (Release 3, E5). The nine
+> fixes below are built. The "Reviewed and confirmed sound" list is wrong: the friction review
+> found faults in the DB pipeline, the scenario selector, the setup wizard and the console.
+> Read it as history only.
+
 ## Problem
 
 The P5 cache-CDC work grew the service graph from 6 services to 18 (8 daemons + 10 one-shots
@@ -97,7 +102,7 @@ with the ScrollView (~40% header, ~60% content). Fixed by pinning the spacer's h
 The banner rendered both a "Dismiss" action button and an "×" with identical behavior.
 Action removed; the "×" remains.
 
-### Reviewed and confirmed sound (no changes)
+### Reviewed and confirmed sound (no changes) — superseded, not correct
 
 - `WorkshopIssuesView` — filter toolbar, list/detail split, close-with-resolution flow
 - `DbSetupPipelineView` / `DbSetupStepRow` — step states, progress, per-step logs, retry-from

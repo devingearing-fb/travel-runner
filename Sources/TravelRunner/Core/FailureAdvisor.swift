@@ -108,7 +108,7 @@ enum FailureAdvisor {
         // earlier in the launch (a page that did not compile) does not explain it.
         case .killed(let signal):
             return condition(
-                "\(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))).",
+                "\(name) was stopped from outside \(Flavor.current.displayName) (\(ServiceTermination.signalName(signal))).",
                 ServiceTermination.killHint(signal), [.restart, .openLog]
             )
         case .wakeCheck(let lastProbe):
@@ -233,6 +233,46 @@ enum FailureAdvisor {
             }
         }
         return nil
+    }
+
+    // MARK: - Help
+
+    /// One row of the in-app Help: a situation, what the service row then says, and its buttons.
+    struct HelpEntry: Equatable, Sendable, Identifiable {
+        let situation: String
+        let headline: String
+        let detail: String?
+        let buttons: [String]
+        var id: String { situation }
+    }
+
+    /// The Help list, made from this table: each row is what `advise` says for one
+    /// situation, so Help and the service rows never differ.
+    static func helpEntries(runtime: String = ContainerRuntime.detect().displayName, now: Date = .now) -> [HelpEntry] {
+        let name = "Booking Portal"
+        func row(_ situation: String, _ kind: Kind, port: Int? = 3002, log: [String] = [], cache: Bool = true) -> HelpEntry {
+            let context = Context(name: name, port: port, probePath: "/api/health", logTail: log, canClearCache: cache, runtime: runtime)
+            let condition = advise(kind, context, now: now)
+            let appName = ContainerRuntime.detect().appName
+            return HelpEntry(
+                situation: situation, headline: condition.headline, detail: condition.detail,
+                buttons: condition.actions.map { $0.title(runtime: appName) }
+            )
+        }
+        return [
+            row("A port is taken", .exited(code: 1), log: ["Error: listen EADDRINUSE: address already in use :::3002"]),
+            row("Docker or OrbStack is not running", .exited(code: 1), log: ["\(CrashCause.containerRuntimeDown) at unix:///var/run/docker.sock"]),
+            row("A package is missing", .exited(code: 1), log: ["Error: Cannot find module 'next'"]),
+            row("A start is slow", .probeTimeout(seconds: 60, processAlive: true, lastProbe: nil)),
+            row("The health route is missing", .probeTimeout(seconds: 60, processAlive: true, lastProbe: .http(status: 404))),
+            row("It crashes again and again", .crashLoop),
+            row("Restarts did not help", .exhausted(restarts: AutoRestart.maxRestarts)),
+            row("Something stopped it", .killed(signal: SIGKILL)),
+            row("Something keeps stopping it", .killedRepeatedly(signal: SIGKILL, times: AutoRestart.failuresToTrip)),
+            row("It ended by itself", .cleanExit),
+            row("It did not come back after sleep", .wakeCheck(lastProbe: .refused)),
+            row("The container runtime went away", .runtimeDown(waiting: true)),
+        ]
     }
 
     /// Ends a cause with a full stop, unless it has one.

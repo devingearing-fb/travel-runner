@@ -387,9 +387,13 @@ struct StripeOffReason: Equatable, Sendable {
     static func didNotConnect(seconds: Int) -> StripeOffReason {
         StripeOffReason(headline: "Stripe did not connect within \(seconds)s — webhooks are off.", actions: [.startService])
     }
-    static let crashedTwice = StripeOffReason(
-        headline: "Stripe CLI crashed twice (see log) — webhooks are off.", actions: [.startService, .openLog]
-    )
+    /// The CLI kept crashing after its automatic restarts (`StripeRetryPolicy.crashRestarts`).
+    static func keptCrashing(restarts: Int) -> StripeOffReason {
+        StripeOffReason(
+            headline: "Stripe CLI kept crashing after \(restarts) restart\(restarts == 1 ? "" : "s") (see log) — webhooks are off.",
+            actions: [.startService, .openLog]
+        )
+    }
     static func restarting(_ attempt: Int, of total: Int) -> StripeOffReason {
         StripeOffReason(headline: "Stripe CLI exited — restarting it (\(attempt) of \(total)).", retries: true)
     }

@@ -23,26 +23,31 @@ final class ControlServerTests: XCTestCase {
         ControlServer.Actions(
             getStatus: { status },
             getPreflight: { "{\"checks\":[]}" },
-            getLogs: { _, _ in "[]" },
-            restartService: { _ in },
-            clearCacheRestart: { _ in },
-            startAll: {},
-            stopAll: {},
-            toggleLan: {},
-            restartCascade: { _ in },
+            getHealth: { "{}" },
+            getServices: { "[]" },
+            getDiagnostics: { "{}" },
+            getEvents: { "[]" },
+            listLogs: { "{}" },
+            getLogs: { _, _ in .json("[]") },
+            restartService: { _, _ in .accepted },
+            clearCacheRestart: { _ in .accepted },
+            startAll: { .accepted },
+            stopAll: { .accepted },
+            toggleLan: { .accepted },
+            restartCascade: { _ in .accepted },
             dbResetBlock: { resetBlock },
-            dbReset: { onDbChange("reset") },
-            dbSetupRun: { _ in onDbChange("run") },
-            dbSetupRetry: { _ in onDbChange("retry") },
-            dbSetupCancel: {},
+            dbReset: { onDbChange("reset"); return .accepted },
+            dbSetupRun: { _ in onDbChange("run"); return .accepted },
+            dbSetupRetry: { _ in onDbChange("retry"); return .accepted },
+            dbSetupCancel: { .accepted },
             dbSetupStatus: { "{}" },
-            dbSetupRunStep: { _ in onDbChange("step") },
+            dbSetupRunStep: { _ in onDbChange("step"); return .accepted },
             debugListIssues: { "[]" },
-            debugCapture: { _ in "{}" },
-            debugCloseIssue: { _, _ in "{}" },
-            toggleDbMode: {},
+            debugCapture: { _ in .accepted },
+            debugCloseIssue: { _, _ in .done },
+            toggleDbMode: { .accepted },
             getProfile: { "{}" },
-            setProfile: { _ in true }
+            setProfile: { _ in .done }
         )
     }
 
@@ -262,7 +267,7 @@ final class ControlServerTests: XCTestCase {
         )
         for route in routes {
             let (code, _) = try await post(route, port: openPort)
-            XCTAssertEqual(code, 200, route)
+            XCTAssertEqual(code, 202, route)
         }
         XCTAssertEqual(openCalls.all, ["reset", "run", "retry", "step"])
     }
@@ -278,32 +283,45 @@ final class ControlServerTests: XCTestCase {
     }
 
     /// Actions that record each call and answer with a body that names the action.
-    private static func recording(_ calls: Recorder) -> ControlServer.Actions {
-        ControlServer.Actions(
+    /// `answer` gives the result of an action by its record; nil is `.accepted`.
+    private static func recording(
+        _ calls: Recorder, answer: @escaping @Sendable (String) -> ControlResult? = { _ in nil }
+    ) -> ControlServer.Actions {
+        @Sendable func act(_ entry: String) -> ControlResult {
+            calls.add(entry)
+            return answer(entry) ?? .accepted
+        }
+        return ControlServer.Actions(
             getStatus: { calls.add("status"); return #"{"a":"status"}"# },
             getPreflight: { calls.add("preflight"); return #"{"a":"preflight"}"# },
-            getLogs: { id, lines in calls.add("logs \(id) \(lines)"); return #"{"a":"logs"}"# },
-            restartService: { calls.add("restart \($0)") },
-            clearCacheRestart: { calls.add("clear-cache-restart \($0)") },
-            startAll: { calls.add("start-all") },
-            stopAll: { calls.add("stop-all") },
-            toggleLan: { calls.add("toggle-lan") },
-            restartCascade: { calls.add("restart-cascade \($0)") },
-            dbResetBlock: { nil },
-            dbReset: { calls.add("db-reset") },
-            dbSetupRun: { calls.add("db-setup \($0)") },
-            dbSetupRetry: { calls.add("db-setup-retry \($0)") },
-            dbSetupCancel: { calls.add("db-setup-cancel") },
-            dbSetupStatus: { calls.add("db-setup-status"); return #"{"a":"db-setup-status"}"# },
-            dbSetupRunStep: { calls.add("db-setup-step \($0)") },
-            debugListIssues: { calls.add("issues"); return #"{"a":"issues"}"# },
-            debugCapture: { calls.add("capture \($0)"); return #"{"a":"capture"}"# },
-            debugCloseIssue: { id, resolution in
-                calls.add("close \(id) \(resolution ?? "nil")"); return #"{"a":"close"}"#
+            getHealth: { calls.add("health"); return #"{"a":"health"}"# },
+            getServices: { calls.add("services"); return #"{"a":"services"}"# },
+            getDiagnostics: { calls.add("diagnostics"); return #"{"a":"diagnostics"}"# },
+            getEvents: { calls.add("events"); return #"{"a":"events"}"# },
+            listLogs: { calls.add("log-ids"); return #"{"a":"log-ids"}"# },
+            getLogs: { id, lines in
+                calls.add("logs \(id) \(lines)")
+                return answer("logs \(id) \(lines)") ?? .json(#"{"a":"logs"}"#)
             },
-            toggleDbMode: { calls.add("toggle-db-mode") },
+            restartService: { id, stack in act("restart \(id)\(stack ? " stack" : "")") },
+            clearCacheRestart: { act("clear-cache-restart \($0)") },
+            startAll: { act("start-all") },
+            stopAll: { act("stop-all") },
+            toggleLan: { act("toggle-lan") },
+            restartCascade: { act("restart-cascade \($0)") },
+            dbResetBlock: { nil },
+            dbReset: { act("db-reset") },
+            dbSetupRun: { act("db-setup \($0)") },
+            dbSetupRetry: { act("db-setup-retry \($0)") },
+            dbSetupCancel: { act("db-setup-cancel") },
+            dbSetupStatus: { calls.add("db-setup-status"); return #"{"a":"db-setup-status"}"# },
+            dbSetupRunStep: { act("db-setup-step \($0)") },
+            debugListIssues: { calls.add("issues"); return #"{"a":"issues"}"# },
+            debugCapture: { act("capture \($0)") },
+            debugCloseIssue: { id, resolution in act("close \(id) \(resolution ?? "nil")") },
+            toggleDbMode: { act("toggle-db-mode") },
             getProfile: { calls.add("profile"); return #"{"a":"profile"}"# },
-            setProfile: { name in calls.add("set-profile \(name)"); return name == "booking" }
+            setProfile: { name in act("set-profile \(name)") }
         )
     }
 
@@ -330,39 +348,42 @@ final class ControlServerTests: XCTestCase {
     func testEachRouteCallsItsActionWithTheRequestValues() async throws {
         let calls = Recorder()
         let (_, port) = try await startOnFreePort(actions: Self.recording(calls))
-        let ok = #"{"ok":true}"#
+        let accepted = #"{"accepted":true,"ok":true}"#
         let rows: [(method: String, path: String, body: String?, code: Int, answer: String, calls: [String])] = [
             ("GET", "/api/status", nil, 200, #"{"a":"status"}"#, ["status"]),
             ("GET", "/api/preflight", nil, 200, #"{"a":"preflight"}"#, ["preflight"]),
+            ("GET", "/api/health", nil, 200, #"{"a":"health"}"#, ["health"]),
+            ("GET", "/api/services", nil, 200, #"{"a":"services"}"#, ["services"]),
+            ("GET", "/api/diagnostics", nil, 200, #"{"a":"diagnostics"}"#, ["diagnostics"]),
+            ("GET", "/api/events", nil, 200, #"{"a":"events"}"#, ["events"]),
+            ("GET", "/api/logs", nil, 200, #"{"a":"log-ids"}"#, ["log-ids"]),
             ("GET", "/api/logs/travel-portal?lines=7", nil, 200, #"{"a":"logs"}"#, ["logs travel-portal 7"]),
             ("GET", "/api/logs/travel-portal", nil, 200, #"{"a":"logs"}"#, ["logs travel-portal 50"]),
-            ("GET", "/api/logs/travel-portal?lines=many", nil, 200, #"{"a":"logs"}"#, ["logs travel-portal 50"]),
-            ("POST", "/api/restart/partner-portal", nil, 200, ok, ["restart partner-portal"]),
-            ("POST", "/api/clear-cache-restart/travel-portal", nil, 200, ok, ["clear-cache-restart travel-portal"]),
-            ("POST", "/api/restart-cascade/supabase", nil, 200, ok, ["restart-cascade supabase"]),
-            ("POST", "/api/start-all", nil, 200, ok, ["start-all"]),
-            ("POST", "/api/stop-all", nil, 200, ok, ["stop-all"]),
-            ("POST", "/api/toggle-lan", nil, 200, ok, ["toggle-lan"]),
-            ("POST", "/api/toggle-db-mode", nil, 200, ok, ["toggle-db-mode"]),
-            ("POST", "/api/db-reset", nil, 200, ok, ["db-reset"]),
-            ("POST", "/api/db-setup", #"{"profile":"seed"}"#, 200, ok, ["db-setup seed"]),
-            ("POST", "/api/db-setup", nil, 200, ok, ["db-setup reset"]),
-            ("POST", "/api/db-setup", "not json", 200, ok, ["db-setup reset"]),
-            ("POST", "/api/db-setup/retry/load-hotels", nil, 200, ok, ["db-setup-retry load-hotels"]),
-            ("POST", "/api/db-setup/step/verify-data", nil, 200, ok, ["db-setup-step verify-data"]),
-            ("POST", "/api/db-setup/cancel", nil, 200, ok, ["db-setup-cancel"]),
+            ("GET", "/api/logs/db-setup-load-hotels", nil, 200, #"{"a":"logs"}"#, ["logs db-setup-load-hotels 50"]),
+            ("POST", "/api/restart/partner-portal", nil, 202, accepted, ["restart partner-portal"]),
+            ("POST", "/api/restart/supabase?stack=1", nil, 202, accepted, ["restart supabase stack"]),
+            ("POST", "/api/clear-cache-restart/travel-portal", nil, 202, accepted, ["clear-cache-restart travel-portal"]),
+            ("POST", "/api/restart-cascade/supabase", nil, 202, accepted, ["restart-cascade supabase"]),
+            ("POST", "/api/start-all", nil, 202, accepted, ["start-all"]),
+            ("POST", "/api/stop-all", nil, 202, accepted, ["stop-all"]),
+            ("POST", "/api/toggle-lan", nil, 202, accepted, ["toggle-lan"]),
+            ("POST", "/api/toggle-db-mode", nil, 202, accepted, ["toggle-db-mode"]),
+            ("POST", "/api/db-reset", nil, 202, accepted, ["db-reset"]),
+            ("POST", "/api/db-setup", #"{"profile":"seed"}"#, 202, accepted, ["db-setup seed"]),
+            ("POST", "/api/db-setup", nil, 202, accepted, ["db-setup reset"]),
+            ("POST", "/api/db-setup", "{}", 202, accepted, ["db-setup reset"]),
+            ("POST", "/api/db-setup/retry/load-hotels", nil, 202, accepted, ["db-setup-retry load-hotels"]),
+            ("POST", "/api/db-setup/step/verify-data", nil, 202, accepted, ["db-setup-step verify-data"]),
+            ("POST", "/api/db-setup/cancel", nil, 202, accepted, ["db-setup-cancel"]),
             ("GET", "/api/db-setup/status", nil, 200, #"{"a":"db-setup-status"}"#, ["db-setup-status"]),
             ("GET", "/api/debug/issues", nil, 200, #"{"a":"issues"}"#, ["issues"]),
-            ("POST", "/api/debug/issues", #"{"description":"portal hangs"}"#, 200, #"{"a":"capture"}"#,
-             ["capture portal hangs"]),
-            ("POST", "/api/debug/issues", nil, 200, #"{"a":"capture"}"#, ["capture Manual capture via API"]),
-            ("POST", "/api/debug/issues/close/2026/abc", #"{"resolution":"fixed"}"#, 200, #"{"a":"close"}"#,
+            ("POST", "/api/debug/issues", #"{"description":"portal hangs"}"#, 202, accepted, ["capture portal hangs"]),
+            ("POST", "/api/debug/issues", nil, 202, accepted, ["capture Manual capture via API"]),
+            ("POST", "/api/debug/issues/close/2026/abc", #"{"resolution":"fixed"}"#, 202, accepted,
              ["close 2026/abc fixed"]),
-            ("POST", "/api/debug/issues/close/abc", nil, 200, #"{"a":"close"}"#, ["close abc nil"]),
+            ("POST", "/api/debug/issues/close/abc", nil, 202, accepted, ["close abc nil"]),
             ("GET", "/api/profile", nil, 200, #"{"a":"profile"}"#, ["profile"]),
-            ("POST", "/api/profile/booking", nil, 200, ok, ["set-profile booking"]),
-            ("POST", "/api/profile/nonsense", nil, 400, #"{"ok":false,"error":"unknown profile"}"#,
-             ["set-profile nonsense"]),
+            ("POST", "/api/profile/booking", nil, 202, accepted, ["set-profile booking"]),
         ]
         for row in rows {
             let name = "\(row.method) \(row.path)"
@@ -370,6 +391,86 @@ final class ControlServerTests: XCTestCase {
             XCTAssertEqual(code, row.code, name)
             XCTAssertEqual(body, row.answer, name)
             XCTAssertEqual(calls.take(), row.calls, name)
+        }
+    }
+
+    /// A parameter or a body that the route cannot read is a 400, and runs nothing:
+    /// a body that is not JSON must never reset the database by default.
+    func testAMalformedRequestIsA400AndRunsNothing() async throws {
+        let calls = Recorder()
+        let (_, port) = try await startOnFreePort(actions: Self.recording(calls))
+        let rows: [(method: String, path: String, body: String?, error: String)] = [
+            ("POST", "/api/db-setup", "not json", "the body must be a JSON object"),
+            ("POST", "/api/db-setup", #"["reset"]"#, "the body must be a JSON object"),
+            ("POST", "/api/db-setup", #"{"profile":7}"#, "profile must be a string"),
+            ("GET", "/api/logs/travel-portal?lines=many", nil, "lines must be a positive number, not 'many'"),
+            ("GET", "/api/logs/travel-portal?lines=0", nil, "lines must be a positive number, not '0'"),
+            ("POST", "/api/restart/supabase?stack=maybe", nil, "stack must be 1 or 0, not 'maybe'"),
+            ("POST", "/api/debug/issues", "not json", "the body must be a JSON object"),
+            ("POST", "/api/debug/issues/close/abc", #"{"resolution":1}"#, "resolution must be a string"),
+        ]
+        for row in rows {
+            let name = "\(row.method) \(row.path) \(row.body ?? "")"
+            let (code, body) = try await request(row.method, row.path, body: row.body, port: port)
+            XCTAssertEqual(code, 400, name)
+            XCTAssertEqual(body, #"{"error":"\#(row.error)","ok":false}"#, name)
+            XCTAssertEqual(calls.take(), [], name)
+        }
+    }
+
+    /// Each refusal of an action has its status and a body that says why.
+    func testEachRefusalHasItsStatusAndReason() async throws {
+        let calls = Recorder()
+        let answers: [String: ControlResult] = [
+            "restart nope": .unknownService("nope", known: ["supabase", "travel-portal"]),
+            "restart travel-portal": .alreadyQueued("Booking Portal is already restarting."),
+            "clear-cache-restart travel-portal": .stackStopped,
+            "restart-cascade supabase": .stackStopping,
+            "start-all": .queuedAfterStop,
+            "toggle-lan": .alreadyQueued("A LAN mode change is already running."),
+            "toggle-db-mode": .refused("A start is in progress — wait for it to finish, or stop the stack, then switch."),
+            "db-setup nonsense": .unknownProfile("nonsense", known: ["fast", "reset"]),
+            "db-setup reset": .runActive(step: "Reset & Seed Data"),
+            "db-reset": .invalidScenario("Choose a valid seed scenario before resetting the database."),
+            "db-setup-step nope": .unknownStep("nope", known: ["load-hotels", "verify-data"]),
+            "db-setup-cancel": .refused("No database setup is running."),
+            "capture x": .refused("issue capture is off"),
+            "close gone nil": .notFound("issue not found"),
+            "set-profile nonsense": .unknownProfile("nonsense", known: ["booking", "partner", "both", "full"]),
+            "logs nope 50": .notFound("no log 'nope'"),
+        ]
+        let (_, port) = try await startOnFreePort(actions: Self.recording(calls, answer: { answers[$0] }))
+        let rows: [(method: String, path: String, body: String?, code: Int, answer: String)] = [
+            ("POST", "/api/restart/nope", nil, 404,
+             #"{"error":"unknown service 'nope'","known":["supabase","travel-portal"],"ok":false}"#),
+            ("POST", "/api/restart/travel-portal", nil, 409, #"{"error":"Booking Portal is already restarting.","ok":false}"#),
+            ("POST", "/api/clear-cache-restart/travel-portal", nil, 409,
+             #"{"error":"The stack is stopped. POST /api/start-all first.","ok":false}"#),
+            ("POST", "/api/restart-cascade/supabase", nil, 409,
+             #"{"error":"The stack is stopping. Wait for it to stop, then POST /api/start-all.","ok":false}"#),
+            ("POST", "/api/start-all", nil, 202, #"{"accepted":true,"ok":true,"state":"queued_after_stop"}"#),
+            ("POST", "/api/toggle-lan", nil, 409, #"{"error":"A LAN mode change is already running.","ok":false}"#),
+            ("POST", "/api/toggle-db-mode", nil, 409,
+             #"{"error":"A start is in progress — wait for it to finish, or stop the stack, then switch.","ok":false}"#),
+            ("POST", "/api/db-setup", #"{"profile":"nonsense"}"#, 400,
+             #"{"error":"unknown profile 'nonsense'","known_profiles":["fast","reset"],"ok":false}"#),
+            ("POST", "/api/db-setup", nil, 409, #"{"error":"a DB setup run is in progress (step: Reset & Seed Data)","ok":false}"#),
+            ("POST", "/api/db-reset", nil, 422,
+             #"{"error":"Choose a valid seed scenario before resetting the database.","ok":false}"#),
+            ("POST", "/api/db-setup/step/nope", nil, 404,
+             #"{"error":"unknown step 'nope'","known_steps":["load-hotels","verify-data"],"ok":false}"#),
+            ("POST", "/api/db-setup/cancel", nil, 409, #"{"error":"No database setup is running.","ok":false}"#),
+            ("POST", "/api/debug/issues", #"{"description":"x"}"#, 409, #"{"error":"issue capture is off","ok":false}"#),
+            ("POST", "/api/debug/issues/close/gone", nil, 404, #"{"error":"issue not found","ok":false}"#),
+            ("POST", "/api/profile/nonsense", nil, 400,
+             #"{"error":"unknown profile 'nonsense'","known_profiles":["booking","partner","both","full"],"ok":false}"#),
+            ("GET", "/api/logs/nope", nil, 404, #"{"error":"no log 'nope'","ok":false}"#),
+        ]
+        for row in rows {
+            let name = "\(row.method) \(row.path)"
+            let (code, body) = try await request(row.method, row.path, body: row.body, port: port)
+            XCTAssertEqual(code, row.code, name)
+            XCTAssertEqual(body, row.answer, name)
         }
     }
 
@@ -390,8 +491,9 @@ final class ControlServerTests: XCTestCase {
         ]
         for row in rows {
             let name = "\(row.method) \(row.path)"
-            let (code, _) = try await request(row.method, row.path, port: port)
-            XCTAssertNotEqual(code, 200, name)
+            let (code, body) = try await request(row.method, row.path, port: port)
+            XCTAssertEqual(code, 404, name)
+            XCTAssertTrue(body.hasPrefix(#"{"error":"no route "#), "\(name): \(body)")
             XCTAssertEqual(calls.take(), [], name)
         }
     }

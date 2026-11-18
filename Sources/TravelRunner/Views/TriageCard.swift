@@ -104,7 +104,7 @@ struct TriageCard: View {
                     }
 
                     Button(action: onCascadeRestart) {
-                        Label("Cascade", systemImage: "arrow.clockwise.circle")
+                        Label("Restart with dependents", systemImage: "arrow.clockwise.circle")
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.mini)

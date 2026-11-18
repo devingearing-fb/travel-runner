@@ -163,37 +163,192 @@ final class WatcherTests: XCTestCase {
         XCTAssertEqual(fresh, [])
     }
 
-    func testServicesInOneRepositoryShareOneRootAndBranch() async throws {
-        let repo = root.appendingPathComponent("mono")
-        let app = repo.appendingPathComponent("apps/booking-portal")
-        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
-        try git(["init", "-q", "-b", "dev", repo.path])
-        try git(["-C", repo.path, "commit", "-q", "--allow-empty", "-m", "init"])
+    // MARK: - Branch watcher
 
-        let watcher = GitBranchWatcher(repos: ["supabase": repo.path, "travel-portal": app.path])
+    /// A git that a test drives: one repo, its branch, its commit and its git folder.
+    private final class FakeGit: @unchecked Sendable {
+        private let lock = NSLock()
+        let gitDir: URL
+        private var _branch: String? = "dev"
+        private var _commit = "aaaaaaaa1111"
+        private var _diff: CommandResult = FakeCommandRunner.ok("")
+        private var _fetch: CommandResult = FakeCommandRunner.ok()
+
+        init(gitDir: URL) { self.gitDir = gitDir }
+
+        var branch: String? {
+            get { lock.lock(); defer { lock.unlock() }; return _branch }
+            set { lock.lock(); _branch = newValue; lock.unlock() }
+        }
+        var commit: String {
+            get { lock.lock(); defer { lock.unlock() }; return _commit }
+            set { lock.lock(); _commit = newValue; lock.unlock() }
+        }
+        var diff: CommandResult {
+            get { lock.lock(); defer { lock.unlock() }; return _diff }
+            set { lock.lock(); _diff = newValue; lock.unlock() }
+        }
+        var fetch: CommandResult {
+            get { lock.lock(); defer { lock.unlock() }; return _fetch }
+            set { lock.lock(); _fetch = newValue; lock.unlock() }
+        }
+
+        func runner(root: String) -> FakeCommandRunner {
+            FakeCommandRunner { call in
+                let command = call.command
+                if command.contains("--show-toplevel") { return FakeCommandRunner.ok(root + "\n") }
+                if command.contains("--absolute-git-dir") {
+                    return FakeCommandRunner.ok("\(self.gitDir.path)\n\(self.commit)\n")
+                }
+                if command.contains("symbolic-ref") {
+                    return self.branch.map { FakeCommandRunner.ok($0 + "\n") } ?? FakeCommandRunner.failed(1)
+                }
+                if command.contains("diff --name-only") { return self.diff }
+                if command.contains(" fetch ") { return self.fetch }
+                if command.contains("rev-list") { return FakeCommandRunner.ok("3\n") }
+                return FakeCommandRunner.failed(128)
+            }
+        }
+    }
+
+    /// A watcher of one repo that the monorepo's supabase and booking portal share.
+    private func branchWatcher(clock: RunnerClock = .live) async throws -> (GitBranchWatcher, FakeGit, FakeCommandRunner) {
+        let gitDir = root.appendingPathComponent("mono/.git")
+        try FileManager.default.createDirectory(at: gitDir, withIntermediateDirectories: true)
+        let git = FakeGit(gitDir: gitDir)
+        let shell = git.runner(root: root.appendingPathComponent("mono").path)
+        let roots = await GitBranchWatcher.resolveRoots(
+            repos: ["supabase": root.appendingPathComponent("mono").path,
+                    "travel-portal": root.appendingPathComponent("mono/apps/booking-portal").path],
+            shell: shell
+        )
+        return (GitBranchWatcher(roots: roots, shell: shell, clock: clock), git, shell)
+    }
+
+    func testServicesInOneRepositoryShareOneRootAndBranch() async throws {
+        let (watcher, _, _) = try await branchWatcher()
         XCTAssertEqual(Set(watcher.repoRoots.values).count, 1)
         _ = await watcher.check()
         let branches = await watcher.branches
         XCTAssertEqual(branches["supabase"], "dev")
         XCTAssertEqual(branches["travel-portal"], "dev")
-
-        try git(["-C", repo.path, "checkout", "-q", "-b", "feature"])
-        let changed = await watcher.check()
-        XCTAssertEqual(changed, ["supabase", "travel-portal"])
     }
 
-    func testBranchIsReadInsideAWorktree() async throws {
-        let repo = root.appendingPathComponent("mono")
-        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
-        try git(["init", "-q", "-b", "dev", repo.path])
-        try git(["-C", repo.path, "commit", "-q", "--allow-empty", "-m", "init"])
-        let worktree = root.appendingPathComponent("mono-wt")
-        try git(["-C", repo.path, "worktree", "add", "-q", "-b", "wt-branch", worktree.path])
-
-        let watcher = GitBranchWatcher(repos: ["travel-portal": worktree.path])
+    /// One poll that sees a new branch reports nothing; the next one that agrees
+    /// reports it once, for every service of the repo, with the files that changed.
+    func testAChangeCountsOnlyWhenTwoPollsAgree() async throws {
+        let (watcher, git, _) = try await branchWatcher()
         _ = await watcher.check()
-        let branches = await watcher.branches
-        XCTAssertEqual(branches["travel-portal"], "wt-branch")
+
+        git.branch = "feature"
+        git.commit = "bbbbbbbb2222"
+        git.diff = FakeCommandRunner.ok("apps/booking-portal/src/page.tsx\n")
+        let first = await watcher.check()
+        XCTAssertEqual(first, [])
+        let second = await watcher.check()
+        XCTAssertEqual(second, [GitBranchWatcher.Change(
+            serviceIDs: ["supabase", "travel-portal"], branch: "feature",
+            changedFiles: ["apps/booking-portal/src/page.tsx"]
+        )])
+        let third = await watcher.check()
+        XCTAssertEqual(third, [], "a change is reported once")
+
+        // A branch that one poll saw and the next did not is no change.
+        git.branch = "other"
+        _ = await watcher.check()
+        git.branch = "feature"
+        let back = await watcher.check()
+        XCTAssertEqual(back, [])
+    }
+
+    /// A rebase, merge, cherry-pick, revert or bisect moves HEAD step by step, and
+    /// a detached HEAD is no branch: none of them is a change. The display still
+    /// follows HEAD.
+    func testNoChangeDuringAGitOperationOrOnADetachedHead() async throws {
+        let (watcher, git, _) = try await branchWatcher()
+        _ = await watcher.check()
+
+        for marker in GitBranchWatcher.busyMarkers {
+            let path = git.gitDir.appendingPathComponent(marker)
+            FileManager.default.createFile(atPath: path.path, contents: nil)
+            git.branch = "rebase-step-\(marker)"
+            let during = [await watcher.check(), await watcher.check()]
+            XCTAssertEqual(during, [[], []], marker)
+            try FileManager.default.removeItem(at: path)
+            git.branch = "dev"
+            let after = await watcher.check()
+            XCTAssertEqual(after, [], marker)
+        }
+
+        git.branch = nil
+        git.commit = "cccccccc3333"
+        let detached = [await watcher.check(), await watcher.check()]
+        XCTAssertEqual(detached, [[], []])
+        let shown = await watcher.branches
+        XCTAssertEqual(shown["travel-portal"], "cccccccc")
+
+        // Control: the same switch with no marker and on a branch is a change.
+        git.branch = "feature"
+        _ = await watcher.check()
+        let change = await watcher.check()
+        XCTAssertEqual(change.map(\.branch), ["feature"])
+    }
+
+    /// Only packages, a lockfile, the Next config or an env file restart a dev
+    /// server. A diff that git cannot give restarts, to be safe.
+    func testOnlyPackageConfigAndEnvChangesNeedARestart() {
+        for path in ["package.json", "apps/booking-portal/package.json", "pnpm-lock.yaml", "package-lock.json",
+                     "apps/partner-portal/next.config.ts", "next.config.mjs", "apps/booking-portal/.env",
+                     ".env.example", "pnpm-workspace.yaml"] {
+            XCTAssertTrue(GitBranchWatcher.needsRestart(path), path)
+        }
+        for path in ["apps/booking-portal/src/app/page.tsx", "packages/travel-data/src/index.ts", "README.md",
+                     "supabase/migrations/20261101_a.sql", "environment.ts"] {
+            XCTAssertFalse(GitBranchWatcher.needsRestart(path), path)
+        }
+        func change(_ files: [String]?) -> GitBranchWatcher.Change {
+            GitBranchWatcher.Change(serviceIDs: ["travel-portal"], branch: "x", changedFiles: files)
+        }
+        XCTAssertFalse(change(["src/a.ts", "README.md"]).needsRestart)
+        XCTAssertTrue(change(["src/a.ts", "pnpm-lock.yaml"]).needsRestart)
+        XCTAssertTrue(change(nil).needsRestart)
+        XCTAssertFalse(change([]).needsRestart)
+    }
+
+    /// The fetch has a 20 s limit and never prompts. A failure leaves the tooltip
+    /// with its time, and the next fetch waits longer; a success clears both.
+    func testAFetchIsBoundedAndBacksOffAfterAFailure() async throws {
+        let time = FakeClock()
+        let (watcher, git, shell) = try await branchWatcher(clock: time.manual)
+        func fetches() -> [FakeCommandRunner.Call] { shell.calls.filter { $0.command.contains(" fetch ") } }
+
+        git.fetch = FakeCommandRunner.timedOut
+        await watcher.fetchAndCount(fetchInterval: 0)
+        XCTAssertEqual(fetches().count, 1)
+        XCTAssertEqual(fetches().first?.timeout, .seconds(20))
+        XCTAssertEqual(fetches().first?.environment["GIT_TERMINAL_PROMPT"], "0")
+        let failures = await watcher.fetchFailures
+        XCTAssertEqual(failures["travel-portal"], GitBranchWatcher.fetchFailedText(at: time.now))
+        let behind = await watcher.behindCounts
+        XCTAssertEqual(behind["travel-portal"], 3, "the count still comes from the last fetch")
+
+        // A forced fetch right after the failure waits for its backoff.
+        await watcher.fetchAndCount(fetchInterval: 0)
+        XCTAssertEqual(fetches().count, 1)
+        time.advance(by: .seconds(121))
+        git.fetch = FakeCommandRunner.ok()
+        await watcher.fetchAndCount(fetchInterval: 0)
+        XCTAssertEqual(fetches().count, 2)
+        let cleared = await watcher.fetchFailures
+        XCTAssertEqual(cleared, [:])
+
+        XCTAssertEqual(
+            GitBranchWatcher.fetchFailedText(
+                at: Date(timeIntervalSince1970: 1_800_021_720),  // 14:02 UTC
+                timeZone: TimeZone(identifier: "UTC")!
+            ),
+            "fetch failed 14:02 (remote not reachable)"
+        )
     }
 
     private func date(_ offset: TimeInterval) -> Date {
@@ -210,20 +365,5 @@ final class WatcherTests: XCTestCase {
     private func write(_ text: String, to url: URL, at date: Date) throws {
         try Data(text.utf8).write(to: url)
         try FileManager.default.setAttributes([.modificationDate: date], ofItemAtPath: url.path)
-    }
-
-    private func git(_ arguments: [String]) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.environment = ProcessInfo.processInfo.environment.merging([
-            "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
-            "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com",
-        ]) { $1 }
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        process.waitUntilExit()
-        XCTAssertEqual(process.terminationStatus, 0, arguments.joined(separator: " "))
     }
 }

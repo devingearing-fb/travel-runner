@@ -438,7 +438,8 @@ final class StripeSupportTests: XCTestCase {
             (.afterWake, "Reconnecting Stripe after wake…", [], true),
             (.unverified, "Stripe could not be checked — the runner tries again.", [], true),
             (.didNotConnect(seconds: 25), "Stripe did not connect within 25s — webhooks are off.", [.startService], false),
-            (.crashedTwice, "Stripe CLI crashed twice (see log) — webhooks are off.", [.startService, .openLog], false),
+            (.keptCrashing(restarts: 2), "Stripe CLI kept crashing after 2 restarts (see log) — webhooks are off.", [.startService, .openLog], false),
+            (.keptCrashing(restarts: 1), "Stripe CLI kept crashing after 1 restart (see log) — webhooks are off.", [.startService, .openLog], false),
         ]
         for row in rows {
             XCTAssertEqual(row.reason.headline, row.text)

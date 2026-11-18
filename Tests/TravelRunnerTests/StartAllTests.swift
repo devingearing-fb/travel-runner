@@ -60,6 +60,8 @@ final class StartAllTests: XCTestCase {
         var webFolder = "web"
         var tables = DbQueryResult(exitCode: 0, stdout: "42", stderr: "")
         var applied: Set<String> = []
+        /// The keys that `local-db.sh status -o env` gives. Made up: a portal needs some.
+        var stackKeys = ""
     }
 
     private func daemon(_ id: String, cwd: String, phase: String, dependsOn: [String] = []) -> ServiceDefinition {
@@ -70,7 +72,10 @@ final class StartAllTests: XCTestCase {
     }
 
     /// A supervisor with the fakes of `setup`, after its Start All has ended.
-    private func startAll(_ setup: Setup) async throws -> (run: Run, shell: FakeCommandRunner) {
+    /// `services` replaces the stand-in for Supabase and the service that needs it.
+    private func startAll(
+        _ setup: Setup, services: [ServiceDefinition]? = nil, profile: RunProfile = .full
+    ) async throws -> (run: Run, shell: FakeCommandRunner) {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: "StartAllTests-\(UUID().uuidString)"))
         supervisor = EnvironmentSupervisor(
             userDefaults: defaults, tools: .shared,
@@ -82,9 +87,10 @@ final class StartAllTests: XCTestCase {
         supervisor.secretRegistryPorts = 0...0
         let siblingServices = setup.siblingServices
         supervisor.siblingActiveServices = { siblingServices }
-        let (node, docker) = (setup.node, setup.dockerAnswers)
+        let (node, docker, keys) = (setup.node, setup.dockerAnswers, setup.stackKeys)
         let shell = FakeCommandRunner { call in
             if call.command == "node --version" { return node }
+            if call.command.contains("local-db.sh status -o env") { return FakeCommandRunner.ok(keys) }
             if call.command.hasPrefix("docker ps") { return docker ? FakeCommandRunner.ok() : FakeCommandRunner.failed(1) }
             return FakeCommandRunner.ok()
         }
@@ -107,10 +113,10 @@ final class StartAllTests: XCTestCase {
         // The wait for a runtime that does not come up takes no real time.
         if !setup.dockerAnswers { supervisor.clock = FakeClock().clock }
 
-        try supervisor.loadServices([
+        try supervisor.loadServices(services ?? [
             daemon("supabase", cwd: monorepo.path, phase: "ground"),
             daemon("web", cwd: container.appendingPathComponent(setup.webFolder).path, phase: "portal", dependsOn: ["supabase"]),
-        ])
+        ], profile: profile)
         supervisor.startAll()
         let ended = await waitUntil(30) {
             self.supervisor.currentPhase == .running
@@ -207,6 +213,63 @@ final class StartAllTests: XCTestCase {
             }
             await stop()
         }
+    }
+
+    // MARK: - Profiles
+
+    /// A profile change while the stack runs changes nothing until the next start
+    /// or "Apply now". Apply now stops the services that left the profile and starts
+    /// the ones that joined it; the services of both profiles keep their process.
+    func testAProfileChangeWhileRunningAppliesWithApplyNow() async throws {
+        let web = container.appendingPathComponent("web").path
+        let services = [
+            daemon("supabase", cwd: monorepo.path, phase: "ground"),
+            daemon("travel-portal", cwd: web, phase: "portal", dependsOn: ["supabase"]),
+            daemon("partner-portal", cwd: web, phase: "portal", dependsOn: ["supabase"]),
+        ]
+        let keys = "ANON_KEY=test-anon\nSERVICE_ROLE_KEY=test-service-role\nJWT_SECRET=test-jwt-secret\n"
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: keys), services: services, profile: .both)
+        var saved: [RunProfile] = []
+        supervisor.saveProfile = { saved.append($0) }
+        var feedback: [String] = []
+        supervisor.onFeedback = { feedback.append($0.message) }
+        func phase(_ id: String) -> ServicePhase? { supervisor.serviceStates[id]?.phase }
+        XCTAssertEqual(phase("partner-portal"), .running, supervisor.lastError ?? "")
+        let portalPid = try XCTUnwrap(supervisor.serviceStates["travel-portal"]?.pid)
+        let partnerPid = try XCTUnwrap(supervisor.serviceStates["partner-portal"]?.pid)
+
+        supervisor.setProfile(.booking)
+        XCTAssertEqual(saved, [.booking])
+        XCTAssertTrue(supervisor.profileApplyPending)
+        XCTAssertEqual(feedback, [EnvironmentSupervisor.profileSavedText])
+        XCTAssertEqual(phase("partner-portal"), .running, "nothing changes before Apply now")
+
+        supervisor.applyProfileNow()
+        XCTAssertFalse(supervisor.profileApplyPending)
+        let left = await waitUntil(30) {
+            [.stopped, .skipped].contains(phase("partner-portal")) && !supervisor.startRunning
+                && supervisor.currentPhase == .running
+        }
+        XCTAssertTrue(left, "partner-portal is \(String(describing: phase("partner-portal")))")
+        let gone = await waitUntil(10) { kill(partnerPid, 0) != 0 }
+        XCTAssertTrue(gone, "the partner portal's process still runs")
+        XCTAssertEqual(supervisor.serviceStates["travel-portal"]?.pid, portalPid)
+
+        // Back to both: the partner portal starts again, the booking portal stays.
+        supervisor.setProfile(.both)
+        supervisor.applyProfileNow()
+        let joined = await waitUntil(30) {
+            phase("partner-portal") == .running && !supervisor.startRunning && supervisor.currentPhase == .running
+        }
+        XCTAssertTrue(joined, "partner-portal is \(String(describing: phase("partner-portal")))")
+        XCTAssertEqual(supervisor.serviceStates["travel-portal"]?.pid, portalPid)
+
+        // A stopped stack takes a new profile at once: no Apply now.
+        await stop()
+        feedback = []
+        supervisor.setProfile(.partner)
+        XCTAssertFalse(supervisor.profileApplyPending)
+        XCTAssertEqual(feedback, ["Profile: Partner"])
     }
 
     // MARK: - Starts that run

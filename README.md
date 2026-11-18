@@ -104,8 +104,13 @@ When running, travel-runner exposes an HTTP API on `http://localhost:19900` (it 
 |--------|----------|-------------|
 | `GET` | `/api/status` | All service statuses, health, LAN mode, profile, DB mode, git branches, `app` (`standard` or `hackathon`), and `configured` (false until a `services.json` loads) |
 | `GET` | `/api/preflight` | Runs the start checks that change nothing (the fast setup checks of Health, ports, folders) and gives each result |
-| `GET` | `/api/logs/{serviceId}?lines=N` | Last N log lines (default 50) |
-| `POST` | `/api/restart/{serviceId}` | Restart a service |
+| `GET` | `/api/health` | Health and its reason |
+| `GET` | `/api/services` | Each service with its phase, reason and fix |
+| `GET` | `/api/diagnostics` | The diagnostics snapshot of an issue, secrets masked |
+| `GET` | `/api/events` | The events that made no issue (`events.jsonl`) |
+| `GET` | `/api/logs` | The log ids, with each DB step as `db-setup-<stepId>` |
+| `GET` | `/api/logs/{id}?lines=N` | Last N log lines (default 50) of a service or a DB step |
+| `POST` | `/api/restart/{serviceId}` | Restart a service; for `supabase`, `?stack=1` stops and starts the containers too |
 | `POST` | `/api/restart-cascade/{serviceId}` | Restart a service and its dependents |
 | `POST` | `/api/clear-cache-restart/{serviceId}` | Clear `.next` cache + restart (`travel-portal`, `partner-portal`) |
 | `POST` | `/api/start-all` | Start the active profile's services |
@@ -123,6 +128,8 @@ When running, travel-runner exposes an HTTP API on `http://localhost:19900` (it 
 | `GET` | `/api/debug/issues` | List open debug-tracking issues |
 | `POST` | `/api/debug/issues` | Capture an issue; body `{"description": "..."}` |
 | `POST` | `/api/debug/issues/close/{id}` | Close an issue; optional body `{"resolution": "..."}` |
+
+An action answers `202` when it was accepted, `400` for a parameter or body it cannot read, `404` for an unknown service, step or route, `409` when it cannot run now (with the reason in `error`), and `422` for a reset with no valid seed scenario. `.claude/skills/travel-runner-api/SKILL.md` has the full table.
 
 The API listens from launch, also before the setup wizard has saved a config.
 

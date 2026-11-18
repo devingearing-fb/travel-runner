@@ -20,6 +20,21 @@ curl -sf http://localhost:19900/api/status > /dev/null && echo "running" || echo
 
 If it's not running, the user needs to launch the TravelRunner.app manually.
 
+## Answers
+
+Every route answers JSON. A route never says ok when nothing ran:
+
+| Status | When | Body |
+|---|---|---|
+| 200 | A read, or a change that is done before the answer (`/api/profile/{name}`, closing an issue) | the data, or `{"ok":true}` |
+| 202 | The action runs now, or after the stack operation before it | `{"accepted":true,"ok":true}`; Start All during a stop adds `"state":"queued_after_stop"` |
+| 400 | A parameter or a body the route cannot read (`?lines=many`, a body that is not a JSON object), or an unknown profile | `{"error":"…","ok":false}`; an unknown profile adds `known_profiles` |
+| 404 | No such service, step, issue, log or route | `{"error":"unknown service 'x'","known":[…],"ok":false}`; a step has `known_steps` |
+| 409 | The action cannot run now: the stack is stopped or stopping, the same action is queued, a start runs, a DB setup runs (`"a DB setup run is in progress (step: <name>)"`), a database switch is refused, issue capture is off, or the runner is too old for the checkout (`runner_too_old`) | `{"error":"…","ok":false}` |
+| 422 | A reset with no valid seed scenario | `{"error":"…","ok":false}` |
+
+Read `error` and act on it: a 409 for a stopped stack says `POST /api/start-all first`.
+
 ## Endpoints
 
 ### GET /api/status
@@ -73,6 +88,24 @@ curl -s http://localhost:19900/api/status | python3 -m json.tool
 | `DEGRADED` | One or more services failed | Check logs for the failed service, restart it |
 | `STOPPED` | All services stopped | Call start-all |
 
+`health_reason` is there when the health has a reason: the failed service and its headline, the services that are off ("OK · Stripe webhooks off"), or a refused start ("Not started — 2 checks failed").
+
+### GET /api/health
+
+Only the health and its reason: `{"health":"DEGRADED","health_reason":"Booking Portal failed: …"}`.
+
+### GET /api/services
+
+Each service in start order: `id`, `name`, `phase`, `pid`, `in_profile`, and when there is one, `reason` (why it failed), `skip_reason`, `likely_cause`, `last_probe` and `action` (the fix button).
+
+### GET /api/diagnostics
+
+The diagnostics snapshot that an issue saves (`diagnostics.json`): app version and build, macOS, the tools, profile, DB mode, preflight results, the DB pipeline, pending migrations, repo paths with `~`, and each service. Secrets are masked. It takes a few seconds: it reads the tools.
+
+### GET /api/events
+
+The events of `events.jsonl` that make no issue (Stripe skips, outside kills, breaker trips, DB resets), oldest first. `[]` while issue capture is off.
+
 **Phase values per service:**
 
 | Phase | Meaning |
@@ -86,9 +119,13 @@ curl -s http://localhost:19900/api/status | python3 -m json.tool
 | `PENDING` | Queued, dependencies not yet ready |
 | `SKIPPED` | Not in the active profile (or skipped) — not started |
 
-### GET /api/logs/{serviceId}?lines=N
+### GET /api/logs
 
-Returns the last N log lines (default 50) for a service. Each line includes which output stream it came from and the raw text.
+The ids that `/api/logs/{id}` reads: `{"ids":["supabase",…,"db-setup-load-hotels","runner"]}`. A DB step's log is `db-setup-<stepId>`.
+
+### GET /api/logs/{id}?lines=N
+
+Returns the last N log lines (default 50) of a service or a DB step (`db-setup-<stepId>`), with secrets masked. Each line includes which output stream it came from and the text. `lines` must be a positive number (else 400); an id with no log is a 404.
 
 ```bash
 curl -s "http://localhost:19900/api/logs/travel-portal?lines=100" | python3 -m json.tool
@@ -146,7 +183,9 @@ Stops the service process, waits briefly, restarts it, and waits for its health 
 curl -s -X POST http://localhost:19900/api/restart/travel-portal
 ```
 
-Response: `{"ok": true}` — returns immediately; restart happens async.
+Response: 202 `{"accepted":true,"ok":true}` — the restart runs after the answer. 404 for an unknown service (with `known`), 409 when the stack is stopped or stopping, or the same restart already waits.
+
+For `supabase` the restart only starts what is down; the containers keep running. `POST /api/restart/supabase?stack=1` stops and starts the Supabase containers (the data stays; about a minute with the database down under the running portals). The panel asks before it does this; the API does not, so use it only when the stack is broken.
 
 ### POST /api/clear-cache-restart/{serviceId}
 
@@ -156,7 +195,7 @@ Deletes the `.next/` cache directory in the service's directory then restarts. U
 curl -s -X POST http://localhost:19900/api/clear-cache-restart/travel-portal
 ```
 
-This is the **nuclear option** for Next.js weirdness. First cold compile after clearing takes 8-12 seconds.
+This is the **nuclear option** for Next.js weirdness. First cold compile after clearing takes 8-12 seconds. Answers like `/api/restart`.
 
 ### POST /api/start-all
 
@@ -166,7 +205,7 @@ Starts the active profile's service DAG from scratch: preflight checks, then gro
 curl -s -X POST http://localhost:19900/api/start-all
 ```
 
-Only works when health is `STOPPED`. If already running, this is a no-op.
+A start that is already running answers 409. A start during Stop All waits for the stop and answers 202 with `"state":"queued_after_stop"`. On a stack that runs, Start All restarts everything.
 
 ### POST /api/stop-all
 
@@ -197,7 +236,7 @@ Restarts a service AND all its dependents in topological order. Stops dependents
 curl -s -X POST http://localhost:19900/api/restart-cascade/universal-login
 ```
 
-Response: `{"ok": true}` — cascade runs async.
+Response: 202 — the restart runs after the answer; refusals as for `/api/restart`. The panel calls this "Restart with dependents".
 
 ### GET /api/profile
 
@@ -230,17 +269,17 @@ Custom services from `services.json` join a profile when all their dependencies 
 
 ### POST /api/profile/{booking|partner|both|full}
 
-Sets the run profile (saved to `~/.config/travel-runner/services.json`). It does not start or stop anything by itself: the next `start-all` brings up the new profile's services, and services outside it show phase `SKIPPED`.
+Sets the run profile (saved to `~/.config/travel-runner/services.json`). It does not start or stop anything by itself: the next `start-all` brings up the new profile's services, and services outside it show phase `SKIPPED`. While the stack runs, the app says "Profile saved — applies on the next start." and offers **Apply now**, which stops the services that left the profile and starts the ones that joined it.
 
 ```bash
 curl -s -X POST http://localhost:19900/api/profile/partner
 ```
 
-Response: `{"ok":true}`; an unknown profile name returns 400 `{"ok":false,"error":"unknown profile"}`.
+Response: 200 `{"ok":true}`; an unknown profile name returns 400 with `known_profiles`.
 
 ### POST /api/toggle-db-mode
 
-Toggles between local Supabase (localhost:54321) and the hosted dev database. Rewrites the runner-managed block in each app's `.env.local` (and universal-login's env), then restarts travel-portal, universal-login (and partner-portal when it is in the profile). Only allowed when health is `HEALTHY` or `STOPPED`.
+Toggles between local Supabase (localhost:54321) and the hosted dev database. Rewrites the runner-managed block in each app's `.env.local` (and universal-login's env), then restarts travel-portal, universal-login (and partner-portal when it is in the profile). Allowed when the stack is stopped, healthy or degraded; during a start, a stop or another switch it answers 409 with the reason. The API does not ask before a switch to the shared dev data.
 
 ```bash
 curl -s -X POST http://localhost:19900/api/toggle-db-mode
@@ -284,11 +323,15 @@ curl -s -X POST http://localhost:19900/api/db-setup \
   -d '{"profile": "migrate"}'
 ```
 
-**Profiles:** `full` (all steps), `reset` (skip event contracts), `fast` (skip hotels + contracts), `migrate` (apply migrations only, never resets). A profile the branch's manifest does not define runs nothing.
+**Profiles:** `full` (all steps), `reset` (skip event contracts), `fast` (skip hotels + contracts), `migrate` (apply migrations only, never resets). A profile the branch's manifest does not define runs nothing and answers 400 with `known_profiles`.
+
+No body, or `{}`, runs `reset`. A body that is not a JSON object, or a `profile` that is not a string, answers 400 and runs nothing. A DB setup that already runs answers 409 (`"a DB setup run is in progress (step: <name>)"`); no valid seed scenario answers 422. Accepted runs answer 202; follow them with `GET /api/db-setup/status`.
+
+**After a reset** a step can ask for services to restart (`##db:restart:` in `scripts/db/README.md`): when Sequin's replication slot is gone, the runner restarts `stream-db-setup`, then `stream-sequin`, if they run, once the run has passed.
 
 ### POST /api/db-setup/retry/{stepId}
 
-Re-run the database setup pipeline from a specific step. Steps before the retry point keep their previous status.
+Re-run the database setup pipeline from a specific step. Steps before the retry point keep their previous status. An id that neither the shown pipeline nor the `reset` profile has answers 404 with `known_steps`.
 
 ```bash
 curl -s -X POST http://localhost:19900/api/db-setup/retry/load-hotels
@@ -298,7 +341,7 @@ curl -s -X POST http://localhost:19900/api/db-setup/retry/load-hotels
 
 ### POST /api/db-setup/cancel
 
-Cancel a running database setup pipeline. The step and its child processes are stopped (SIGTERM, then SIGKILL); `running` stays true until they are gone.
+Cancel a running database setup pipeline. The step and its child processes are stopped (SIGTERM, then SIGKILL); `running` stays true until they are gone. With nothing running it answers 409.
 
 ```bash
 curl -s -X POST http://localhost:19900/api/db-setup/cancel
@@ -336,7 +379,7 @@ Failed steps include `error` and `recovery` fields with diagnostic info; steps m
 
 ### POST /api/db-setup/step/{stepId}
 
-Run a single database setup step independently. Does NOT run the full pipeline — just executes the one step. Useful for re-running just hotel load or just verification.
+Run a single database setup step independently. Does NOT run the full pipeline — just executes the one step. Useful for re-running just hotel load or just verification. The step can be from any profile of the manifest, also one the last run did not have (`load-hotels` after a `fast` run). An unknown id answers 404 with `known_steps`.
 
 ```bash
 # Re-run just the hotel data load
@@ -376,7 +419,7 @@ When the service's output shows the cause, `summary` ends with ` — <likely cau
 
 ### POST /api/debug/issues
 
-Manually capture a debug issue. The system auto-captures most errors, but use this for issues the auto-capture missed. The only body field is `description`. Response: `{"ok":true}` (capture is async; the ID is not returned).
+Manually capture a debug issue. The system auto-captures most errors, but use this for issues the auto-capture missed. The only body field is `description`. Response: 202 (capture is async; the ID is not returned); 409 `issue capture is off` when capture is off; 400 for a body that is not a JSON object.
 
 ```bash
 curl -s -X POST http://localhost:19900/api/debug/issues \
@@ -386,7 +429,7 @@ curl -s -X POST http://localhost:19900/api/debug/issues \
 
 ### POST /api/debug/issues/close/{id}
 
-Close a debug issue after fixing it. Moves from `open/` to `closed/`. Body is optional (`resolution` defaults to `"Closed via API"`). Response: `{"ok":true}` or `{"ok":false,"error":"issue not found"}`.
+Close a debug issue after fixing it. Moves from `open/` to `closed/`. Body is optional (`resolution` defaults to `"Closed via API"`). Response: 200 `{"ok":true}`, 404 `{"error":"issue not found","ok":false}`, or 409 when capture is off.
 
 ```bash
 curl -s -X POST "http://localhost:19900/api/debug/issues/close/20260513T143022_service-crash-travel-portal" \
@@ -434,7 +477,7 @@ Shared code in `packages/travel-data` hot-reloads into both apps; there is nothi
 
 1. `GET /api/status` — identify which service has phase FAILED
 2. `GET /api/logs/{serviceId}?lines=100` — read the last output before crash
-3. `POST /api/restart/{serviceId}` — attempt restart
+3. `POST /api/restart/{serviceId}` — attempt restart (202 means it was accepted; read `/api/status` for the result). For `supabase` this starts what is down; `?stack=1` stops and starts the containers too
 4. If it fails again, check for port conflicts (`lsof -ti TCP:PORT -sTCP:LISTEN`; plain `lsof -ti :PORT` also lists the clients of the port, such as a browser — do not kill those)
 5. A service whose reason says "failed 3 times in a minute" or "did not come back after 5 restarts" stopped its automatic restarts. Fix the cause in its log, then `POST /api/restart/{serviceId}`. "Something else keeps stopping …" means another process kills it (SIGKILL often means low memory). "… is not running — waiting for it" means the container runtime is down; the service starts by itself when it is back (the wait lasts 10 minutes)
 
@@ -460,7 +503,7 @@ Same as above with `partner-portal` (port 3006). If it is `SKIPPED`, it is not i
 
 ### "Database won't reset"
 
-1. `POST /api/db-setup` — run the granular pipeline (shows per-step progress; `GET /api/db-setup/status` to monitor)
-2. If a step fails, check the UI for the specific error and recovery guidance
+1. `POST /api/db-setup` — run the granular pipeline (shows per-step progress; `GET /api/db-setup/status` to monitor; a 409 or 422 says why it did not run)
+2. If a step fails, read `error` and `recovery` in the status, and its log at `GET /api/logs/db-setup-<stepId>`
 3. Retry from the failed step: `POST /api/db-setup/retry/{stepId}`
 4. For a clean slate: `POST /api/db-setup` with `{"profile": "full"}`

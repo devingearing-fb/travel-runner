@@ -130,6 +130,12 @@ final class EnvironmentSupervisor {
     @ObservationIgnored private var healthCheckerPaths: RepoPaths?
     var gitBranches: [String: String] = [:]
     var gitBehindCounts: [String: Int] = [:]
+    /// The profile changed while the stack ran: it applies at the next start or with "Apply now".
+    var profileApplyPending = false
+    /// Saves the profile. Tests replace it, so they never write the real services.json.
+    @ObservationIgnored var saveProfile: (RunProfile) throws -> Void = { try ConfigLoader.saveProfile($0) }
+    /// The tooltip of a repo whose last fetch failed, by service.
+    var gitFetchFailures: [String: String] = [:]
     var behindBannerDismissed = false
     var npmStaleServices: Set<String> = []
     var dbMode: DatabaseMode = .local
@@ -487,6 +493,20 @@ final class EnvironmentSupervisor {
             case .running: 7
             }
         }
+
+        /// The plain name on the timeline pills and the Status sections.
+        var label: String {
+            switch self {
+            case .idle: "Idle"
+            case .preflight: "Checks"
+            case .ground: "Database"
+            case .gateway: "Gateway"
+            case .portal: "Portals"
+            case .stream: "Streams"
+            case .verification: "Verify"
+            case .running: "Running"
+            }
+        }
     }
 
     /// The texts use display names.
@@ -761,6 +781,7 @@ final class EnvironmentSupervisor {
         gitRepoRoots = [:]
         gitBranches = [:]
         gitBehindCounts = [:]
+        gitFetchFailures = [:]
         depsWatcherTask?.cancel()
         depsWatcherTask = nil
         dependencyWatcher = nil
@@ -774,10 +795,16 @@ final class EnvironmentSupervisor {
             }
         }
         if configHost.startsWatchers, !repoMap.isEmpty {
-            let watcher = GitBranchWatcher(repos: repoMap)
-            gitBranchWatcher = watcher
-            gitRepoRoots = watcher.repoRoots
-            gitWatcherTask = Task { await startGitBranchWatching(watcher: watcher) }
+            // git runs off the main thread, each command with a time limit.
+            let (shell, clock) = (shell, clock)
+            gitWatcherTask = Task { [weak self] in
+                let roots = await GitBranchWatcher.resolveRoots(repos: repoMap, shell: shell)
+                guard let self, !Task.isCancelled else { return }
+                let watcher = GitBranchWatcher(roots: roots, shell: shell, clock: clock)
+                self.gitBranchWatcher = watcher
+                self.gitRepoRoots = roots
+                await self.startGitBranchWatching(watcher: watcher)
+            }
         }
 
         // Initialize dependency (npm install) freshness watcher
@@ -873,6 +900,8 @@ final class EnvironmentSupervisor {
 
     /// The state of a new Start All.
     private func prepareStartAll() {
+        // The start uses the profile that is saved now.
+        profileApplyPending = false
         // A start that a person asks for begins a new failure series for each service.
         for serviceID in serviceStates.keys { clearFailureHistory(serviceID) }
         // This start takes over the services that wait for a dependency.
@@ -1145,7 +1174,9 @@ final class EnvironmentSupervisor {
         completedPhases.insert(phase)
     }
 
-    func stopAll() {
+    /// Stops the stack. The task ends when the stack is stopped.
+    @discardableResult
+    func stopAll() -> Task<Void, Never> {
         beginStopAll()
     }
 
@@ -1153,6 +1184,7 @@ final class EnvironmentSupervisor {
     @discardableResult
     private func beginStopAll() -> Task<Void, Never> {
         isShuttingDown = true
+        profileApplyPending = false
         stopAllCount += 1
         let stops = stopAllCount
         startTask?.cancel()
@@ -1354,124 +1386,295 @@ final class EnvironmentSupervisor {
         let logStore = self.logStore
         controlServer = configHost.controlServer()
         Task {
-            let failures = await controlServer?.start(
-                actions: ControlServer.Actions(
-                    getStatus: { [weak self] in
-                        guard let self else { return "{}" }
-                        return await MainActor.run { self.statusJSON() }
-                    },
-                    getPreflight: { [weak self] in
-                        guard let self else { return "{}" }
-                        return await self.preflightJSON()
-                    },
-                    getLogs: { [weak self] serviceId, lines in
-                        guard let self else { return "[]" }
-                        let entries = await self.logStore.entries(for: serviceId)
-                        let tail = entries.suffix(lines)
-                        let redactor = await MainActor.run { self.makeRedactor() }
-                        let lines = tail.map {
-                            ["stream": $0.stream == .stdout ? "stdout" : "stderr", "text": redactor.redact($0.text)]
-                        }
-                        if let data = try? JSONSerialization.data(withJSONObject: lines, options: []),
-                           let str = String(data: data, encoding: .utf8) { return str }
-                        return "[]"
-                    },
-                    restartService: { [weak self] serviceId in
-                        await MainActor.run { self?.restartService(serviceId, stopsStack: true) }
-                    },
-                    clearCacheRestart: { [weak self] serviceId in
-                        await MainActor.run { self?.clearCacheAndRestart(serviceId) }
-                    },
-                    startAll: { [weak self] in
-                        await MainActor.run { self?.startAll() }
-                    },
-                    stopAll: { [weak self] in
-                        await MainActor.run { self?.stopAll() }
-                    },
-                    toggleLan: { [weak self] in
-                        await MainActor.run { self?.toggleNetworkMode() }
-                    },
-                    restartCascade: { [weak self] serviceId in
-                        await MainActor.run { self?.restartCascade(serviceId) }
-                    },
-                    dbResetBlock: { [weak self] in
-                        await MainActor.run { self?.resetBlockJSON() }
-                    },
-                    dbReset: { [weak self] in
-                        await MainActor.run { self?.resetDatabase() }
-                    },
-                    dbSetupRun: { [weak self] profile in
-                        await MainActor.run { self?.runDbSetup(profile: profile) }
-                    },
-                    dbSetupRetry: { [weak self] stepId in
-                        await MainActor.run { self?.runDbSetup(from: stepId) }
-                    },
-                    dbSetupCancel: { [weak self] in
-                        await MainActor.run { self?.cancelDbSetup() }
-                    },
-                    dbSetupStatus: { [weak self] in
-                        await MainActor.run { self?.dbSetupStatusJSON() ?? "{}" }
-                    },
-                    dbSetupRunStep: { [weak self] stepId in
-                        await MainActor.run { self?.runDbSetupStep(stepId) }
-                    },
-                    debugListIssues: { [weak self] in
-                        guard let self, let tracker = await MainActor.run(body: { self.debugTracker }) else { return "[]" }
-                        let issues: [[String: String]] = await tracker.listOpenIssues()
-                        if let data = try? JSONSerialization.data(withJSONObject: issues, options: [.sortedKeys]),
-                           let str = String(data: data, encoding: .utf8) { return str }
-                        return "[]"
-                    },
-                    debugCapture: { [weak self] description in
-                        guard let self else { return "{\"ok\":false}" }
-                        await MainActor.run {
-                            Task { await self.captureDebugIssue(
-                                trigger: "manual",
-                                serviceID: nil,
-                                summary: description
-                            )}
-                        }
-                        return "{\"ok\":true}"
-                    },
-                    debugCloseIssue: { [weak self] id, resolution in
-                        guard let self, let tracker = await MainActor.run(body: { self.debugTracker }) else {
-                            return "{\"ok\":false,\"error\":\"debug tracking not enabled\"}"
-                        }
-                        let ok = await tracker.closeIssue(id: id, resolution: resolution ?? "Closed via API")
-                        if ok {
-                            let count = await tracker.openIssueCount()
-                            await MainActor.run { self.debugOpenIssueCount = count }
-                        }
-                        return ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"issue not found\"}"
-                    },
-                    toggleDbMode: { [weak self] in
-                        await MainActor.run {
-                            guard let self else { return }
-                            self.setDatabaseMode(self.dbMode == .local ? .remote : .local)
-                        }
-                    },
-                    getProfile: { [weak self] in
-                        guard let self else { return "{}" }
-                        let (name, members) = await MainActor.run { (self.profile.rawValue, self.profileMembers.sorted()) }
-                        let dict: [String: Any] = [
-                            "profile": name,
-                            "services": members,
-                            "available": RunProfile.allCases.map(\.rawValue),
-                        ]
-                        if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
-                           let str = String(data: data, encoding: .utf8) { return str }
-                        return "{}"
-                    },
-                    setProfile: { [weak self] name in
-                        guard let profile = RunProfile(rawValue: name) else { return false }
-                        await MainActor.run { self?.setProfile(profile) }
-                        return true
-                    }
-                ),
-                logStore: logStore
-            ) ?? []
+            let failures = await controlServer?.start(actions: controlActions(), logStore: logStore) ?? []
             controlAPIError = ControlServer.BindFailure.summary(failures)
         }
+    }
+
+    // MARK: - Control API
+
+    /// The actions of the control API. Each one checks what it can do now and
+    /// answers with what it did (`ControlResult`): a route never says ok when
+    /// nothing ran.
+    func controlActions() -> ControlServer.Actions {
+        ControlServer.Actions(
+            getStatus: { [weak self] in await self?.statusJSON() ?? "{}" },
+            getPreflight: { [weak self] in await self?.preflightJSON() ?? "{}" },
+            getHealth: { [weak self] in await self?.healthJSON() ?? "{}" },
+            getServices: { [weak self] in await self?.servicesJSON() ?? "[]" },
+            getDiagnostics: { [weak self] in await self?.diagnosticsJSON() ?? "{}" },
+            getEvents: { [weak self] in await self?.eventsJSON() ?? "[]" },
+            listLogs: { [weak self] in await self?.logIDsJSON() ?? "{}" },
+            getLogs: { [weak self] id, lines in await self?.apiLogs(id, lines: lines) ?? .notFound("no runner") },
+            restartService: { [weak self] id, stack in await self?.apiRestart(id, stopsStack: stack) ?? .accepted },
+            clearCacheRestart: { [weak self] id in await self?.apiClearCacheRestart(id) ?? .accepted },
+            startAll: { [weak self] in await self?.apiStartAll() ?? .accepted },
+            stopAll: { [weak self] in
+                await self?.stopAll()
+                return .accepted
+            },
+            toggleLan: { [weak self] in await self?.apiToggleLan() ?? .accepted },
+            restartCascade: { [weak self] id in await self?.apiRestartCascade(id) ?? .accepted },
+            dbResetBlock: { [weak self] in await self?.resetBlockJSON() },
+            dbReset: { [weak self] in await self?.apiRunDbSetup(profile: "reset") ?? .accepted },
+            dbSetupRun: { [weak self] profile in await self?.apiRunDbSetup(profile: profile) ?? .accepted },
+            dbSetupRetry: { [weak self] stepId in await self?.apiRetryDbSetup(from: stepId) ?? .accepted },
+            dbSetupCancel: { [weak self] in await self?.apiCancelDbSetup() ?? .accepted },
+            dbSetupStatus: { [weak self] in await self?.dbSetupStatusJSON() ?? "{}" },
+            dbSetupRunStep: { [weak self] stepId in await self?.apiRunDbSetupStep(stepId) ?? .accepted },
+            debugListIssues: { [weak self] in
+                guard let self, let tracker = await self.debugTracker else { return "[]" }
+                let issues: [[String: String]] = await tracker.listOpenIssues()
+                if let data = try? JSONSerialization.data(withJSONObject: issues, options: [.sortedKeys]),
+                   let str = String(data: data, encoding: .utf8) { return str }
+                return "[]"
+            },
+            debugCapture: { [weak self] description in await self?.apiCaptureIssue(description) ?? .accepted },
+            debugCloseIssue: { [weak self] id, resolution in
+                await self?.apiCloseIssue(id, resolution: resolution) ?? .notFound("issue not found")
+            },
+            toggleDbMode: { [weak self] in await self?.apiToggleDbMode() ?? .accepted },
+            getProfile: { [weak self] in
+                guard let self else { return "{}" }
+                let (name, members) = await (self.profile.rawValue, self.profileMembers.sorted())
+                let dict: [String: Any] = [
+                    "profile": name,
+                    "services": members,
+                    "available": RunProfile.allCases.map(\.rawValue),
+                ]
+                if let data = try? JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys]),
+                   let str = String(data: data, encoding: .utf8) { return str }
+                return "{}"
+            },
+            setProfile: { [weak self] name in await self?.apiSetProfile(name) ?? .done }
+        )
+    }
+
+    private static func jsonString(_ object: Any) -> String {
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]) else { return "{}" }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// `GET /api/health`: the four health strings and the reason.
+    func healthJSON() -> String {
+        var dict: [String: Any] = ["health": health.rawValue]
+        if let reason = healthSummary.reason { dict["health_reason"] = reason }
+        return Self.jsonString(dict)
+    }
+
+    /// `GET /api/services`: each service in start order, with its name, profile and reason.
+    func servicesJSON() -> String {
+        let rows: [[String: Any]] = sortedServiceIDs.compactMap { id in
+            guard let state = serviceStates[id] else { return nil }
+            var row: [String: Any] = Self.statusFields(state)
+            row["id"] = id
+            row["name"] = state.definition.displayName
+            row["in_profile"] = isInProfile(id)
+            if let action = state.condition?.action { row["action"] = "\(action)" }
+            return row
+        }
+        return Self.jsonString(rows)
+    }
+
+    /// `GET /api/diagnostics`: the snapshot of an issue, redacted.
+    func diagnosticsJSON() async -> String {
+        let snapshot = await diagnosticsSnapshot()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(snapshot) else { return "{}" }
+        return makeRedactor().redact(String(decoding: data, as: UTF8.self))
+    }
+
+    /// `GET /api/events`: the events of `events.jsonl`, oldest first. Empty while capture is off.
+    func eventsJSON() async -> String {
+        guard let tracker = debugTracker else { return "[]" }
+        let events = await tracker.listEvents()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(events) else { return "[]" }
+        return makeRedactor().redact(String(decoding: data, as: UTF8.self))
+    }
+
+    /// The log ids: each service, then each id with lines in the store (DB steps).
+    private func logIDs() async -> [String] {
+        let stored = await logStore.serviceIDs()
+        return sortedServiceIDs + stored.filter { !sortedServiceIDs.contains($0) }.sorted()
+    }
+
+    /// `GET /api/logs`: the ids that `/api/logs/<id>` reads.
+    func logIDsJSON() async -> String {
+        Self.jsonString(["ids": await logIDs()])
+    }
+
+    /// `GET /api/logs/<id>`: the last lines, redacted. An id with no service and no lines is a 404.
+    func apiLogs(_ id: String, lines: Int) async -> ControlResult {
+        let known = await logIDs()
+        guard known.contains(id) else { return .notFound("no log '\(id)'; known: \(known.joined(separator: ", "))") }
+        let entries = await logStore.entries(for: id).suffix(lines)
+        let redactor = makeRedactor()
+        let rows = entries.map {
+            ["stream": $0.stream == .stdout ? "stdout" : "stderr", "text": redactor.redact($0.text)]
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: rows, options: []) else { return .json("[]") }
+        return .json(String(decoding: data, as: UTF8.self))
+    }
+
+    /// Why an action on one service cannot run now, or nil. `queued` holds the
+    /// services whose same action already waits.
+    private func serviceActionRefusal(_ serviceID: String, queued: Bool) -> ControlResult? {
+        guard serviceStates[serviceID] != nil else { return .unknownService(serviceID, known: sortedServiceIDs) }
+        if isShuttingDown { return .stackStopping }
+        if health == .stopped, startTask == nil { return .stackStopped }
+        if queued { return .alreadyQueued(ActionFeedback.alreadyRestarting(displayName(serviceID))) }
+        return nil
+    }
+
+    /// `POST /api/restart/<id>`. It starts what is down; `?stack=1` stops and starts
+    /// the Supabase containers too, as the panel's confirmed restart does.
+    func apiRestart(_ serviceID: String, stopsStack: Bool) -> ControlResult {
+        if let refusal = serviceActionRefusal(serviceID, queued: queuedRestarts.contains(serviceID)) { return refusal }
+        restartService(serviceID, stopsStack: stopsStack)
+        return .accepted
+    }
+
+    func apiClearCacheRestart(_ serviceID: String) -> ControlResult {
+        if let refusal = serviceActionRefusal(serviceID, queued: queuedCacheClears.contains(serviceID)) { return refusal }
+        guard serviceCwd(serviceID) != nil else { return .refused("\(displayName(serviceID)) has no folder") }
+        clearCacheAndRestart(serviceID)
+        return .accepted
+    }
+
+    func apiRestartCascade(_ serviceID: String) -> ControlResult {
+        if let refusal = serviceActionRefusal(serviceID, queued: actionsInFlight.contains(serviceID)) { return refusal }
+        restartCascade(serviceID)
+        return .accepted
+    }
+
+    /// `POST /api/start-all`. A start during a stop waits for it.
+    func apiStartAll() -> ControlResult {
+        guard graph != nil else { return .refused("No services are loaded — finish the setup in the app first.") }
+        if startTask != nil { return .alreadyStarting }
+        let afterStop = stopTask != nil
+        startAll()
+        return afterStop ? .queuedAfterStop : .accepted
+    }
+
+    func apiToggleLan() -> ControlResult {
+        if isTogglingNetwork { return .alreadyQueued("A LAN mode change is already running.") }
+        toggleNetworkMode()
+        return .accepted
+    }
+
+    /// `POST /api/toggle-db-mode`: refused with the same reason as the panel.
+    func apiToggleDbMode() -> ControlResult {
+        let target: DatabaseMode = dbMode == .local ? .remote : .local
+        if let refusal = databaseModeRefusal(for: target) { return .refused(refusal) }
+        setDatabaseMode(target)
+        return .accepted
+    }
+
+    /// `POST /api/profile/<name>`. Saved at once; the result is 200.
+    func apiSetProfile(_ name: String) -> ControlResult {
+        guard let newProfile = RunProfile(rawValue: name) else {
+            return .unknownProfile(name, known: RunProfile.allCases.map(\.rawValue))
+        }
+        setProfile(newProfile)
+        if let error = notices.text(.profile) { return .refused(error) }
+        return .done
+    }
+
+    /// The profiles of the checkout's manifest, or nil when it has none.
+    private var manifestProfiles: [String: [String]]? {
+        guard let cwd = supabaseCwd else { return nil }
+        return DbManifestLoader.profiles(from: (cwd as NSString).appendingPathComponent("scripts/db/manifest.json"))
+    }
+
+    /// Why no DB setup can begin now, or nil.
+    private func dbSetupRefusal() -> ControlResult? {
+        if dbResetRunning || dbSetupPipeline?.isRunning == true {
+            let active: Set<DbStepStatus> = [.running, .healthCheck]
+            let steps: [DbSetupStep] = dbSetupPipeline?.steps ?? []
+            let step: DbSetupStep? = steps.first { active.contains($0.status) }
+            return .runActive(step: step?.name ?? "starting")
+        }
+        if supabaseCwd == nil { return .refused("Cannot find supabase service cwd in config") }
+        return nil
+    }
+
+    /// 422 when a reset has no valid seed scenario. The migrate profile seeds nothing.
+    private func scenarioRefusal(profile: String) -> ControlResult? {
+        guard dbPipelineFactory == nil, dbResetAction == nil, profile != DbResetPolicy.migrateProfile else { return nil }
+        reloadDbSeedScenarios()
+        guard selectedDbSeedScenario == nil else { return nil }
+        return .invalidScenario(dbSeedScenarioLoadError ?? "Choose a valid seed scenario before resetting the database.")
+    }
+
+    private static func controlResult(_ outcome: DbSetupQueueOutcome) -> ControlResult {
+        switch outcome {
+        case .began, .queued: .accepted
+        case .refused(let why): .refused(why)
+        }
+    }
+
+    /// `POST /api/db-setup` and `/api/db-reset`.
+    func apiRunDbSetup(profile: String) -> ControlResult {
+        if let refusal = dbSetupRefusal() { return refusal }
+        if let profiles = manifestProfiles, profiles[profile] == nil {
+            return .unknownProfile(profile, known: profiles.keys.sorted())
+        }
+        if let refusal = scenarioRefusal(profile: profile) { return refusal }
+        return Self.controlResult(runDbSetup(profile: profile))
+    }
+
+    /// `POST /api/db-setup/retry/<step>`: from a step of the shown pipeline, or of `reset`.
+    func apiRetryDbSetup(from stepId: String) -> ControlResult {
+        if let refusal = dbSetupRefusal() { return refusal }
+        var known = dbSetupPipeline?.steps.map(\.id) ?? []
+        if let profiles = manifestProfiles {
+            known += (profiles["reset"] ?? []).filter { !known.contains($0) }
+            guard known.contains(stepId) else { return .unknownStep(stepId, known: known) }
+        }
+        if dbSetupPipeline?.steps.contains(where: { $0.id == stepId }) != true,
+           let refusal = scenarioRefusal(profile: "reset") { return refusal }
+        return Self.controlResult(runDbSetup(from: stepId))
+    }
+
+    /// `POST /api/db-setup/step/<step>`: one step of any profile, also one that the
+    /// shown pipeline lacks (`load-hotels` after a `fast` run).
+    func apiRunDbSetupStep(_ stepId: String) -> ControlResult {
+        if let refusal = dbSetupRefusal() { return refusal }
+        if let profiles = manifestProfiles {
+            var known: [String] = []
+            for name in ["full", "reset"] + profiles.keys.sorted() {
+                for id in profiles[name] ?? [] where !known.contains(id) { known.append(id) }
+            }
+            guard known.contains(stepId) else { return .unknownStep(stepId, known: known) }
+            if let refusal = scenarioRefusal(profile: singleStepProfile(stepId)) { return refusal }
+        }
+        return Self.controlResult(runDbSetupStep(stepId))
+    }
+
+    func apiCancelDbSetup() -> ControlResult {
+        guard dbResetRunning || dbSetupPipeline?.isRunning == true else {
+            return .refused("No database setup is running.")
+        }
+        cancelDbSetup()
+        return .accepted
+    }
+
+    func apiCaptureIssue(_ description: String) -> ControlResult {
+        guard debugTracker != nil else { return .refused("issue capture is off") }
+        Task { await captureDebugIssue(trigger: "manual", serviceID: nil, summary: description) }
+        return .accepted
+    }
+
+    func apiCloseIssue(_ id: String, resolution: String?) async -> ControlResult {
+        guard let tracker = debugTracker else { return .refused("issue capture is off") }
+        guard await tracker.closeIssue(id: id, resolution: resolution ?? "Closed via API") else {
+            return .notFound("issue not found")
+        }
+        debugOpenIssueCount = await tracker.openIssueCount()
+        return .done
     }
 
     func resetEnvToLocalhost() {
@@ -1704,7 +1907,7 @@ final class EnvironmentSupervisor {
         }
         guard !lacking.isEmpty else { return nil }
         let files = lacking.map { $0 == "travel-portal" ? "apps/booking-portal/.env" : "apps/partner-portal/.env" }
-        return "Hosted dev values are missing from \(files.joined(separator: " and ")) — import the shared file (Settings → Reconfigure Repos… → Environment Check), then switch again"
+        return "Hosted dev values are missing from \(files.joined(separator: " and ")) — use Import… or Pull from Doppler in Health, then switch again"
     }
 
     /// The text under "Use the shared dev database?": which apps restart now and
@@ -2761,14 +2964,16 @@ final class EnvironmentSupervisor {
                         break
                     }
                 } catch {
-                    recordFailure(id, error: error, lastError: "Cascade restart failed at \(displayName(id)): \(error)")
+                    let text = Self.restartWithDependentsFailedText(displayName(id), cause: "\(error)")
+                    recordFailure(id, error: error, lastError: text)
                     recalculateHealth()
-                    onActionFeedback?("Cascade restart failed at \(displayName(id))", false)
+                    onActionFeedback?(text, false)
                     return
                 }
                 if serviceStates[id]?.phase == .failed {
                     recalculateHealth()
-                    onActionFeedback?("Cascade restart failed at \(displayName(id))", false)
+                    let cause = serviceStates[id]?.condition?.headline ?? "it failed"
+                    onActionFeedback?(Self.restartWithDependentsFailedText(displayName(id), cause: cause), false)
                     return
                 }
                 clearCleanExitError(id)
@@ -2790,6 +2995,11 @@ final class EnvironmentSupervisor {
         }
     }
 
+    /// The failure of "Restart with dependents": where it stopped, why, and where to look.
+    nonisolated static func restartWithDependentsFailedText(_ name: String, cause: String) -> String {
+        "Restart with dependents failed at \(name): \(cause) — see its log"
+    }
+
     /// "Retry failed": starts what does not run, and leaves the services that do.
     func retryStartAll() {
         preflightChecks = []
@@ -2806,19 +3016,57 @@ final class EnvironmentSupervisor {
         startAll(mode: .everything)
     }
 
-    /// Switches the profile and saves it to services.json. Running services outside the
-    /// new profile keep running until the next stop; start-all uses the new profile.
+    nonisolated static let profileSavedText = "Profile saved — applies on the next start."
+    nonisolated static let applyProfileTitle = "Apply now"
+
+    /// Switches the profile and saves it to services.json. A stopped stack uses it
+    /// at the next start. While the stack runs, the running services stay as they
+    /// are until the next start or "Apply now" (`profileApplyPending`).
     func setProfile(_ newProfile: RunProfile) {
         do {
-            try ConfigLoader.saveProfile(newProfile)
+            try saveProfile(newProfile)
         } catch {
             postNotice(.profile, "Could not save profile: \(error)")
             return
         }
         notices.resolve(.profile)
+        let changed = newProfile != profile
         profile = newProfile
         profileMembers = newProfile.members(of: loadedServices)
-        onActionFeedback?("Profile: \(newProfile.displayName)", true)
+        if health == .stopped, startTask == nil, stopTask == nil {
+            profileApplyPending = false
+            onActionFeedback?("Profile: \(newProfile.displayName)", true)
+        } else {
+            profileApplyPending = profileApplyPending || changed
+            showFeedback(Self.profileSavedText, .info)
+        }
+    }
+
+    /// "Apply now": stops the services that left the profile, then starts the ones
+    /// that joined it ("Retry failed": the services that run stay as they are).
+    func applyProfileNow() {
+        profileApplyPending = false
+        let live: Set<ServicePhase> = [.running, .starting, .pending, .waiting, .failed]
+        let leaving = sortedServiceIDs.filter { id in
+            guard !isInProfile(id), let phase = serviceStates[id]?.phase else { return false }
+            return live.contains(phase)
+        }
+        if !leaving.isEmpty {
+            enqueueStackOperation { [self] in
+                // Dependents first: a service stops before what it needs.
+                for id in leaving.reversed() {
+                    await lifecycle.withLock(id) {
+                        serviceStates[id]?.phase = .stopping
+                        await processRunner.stop(serviceID: id)
+                        serviceStates[id]?.phase = .stopped
+                        serviceStates[id]?.clearCondition()
+                    }
+                    notices.resolve(.service(id))
+                }
+                recalculateHealth()
+            }
+        }
+        startAll(mode: .missingOnly)
     }
 
     private func startDepsWatching(watcher: DependencyWatcher) async {
@@ -2834,71 +3082,89 @@ final class EnvironmentSupervisor {
     private func startGitBranchWatching(watcher: GitBranchWatcher) async {
         _ = await watcher.check()
         await watcher.fetchAndCount(fetchInterval: 0)
-        let initial = await watcher.branches
-        let initialBehind = await watcher.behindCounts
         // A reconfigure replaced this watcher: its answers are for other folders.
         if Task.isCancelled { return }
-        await MainActor.run {
-            self.gitBranches = initial
-            self.gitBehindCounts = initialBehind
-        }
+        await publishGitState(watcher)
 
         while !Task.isCancelled {
             try? await clock.sleep(for: .seconds(5))
             if Task.isCancelled { break }
-            let changed = await watcher.check()
-            await watcher.fetchAndCount()
-            let allBranches = await watcher.branches
-            let allBehind = await watcher.behindCounts
+            let changes = await watcher.check()
+            // The fetch runs here, never in a stack operation: a remote that does
+            // not answer must not hold a start or a DB step.
+            await watcher.fetchAndCount(fetchInterval: changes.isEmpty ? 120 : 0)
             if Task.isCancelled { break }
-            let prevBehind = await MainActor.run { self.gitBehindCounts }
-            await MainActor.run {
-                self.gitBranches = allBranches
-                if allBehind != prevBehind {
-                    self.gitBehindCounts = allBehind
-                    self.behindBannerDismissed = false
-                }
+            await publishGitState(watcher)
+            if !changes.isEmpty {
+                behindBannerDismissed = false
+                await applyBranchChanges(changes)
             }
+        }
+    }
 
-            guard !changed.isEmpty, health == .healthy else { continue }
+    /// The branches, the behind counts and the fetch failures of the watcher.
+    private func publishGitState(_ watcher: GitBranchWatcher) async {
+        let branches = await watcher.branches
+        let behind = await watcher.behindCounts
+        let failures = await watcher.fetchFailures
+        gitBranches = branches
+        if behind != gitBehindCounts {
+            gitBehindCounts = behind
+            behindBannerDismissed = false
+        }
+        gitFetchFailures = failures
+    }
 
-            for serviceID in changed {
-                let branchName = allBranches[serviceID] ?? "unknown"
-                let displayName = serviceStates[serviceID]?.definition.displayName ?? serviceID
+    nonisolated static func branchRestartLine(_ branch: String, _ name: String) -> String {
+        "[travel-runner] Branch changed to '\(branch)' — restarting \(name)"
+    }
+
+    nonisolated static func branchNoRestartLine(_ branch: String) -> String {
+        "[travel-runner] Branch changed to '\(branch)' — no restart needed (dev servers hot-reload)"
+    }
+
+    /// A confirmed branch change. Only a change of the packages, the lockfile, the
+    /// Next config or the env files restarts the running services of the repo;
+    /// other files hot-reload. The database check runs for any change. A stopped
+    /// stack restarts nothing: the next start reads the new branch.
+    func applyBranchChanges(_ changes: [GitBranchWatcher.Change]) async {
+        guard health != .stopped else { return }
+        var changed: Set<String> = []
+        var restarts: Set<String> = []
+        for change in changes {
+            changed.formUnion(change.serviceIDs)
+            if change.needsRestart { restarts.formUnion(change.serviceIDs) }
+            for serviceID in sortedServiceIDs where change.serviceIDs.contains(serviceID) {
                 // A restart of Sequin tears down and rebuilds its containers: it keeps
-                // running. A Sequin that does not run gets no line.
+                // running. Only a running service gets a line.
+                guard serviceStates[serviceID]?.phase == .running else { continue }
                 let text: String
                 if Self.keptOnBranchChange.contains(serviceID) {
-                    guard serviceStates[serviceID]?.phase == .running else { continue }
                     text = Self.sequinBranchChangeLine
+                } else if change.needsRestart {
+                    text = Self.branchRestartLine(change.branch, displayName(serviceID))
                 } else {
-                    text = "[travel-runner] Branch changed to '\(branchName)' — restarting \(displayName)"
+                    text = Self.branchNoRestartLine(change.branch)
                 }
                 await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stdout, text: text))
             }
-
-            // A stack operation: it waits for a start, a stop or a DB step that runs.
-            await enqueueStackOperation { [self] in
-                if changed.contains("supabase") || changed.contains("travel-portal") {
-                    if let cwd = serviceCwd("supabase") ?? serviceCwd("travel-portal") {
-                        // The new branch can name another minimum runner version.
-                        refreshCompatibility(cwd: cwd)
-                        // The same policy as Start All: new migrations show the banner,
-                        // and reset only with the opt-in setting.
-                        await resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true)
-                        await refreshPendingMigrations(cwd: cwd)
-                    }
-                }
-
-                await watcher.fetchAndCount(fetchInterval: 0)
-                let freshBehind = await watcher.behindCounts
-                gitBehindCounts = freshBehind
-                behindBannerDismissed = false
-
-                let runningChanged = Self.branchChangeRestarts(changed, phases: serviceStates.mapValues(\.phase))
-                await restartAfterBranchChange(sortedServiceIDs.filter { runningChanged.contains($0) })
-            }.value
         }
+
+        // A stack operation: it waits for a start, a stop or a DB step that runs.
+        await enqueueStackOperation { [self] in
+            if changed.contains("supabase") || changed.contains("travel-portal") {
+                if let cwd = serviceCwd("supabase") ?? serviceCwd("travel-portal") {
+                    // The new branch can name another minimum runner version.
+                    refreshCompatibility(cwd: cwd)
+                    // The same policy as Start All: new migrations show the banner,
+                    // and reset only with the opt-in setting.
+                    await resetDatabaseIfNeeded(cwd: cwd, checkMigrations: true)
+                    await refreshPendingMigrations(cwd: cwd)
+                }
+            }
+            let running = Self.branchChangeRestarts(restarts, phases: serviceStates.mapValues(\.phase))
+            await restartAfterBranchChange(sortedServiceIDs.filter { running.contains($0) })
+        }.value
     }
 
     func reloadDbSeedScenarios() {
@@ -2952,10 +3218,11 @@ final class EnvironmentSupervisor {
     }
 
     /// A DB setup that a person asked for: a button, a retry, or the control API.
-    func runDbSetup(from stepId: String? = nil, profile: String = "reset") {
+    @discardableResult
+    func runDbSetup(from stepId: String? = nil, profile: String = "reset") -> DbSetupQueueOutcome {
         let origin: DbSetupOrigin = profile == DbResetPolicy.migrateProfile
             ? .applyMigrations : (stepId == nil ? .manual : .retry)
-        queueDbSetup { [self] in
+        return queueDbSetup { [self] in
             beginDbSetup(cwd: supabaseCwd, profile: profile, reason: nil, origin: origin, from: stepId)
         }
     }
@@ -2963,19 +3230,45 @@ final class EnvironmentSupervisor {
     nonisolated static let dbSetupWaitsText = "The database step waits for the running start or step to finish"
     nonisolated static let dbSetupDroppedText = "Stop all cancelled the database step that waited"
 
+    /// What became of a DB setup that a person asked for.
+    enum DbSetupQueueOutcome: Equatable, Sendable {
+        /// The checks passed and the setup runs.
+        case began
+        /// It waits for the start, the stop or the operation that runs.
+        case queued
+        /// Nothing runs; the reason.
+        case refused(String)
+    }
+
     /// A DB setup that a person asked for is a stack operation: it waits for a
-    /// start, a stop or another operation that runs. With none it begins at once.
-    private func queueDbSetup(_ begin: @escaping @MainActor () -> DbSetupRun?) {
-        if stackIsIdle {
-            guard let run = begin() else { return }
-            enqueueStackOperation { [self] in _ = await completeDbSetup(run) }
-        } else {
+    /// start, a stop or another operation that runs. With none it begins at once,
+    /// so the caller learns whether it could begin.
+    @discardableResult
+    private func queueDbSetup(_ begin: @escaping @MainActor () -> DbSetupRun?) -> DbSetupQueueOutcome {
+        guard stackIsIdle else {
             onActionFeedback?(Self.dbSetupWaitsText, true)
             enqueueStackOperation(dropped: Self.dbSetupDroppedText) { [self] in
                 guard let run = begin() else { return }
                 _ = await completeDbSetup(run)
             }
+            return .queued
         }
+        guard let run = begin() else {
+            return .refused(notices.text(.dbSetup) ?? ActionFeedback.dbSetupRunning)
+        }
+        // The setup has begun: the DB controls are locked. A Stop All in this turn
+        // of the main actor drops the operation before its body runs, and then
+        // nothing would unlock them.
+        final class Ran { var value = false }
+        let ran = Ran()
+        enqueueStackOperation(dropped: Self.dbSetupDroppedText, finally: { [self] in
+            guard !ran.value else { return }
+            if run.runner == nil || dbSetupRunner === run.runner { dbResetRunning = false }
+        }) { [self] in
+            ran.value = true
+            _ = await completeDbSetup(run)
+        }
+        return .began
     }
 
     /// "Apply migrations": the manifest's `migrate` profile. It never resets. A failed
@@ -3251,6 +3544,13 @@ final class EnvironmentSupervisor {
             // The run ended with no failed step: it was cancelled between two steps.
             postNotice(.dbSetup, Self.dbResetCancelledMessage)
         }
+        // A step asked for services to restart (`##db:restart:`): Sequin reads a
+        // slot that the reset dropped. Only after the run passed, and not after a cancel.
+        if ok, let pipeline = run.pipeline {
+            let cancelled: Bool
+            if let runner = run.runner { cancelled = await runner.wasCancelled } else { cancelled = false }
+            if !cancelled { await restartAfterReset(pipeline.steps.flatMap(\.restartRequests)) }
+        }
         // The automatic callers read the database again themselves.
         if !run.origin.isAutomatic {
             await refreshPendingMigrations(cwd: run.cwd)
@@ -3265,6 +3565,50 @@ final class EnvironmentSupervisor {
     }
 
     // MARK: - After a reset
+
+    /// Restarts the services that the steps asked for, in order: each one is ready,
+    /// or its oneshot is done, before the next. A service that is not in the profile
+    /// or does not run is left alone. A failed restart is a failure of that service;
+    /// the DB setup stays passed (`scripts/db/README.md`, "After a reset").
+    func restartAfterReset(_ requests: [DbRestartRequest]) async {
+        var seen: Set<String> = []
+        for request in requests {
+            for serviceID in request.serviceIDs where seen.insert(serviceID).inserted {
+                guard let state = serviceStates[serviceID] else {
+                    await logStore.append(serviceID: LogFileSink.runnerLogID, entry: LogEntry(
+                        stream: .stderr, text: Self.unknownRestartLine(serviceID)
+                    ))
+                    continue
+                }
+                guard !isShuttingDown, isInProfile(serviceID),
+                      state.phase == .running || state.phase == .completed else { continue }
+                let name = displayName(serviceID)
+                await logStore.append(serviceID: serviceID, entry: LogEntry(
+                    stream: .stdout, text: Self.restartAfterResetLine(name, reason: request.reason)
+                ))
+                beginAction(serviceID)
+                do {
+                    let outcome = try await replaceProcess(serviceID)
+                    if let why = notRestarted(serviceID, outcome) {
+                        postNotice(.service(serviceID), "\(name) did not restart after the database reset: \(why)")
+                    }
+                } catch {
+                    recordFailure(serviceID, error: error, lastError: "\(name) did not restart after the database reset: \(error)")
+                }
+                endAction(serviceID)
+            }
+        }
+        if !seen.isEmpty { recalculateHealth() }
+    }
+
+    nonisolated static func restartAfterResetLine(_ name: String, reason: String) -> String {
+        let why = reason.isEmpty ? "The database reset changed what it reads" : reason
+        return "[travel-runner] \(why) — restarting \(name)"
+    }
+
+    nonisolated static func unknownRestartLine(_ serviceID: String) -> String {
+        "[travel-runner] The database setup asked to restart '\(serviceID)', which is not a service here — skipped"
+    }
 
     nonisolated static let portalRestartText = "Database reset — restart portals to pick up fresh data"
     nonisolated static let restartPortalsTitle = "Restart portals"
@@ -3372,7 +3716,8 @@ final class EnvironmentSupervisor {
 
     /// One step from DB Tools, on its own. It goes through the same guard, event and
     /// failure issue as every other setup.
-    func runDbSetupStep(_ stepId: String) {
+    @discardableResult
+    func runDbSetupStep(_ stepId: String) -> DbSetupQueueOutcome {
         queueDbSetup { [self] in
             beginDbSetup(
                 cwd: supabaseCwd, profile: singleStepProfile(stepId), reason: nil, origin: .singleStep, from: stepId,
@@ -4632,7 +4977,7 @@ final class EnvironmentSupervisor {
             let notifiesKill = signal == SIGKILL && !state.memoryNotified
             if notifiesKill { state.memoryNotified = true }
             let action = restarts ? "restarting it" : "it stays stopped"
-            let killed = "\(name) was stopped from outside Travel Runner (\(ServiceTermination.signalName(signal))) — \(action)"
+            let killed = "\(name) was stopped from outside \(Flavor.current.displayName) (\(ServiceTermination.signalName(signal))) — \(action)"
             let hint = ServiceTermination.killHint(signal)
             Task {
                 await logStore.append(serviceID: serviceID, entry: LogEntry(
@@ -4800,9 +5145,16 @@ final class EnvironmentSupervisor {
                     let runtime = probe.runtime
                     guard case .daemonDown = probe else {
                         // No docker CLI, or a socket that refuses: a wait does not fix it.
+                        // A refused socket names the next step and opens the runtime.
+                        var reason = reason
+                        var kind = FailureAdvisor.Kind.message(reason)
+                        if case .permissionDenied = probe {
+                            reason += " — quit and reopen \(runtime.appName), then restart \(name)"
+                            kind = .blocked(reason, action: .openContainerRuntime)
+                        }
                         state.haltReason = .runtimeUnusable(reason)
                         postNotice(.service(serviceID), reason)
-                        recordFailure(serviceID, kind: .message(reason))
+                        recordFailure(serviceID, kind: kind)
                         await recordDebugEvent(
                             kind: "breaker_trip", serviceID: serviceID, message: "\(reason) — the restart of \(name) stopped"
                         )
@@ -5781,7 +6133,7 @@ final class EnvironmentSupervisor {
                         await retryStripe(generation)
                     }
                 } else {
-                    await stripeOff(state, .crashedTwice, cause: "\(exit) — \(StripeLauncher.unknownExitHint(mode))")
+                    await stripeOff(state, .keptCrashing(restarts: total), cause: "\(exit) — \(StripeLauncher.unknownExitHint(mode))")
                     await captureDebugIssue(
                         trigger: "service_crash",
                         serviceID: "stripe",

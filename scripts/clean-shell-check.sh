@@ -197,6 +197,10 @@ if [ ${#PY_SCRIPTS[@]} -gt 0 ]; then
         fail "a Python script imports a module that a python3 with only its standard library does not have. A teammate who followed the README hits this too: use the standard library, or add the package to both READMEs."
     fi
 fi
-echo "    ✓ ${#PY_SCRIPTS[@]} Python scripts import only the standard library"
+case ${#PY_SCRIPTS[@]} in
+    0) echo "    ✓ no Python scripts to check" ;;
+    1) echo "    ✓ 1 Python script imports only the standard library" ;;
+    *) echo "    ✓ ${#PY_SCRIPTS[@]} Python scripts import only the standard library" ;;
+esac
 
 echo "  ✓ clean-shell check passed"

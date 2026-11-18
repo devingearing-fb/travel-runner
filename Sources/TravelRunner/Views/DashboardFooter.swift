@@ -15,6 +15,11 @@ struct DashboardFooter: View {
         return nil
     }
 
+    /// The service whose branch the footer shows.
+    private var footerServiceID: String? {
+        selectedServiceID ?? (supervisor.gitBranches.keys.contains("travel-portal") ? "travel-portal" : nil)
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             if let label = branchLabel {
@@ -25,14 +30,19 @@ struct DashboardFooter: View {
                         .font(.system(.caption2, design: .monospaced))
                         .lineLimit(1)
 
-                    if let sid = selectedServiceID ?? (supervisor.gitBranches.keys.contains("travel-portal") ? "travel-portal" : nil),
-                       let behind = supervisor.gitBehindCounts[sid], behind > 0 {
+                    if let sid = footerServiceID, let behind = supervisor.gitBehindCounts[sid], behind > 0 {
                         Text("\(behind)\u{2193}")
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.blue)
                     }
+                    if let sid = footerServiceID, supervisor.gitFetchFailures[sid] != nil {
+                        Image(systemName: "exclamationmark.icloud")
+                            .font(.system(size: 8))
+                            .foregroundStyle(.orange)
+                    }
                 }
                 .foregroundStyle(.secondary)
+                .help(footerServiceID.flatMap { supervisor.gitFetchFailures[$0] } ?? "")
             }
 
             Spacer()

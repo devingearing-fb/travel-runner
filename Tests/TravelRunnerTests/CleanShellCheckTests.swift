@@ -113,7 +113,17 @@ final class CleanShellCheckTests: XCTestCase {
 
         let result = try runCheck()
         XCTAssertEqual(result.code, 0, result.output)
-        XCTAssertTrue(result.output.contains("1 Python scripts import only the standard library"), result.output)
+        XCTAssertTrue(result.output.contains("1 Python script imports only the standard library"), result.output)
+    }
+
+    /// With no Python script the line does not count files that it did not read.
+    func testNoPythonScriptsSaysSo() throws {
+        try write("scripts/db/check-prerequisites.mjs", "exit 0")
+
+        let result = try runCheck()
+        XCTAssertEqual(result.code, 0, result.output)
+        XCTAssertTrue(result.output.contains("✓ no Python scripts to check"), result.output)
+        XCTAssertFalse(result.output.contains("0 Python scripts"), result.output)
     }
 
     func testANodeOlderThanTheNvmrcFails() throws {

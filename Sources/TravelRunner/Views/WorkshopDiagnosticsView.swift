@@ -47,6 +47,10 @@ struct WorkshopDiagnosticsView: View {
 
                 Divider()
 
+                helpSection
+
+                Divider()
+
                 sectionHeader("Issue Capture")
 
                 if supervisor.debugTrackingEnabled {
@@ -117,6 +121,37 @@ struct WorkshopDiagnosticsView: View {
             Text("Run Checks Now leaves out the ports of running services (\(leftOut.map(String.init).joined(separator: ", "))): those services hold them.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// What a failed service row means and which button fixes it, from the
+    /// table that writes the rows (`FailureAdvisor.helpEntries`).
+    private var helpSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("Help")
+            ForEach(FailureAdvisor.helpEntries()) { entry in
+                DisclosureGroup {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(entry.headline)
+                            .font(.caption)
+                        if let detail = entry.detail {
+                            Text(detail)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        if !entry.buttons.isEmpty {
+                            Text("Buttons: \(entry.buttons.joined(separator: " · "))")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .textSelection(.enabled)
+                    .padding(.leading, 4)
+                } label: {
+                    Text(entry.situation)
+                        .font(.caption)
+                }
+            }
         }
     }
 

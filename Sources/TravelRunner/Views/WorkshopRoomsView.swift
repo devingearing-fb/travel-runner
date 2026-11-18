@@ -76,9 +76,9 @@ struct WorkshopRoomsView: View {
             message(
                 "The holds viewer is not available yet",
                 """
-                The viewer is in the monolith at scripts/holds-viewer. Your checkout does not have it, and origin/dev does not have it.
+                The viewer is in the monolith at scripts/holds-viewer, and your checkout does not have it. Update your monolith checkout (git pull on dev) to get the holds viewer, then press Try Again.
 
-                The tab starts to work when the viewer is on dev and this Mac has fetched it. To use a copy from another folder now:
+                To use a copy from another folder now:
                 defaults write \(Flavor.current.bundleID) \(HoldsViewerHost.overrideDefaultsKey) /path/to/scripts/holds-viewer
                 """
             )

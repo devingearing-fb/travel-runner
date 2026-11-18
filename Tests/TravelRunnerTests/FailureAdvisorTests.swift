@@ -227,4 +227,24 @@ final class FailureAdvisorTests: XCTestCase {
         let condition = advise(.exited(code: 1), portal(log: old))
         XCTAssertEqual(condition.text, "Booking Portal exited with code 1. No clear cause in the last 120 lines.")
     }
+
+    /// The Help list comes from the table: each row says what the service row
+    /// says, and names a button.
+    func testTheHelpListComesFromTheTable() {
+        let now = Date(timeIntervalSince1970: 0)
+        let entries = FailureAdvisor.helpEntries(runtime: "OrbStack", now: now)
+        XCTAssertEqual(Set(entries.map(\.situation)).count, entries.count, "one row per situation")
+        for entry in entries {
+            XCTAssertFalse(entry.headline.isEmpty, entry.situation)
+            XCTAssertFalse(entry.buttons.isEmpty, entry.situation)
+        }
+        let port = entries.first { $0.situation == "A port is taken" }
+        XCTAssertEqual(port?.headline, "Port 3002 is already in use by another process.")
+        XCTAssertEqual(port?.buttons, ["Free port and restart"])
+        let loop = FailureAdvisor.advise(
+            .crashLoop, .init(name: "Booking Portal", port: 3002, probePath: "/api/health", canClearCache: true, runtime: "OrbStack"),
+            now: now
+        )
+        XCTAssertEqual(entries.first { $0.situation == "It crashes again and again" }?.headline, loop.headline)
+    }
 }

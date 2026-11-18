@@ -187,6 +187,14 @@ struct SettingsPageView: View {
                         }
                         .labelsHidden()
                         .controlSize(.small)
+                        if supervisor.profileApplyPending {
+                            HStack(spacing: 6) {
+                                Text(EnvironmentSupervisor.profileSavedText)
+                                    .font(.caption2)
+                                Button(EnvironmentSupervisor.applyProfileTitle) { supervisor.applyProfileNow() }
+                                    .controlSize(.mini)
+                            }
+                        }
                         Text("Services Start All brings up. Booking + Partner runs both portals (3002, 3006). Full adds the CDC stack and cache verification.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
@@ -227,7 +235,7 @@ struct SettingsPageView: View {
             .clipShape(RoundedRectangle(cornerRadius: 8))
 
             Button(action: onReconfigureRepos) {
-                Label("Reconfigure Repos...", systemImage: "folder.badge.gearshape")
+                Label("Reconfigure Repos…", systemImage: "folder.badge.gearshape")
                     .font(.caption)
             }
             .buttonStyle(.bordered)

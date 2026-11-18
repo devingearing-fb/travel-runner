@@ -154,14 +154,14 @@ final class ModeSwitchTests: XCTestCase {
         // `urls`: the AMATEUR_SUPABASE_URL of each app's shared .env.
         let rows: [(name: String, profile: RunProfile, urls: [String: String], health: HealthStatus, error: String)] = [
             ("the booking portal has no shared .env", .booking, [:], .stopped,
-             "Hosted dev values are missing from apps/booking-portal/.env — import the shared file "
-                + "(Settings → Reconfigure Repos… → Environment Check), then switch again"),
+             "Hosted dev values are missing from apps/booking-portal/.env — use Import… "
+                + "or Pull from Doppler in Health, then switch again"),
             ("both portals have no shared .env", .both, [:], .stopped,
-             "Hosted dev values are missing from apps/booking-portal/.env and apps/partner-portal/.env — import the shared file "
-                + "(Settings → Reconfigure Repos… → Environment Check), then switch again"),
+             "Hosted dev values are missing from apps/booking-portal/.env and apps/partner-portal/.env — use Import… "
+                + "or Pull from Doppler in Health, then switch again"),
             ("the partner portal's shared .env has no hosted URL", .both, ["booking": hosted, "partner": ""], .stopped,
-             "Hosted dev values are missing from apps/partner-portal/.env — import the shared file "
-                + "(Settings → Reconfigure Repos… → Environment Check), then switch again"),
+             "Hosted dev values are missing from apps/partner-portal/.env — use Import… "
+                + "or Pull from Doppler in Health, then switch again"),
         ]
         for row in rows {
             try? FileManager.default.removeItem(at: folder("booking").appendingPathComponent(".env"))

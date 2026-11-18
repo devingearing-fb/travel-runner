@@ -6,13 +6,8 @@ struct TimelineStrip: View {
     var phaseTimings: [String: TimeInterval] = [:]
 
     private let phases: [(id: String, label: String)] = [
-        ("PREFLIGHT", "PRE"),
-        ("GROUND", "GND"),
-        ("GATEWAY", "GW"),
-        ("PORTAL", "APP"),
-        ("STREAM", "STM"),
-        ("VERIFICATION", "VER"),
-    ]
+        EnvironmentSupervisor.StartupPhase.preflight, .ground, .gateway, .portal, .stream, .verification,
+    ].map { ($0.rawValue, $0.label) }
 
     var body: some View {
         HStack(spacing: 4) {

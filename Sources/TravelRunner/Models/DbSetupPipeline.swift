@@ -25,6 +25,13 @@ enum DbStepStatus: String, Sendable {
     }
 }
 
+/// A `##db:restart:<ids>:<reason>` line (`scripts/db/README.md`, "After a reset"):
+/// the services to restart, in order, once the profile has passed.
+struct DbRestartRequest: Equatable, Sendable {
+    let serviceIDs: [String]
+    let reason: String
+}
+
 @Observable
 @MainActor
 final class DbSetupStep: Identifiable {
@@ -80,6 +87,8 @@ final class DbSetupStep: Identifiable {
     var healthResult: String? = nil
     /// Every `health:fail` detail of this run, in order.
     var healthFailures: [String] = []
+    /// The `restart:` lines of this run: services to restart once the profile passed.
+    var restartRequests: [DbRestartRequest] = []
     var errorMessage: String? = nil
     /// The exit code of a step command that failed. The scripts name some causes by
     /// it (10 to 13: the hotels cannot be had).

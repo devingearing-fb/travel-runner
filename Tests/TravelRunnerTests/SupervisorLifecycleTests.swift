@@ -80,8 +80,10 @@ final class SupervisorLifecycleTests: XCTestCase {
     }
 
     override func tearDown() async throws {
-        supervisor.stopAll()
-        _ = await waitUntil(10) { self.supervisor.health == .stopped }
+        // The folders go only after the stop ended: its last steps write the env
+        // files there. A stop that hangs fails the test and does not hang the suite.
+        let stopped = await Self.finishes(supervisor.stopAll(), within: .seconds(60))
+        XCTAssertTrue(stopped, "Stop All did not end in 60 s")
         for pid in Self.listeners(on: port) where Self.process(pid, runsIn: workDir.lastPathComponent) {
             kill(pid, SIGKILL)
         }
@@ -89,6 +91,27 @@ final class SupervisorLifecycleTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// True when `task` ends within `limit`. A task that hangs is left behind.
+    private static func finishes(_ task: Task<Void, Never>, within limit: Duration) async -> Bool {
+        final class Once: @unchecked Sendable {
+            private let lock = NSLock()
+            private var continuation: CheckedContinuation<Bool, Never>?
+            init(_ continuation: CheckedContinuation<Bool, Never>) { self.continuation = continuation }
+            func resume(_ value: Bool) {
+                lock.lock()
+                let pending = continuation
+                continuation = nil
+                lock.unlock()
+                pending?.resume(returning: value)
+            }
+        }
+        return await withCheckedContinuation { continuation in
+            let once = Once(continuation)
+            Task { await task.value; once.resume(true) }
+            Task { try? await Task.sleep(for: limit); once.resume(false) }
+        }
+    }
 
     private static func freePort() -> Int {
         let sock = socket(AF_INET, SOCK_STREAM, 0)
@@ -506,12 +529,15 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// A tripped breaker must not outlive a deliberate restart: the next failure of
     /// the service gets its automatic restart again.
     func testADeliberateRestartClearsATrippedBreaker() async throws {
+        // The time stamps stand still, so the three failures are always inside the
+        // breaker's minute: a slow machine cannot spread them out. The waits stay real.
+        supervisor.clock = FakeClock().stampsOnly
         let marker = workDir.appendingPathComponent("healthy").path
         let script = "if [ -f '\(marker)' ]; then exec python3 -u -m http.server \(port) --bind 127.0.0.1; else exit 1; fi"
         try load(daemon("flaky", ["sh", "-c", script], probeTimeout: 60))
         supervisor.restartService("flaky")
-        let tripped = await waitUntil(40) { self.state("flaky").isCircuitBroken && self.supervisor.actionsInFlight.isEmpty }
-        XCTAssertTrue(tripped)
+        let tripped = await waitUntil(60) { self.state("flaky").isCircuitBroken && self.supervisor.actionsInFlight.isEmpty }
+        XCTAssertTrue(tripped, "flaky is \(state("flaky").phase.rawValue), \(state("flaky").failureTimestamps.count) failures")
 
         // The cause is fixed, and a deliberate restart brings the service back.
         FileManager.default.createFile(atPath: marker, contents: nil)
@@ -3130,9 +3156,9 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         supervisor.restartService("stripe")
 
-        let off = await waitUntil(30) { self.state("stripe").condition?.headline == StripeOffReason.crashedTwice.headline }
+        let off = await waitUntil(30) { self.state("stripe").condition?.headline == StripeOffReason.keptCrashing(restarts: 2).headline }
         XCTAssertTrue(off, "stripe: \(state("stripe").condition?.text ?? "no condition")")
-        XCTAssertEqual(state("stripe").condition?.headline, "Stripe CLI crashed twice (see log) — webhooks are off.")
+        XCTAssertEqual(state("stripe").condition?.headline, "Stripe CLI kept crashing after 2 restarts (see log) — webhooks are off.")
         XCTAssertEqual(state("stripe").condition?.actions, [.startService, .openLog])
         try await Task.sleep(for: .seconds(2))
 
@@ -3193,7 +3219,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         supervisor.restartService("stripe")
 
         // An exit with no known cause restarts twice before Stripe is off.
-        let off = await waitUntil(30) { self.state("stripe").condition?.headline == StripeOffReason.crashedTwice.headline }
+        let off = await waitUntil(30) { self.state("stripe").condition?.headline == StripeOffReason.keptCrashing(restarts: 2).headline }
         XCTAssertTrue(off, "stripe: \(state("stripe").condition?.text ?? "no condition")")
         let prefix = "[travel-runner] Stripe stopped: the Stripe CLI exited with code 1"
         var lines: [String] = []
@@ -3325,7 +3351,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(crashes.isEmpty, "a stop by the runner is no crash: \(crashes)")
     }
 
-    /// A crash series ended "crashed twice". After Stop All and Start All the CLI
+    /// A crash series ended "kept crashing". After Stop All and Start All the CLI
     /// gets its two restarts again, not none.
     func testStartAllGivesACrashingStripeItsTwoRestartsAgain() async throws {
         _ = fakeTheOutsideOfStartAll()
@@ -3333,7 +3359,7 @@ final class SupervisorLifecycleTests: XCTestCase {
         try supervisor.loadServices([stripe("echo stripe-start; sleep 1; exit 1")])
         supervisor.health = .healthy
         supervisor.restartService("stripe")
-        let first = await waitUntil(30) { self.state("stripe").condition?.headline == StripeOffReason.crashedTwice.headline }
+        let first = await waitUntil(30) { self.state("stripe").condition?.headline == StripeOffReason.keptCrashing(restarts: 2).headline }
         XCTAssertTrue(first, "stripe: \(state("stripe").condition?.text ?? "no condition")")
 
         supervisor.stopAll()
@@ -3346,7 +3372,7 @@ final class SupervisorLifecycleTests: XCTestCase {
             try await Task.sleep(for: .milliseconds(50))
             lines = await logLines("stripe")
         }
-        let again = await waitUntil(15) { self.state("stripe").condition?.headline == StripeOffReason.crashedTwice.headline }
+        let again = await waitUntil(15) { self.state("stripe").condition?.headline == StripeOffReason.keptCrashing(restarts: 2).headline }
         XCTAssertTrue(again, "stripe: \(state("stripe").condition?.text ?? "no condition")")
         lines = await logLines("stripe")
         XCTAssertEqual(lines.filter { $0 == "stripe-start" }.count, 6, "two runs, each with two restarts: \(lines.joined(separator: "\n"))")
@@ -5839,6 +5865,157 @@ final class SupervisorLifecycleTests: XCTestCase {
         )
     }
 
+    /// The control API's actions check what they can do now and say it (C7): an
+    /// unknown service, a stopped stack, a queued restart, a DB run that is active,
+    /// an unknown profile, capture that is off, and a log that is not there.
+    func testTheControlActionsSayWhatTheyDid() async throws {
+        try load(daemon("web", webServer))
+
+        guard case .unknownService("nope", let known) = supervisor.apiRestart("nope", stopsStack: false) else {
+            return XCTFail("an unknown service is not refused")
+        }
+        XCTAssertEqual(Set(known), ["web", "anchor"])
+
+        supervisor.health = .stopped
+        XCTAssertEqual(supervisor.apiRestart("web", stopsStack: false), .stackStopped)
+        XCTAssertEqual(supervisor.apiClearCacheRestart("web"), .stackStopped)
+        XCTAssertEqual(supervisor.apiRestartCascade("web"), .stackStopped)
+        supervisor.health = .healthy
+
+        XCTAssertEqual(supervisor.apiRestart("web", stopsStack: false), .accepted)
+        XCTAssertEqual(supervisor.apiRestart("web", stopsStack: false), .alreadyQueued("web is already restarting."))
+        let up = await waitUntil(20) { self.settled("web") }
+        XCTAssertTrue(up)
+
+        supervisor.dbResetRunning = true
+        XCTAssertEqual(supervisor.apiRunDbSetup(profile: "reset"), .runActive(step: "starting"))
+        XCTAssertEqual(supervisor.apiRunDbSetupStep("verify-data"), .runActive(step: "starting"))
+        supervisor.dbResetRunning = false
+        XCTAssertEqual(supervisor.apiCancelDbSetup(), .refused("No database setup is running."))
+
+        XCTAssertEqual(
+            supervisor.apiSetProfile("nonsense"), .unknownProfile("nonsense", known: RunProfile.allCases.map(\.rawValue))
+        )
+        supervisor.debugTracker = nil
+        XCTAssertEqual(supervisor.apiCaptureIssue("x"), .refused("issue capture is off"))
+        let closed = await supervisor.apiCloseIssue("x", resolution: nil)
+        XCTAssertEqual(closed, .refused("issue capture is off"))
+        let log = await supervisor.apiLogs("nope", lines: 5)
+        guard case .notFound = log else { return XCTFail("a log that is not there is \(log)") }
+        let webLog = await supervisor.apiLogs("web", lines: 5)
+        guard case .json = webLog else { return XCTFail("the log of a service is \(webLog)") }
+    }
+
+    /// A DB setup that began while the stack was idle, then a Stop All in the same
+    /// turn of the main actor: the stop drops the queued run, and the DB controls
+    /// unlock. Before, `dbResetRunning` stayed true and every later setup was refused.
+    func testAStopAllInTheSameTurnUnlocksADbSetupThatBegan() async throws {
+        try loadSupabase()
+        var runs = 0
+        supervisor.dbResetAction = { _ in
+            runs += 1
+            return true
+        }
+
+        supervisor.runDbSetup()
+        XCTAssertTrue(supervisor.dbResetRunning, "an idle stack begins the setup at once")
+        supervisor.stopAll()
+
+        let unlocked = await waitUntil(15) { !self.supervisor.dbResetRunning && self.supervisor.health == .stopped }
+        XCTAssertTrue(unlocked, "the DB controls stay locked")
+        XCTAssertEqual(runs, 0, "the stop dropped the run")
+
+        // A second setup starts.
+        var feedback: [String] = []
+        supervisor.onFeedback = { feedback.append($0.message) }
+        supervisor.runDbSetup()
+        let ran = await waitUntil(15) { runs == 1 && !self.supervisor.dbResetRunning }
+        XCTAssertTrue(ran)
+        XCTAssertFalse(feedback.contains(ActionFeedback.dbSetupRunning), "\(feedback)")
+    }
+
+    /// `##db:restart:` (scripts/db/README.md, "After a reset"): after the run passed,
+    /// each listed service that runs restarts, in order, the next one after the one
+    /// before is ready or done. An unknown id is logged and skipped. A run that failed
+    /// restarts nothing.
+    func testARestartLineRestartsTheStreamServicesAfterTheRunPassed() async throws {
+        try loadSupabase()
+        supervisor.shell = FakeCommandRunner()
+        supervisor.databaseQuery = { _, _ in DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+        supervisor.dbStepLauncher = StepLauncher(executable: "/bin/zsh", arguments: { ["-f", "-c", $0] })
+        let sequin = ServiceDefinition(
+            id: "stream-sequin", name: nil, cmd: ["sleep", "60"], cwd: workDir.path, probe: nil, type: .daemon,
+            restart: .never, dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try supervisor.loadServices([
+            daemon("supabase", ["sleep", "60"]), oneshot("stream-db-setup"), sequin, oneshot("not-running"),
+        ])
+        state("supabase").phase = .running
+        supervisor.health = .healthy
+        state("stream-db-setup").phase = .completed
+        supervisor.restartService("stream-sequin")
+        let up = await waitUntil(20) { self.settled("stream-sequin") }
+        XCTAssertTrue(up, "stream-sequin is \(state("stream-sequin").phase.rawValue)")
+        let sequinPid = try XCTUnwrap(state("stream-sequin").pid)
+
+        let reason = "The reset dropped the replication slot Sequin reads"
+        var command = "echo '##db:restart:stream-db-setup,stream-sequin,not-running,nope:\(reason)'; exit 1"
+        supervisor.dbPipelineFactory = { _, profile in
+            self.pipeline([self.step("refresh-after-reset", command)], profile: profile)
+        }
+
+        // A run that failed restarts nothing.
+        supervisor.runDbSetup()
+        let failed = await waitUntil(20) { !self.supervisor.dbResetRunning }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(state("stream-sequin").pid, sequinPid)
+        XCTAssertNil(state("stream-db-setup").lastStarted)
+
+        command = "echo '##db:restart:stream-db-setup,stream-sequin,not-running,nope:\(reason)'; exit 0"
+        supervisor.runDbSetup()
+        let restarted = await waitUntil(30) {
+            !self.supervisor.dbResetRunning && self.settled("stream-sequin")
+                && self.state("stream-sequin").pid != sequinPid && self.state("stream-db-setup").phase == .completed
+        }
+        XCTAssertTrue(restarted, "stream-sequin is \(state("stream-sequin").phase.rawValue)")
+        let setupStarted = try XCTUnwrap(state("stream-db-setup").lastStarted)
+        let sequinStarted = try XCTUnwrap(state("stream-sequin").lastStarted)
+        XCTAssertLessThanOrEqual(setupStarted, sequinStarted, "the CDC setup runs before Sequin starts again")
+        XCTAssertNil(state("not-running").lastStarted, "a service that does not run stays as it is")
+        let sequinLog = await logLines("stream-sequin")
+        XCTAssertTrue(sequinLog.contains(EnvironmentSupervisor.restartAfterResetLine(state("stream-sequin").definition.displayName, reason: reason)), "\(sequinLog)")
+        let runnerLog = await logLines(LogFileSink.runnerLogID)
+        XCTAssertTrue(runnerLog.contains(EnvironmentSupervisor.unknownRestartLine("nope")), "\(runnerLog)")
+        XCTAssertNil(supervisor.lastError)
+    }
+
+    /// A branch change restarts a running service only when it changed the packages,
+    /// the lockfile, the Next config or an env file. Other files hot-reload.
+    func testABranchChangeRestartsOnlyForPackageConfigOrEnvFiles() async throws {
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        let up = await waitUntil(20) { self.settled("web") }
+        XCTAssertTrue(up)
+        let pid = try XCTUnwrap(state("web").pid)
+
+        await supervisor.applyBranchChanges([GitBranchWatcher.Change(
+            serviceIDs: ["web"], branch: "feature", changedFiles: ["apps/booking-portal/src/page.tsx"]
+        )])
+        try? await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(state("web").pid, pid)
+        var lines = await logLines("web")
+        XCTAssertTrue(lines.contains(EnvironmentSupervisor.branchNoRestartLine("feature")), "\(lines)")
+
+        // Control: a changed package.json restarts it.
+        await supervisor.applyBranchChanges([GitBranchWatcher.Change(
+            serviceIDs: ["web"], branch: "feature", changedFiles: ["apps/booking-portal/package.json"]
+        )])
+        let restarted = await waitUntil(20) { self.settled("web") && self.state("web").pid != pid }
+        XCTAssertTrue(restarted)
+        lines = await logLines("web")
+        XCTAssertTrue(lines.contains(EnvironmentSupervisor.branchRestartLine("feature", "web")), "\(lines)")
+    }
+
     /// The DB setup runs the pipeline that the test gives: no manifest, no seed
     /// scenario. The health check of a step runs in the shell of the supervisor.
     func testADbSetupRunsThePipelineOfTheFactory() async throws {
@@ -6054,12 +6231,16 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         supervisor.restartService("db")
 
-        let text = "Docker refused the connection (permission denied on /var/run/docker.sock)"
+        let refusedText = "Docker refused the connection (permission denied on /var/run/docker.sock)"
         let halted = await waitUntil(30) {
-            self.state("db").isCircuitBroken && self.state("db").condition?.headline == text
+            self.state("db").isCircuitBroken && self.state("db").condition?.headline.hasPrefix(refusedText) == true
         }
         XCTAssertTrue(halted, state("db").condition?.text ?? "no condition")
+        // The text names the next step: the probe found the runtime of its context.
+        let text = refusedText + " — quit and reopen \(ContainerRuntime.detect().appName), then restart db"
+        XCTAssertEqual(state("db").condition?.headline, text)
         XCTAssertEqual(supervisor.lastError, text)
+        XCTAssertEqual(state("db").condition?.action, .openContainerRuntime)
         XCTAssertFalse(shell.commands.contains { $0.hasPrefix("open") }, "\(shell.commands)")
         XCTAssertEqual(dockerPsCount(shell), 1)
     }

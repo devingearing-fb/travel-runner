@@ -77,7 +77,7 @@ curl -s -X POST http://localhost:19900/api/debug/issues \
 
 The issue is created asynchronously with trigger `manual` and no service, so no service logs are captured — put the service, steps to reproduce and error message in the description. A state snapshot of all services is still written.
 
-Response: `{"ok":true}` (the new issue ID is not returned — list the issues to find it)
+Response: 202 `{"accepted":true,"ok":true}` (the new issue ID is not returned — list the issues to find it). 409 `{"error":"issue capture is off","ok":false}` when capture is off; 400 for a body that is not a JSON object.
 
 ### POST /api/debug/issues/close/{id}
 
@@ -89,7 +89,7 @@ curl -s -X POST http://localhost:19900/api/debug/issues/close/20260510T143200_se
   -d '{"resolution": "Cleared .next cache and restarted; turbopack cache corruption"}'
 ```
 
-Response: `{"ok":true}`, or `{"ok":false,"error":"issue not found"}` when no open issue has that ID.
+Response: 200 `{"ok":true}`; 404 `{"error":"issue not found","ok":false}` when no open issue has that ID; 409 when capture is off.
 
 ## Triggers
 
@@ -149,7 +149,7 @@ These are not failures of the service, so they make no issue and no crash notifi
 1. `GET /api/debug/issues` — check for auto-captured open issues first
 2. If found, read `~/Desktop/debug-tracking/open/{id}/issue.json` for pre-captured context (error message, `likely_cause`, trigger, recurrence), `diagnostics.json` for the Mac and the stack (written a moment after the issue) (build, macOS, tools, profile, DB mode, checks, DB steps, pending migrations) and `state-snapshot.json` for service states
 3. Review the captured logs: `logs-{service_id}.txt` and `logs-all.txt` in the same folder. Each line starts with its time (`HH:mm:ss.SSS`)
-4. If no issue found, fall back to `GET /api/status` and `GET /api/logs/{serviceId}` via the travel-runner-api skill
+4. If no issue found, fall back to `GET /api/status` and `GET /api/logs/{serviceId}` via the travel-runner-api skill. `GET /api/events` lists what made no issue (Stripe skips, outside kills, breaker trips, DB resets); `GET /api/logs` lists the log ids, with each DB step as `db-setup-<stepId>`; `GET /api/diagnostics` gives the snapshot an issue would save
 
 ### Recurring issue
 
