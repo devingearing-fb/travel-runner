@@ -89,6 +89,8 @@ enum AutoRestart {
     /// this many times (10 minutes), and restarts the service when it answers.
     static let runtimeCheckInterval: Duration = .seconds(5)
     static let runtimeChecks = 120
+    /// The wait ends at this time too: a check of a hung runtime takes up to 10 s.
+    static let runtimeWaitLimit: Duration = .seconds(600)
 
     static func recentFailures(_ timestamps: [Date], now: Date) -> [Date] {
         let cutoff = now.addingTimeInterval(-failureWindow)

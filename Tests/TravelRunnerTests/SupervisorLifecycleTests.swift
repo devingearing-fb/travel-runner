@@ -1855,6 +1855,30 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains("[travel-runner] \(ServiceTermination.memoryHint)"), lines.joined(separator: "\n"))
     }
 
+    /// A service that ran for a while before the next SIGKILL starts a new series,
+    /// so that kill notifies again. The test above is its negative control.
+    func testASigkillAfterAStableRunNotifiesAgain() async throws {
+        let time = FakeClock()
+        supervisor.clock = time.stampsOnly
+        try load(daemon("web", webServer))
+        supervisor.restartService("web")
+        var last: pid_t = 0
+        for kill in 1...2 {
+            let up = await waitUntil(40) {
+                self.settled("web") && Self.listeners(on: self.port).first.map { $0 != last } == true
+            }
+            XCTAssertTrue(up, "kill \(kill): web is \(state("web").phase.rawValue)")
+            // The service runs longer than the stable time before each kill.
+            time.advance(by: .seconds(AutoRestart.stableUptime + 10))
+            last = try ownListener()
+            Darwin.kill(last, SIGKILL)
+            let said = await waitUntil(10) { self.crashes.count == kill }
+            XCTAssertTrue(said, "kill \(kill): \(crashes)")
+        }
+
+        XCTAssertEqual(crashes.map(\.code), [137, 137])
+    }
+
     /// Finding "breaker never self-clears": a service that failed because the
     /// container runtime was down waits for it, and starts by itself when it is back.
     func testAServiceThatWaitsForTheContainerRuntimeStartsWhenItIsBack() async throws {
@@ -1931,6 +1955,42 @@ final class SupervisorLifecycleTests: XCTestCase {
         // The checks of the wait: 120 of them, after the 10 checks of the start.
         let checks = shell.commands.filter { $0.hasPrefix("docker ps") }.count
         XCTAssertEqual(checks, 1 + 1 + 10 + AutoRestart.runtimeChecks)
+    }
+
+    /// A hung runtime answers each check after 10 s, not at once. The wait still
+    /// ends after 10 minutes, not after 120 slow checks.
+    func testAWaitForAHungContainerRuntimeEndsAfterTenMinutes() async throws {
+        let down = "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?"
+        try load(daemon("db", ["sh", "-c", "echo '\(down)'; exit 1"], probeTimeout: 60))
+        let time = FakeClock()
+        // Each check hangs for 10 s.
+        let shell = FakeCommandRunner { call in
+            guard call.command.hasPrefix("docker ps") else { return FakeCommandRunner.ok() }
+            time.advance(by: .seconds(10))
+            return FakeCommandRunner.failed(1)
+        }
+        supervisor.shell = shell
+        supervisor.clock = RunnerClock(
+            date: RunnerClock.live.date, uptime: { time.uptime },
+            wait: { duration in
+                time.advance(by: duration)
+                try await Task.sleep(for: .milliseconds(5))
+            }
+        )
+
+        supervisor.restartService("db")
+
+        let gaveUp = await waitUntil(40) {
+            if case .runtimeDown(_, false)? = self.state("db").haltReason { return true }
+            return false
+        }
+        XCTAssertTrue(gaveUp, "db: \(String(describing: state("db").haltReason))")
+        // Each round takes 5 s of wait and 10 s of check: 40 rounds fill 10 minutes,
+        // after the checks of the start.
+        let checks = shell.commands.filter { $0.hasPrefix("docker ps") }.count
+        XCTAssertEqual(checks, 1 + 1 + 10 + 40)
+        let lines = await logLines("db")
+        XCTAssertTrue(lines.contains { $0.hasSuffix("did not come back in 10 min — open it, then restart db") }, lines.joined(separator: "\n"))
     }
 
     /// A service outside the profile is skipped, and `/api/status` says why.

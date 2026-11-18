@@ -4120,10 +4120,12 @@ final class EnvironmentSupervisor {
     }
 
     /// Records one failure of a daemon. A service that ran for a while before it
-    /// failed starts a new series: the restart count and the backoff start again.
+    /// failed starts a new series: the restart count, the backoff and the memory
+    /// notification start again.
     private func noteFailure(_ state: ServiceState, stableFor: TimeInterval?, countsTowardBreaker: Bool = true) {
         if AutoRestart.startsNewSeries(uptime: stableFor) {
             state.restartCount = 0
+            state.memoryNotified = false
         }
         if countsTowardBreaker {
             state.failureTimestamps.append(clock.date())
@@ -4269,6 +4271,7 @@ final class EnvironmentSupervisor {
 
     /// Asks the container runtime every 5 s for 10 minutes. When it answers, the
     /// service starts again. A restart, a stop or a new failure ends the wait.
+    /// A check of a hung runtime can take 10 s, so the wait also ends at a deadline.
     private func waitForContainerRuntime(_ serviceID: String, runtime: ContainerRuntime) {
         guard let state = serviceStates[serviceID] else { return }
         let name = state.definition.displayName
@@ -4277,10 +4280,14 @@ final class EnvironmentSupervisor {
             state.haltReason == reason && state.phase == .failed && !self.isShuttingDown && self.health != .stopped
         }
         Task {
+            let deadline = clock.uptime() + AutoRestart.runtimeWaitLimit
             for _ in 0..<AutoRestart.runtimeChecks {
                 try? await clock.sleep(for: AutoRestart.runtimeCheckInterval)
                 guard waiting() else { return }
-                guard await ContainerRuntime.isResponding(shell: shell) else { continue }
+                guard await ContainerRuntime.isResponding(shell: shell) else {
+                    if clock.uptime() >= deadline { break }
+                    continue
+                }
                 guard waiting() else { return }
                 await logStore.append(serviceID: serviceID, entry: LogEntry(
                     stream: .stdout, text: "[travel-runner] \(runtime.displayName) is back — starting \(name)"
