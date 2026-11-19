@@ -19,10 +19,10 @@ canary channel only. `./release.sh --promote <version>` gives it to everyone.
 
 The script, in order:
 
-1. Checks that the release can finish: signing identity, notary access, GitHub access,
+1. Checks that the release can finish: the installed app is closed (the smoke test starts the new build, and one copy runs at a time), signing identity, notary access, GitHub access,
    a clean tree whose commit is on the remote, a version number that is not used, and
    that the latest release on GitHub is a standard release.
-2. Runs `swift test`, then `scripts/clean-shell-check.sh` on the monolith (see below).
+2. Runs `swift test --parallel` (about 3 minutes), then `scripts/clean-shell-check.sh` on the monolith (see below).
 3. Builds, packages and signs the app.
 4. Runs `scripts/smoke.sh` on the signed app (see below). A failure stops the release
    before the notarization, so the version number is still free.

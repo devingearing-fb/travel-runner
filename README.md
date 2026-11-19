@@ -211,7 +211,7 @@ Requires Swift 6+ (Xcode or Command Line Tools).
 ./build.sh --install    # Build + copy to /Applications
 ```
 
-`swift test` runs the tests with fakes: no dev stack, database or network. The tests of the monolith contract (manifest, `##db:` lines, bootstrap migrations) read a pinned snapshot in `Tests/Fixtures/monolith-snapshot`. `TR_INTEGRATION=1 swift test` runs them against `../fb-travel-monolith` (or `TR_MONOLITH_DIR`) and also runs the tests that call monolith scripts.
+`swift test --parallel` runs the tests with fakes in about 3 minutes (a plain `swift test` takes about 15): no dev stack, database or network. The tests of the monolith contract (manifest, `##db:` lines, bootstrap migrations) read a pinned snapshot in `Tests/Fixtures/monolith-snapshot`. `TR_INTEGRATION=1 swift test` runs them against `../fb-travel-monolith` (or `TR_MONOLITH_DIR`) and also runs the tests that call monolith scripts.
 
 Only one copy of the app runs at a time. A second copy says where the first one runs from, and quits. A release copy outside `/Applications` (or `~/Applications`) shows a banner once for each place: move the app to `/Applications`, so that updates install and old copies do not start by mistake.
 

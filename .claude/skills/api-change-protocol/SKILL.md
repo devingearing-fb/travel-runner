@@ -11,7 +11,7 @@ The travel-runner control API is documented in three places that must stay in sy
 | Location | Role | Path |
 |----------|------|------|
 | **travel-runner API skill** | Source of truth | `travel-runner/.claude/skills/travel-runner-api/SKILL.md` |
-| **booking-portal consumer skill** | Downstream copy for portal agents | `fb-travel-monolith/apps/booking-portal/.claude/skills/travel-runner-control/skill.md` |
+| **booking-portal consumer skill** | Downstream copy for portal agents | `fb-travel-monolith/apps/booking-portal/.claude/skills/travel-runner-control/SKILL.md` |
 | **bug-report schema** | References API response shapes | `fb-travel-monolith/docs/claude-issues/README.md` |
 
 ## When this applies
@@ -36,7 +36,7 @@ API change sync:
 - [ ] 1) Make the code change in ControlServer.swift (or related files)
 - [ ] 2) Update travel-runner/.claude/skills/travel-runner-api/SKILL.md
        - Endpoint table, response shapes, service ID table, diagnostic workflows
-- [ ] 3) Update fb-travel-monolith/apps/booking-portal/.claude/skills/travel-runner-control/skill.md
+- [ ] 3) Update fb-travel-monolith/apps/booking-portal/.claude/skills/travel-runner-control/SKILL.md
        - Mirror the endpoint changes in the "Available Commands" section
        - Update the "Service IDs" table if IDs changed
        - Update the "When to use" section if new endpoints enable new workflows

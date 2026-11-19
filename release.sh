@@ -313,6 +313,13 @@ case "$LATEST_BEFORE" in
     hackathon-*|*-appcast) fail "GitHub marks $LATEST_BEFORE as the latest release. Fix it first: the standard app reads its updates from the latest release." ;;
 esac
 
+# The smoke test starts the new build, and only one copy of the app runs at a time.
+# Checked here, not after the tests: a copy that is open would stop the release late.
+if [ "${SKIP_SMOKE:-0}" != "1" ] \
+    && [ "$(osascript -e "application id \"$BUNDLE_ID\" is running" 2>/dev/null)" = "true" ]; then
+    fail "$DISPLAY_NAME is open. Quit it (menu bar icon → Quit) and keep it closed until the release ends: the smoke test starts the new build."
+fi
+
 [ -z "$(git status --porcelain)" ] || fail "The working tree has changes. Commit them first."
 
 # The tag must be the commit of this build, and that commit must be on the remote.
@@ -337,9 +344,11 @@ if [ "${SKIP_TESTS:-0}" != "1" ]; then
     [ -z "$(git -C "$MONOLITH_DIR" status --porcelain --untracked-files=no)" ] \
         || fail "The monolith at $MONOLITH_DIR has local changes. Teammates do not have them: stash them, or set TR_MONOLITH_DIR."
 
+    # In parallel: one worker for each core. The suite takes about 3 minutes this
+    # way, and about 15 on one worker.
     echo "  Running tests..."
     TEST_LOG=$(mktemp)
-    if ! swift test >"$TEST_LOG" 2>&1; then
+    if ! swift test --parallel >"$TEST_LOG" 2>&1; then
         grep -E "error:|failed" "$TEST_LOG" | head -20 || true
         rm -f "$TEST_LOG"
         fail "Tests failed. Fix them. (SKIP_TESTS=1 works for a --draft only.)"
