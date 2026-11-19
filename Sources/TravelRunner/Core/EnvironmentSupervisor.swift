@@ -132,6 +132,8 @@ final class EnvironmentSupervisor {
     var gitBehindCounts: [String: Int] = [:]
     /// The profile changed while the stack ran: it applies at the next start or with "Apply now".
     var profileApplyPending = false
+    /// The profile of the last start: "Apply now" shows only while the saved one differs.
+    @ObservationIgnored private var startedProfile: RunProfile?
     /// Saves the profile. Tests replace it, so they never write the real services.json.
     @ObservationIgnored var saveProfile: (RunProfile) throws -> Void = { try ConfigLoader.saveProfile($0) }
     /// The tooltip of a repo whose last fetch failed, by service.
@@ -902,6 +904,7 @@ final class EnvironmentSupervisor {
     private func prepareStartAll() {
         // The start uses the profile that is saved now.
         profileApplyPending = false
+        startedProfile = profile
         // A start that a person asks for begins a new failure series for each service.
         for serviceID in serviceStates.keys { clearFailureHistory(serviceID) }
         // This start takes over the services that wait for a dependency.
@@ -1553,7 +1556,10 @@ final class EnvironmentSupervisor {
 
     func apiClearCacheRestart(_ serviceID: String) -> ControlResult {
         if let refusal = serviceActionRefusal(serviceID, queued: queuedCacheClears.contains(serviceID)) { return refusal }
-        guard serviceCwd(serviceID) != nil else { return .refused("\(displayName(serviceID)) has no folder") }
+        guard Self.cacheClearingServices.contains(serviceID) else {
+            return .refused("\(displayName(serviceID)) has no Next cache to clear")
+        }
+        guard serviceCwd(serviceID) != nil else { return .refused(Self.noFolderText(displayName(serviceID))) }
         clearCacheAndRestart(serviceID)
         return .accepted
     }
@@ -1562,6 +1568,13 @@ final class EnvironmentSupervisor {
         if let refusal = serviceActionRefusal(serviceID, queued: actionsInFlight.contains(serviceID)) { return refusal }
         restartCascade(serviceID)
         return .accepted
+    }
+
+    nonisolated static let noSupabaseFolderText =
+        "No Supabase folder is set — set the monorepo path in Settings > Paths, then try again."
+
+    nonisolated static func noFolderText(_ name: String) -> String {
+        "\(name) has no folder set — set it in Settings > Paths, then try again."
     }
 
     /// `POST /api/start-all`. A start during a stop waits for it.
@@ -1612,7 +1625,7 @@ final class EnvironmentSupervisor {
             return .runActive(step: step?.name ?? "starting")
         }
         if dbSetupsWaiting > 0 { return .alreadyQueued(Self.dbSetupAlreadyWaitsText) }
-        if supabaseCwd == nil { return .refused("Cannot find supabase service cwd in config") }
+        if supabaseCwd == nil { return .refused(Self.noSupabaseFolderText) }
         return nil
     }
 
@@ -3055,7 +3068,8 @@ final class EnvironmentSupervisor {
             profileApplyPending = false
             onActionFeedback?("Profile: \(newProfile.displayName)", true)
         } else {
-            profileApplyPending = profileApplyPending || changed
+            // Back to the profile the stack started with: nothing waits to apply.
+            profileApplyPending = startedProfile.map { newProfile != $0 } ?? (profileApplyPending || changed)
             showFeedback(Self.profileSavedText, .info)
         }
     }
@@ -3063,10 +3077,13 @@ final class EnvironmentSupervisor {
     /// "Apply now": stops the services that left the profile, then starts the ones
     /// that joined it ("Retry failed": the services that run stay as they are).
     /// Pressed during a start, it acts after that start ends. A stack that is
-    /// stopped or stops first takes the profile at its next start.
-    func applyProfileNow() {
+    /// stopped or stops first takes the profile at its next start. The task ends
+    /// when the start is queued, or when it is clear that none starts; nil when
+    /// there is nothing to apply.
+    @discardableResult
+    func applyProfileNow() -> Task<Void, Never>? {
         profileApplyPending = false
-        guard stopTask == nil, startTask != nil || health != .stopped else { return }
+        guard stopTask == nil, startTask != nil || health != .stopped else { return nil }
         let stops = stopAllCount
         let leave = enqueueStackOperation { [self] in
             let live: Set<ServicePhase> = [.running, .starting, .pending, .waiting, .failed]
@@ -3087,7 +3104,7 @@ final class EnvironmentSupervisor {
             }
             recalculateHealth()
         }
-        Task { [weak self] in
+        return Task { [weak self] in
             await leave.value
             // A Stop All since the press ends it: the stack stays stopped.
             guard let self, self.stopAllCount == stops else { return }
@@ -3155,12 +3172,16 @@ final class EnvironmentSupervisor {
     /// Next config or the env files restarts the running services of the repo;
     /// other files hot-reload. The database check runs for any change. A stopped
     /// stack restarts nothing: the next start reads the new branch. The runner
-    /// version banner follows the new branch at once.
+    /// version banner, the DB banner and the seed scenarios follow the new branch at once.
     func applyBranchChanges(_ changes: [GitBranchWatcher.Change]) async {
         guard health != .stopped else {
             let monorepo = changes.contains { $0.serviceIDs.contains("supabase") || $0.serviceIDs.contains("travel-portal") }
             if monorepo, let cwd = serviceCwd("supabase") ?? serviceCwd("travel-portal") {
                 refreshCompatibility(cwd: cwd)
+                // The DB banner and the seed scenarios follow the new branch too. Both
+                // only read: nothing starts and the database stays as it is.
+                await refreshPendingMigrations(cwd: cwd)
+                reloadDbSeedScenarios()
             }
             return
         }
@@ -3469,7 +3490,7 @@ final class EnvironmentSupervisor {
             return nil
         }
         guard let cwd else {
-            postNotice(.dbSetup, "Cannot find supabase service cwd in config")
+            postNotice(.dbSetup, Self.noSupabaseFolderText)
             return nil
         }
         guard !refreshCompatibility(cwd: cwd) else { return nil }
@@ -3639,7 +3660,14 @@ final class EnvironmentSupervisor {
                     ))
                     continue
                 }
-                guard isInProfile(serviceID), state.phase == .running || state.phase == .completed else { continue }
+                guard isInProfile(serviceID), state.phase == .running || state.phase == .completed else {
+                    // The step's log said this service restarts: say why it does not.
+                    let line = isInProfile(serviceID)
+                        ? Self.notUpRestartLine(displayName(serviceID))
+                        : Self.outsideProfileRestartLine(displayName(serviceID))
+                    await logStore.append(serviceID: LogFileSink.runnerLogID, entry: LogEntry(stream: .stderr, text: line))
+                    continue
+                }
                 plan.append((serviceID, request.reason))
             }
         }
@@ -3677,6 +3705,14 @@ final class EnvironmentSupervisor {
     nonisolated static func restartAfterResetLine(_ name: String, reason: String) -> String {
         let why = reason.isEmpty ? "The database reset changed what it reads" : reason
         return "[travel-runner] \(why) — restarting \(name)"
+    }
+
+    nonisolated static func outsideProfileRestartLine(_ name: String) -> String {
+        "[travel-runner] The database setup asked to restart \(name), which does not run in this profile — skipped. If it runs elsewhere, restart it yourself."
+    }
+
+    nonisolated static func notUpRestartLine(_ name: String) -> String {
+        "[travel-runner] The database setup asked to restart \(name), which does not run now — skipped. It reads the new database when it starts."
     }
 
     nonisolated static func unknownRestartLine(_ serviceID: String) -> String {

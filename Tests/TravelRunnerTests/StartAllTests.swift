@@ -243,6 +243,11 @@ final class StartAllTests: XCTestCase {
         XCTAssertTrue(supervisor.profileApplyPending)
         XCTAssertEqual(feedback, [EnvironmentSupervisor.profileSavedText])
         XCTAssertEqual(phase("partner-portal"), .running, "nothing changes before Apply now")
+        // Back to the profile the stack started with: nothing waits to apply.
+        supervisor.setProfile(.both)
+        XCTAssertFalse(supervisor.profileApplyPending)
+        supervisor.setProfile(.booking)
+        XCTAssertTrue(supervisor.profileApplyPending)
 
         supervisor.applyProfileNow()
         XCTAssertFalse(supervisor.profileApplyPending)
@@ -340,12 +345,13 @@ final class StartAllTests: XCTestCase {
         supervisor.retryStartAll()
         XCTAssertTrue(supervisor.startRunning)
         supervisor.setProfile(.both)
-        supervisor.applyProfileNow()
+        let applying = try XCTUnwrap(supervisor.applyProfileNow())
         let stopping = supervisor.stopAll()
         await stopping.value
         XCTAssertEqual(supervisor.health, .stopped)
 
-        try await Task.sleep(for: .milliseconds(500))
+        // Its last step has ended: a start it queued would run now.
+        await applying.value
         XCTAssertFalse(supervisor.startRunning)
         XCTAssertEqual(supervisor.health, .stopped)
         XCTAssertEqual(phase("travel-portal"), .stopped)
@@ -369,8 +375,7 @@ final class StartAllTests: XCTestCase {
         await stopping.value
         XCTAssertEqual(supervisor.health, .stopped)
 
-        supervisor.applyProfileNow()
-        try await Task.sleep(for: .milliseconds(300))
+        XCTAssertNil(supervisor.applyProfileNow(), "a stopped stack has nothing to apply")
         XCTAssertFalse(supervisor.startRunning)
         XCTAssertEqual(supervisor.health, .stopped)
         XCTAssertEqual(supervisor.serviceStates["travel-portal"]?.phase, .stopped)

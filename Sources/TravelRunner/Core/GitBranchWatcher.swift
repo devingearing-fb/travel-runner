@@ -198,7 +198,7 @@ actor GitBranchWatcher {
                     let failures = (fetchBackoff[root]?.failures ?? 0) + 1
                     let wait = min(max(fetchInterval, 120) * pow(2, Double(failures - 1)), Self.maxFetchBackoff)
                     fetchBackoff[root] = (failures, now.addingTimeInterval(wait))
-                    let text = Self.fetchFailedText(at: now)
+                    let text = Self.fetchFailedText(at: now, signInNeeded: !result.timedOut && Self.needsSignIn(result.stderr))
                     for serviceID in serviceIDs { fetchFailures[serviceID] = text }
                 }
             }
@@ -211,12 +211,25 @@ actor GitBranchWatcher {
         }
     }
 
-    /// "fetch failed 14:02 (remote not reachable)".
-    static func fetchFailedText(at date: Date, timeZone: TimeZone = .current) -> String {
+    /// "fetch failed 14:02 (remote not reachable)", or "(sign-in needed — ...)"
+    /// when git asked for credentials that it could not get without a prompt.
+    static func fetchFailedText(at date: Date, signInNeeded: Bool = false, timeZone: TimeZone = .current) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = timeZone
         formatter.dateFormat = "HH:mm"
-        return "fetch failed \(formatter.string(from: date)) (remote not reachable)"
+        let why = signInNeeded ? "sign-in needed — run git fetch in a terminal once" : "remote not reachable"
+        return "fetch failed \(formatter.string(from: date)) (\(why))"
+    }
+
+    /// The fetch never prompts (`GIT_ASKPASS=/usr/bin/false`), so a remote that
+    /// wants credentials the helper does not hold fails at once with one of these.
+    static let signInErrors = [
+        "Authentication failed", "could not read Username", "could not read Password",
+        "Permission denied (publickey)", "terminal prompts disabled",
+    ]
+
+    static func needsSignIn(_ stderr: String) -> Bool {
+        signInErrors.contains { stderr.localizedCaseInsensitiveContains($0) }
     }
 }

@@ -173,6 +173,8 @@ final class WatcherTests: XCTestCase {
         private var _commit = "aaaaaaaa1111"
         private var _diff: CommandResult = FakeCommandRunner.ok("")
         private var _fetch: CommandResult = FakeCommandRunner.ok()
+        private var _behind = 3
+        private var _remoteBehind = 3
 
         init(gitDir: URL) { self.gitDir = gitDir }
 
@@ -193,6 +195,17 @@ final class WatcherTests: XCTestCase {
             set { lock.lock(); _fetch = newValue; lock.unlock() }
         }
 
+        /// What `rev-list` counts now: what the last successful fetch brought.
+        var behind: Int {
+            get { lock.lock(); defer { lock.unlock() }; return _behind }
+            set { lock.lock(); _behind = newValue; lock.unlock() }
+        }
+        /// What the remote holds: a successful fetch brings it into `behind`.
+        var remoteBehind: Int {
+            get { lock.lock(); defer { lock.unlock() }; return _remoteBehind }
+            set { lock.lock(); _remoteBehind = newValue; lock.unlock() }
+        }
+
         func runner(root: String) -> FakeCommandRunner {
             FakeCommandRunner { call in
                 let command = call.command
@@ -204,8 +217,12 @@ final class WatcherTests: XCTestCase {
                     return self.branch.map { FakeCommandRunner.ok($0 + "\n") } ?? FakeCommandRunner.failed(1)
                 }
                 if command.contains("diff --name-only") { return self.diff }
-                if command.contains(" fetch ") { return self.fetch }
-                if command.contains("rev-list") { return FakeCommandRunner.ok("3\n") }
+                if command.contains(" fetch ") {
+                    let result = self.fetch
+                    if result.succeeded { self.behind = self.remoteBehind }
+                    return result
+                }
+                if command.contains("rev-list") { return FakeCommandRunner.ok("\(self.behind)\n") }
                 return FakeCommandRunner.failed(128)
             }
         }
@@ -316,12 +333,15 @@ final class WatcherTests: XCTestCase {
     }
 
     /// The fetch has a 20 s limit and never prompts. A failure leaves the tooltip
-    /// with its time, and the next fetch waits longer; a success clears both.
+    /// with its time, and the next fetch waits twice as long each time, up to 30
+    /// min; a success clears both.
     func testAFetchIsBoundedAndBacksOffAfterAFailure() async throws {
         let time = FakeClock()
         let (watcher, git, shell) = try await branchWatcher(clock: time.manual)
         func fetches() -> [FakeCommandRunner.Call] { shell.calls.filter { $0.command.contains(" fetch ") } }
 
+        // The remote has 2 more commits, which a fetch that fails does not bring.
+        git.remoteBehind = 5
         git.fetch = FakeCommandRunner.timedOut
         await watcher.fetchAndCount(fetchInterval: 0)
         XCTAssertEqual(fetches().count, 1)
@@ -338,12 +358,29 @@ final class WatcherTests: XCTestCase {
         // A forced fetch right after the failure waits for its backoff.
         await watcher.fetchAndCount(fetchInterval: 0)
         XCTAssertEqual(fetches().count, 1)
-        time.advance(by: .seconds(121))
+
+        // Each failure doubles the wait: 120 s, 240 s, ... and never more than 30 min.
+        var waits: [TimeInterval] = []
+        for failure in 1...7 {
+            let wait = min(120 * pow(2, Double(failure - 1)), GitBranchWatcher.maxFetchBackoff)
+            waits.append(wait)
+            time.advance(by: .seconds(wait - 1))
+            await watcher.fetchAndCount(fetchInterval: 0)
+            XCTAssertEqual(fetches().count, failure, "fetch \(failure + 1) waits \(Int(wait)) s")
+            time.advance(by: .seconds(1))
+            await watcher.fetchAndCount(fetchInterval: 0)
+            XCTAssertEqual(fetches().count, failure + 1, "fetch \(failure + 1) runs after \(Int(wait)) s")
+        }
+        XCTAssertEqual(waits, [120, 240, 480, 960, 1800, 1800, 1800])
+
+        time.advance(by: .seconds(1800))
         git.fetch = FakeCommandRunner.ok()
         await watcher.fetchAndCount(fetchInterval: 0)
-        XCTAssertEqual(fetches().count, 2)
+        XCTAssertEqual(fetches().count, 9)
         let cleared = await watcher.fetchFailures
         XCTAssertEqual(cleared, [:])
+        let caughtUp = await watcher.behindCounts
+        XCTAssertEqual(caughtUp["travel-portal"], 5, "the count comes from the new fetch")
 
         XCTAssertEqual(
             GitBranchWatcher.fetchFailedText(
@@ -352,6 +389,31 @@ final class WatcherTests: XCTestCase {
             ),
             "fetch failed 14:02 (remote not reachable)"
         )
+    }
+
+    /// A fetch that needs credentials fails at once (it never prompts). The tooltip
+    /// says to sign in, not that the network is down.
+    func testAFetchThatNeedsASignInSaysSo() async throws {
+        let time = FakeClock()
+        let (watcher, git, _) = try await branchWatcher(clock: time.manual)
+        let signIn = GitBranchWatcher.fetchFailedText(at: time.now, signInNeeded: true)
+        XCTAssertTrue(signIn.hasSuffix("(sign-in needed — run git fetch in a terminal once)"), signIn)
+
+        let rows: [(stderr: String, signIn: Bool)] = [
+            ("fatal: Authentication failed for 'https://github.com/o/r.git/'", true),
+            ("fatal: could not read Username for 'https://github.com': terminal prompts disabled", true),
+            ("git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.", true),
+            ("fatal: unable to access 'https://github.com/o/r.git/': Could not resolve host: github.com", false),
+            ("ssh: connect to host github.com port 22: Operation timed out", false),
+        ]
+        for row in rows {
+            XCTAssertEqual(GitBranchWatcher.needsSignIn(row.stderr), row.signIn, row.stderr)
+        }
+
+        git.fetch = FakeCommandRunner.failed(128, stderr: rows[0].stderr)
+        await watcher.fetchAndCount(fetchInterval: 0)
+        let failures = await watcher.fetchFailures
+        XCTAssertEqual(failures["travel-portal"], signIn)
     }
 
     private func date(_ offset: TimeInterval) -> Date {

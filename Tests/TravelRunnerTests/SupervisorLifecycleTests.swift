@@ -558,12 +558,21 @@ final class SupervisorLifecycleTests: XCTestCase {
         // The time stamps stand still, so the three crashes are always inside the
         // breaker's minute. The waits stay real.
         supervisor.clock = FakeClock().stampsOnly
-        // It serves for a moment, so each start passes its probe, then crashes.
+        // It serves until the marker is there, so each start passes its probe
+        // however slow python3 is to bind, then crashes once.
+        let marker = workDir.appendingPathComponent("crash-now").path
         let script = "python3 -u -m http.server \(port) --bind 127.0.0.1 & srv=$!; "
-            + "sleep 2; kill $srv; wait $srv; exit 1"
+            + "while [ ! -f '\(marker)' ]; do sleep 0.1; done; rm '\(marker)'; kill $srv; wait $srv; exit 1"
         try load(daemon("web", ["sh", "-c", script], probeTimeout: 60))
         supervisor.restartService("web")
 
+        for crash in 1...3 {
+            let up = await waitUntil(60) { self.settled("web") }
+            XCTAssertTrue(up, "start \(crash): web is \(state("web").phase.rawValue)")
+            FileManager.default.createFile(atPath: marker, contents: nil)
+            let alerted = await waitUntil(30) { self.alerts.count == crash }
+            XCTAssertTrue(alerted, "crash \(crash): \(alerts.map(\.next))")
+        }
         let tripped = await waitUntil(60) {
             self.state("web").isCircuitBroken && self.supervisor.actionsInFlight.isEmpty
         }
@@ -5918,12 +5927,17 @@ final class SupervisorLifecycleTests: XCTestCase {
     /// unknown service, a stopped stack, a queued restart, a DB run that is active,
     /// an unknown profile, capture that is off, and a log that is not there.
     func testTheControlActionsSayWhatTheyDid() async throws {
-        try load(daemon("web", webServer))
+        // A portal with no folder: its cache cannot be cleared.
+        let portal = ServiceDefinition(
+            id: "travel-portal", name: nil, cmd: ["sleep", "1"], cwd: nil, probe: nil, type: .daemon, restart: .never,
+            dependsOn: [], env: nil, phase: nil, reuseIfRunning: nil
+        )
+        try load(daemon("web", webServer), portal)
 
         guard case .unknownService("nope", let known) = supervisor.apiRestart("nope", stopsStack: false) else {
             return XCTFail("an unknown service is not refused")
         }
-        XCTAssertEqual(Set(known), ["web", "anchor"])
+        XCTAssertEqual(Set(known), ["web", "travel-portal", "anchor"])
 
         supervisor.health = .stopped
         XCTAssertEqual(supervisor.apiRestart("web", stopsStack: false), .stackStopped)
@@ -5947,6 +5961,14 @@ final class SupervisorLifecycleTests: XCTestCase {
         )
         supervisor.debugTracker = nil
         XCTAssertEqual(supervisor.apiCaptureIssue("x"), .refused("issue capture is off"))
+        // Each refusal says what to do next. Only the portals have a Next cache.
+        XCTAssertEqual(supervisor.apiClearCacheRestart("web"), .refused("web has no Next cache to clear"))
+        XCTAssertEqual(supervisor.apiClearCacheRestart("travel-portal"), .refused(
+            "travel-portal has no folder set — set it in Settings > Paths, then try again."
+        ))
+        XCTAssertEqual(supervisor.apiRunDbSetup(profile: "reset"), .refused(
+            "No Supabase folder is set — set the monorepo path in Settings > Paths, then try again."
+        ))
         let closed = await supervisor.apiCloseIssue("x", resolution: nil)
         XCTAssertEqual(closed, .refused("issue capture is off"))
         let log = await supervisor.apiLogs("nope", lines: 5)
@@ -6197,6 +6219,8 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(sequinLog.contains(EnvironmentSupervisor.restartAfterResetLine(state("stream-sequin").definition.displayName, reason: reason)), "\(sequinLog)")
         let runnerLog = await logLines(LogFileSink.runnerLogID)
         XCTAssertTrue(runnerLog.contains(EnvironmentSupervisor.unknownRestartLine("nope")), "\(runnerLog)")
+        // The step's log said it restarts: the runner says why it did not.
+        XCTAssertTrue(runnerLog.contains(EnvironmentSupervisor.notUpRestartLine("not-running")), "\(runnerLog)")
         XCTAssertNil(supervisor.lastError)
     }
 
@@ -6334,6 +6358,9 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertEqual(supervisor.portalRestartNotice, EnvironmentSupervisor.portalRestartText)
         let runnerLog = await logLines(LogFileSink.runnerLogID)
         XCTAssertTrue(runnerLog.contains(EnvironmentSupervisor.unknownRestartLine("travel-portal-x")), "\(runnerLog)")
+        // Sequin of another profile still runs with a broken slot: the log says to restart it.
+        XCTAssertTrue(runnerLog.contains(EnvironmentSupervisor.outsideProfileRestartLine("stream-sequin")), "\(runnerLog)")
+        XCTAssertFalse(runnerLog.contains(EnvironmentSupervisor.outsideProfileRestartLine("cdc-next")), "\(runnerLog)")
 
         // A Retry of the last step keeps the passed reset, and restarts nothing again.
         let nextStarted = try XCTUnwrap(state("cdc-next").lastStarted)
@@ -6419,9 +6446,9 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(lines.contains(EnvironmentSupervisor.branchRestartLine("feature", "web")), "\(lines)")
     }
 
-    /// A branch change on a stopped stack starts nothing and asks the database
-    /// nothing, but the runner version banner reads the new branch at once, not
-    /// at the next start.
+    /// A branch change on a stopped stack starts nothing and runs no reset check,
+    /// but the runner version banner and the DB banner read the new branch at
+    /// once, not at the next start. The DB banner only reads the migrations.
     func testABranchChangeOnAStoppedStackRefreshesTheRunnerVersionBanner() async throws {
         try load(daemon("supabase", ["sleep", "60"]), daemon("web", webServer))
         supervisor.serviceStates["anchor"]?.phase = .stopped
@@ -6432,12 +6459,17 @@ final class SupervisorLifecycleTests: XCTestCase {
         let migrations = workDir.appendingPathComponent(".backend-baseline/supabase/migrations")
         try FileManager.default.createDirectory(at: migrations, withIntermediateDirectories: true)
         try Data().write(to: migrations.appendingPathComponent("20260101000000_init.sql"))
-        var queries = 0
-        supervisor.databaseQuery = { _, _ in
-            queries += 1
+        var queries: [String] = []
+        let readsMigrations = "SELECT version FROM supabase_migrations.schema_migrations"
+        supervisor.databaseQuery = { _, sql in
+            queries.append(sql)
+            // The database has tables, and none of the branch's migrations.
+            if sql == readsMigrations { return DbQueryResult(exitCode: 0, stdout: "", stderr: "") }
+            if sql.contains("pg_tables") { return DbQueryResult(exitCode: 0, stdout: "5", stderr: "") }
             return DbQueryResult(exitCode: 1, stdout: "", stderr: "")
         }
         XCTAssertNil(supervisor.compatibilityNotice, "negative control: nothing read the new branch yet")
+        XCTAssertNil(supervisor.migrationNotice, "negative control: nothing read the new branch yet")
         let change = GitBranchWatcher.Change(
             serviceIDs: ["supabase", "web"], branch: "feature", changedFiles: ["package.json"]
         )
@@ -6445,17 +6477,26 @@ final class SupervisorLifecycleTests: XCTestCase {
         await supervisor.applyBranchChanges([change])
 
         XCTAssertEqual(supervisor.compatibilityNotice?.text, Self.tooOldText)
-        XCTAssertEqual(queries, 0)
-        // Every service is stopped, so the normal path would start nothing either:
-        // these guard against a regression only. The query count and the control
-        // below test the stopped-stack guard.
+        XCTAssertNotNil(supervisor.migrationNotice, "the DB banner follows the new branch")
+        XCTAssertEqual(supervisor.pendingMigrations, ["20260101000000"])
+        XCTAssertTrue(queries.contains(readsMigrations), "\(queries)")
+
+        // A branch this runner can run, and Supabase's containers left up: the
+        // banner clears, and still only reads. Without the stopped-stack guard,
+        // the reset check would probe the tables and Supabase would restart.
+        try writeManifest(minVersion: "0.13.0")
+        state("supabase").phase = .running
+        await supervisor.applyBranchChanges([change])
+        XCTAssertNil(supervisor.compatibilityNotice)
+        XCTAssertFalse(queries.contains { $0.contains("pg_tables") }, "\(queries)")
+        XCTAssertNil(state("supabase").lastStarted)
+        state("supabase").phase = .stopped
         XCTAssertNil(state("supabase").pid)
         XCTAssertNil(state("web").pid)
         XCTAssertNil(state("web").lastStarted)
         XCTAssertEqual(supervisor.health, .stopped)
 
-        // Control: on a running stack the same change asks the database and
-        // restarts the running service.
+        // Control: on a running stack the same change restarts the running service.
         supervisor.health = .healthy
         supervisor.restartService("web")
         let up = await waitUntil(20) { self.settled("web") }
@@ -6464,7 +6505,6 @@ final class SupervisorLifecycleTests: XCTestCase {
 
         await supervisor.applyBranchChanges([change])
 
-        XCTAssertGreaterThan(queries, 0)
         let restarted = await waitUntil(20) { self.settled("web") && self.state("web").pid != pid }
         XCTAssertTrue(restarted)
         let lines = await logLines("web")
@@ -6691,8 +6731,10 @@ final class SupervisorLifecycleTests: XCTestCase {
             self.state("db").isCircuitBroken && self.state("db").condition?.headline.hasPrefix(refusedText) == true
         }
         XCTAssertTrue(halted, state("db").condition?.text ?? "no condition")
-        // The text names the next step: the probe found the runtime of its context.
-        let text = refusedText + " — quit and reopen \(ContainerRuntime.detect().appName), then restart db"
+        // The text names the next step: the probe found the runtime of its context
+        // (the fake's context is OrbStack), not the app that this Mac has installed.
+        XCTAssertTrue(shell.commands.contains("docker context show"), "\(shell.commands)")
+        let text = refusedText + " — quit and reopen OrbStack, then restart db"
         XCTAssertEqual(state("db").condition?.headline, text)
         XCTAssertEqual(supervisor.lastError, text)
         XCTAssertEqual(state("db").condition?.action, .openContainerRuntime)
