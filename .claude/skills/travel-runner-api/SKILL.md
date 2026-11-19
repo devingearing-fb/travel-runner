@@ -74,7 +74,7 @@ curl -s http://localhost:19900/api/status | python3 -m json.tool
 
 - `version`, `build`, `commit`, `build_kind`: which Travel Runner answers. `build_kind` is `release` (from `release.sh`) or `dev` (built from source with `build.sh`; its `version` comes from `git describe`). A value that the build does not know is `""`.
 
-- `profile`: the active run profile (`booking`, `partner`, `both`, `full`) — see `/api/profile`
+- `profile`: the active run profile (`booking`, `partner`, `core`, `both`, `all`, `full`) — see `/api/profile`
 - `db_mode`: `local` (local Supabase) or `remote` (hosted dev, from the apps' shared `.env` files) — see `/api/toggle-db-mode`
 - `ip` is `"none"` when LAN mode is off; `pid` is `"nil"` when the service has no process
 - `branches` / `gitBehind`: current git branch and commits-behind count per service repo; `npmStale`: service IDs whose dependencies need a reinstall
@@ -193,7 +193,7 @@ For `supabase` the restart only starts what is down; the containers keep running
 
 ### POST /api/clear-cache-restart/{serviceId}
 
-Deletes the `.next/` cache directory in the service's directory then restarts. Use for the portal services (`travel-portal`, `partner-portal`) when Turbopack cache becomes stale (module-not-found errors, stale bundles, phantom type errors).
+Deletes the `.next/` cache directory in the service's directory then restarts. Use for the Next.js apps (`travel-portal`, `partner-portal`, `travel-core`) when Turbopack cache becomes stale (module-not-found errors, stale bundles, phantom type errors).
 
 ```bash
 curl -s -X POST http://localhost:19900/api/clear-cache-restart/travel-portal
@@ -244,6 +244,29 @@ curl -s -X POST http://localhost:19900/api/restart-cascade/universal-login
 
 Response: 202 — the restart runs after the answer; refusals as for `/api/restart`. The panel calls this "Restart with dependents".
 
+### POST /api/start/{serviceId}
+
+Start on the row of one service.
+
+- **Stopped stack** (health `STOPPED`, or a start that was refused): starts that service and the services it needs, with the checks of a start. The other services stay `SKIPPED` with the reason "Not started — this run is <name> and what it needs."
+- **Running stack**: starts a service that is `STOPPED` or `SKIPPED`. A service outside the profile joins the run, and the services it needs that were outside the run start first.
+
+```bash
+curl -s -X POST http://localhost:19900/api/start/travel-core
+```
+
+Response: 202 — the start runs after the answer. 404 for an unknown service (with `known`). 409 with the reason when it cannot start now: the service already runs or starts, the stack is stopping, a start is in progress, or it is a one-shot step.
+
+### POST /api/stop/{serviceId}
+
+Stop on the row of one service. The service gets phase `STOPPED` with the reason "Stopped by you." It stays off until `POST /api/start/{serviceId}`, a restart of it, or the next full `start-all`: the automatic restart, the wake check, a branch change, a database or LAN switch and "Retry failed" all leave it. The services that need it keep running, and a later start of one of them does not wait for it. Health stays `HEALTHY`; `health_reason` names the service that is off.
+
+```bash
+curl -s -X POST http://localhost:19900/api/stop/partner-portal
+```
+
+Response: 202. 404 for an unknown service. 409 with the reason when there is nothing to stop (the service does not run), when the stack is stopping, and for `supabase` (its containers stop with `stop-all`, then "Stop Supabase" in the menu).
+
 ### GET /api/profile
 
 Returns the active run profile, the service IDs it starts, and the available profiles.
@@ -256,7 +279,7 @@ curl -s http://localhost:19900/api/profile | python3 -m json.tool
 
 ```json
 {
-  "available": ["booking", "partner", "both", "full"],
+  "available": ["booking", "partner", "core", "both", "all", "full"],
   "profile": "both",
   "services": ["partner-portal", "stripe", "supabase", "travel-portal", "universal-login"]
 }
@@ -268,12 +291,16 @@ curl -s http://localhost:19900/api/profile | python3 -m json.tool
 |---------|----------|
 | `booking` | supabase, universal-login, stripe, travel-portal |
 | `partner` | supabase, universal-login, partner-portal |
+| `core` | supabase, universal-login, travel-core |
 | `both` (default) | union of booking + partner |
+| `all` | union of booking + partner + core |
 | `full` (experimental) | every service, incl. `stream-*`, `cache-*`, `capacity-*` |
 
 Custom services from `services.json` join a profile when all their dependencies are in it.
 
-### POST /api/profile/{booking|partner|both|full}
+A run can differ from the profile. `POST /api/start/{serviceId}` on a stopped stack starts only that service and what it needs, and on a running stack it adds a service outside the profile to the run. `POST /api/stop/{serviceId}` takes one service out. The next `start-all` after a `stop-all` is the profile again.
+
+### POST /api/profile/{booking|partner|core|both|all|full}
 
 Sets the run profile (saved to `~/.config/travel-runner/services.json`). It does not start or stop anything by itself: the next `start-all` brings up the new profile's services, and services outside it show phase `SKIPPED`. While the stack runs, the app says "Profile saved — applies on the next start." and offers **Apply now**, which stops the services that left the profile and starts the ones that joined it.
 
@@ -459,9 +486,10 @@ The service graph is generated in code (`ServiceCatalog`) from the `paths` in `~
 |----|---------|------|------|----------|
 | `supabase` | Local Supabase (Docker), `pnpm db:start` at the monorepo root | daemon, reuse-if-running | 54321 (API), 54322 (DB probe) | all |
 | `universal-login` | Auth gateway (fb-amateur-universal-login) | daemon | 3000 | all |
-| `stripe` | Stripe CLI webhook listener | daemon | none (captures whsec_ secret) | booking, both, full |
-| `travel-portal` | Booking portal, `pnpm dev` in `apps/booking-portal` | daemon | 3002 (probe `/api/health`) | booking, both, full |
-| `partner-portal` | Partner portal, `pnpm dev` in `apps/partner-portal` | daemon | 3006 (probe `http://127.0.0.1:3006/api/health`) | partner, both, full |
+| `stripe` | Stripe CLI webhook listener | daemon | none (captures whsec_ secret) | booking, both, all, full |
+| `travel-portal` | Booking portal, `pnpm dev` in `apps/booking-portal` | daemon | 3002 (probe `/api/health`) | booking, both, all, full |
+| `partner-portal` | Partner portal, `pnpm dev` in `apps/partner-portal` | daemon | 3006 (probe `http://127.0.0.1:3006/api/health`) | partner, both, all, full |
+| `travel-core` | Travel Core, `pnpm dev` in `apps/travel-core`, standalone with the local login | daemon | 4009 (TCP probe; the liveness check asks `/`) | core, all, full |
 | `stream-services-install` | npm install in stream-services | oneshot | none | full |
 | `stream-qstash` | Local QStash | daemon | 8080 | full |
 | `stream-db-setup` | Stream CDC database setup | oneshot | none | full |
@@ -476,6 +504,8 @@ The service graph is generated in code (`ServiceCatalog`) from the `paths` in `~
 | `capacity-overflow` | Capacity overflow E2E (travel-load-test) | oneshot | none | full |
 
 Shared code in `packages/travel-data` hot-reloads into both apps; there is nothing to build or link.
+
+`travel-core` is skipped, with the reason in its row and in `skip_reason`, when the checkout has no `apps/travel-core` (an older branch), or when no env file has a real `STATSIG_SERVER_KEY` (its pages answer 500 without one; the runner copies it from `apps/partner-portal/.env`). In local database mode the runner writes `EMPLOYEE_SSO_PROVIDER_ID=local-demo` for `partner-portal` and `travel-core`, so the seed admin `servicing-admin@example.com` is staff in both.
 
 ## Diagnostic workflows
 

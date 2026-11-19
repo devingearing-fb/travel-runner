@@ -287,6 +287,305 @@ final class StartAllTests: XCTestCase {
         ]
     }
 
+    // MARK: - One service
+
+    private static let stackKeys = "ANON_KEY=test-anon\nSERVICE_ROLE_KEY=test-service-role\nJWT_SECRET=test-jwt-secret\n"
+
+    private func phase(_ id: String) -> ServicePhase? { supervisor.serviceStates[id]?.phase }
+
+    private func settled() async -> Bool {
+        await waitUntil(30) { !self.supervisor.startRunning && self.supervisor.currentPhase == .running }
+    }
+
+    /// Stop on a row stops that service only. It stays off through each start that
+    /// the runner makes by itself and through "Retry failed"; Start on its row, and
+    /// a full Start All, bring it back.
+    func testStopOnARowKeepsTheServiceOffUntilAPersonStartsIt() async throws {
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: Self.stackKeys), services: twoPortals(), profile: .both)
+        XCTAssertEqual(phase("partner-portal"), .running, supervisor.lastError ?? "")
+        let portalPid = try XCTUnwrap(supervisor.serviceStates["travel-portal"]?.pid)
+        let partnerPid = try XCTUnwrap(supervisor.serviceStates["partner-portal"]?.pid)
+        let partner = try XCTUnwrap(supervisor.serviceStates["partner-portal"])
+        XCTAssertTrue(supervisor.canStopFromRow(partner))
+        XCTAssertFalse(supervisor.canStartFromRow(partner), "a running service has no Start")
+
+        XCTAssertEqual(supervisor.apiStop("partner-portal"), .accepted)
+        let stopped = await waitUntil(15) { self.phase("partner-portal") == .stopped && kill(partnerPid, 0) != 0 }
+        XCTAssertTrue(stopped, "partner-portal is \(String(describing: phase("partner-portal")))")
+        XCTAssertEqual(partner.condition?.kind, .stoppedByUser)
+        XCTAssertEqual(partner.condition?.headline, EnvironmentSupervisor.stoppedByYouHeadline)
+        XCTAssertEqual(supervisor.userStopped, ["partner-portal"])
+        // The stack is healthy, and the header names the service that is off.
+        XCTAssertEqual(supervisor.health, .healthy)
+        XCTAssertEqual(supervisor.healthSummary.note, "partner-portal off")
+        XCTAssertEqual(supervisor.serviceStates["travel-portal"]?.pid, portalPid, "the other portal keeps its process")
+        // A second Stop has nothing to stop, and says so.
+        XCTAssertEqual(supervisor.apiStop("partner-portal"), .refused("partner-portal does not run."))
+
+        // A restart that the runner starts by itself leaves it (a branch change, the wake check).
+        supervisor.restartService("partner-portal")
+        XCTAssertFalse(supervisor.actionsInFlight.contains("partner-portal"), "no restart was queued")
+        XCTAssertEqual(phase("partner-portal"), .stopped)
+        // "Retry failed" leaves it too, and leaves the service that runs.
+        supervisor.retryStartAll()
+        let retried = await settled()
+        XCTAssertTrue(retried)
+        XCTAssertEqual(phase("partner-portal"), .stopped, "Retry failed must not start a service that a person stopped")
+        XCTAssertEqual(partner.condition?.kind, .stoppedByUser)
+        XCTAssertEqual(supervisor.serviceStates["travel-portal"]?.pid, portalPid)
+
+        // Start on its row brings it back; the other portal keeps its process.
+        XCTAssertTrue(supervisor.canStartFromRow(partner))
+        XCTAssertEqual(supervisor.apiStart("partner-portal"), .accepted)
+        let back = await waitUntil(30) { self.phase("partner-portal") == .running }
+        XCTAssertTrue(back, "partner-portal is \(String(describing: phase("partner-portal")))")
+        XCTAssertTrue(supervisor.userStopped.isEmpty)
+        XCTAssertNil(partner.condition)
+        XCTAssertEqual(supervisor.serviceStates["travel-portal"]?.pid, portalPid)
+
+        // Stopped again, a full Start All starts it too.
+        supervisor.stopService("partner-portal")
+        let again = await waitUntil(15) { self.phase("partner-portal") == .stopped }
+        XCTAssertTrue(again)
+        supervisor.restartEverything()
+        let all = await waitUntil(30) {
+            self.phase("partner-portal") == .running && !self.supervisor.startRunning && self.supervisor.currentPhase == .running
+        }
+        XCTAssertTrue(all, "partner-portal is \(String(describing: phase("partner-portal")))")
+        XCTAssertTrue(supervisor.userStopped.isEmpty)
+    }
+
+    /// A service that needs one that a person stopped does not wait for it.
+    func testAServiceDoesNotWaitForADependencyThatAPersonStopped() async throws {
+        let web = container.appendingPathComponent("web").path
+        let services = [
+            daemon("supabase", cwd: monorepo.path, phase: "ground"),
+            daemon("universal-login", cwd: web, phase: "gateway", dependsOn: ["supabase"]),
+            daemon("travel-portal", cwd: web, phase: "portal", dependsOn: ["universal-login"]),
+        ]
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: Self.stackKeys), services: services, profile: .both)
+        XCTAssertEqual(phase("travel-portal"), .running, supervisor.lastError ?? "")
+        let firstPid = try XCTUnwrap(supervisor.serviceStates["travel-portal"]?.pid)
+
+        supervisor.stopService("universal-login")
+        let stopped = await waitUntil(15) { self.phase("universal-login") == .stopped }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(phase("travel-portal"), .running, "the service that needs it keeps running")
+
+        supervisor.requestRestart("travel-portal")
+        let restarted = await waitUntil(30) {
+            self.phase("travel-portal") == .running && self.supervisor.serviceStates["travel-portal"]?.pid != firstPid
+        }
+        XCTAssertTrue(restarted, "travel-portal is \(String(describing: phase("travel-portal")))")
+        XCTAssertEqual(phase("universal-login"), .stopped, "the restart of the portal does not start the login")
+    }
+
+    /// In a stopped stack, Start on a row starts that service and what it needs,
+    /// and nothing else. Start on another row then adds that service to the run.
+    /// After a stop, a plain Start is the profile again.
+    func testStartOnARowOfAStoppedStackStartsTheServiceAndWhatItNeeds() async throws {
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: Self.stackKeys), services: twoPortals(), profile: .both)
+        await stop()
+        XCTAssertEqual(supervisor.health, .stopped)
+        let partner = try XCTUnwrap(supervisor.serviceStates["partner-portal"])
+        let portal = try XCTUnwrap(supervisor.serviceStates["travel-portal"])
+        XCTAssertTrue(supervisor.nothingRuns)
+        XCTAssertTrue(supervisor.canStartFromRow(partner), "a stopped stack offers Start on each row")
+        XCTAssertFalse(supervisor.canStopFromRow(partner))
+        let startsBefore = try XCTUnwrap(portal.lastStarted)
+
+        supervisor.startFromRow("partner-portal")
+        let up = await waitUntil(30) {
+            self.phase("partner-portal") == .running && !self.supervisor.startRunning && self.supervisor.currentPhase == .running
+        }
+        XCTAssertTrue(up, "partner-portal is \(String(describing: phase("partner-portal"))), \(supervisor.lastError ?? "")")
+        XCTAssertEqual(phase("supabase"), .running, "what it needs starts with it")
+        XCTAssertEqual(phase("travel-portal"), .skipped, "the other portal does not start")
+        XCTAssertEqual(portal.lastStarted, startsBefore, "the other portal got no new process")
+        XCTAssertEqual(portal.condition?.kind, .notInProfile)
+        XCTAssertEqual(portal.condition?.headline, "Not started — this run is partner-portal and what it needs.")
+        XCTAssertEqual(supervisor.runSelection?.target, "partner-portal")
+        XCTAssertEqual(supervisor.runSelection?.members, ["supabase", "partner-portal"])
+        // The services that are not in the run do not make the stack look broken.
+        XCTAssertEqual(supervisor.health, .healthy)
+        XCTAssertNil(supervisor.healthSummary.note)
+        let partnerPid = try XCTUnwrap(partner.pid)
+
+        // Start on the other row adds it to the run; the first one keeps its process.
+        XCTAssertTrue(supervisor.canStartFromRow(portal))
+        supervisor.startFromRow("travel-portal")
+        let joined = await waitUntil(30) { self.phase("travel-portal") == .running }
+        XCTAssertTrue(joined, "travel-portal is \(String(describing: phase("travel-portal")))")
+        XCTAssertTrue(supervisor.isInProfile("travel-portal"))
+        XCTAssertEqual(supervisor.extraMembers, ["travel-portal"])
+        XCTAssertEqual(partner.pid, partnerPid)
+
+        // After a stop, the run is the profile again.
+        await stop()
+        XCTAssertNil(supervisor.runSelection)
+        XCTAssertTrue(supervisor.extraMembers.isEmpty)
+        supervisor.startAll()
+        let whole = await waitUntil(30) {
+            self.phase("travel-portal") == .running && self.phase("partner-portal") == .running
+                && !self.supervisor.startRunning && self.supervisor.currentPhase == .running
+        }
+        XCTAssertTrue(whole, "\(String(describing: phase("travel-portal"))), \(String(describing: phase("partner-portal")))")
+    }
+
+    /// In a running stack, Start on the row of a service outside the profile adds
+    /// it to the run. "Retry failed" then leaves it running.
+    func testStartOnARowAddsAServiceOutsideTheProfile() async throws {
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: Self.stackKeys), services: twoPortals(), profile: .booking)
+        XCTAssertEqual(phase("travel-portal"), .running, supervisor.lastError ?? "")
+        let partner = try XCTUnwrap(supervisor.serviceStates["partner-portal"])
+        XCTAssertEqual(partner.phase, .skipped)
+        XCTAssertEqual(partner.condition?.headline, "Not in the Booking profile.")
+        XCTAssertFalse(supervisor.isInProfile("partner-portal"))
+        XCTAssertTrue(supervisor.canStartFromRow(partner), "a service outside the profile can start from its row")
+        let portalPid = try XCTUnwrap(supervisor.serviceStates["travel-portal"]?.pid)
+
+        supervisor.startFromRow("partner-portal")
+        let up = await waitUntil(30) { self.phase("partner-portal") == .running }
+        XCTAssertTrue(up, "partner-portal is \(String(describing: phase("partner-portal")))")
+        XCTAssertTrue(supervisor.isInProfile("partner-portal"))
+        XCTAssertEqual(supervisor.serviceStates["travel-portal"]?.pid, portalPid)
+        let partnerPid = try XCTUnwrap(partner.pid)
+
+        supervisor.retryStartAll()
+        let retried = await settled()
+        XCTAssertTrue(retried)
+        XCTAssertEqual(partner.phase, .running)
+        XCTAssertEqual(partner.pid, partnerPid, "Retry failed leaves a service that a person added")
+
+        // An unknown service is a 404, not a start.
+        XCTAssertEqual(supervisor.apiStart("nope"), .unknownService("nope", known: supervisor.sortedServiceIDs))
+        XCTAssertEqual(supervisor.apiStart("partner-portal"), .refused("partner-portal already runs or starts."))
+    }
+
+    // MARK: - Travel Core
+
+    /// Travel Core answers 500 on every page without a real Statsig server key. With
+    /// no env file that has one, it is skipped with the reason and the rest of the
+    /// stack starts. With the partner portal's shared .env in place, Start on its
+    /// row starts it, and its `.env.local` has the block of a local run.
+    func testTravelCoreIsSkippedWithoutAStatsigKeyAndStartsWithThePartnerEnv() async throws {
+        let partnerFolder = container.appendingPathComponent("apps/partner-portal")
+        let coreFolder = container.appendingPathComponent("apps/travel-core")
+        for folder in [partnerFolder, coreFolder] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        try Data("{}".utf8).write(to: coreFolder.appendingPathComponent("package.json"))
+        // A copy of .env.example: an empty key before the block must not hide the key of the block.
+        try Data("STATSIG_SERVER_KEY=\n".utf8).write(to: coreFolder.appendingPathComponent(".env.local"))
+        let services = [
+            daemon("supabase", cwd: monorepo.path, phase: "ground"),
+            daemon("partner-portal", cwd: partnerFolder.path, phase: "portal", dependsOn: ["supabase"]),
+            daemon("travel-core", cwd: coreFolder.path, phase: "portal", dependsOn: ["supabase"]),
+        ]
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: Self.stackKeys), services: services, profile: .full)
+        let core = try XCTUnwrap(supervisor.serviceStates["travel-core"])
+        XCTAssertEqual(phase("partner-portal"), .running, supervisor.lastError ?? "")
+        XCTAssertEqual(core.phase, .skipped)
+        XCTAssertEqual(core.condition?.headline, EnvironmentSupervisor.travelCoreNeedsStatsig)
+        XCTAssertEqual(core.condition?.detail, EnvironmentSupervisor.travelCoreNeedsStatsigDetail)
+        XCTAssertEqual(core.condition?.actions, [.openHealth])
+        XCTAssertNil(core.lastStarted, "no process started")
+        XCTAssertEqual(supervisor.health, .healthy, "the rest of the stack runs")
+
+        // A teammate imports the partner portal's shared .env.
+        try Data("STATSIG_SERVER_KEY=secret-from-partner\nEMPLOYEE_SSO_PROVIDER_ID=real-provider\n".utf8)
+            .write(to: partnerFolder.appendingPathComponent(".env"))
+        XCTAssertTrue(supervisor.canStartFromRow(core))
+        supervisor.startFromRow("travel-core")
+        let up = await waitUntil(30) { core.phase == .running }
+        XCTAssertTrue(up, "travel-core is \(core.phase): \(core.condition?.text ?? "")")
+
+        let block = try String(contentsOf: coreFolder.appendingPathComponent(".env.local"), encoding: .utf8)
+        for line in [
+            "AMATEUR_SUPABASE_URL=http://localhost:54321", "AMATEUR_SUPABASE_ANON_KEY=test-anon",
+            "AMATEUR_SUPABASE_SIGNING_KEY=test-jwt-secret", "NEXT_PUBLIC_APP_ENV=local",
+            "NEXT_PUBLIC_BASE_URL=http://localhost:4009", "AUTH_COOKIE_DOMAIN=",
+            "LOGIN_URL=http://localhost:3000/login/init", "EMPLOYEE_SSO_PROVIDER_ID=local-demo",
+            "STATSIG_SERVER_KEY=secret-from-partner",
+        ] {
+            XCTAssertTrue(block.components(separatedBy: "\n").contains(line), "\(line) is not in:\n\(block)")
+        }
+        // The partner portal gets the staff provider of the seed too, in local mode.
+        let partnerBlock = try String(contentsOf: partnerFolder.appendingPathComponent(".env.local"), encoding: .utf8)
+        XCTAssertTrue(partnerBlock.contains("\nEMPLOYEE_SSO_PROVIDER_ID=local-demo\n"), partnerBlock)
+    }
+
+    /// A checkout without `apps/travel-core` skips the app with the reason, and
+    /// writes no env file for it.
+    func testTravelCoreOfAnOldCheckoutIsSkippedWithTheReason() async throws {
+        let coreFolder = container.appendingPathComponent("apps/travel-core")
+        let services = [
+            daemon("supabase", cwd: monorepo.path, phase: "ground"),
+            daemon("web", cwd: container.appendingPathComponent("web").path, phase: "portal", dependsOn: ["supabase"]),
+            daemon("travel-core", cwd: coreFolder.path, phase: "portal", dependsOn: ["supabase"]),
+        ]
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: Self.stackKeys), services: services, profile: .full)
+        let core = try XCTUnwrap(supervisor.serviceStates["travel-core"])
+        XCTAssertEqual(phase("web"), .running, supervisor.lastError ?? "")
+        XCTAssertEqual(core.phase, .skipped)
+        XCTAssertEqual(
+            core.condition?.headline,
+            "apps/travel-core is not in this checkout — update the monolith checkout (git pull on dev) to get travel-core."
+        )
+        XCTAssertEqual(core.condition?.actions, [], "Settings does not set the folder of an app of the monolith")
+        XCTAssertEqual(supervisor.health, .healthy)
+    }
+
+    /// A service that failed holds the services that need it. Stop on it takes it
+    /// out of the run: they start, and the stack is not left "starting" for good.
+    /// Its breaker, when it tripped, no longer counts as a failing service.
+    func testStopOnAFailedDependencyLetsItsDependentsStart() async throws {
+        let web = container.appendingPathComponent("web").path
+        let services = [
+            daemon("supabase", cwd: monorepo.path, phase: "ground"),
+            daemon("universal-login", cwd: web, phase: "gateway", dependsOn: ["supabase"]),
+            daemon("travel-portal", cwd: web, phase: "portal", dependsOn: ["universal-login"]),
+        ]
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: Self.stackKeys), services: services, profile: .both)
+        let login = try XCTUnwrap(supervisor.serviceStates["universal-login"])
+        // The portal is off, the login dies, and the portal is started again: it waits for the login.
+        supervisor.stopService("travel-portal")
+        let off = await waitUntil(15) { self.phase("travel-portal") == .stopped }
+        XCTAssertTrue(off)
+        kill(try XCTUnwrap(login.pid), SIGKILL)
+        let failed = await waitUntil(15) { login.phase == .failed }
+        XCTAssertTrue(failed, "universal-login is \(login.phase)")
+        supervisor.startFromRow("travel-portal")
+        let waits = await waitUntil(15) { self.phase("travel-portal") == .waiting }
+        XCTAssertTrue(waits, "travel-portal is \(String(describing: phase("travel-portal")))")
+        login.haltReason = .crashLoop
+
+        supervisor.stopService("universal-login")
+        let started = await waitUntil(30) { self.phase("travel-portal") == .running }
+        XCTAssertTrue(started, "travel-portal is \(String(describing: phase("travel-portal")))")
+        XCTAssertEqual(phase("universal-login"), .stopped)
+        XCTAssertFalse(login.isCircuitBroken, "a stopped service is off, not failing")
+        let healthy = await waitUntil(10) { self.supervisor.health == .healthy }
+        XCTAssertTrue(healthy, "health is \(supervisor.health): \(supervisor.healthSummary.reason ?? "")")
+        XCTAssertEqual(supervisor.healthSummary.failingCount, 0)
+    }
+
+    /// Stop All ends the mark of a service that a person stopped: the next start
+    /// is the whole profile.
+    func testStopAllEndsTheMarkOfAStoppedService() async throws {
+        _ = try await startAll(Setup(applied: builtByLocalDb, stackKeys: Self.stackKeys), services: twoPortals(), profile: .both)
+        supervisor.stopService("partner-portal")
+        let stopped = await waitUntil(15) { self.phase("partner-portal") == .stopped }
+        XCTAssertTrue(stopped)
+        XCTAssertEqual(supervisor.userStopped, ["partner-portal"])
+
+        await stop()
+        XCTAssertTrue(supervisor.userStopped.isEmpty)
+        supervisor.startAll()
+        let whole = await waitUntil(30) { self.phase("partner-portal") == .running && self.phase("travel-portal") == .running }
+        XCTAssertTrue(whole, "partner-portal is \(String(describing: phase("partner-portal")))")
+    }
+
     /// "Apply now" pressed while a start runs acts after that start: the service
     /// that joined the profile starts, and no "start in progress" toast comes.
     func testApplyNowDuringAStartActsAfterIt() async throws {

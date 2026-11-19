@@ -65,6 +65,10 @@ actor ControlServer {
         let stopAll: @Sendable () async -> ControlResult
         let toggleLan: @Sendable () async -> ControlResult
         let restartCascade: @Sendable (String) async -> ControlResult
+        /// Start and Stop on the row of one service. A start in a stopped stack
+        /// starts the service and what it needs.
+        let startService: @Sendable (String) async -> ControlResult
+        let stopService: @Sendable (String) async -> ControlResult
         /// The JSON body of the refusal while this runner is too old to reset the
         /// checkout (`Compatibility`), or nil. The four routes that change the
         /// database ask it first.
@@ -278,6 +282,14 @@ actor ControlServer {
 
         await server.appendRoute("POST /api/restart-cascade/*") { request in
             await actions.restartCascade(Self.pathValue(request, after: 2)).response
+        }
+
+        await server.appendRoute("POST /api/start/*") { request in
+            await actions.startService(Self.pathValue(request, after: 2)).response
+        }
+
+        await server.appendRoute("POST /api/stop/*") { request in
+            await actions.stopService(Self.pathValue(request, after: 2)).response
         }
 
         await server.appendRoute("GET /api/profile") { _ in

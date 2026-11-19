@@ -5,6 +5,9 @@ import Foundation
 struct ServiceCondition: Equatable, Sendable {
     enum Kind: Equatable, Sendable {
         case notInProfile
+        /// A person stopped the service. It stays off until a person starts it, or
+        /// until the next Start All.
+        case stoppedByUser
         /// An optional service (Stripe, the agent) is off. The rest of the stack runs.
         case optionalOff
         case waitingForDependency(String)

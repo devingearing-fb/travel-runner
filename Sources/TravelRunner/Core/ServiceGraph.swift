@@ -72,6 +72,19 @@ struct ServiceGraph: Sendable {
         return levels
     }
 
+    /// The services that `serviceID` needs, directly or through another service.
+    /// An edge in `orderingOnly` only sets the order of a start, so it is left out.
+    func dependencies(of serviceID: String, orderingOnly: [String: Set<String>] = [:]) -> Set<String> {
+        var result: Set<String> = []
+        var queue = [serviceID]
+        while let current = queue.popLast() {
+            for dependency in nodes[current]?.dependsOn ?? [] where orderingOnly[current]?.contains(dependency) != true {
+                if result.insert(dependency).inserted { queue.append(dependency) }
+            }
+        }
+        return result
+    }
+
     func dependents(of serviceID: String) -> Set<String> {
         var result: Set<String> = []
         var queue = [serviceID]

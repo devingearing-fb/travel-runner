@@ -144,6 +144,20 @@ final class EnvironmentSupervisor {
     /// Which part of the graph start-all brings up (stored in services.json).
     var profile: RunProfile = .both
     private(set) var profileMembers: Set<String> = []
+    /// A start of one service from a stopped stack: the run has that service and
+    /// what it needs, and nothing else.
+    struct RunSelection: Equatable, Sendable {
+        let target: String
+        let members: Set<String>
+    }
+    /// Nil: the run is the profile.
+    private(set) var runSelection: RunSelection?
+    /// Services outside the profile that a person started in this run. They are
+    /// members of the run until the stack stops.
+    private(set) var extraMembers: Set<String> = []
+    /// Services that a person stopped. No automatic start brings one back: it
+    /// starts again with Start on its row, or with the next Start All.
+    private(set) var userStopped: Set<String> = []
     /// True when Settings saved new paths while the stack ran. They load at the
     /// next launch, or at the next reconfigure with the stack stopped.
     private(set) var reconfigurePending = false
@@ -158,14 +172,174 @@ final class EnvironmentSupervisor {
 
     func isInProfile(_ serviceID: String) -> Bool { profileMembers.contains(serviceID) }
 
-    /// The row shows Start for a daemon with no process while the environment runs:
-    /// skipped (Stripe without its CLI or its session) or stopped. A service outside
-    /// the profile cannot start.
-    func canStartFromRow(_ state: ServiceState) -> Bool {
-        state.definition.resolvedType != .oneshot
-            && (state.phase == .skipped || state.phase == .stopped)
-            && health != .stopped
-            && isInProfile(state.id)
+    /// The members of the run: the profile, or one service and what it needs, plus
+    /// the services that a person added.
+    private func recomputeMembers() {
+        let base = runSelection?.members ?? profile.members(of: loadedServices)
+        profileMembers = base.union(extraMembers)
+    }
+
+    /// The row shows Start for a daemon with no process. In a stopped stack it
+    /// starts the service and what it needs; in a running stack a service outside
+    /// the profile joins the run.
+    func canStartFromRow(_ state: ServiceState) -> Bool { startRefusal(state) == nil }
+
+    /// Why Start on the row of `state` cannot run now, or nil.
+    func startRefusal(_ state: ServiceState) -> String? {
+        let name = state.definition.displayName
+        guard graph?.nodes[state.id] != nil else { return "\(name) is not in the config." }
+        if state.definition.resolvedType == .oneshot { return "\(name) is a one-shot step: use Run again." }
+        if isShuttingDown || stopTask != nil { return Self.stackStoppingRefusal }
+        if nothingRuns { return nil }
+        if health == .stopped { return ActionFeedback.startInProgress }
+        if state.phase == .failed { return "\(name) failed: use Restart." }
+        guard state.phase == .skipped || state.phase == .stopped else { return "\(name) already runs or starts." }
+        // Start All visits each service: one that joins the run now could start twice.
+        if startTask != nil, !isInProfile(state.id) { return Self.joinAfterStartRefusal }
+        return nil
+    }
+
+    /// True when no service runs and no start is in flight, also after a start that
+    /// was refused: Start on a row then begins a run of that service.
+    var nothingRuns: Bool {
+        startTask == nil && (health == .stopped || healthSummary.notStarted)
+    }
+
+    /// The row shows Stop for a service with a process, or one that waits or failed.
+    func canStopFromRow(_ state: ServiceState) -> Bool { stopRefusal(state) == nil }
+
+    /// Why Stop on the row of `state` cannot run now, or nil.
+    func stopRefusal(_ state: ServiceState) -> String? {
+        let name = state.definition.displayName
+        if isShuttingDown || stopTask != nil { return Self.stackStoppingRefusal }
+        // A one-shot has "Run again", and no Start that would bring it back.
+        if state.definition.resolvedType == .oneshot { return "\(name) is a one-shot step: it ends by itself." }
+        // The portals lose their database: the containers stop with "Stop Supabase".
+        if isSupabaseStack(state.id) { return Self.supabaseStopRefusal }
+        switch state.phase {
+        case .running, .starting, .waiting, .failed: return nil
+        default: return "\(name) does not run."
+        }
+    }
+
+    nonisolated static let stackStoppingRefusal = "The stack is stopping — wait for it to stop."
+    nonisolated static let joinAfterStartRefusal = "A start is in progress — press Start on this row when it ends."
+    nonisolated static let supabaseStopRefusal =
+        "Supabase stops with the stack — press Stop, then Stop Supabase in the menu."
+    nonisolated static let stoppedByYouHeadline = "Stopped by you."
+    nonisolated static let stoppedByYouDetail = "Press Start on this row to start it again. Start All starts it too."
+
+    /// Start on a row, the "Start" button of a condition, or `POST /api/start/<id>`.
+    /// In a stopped stack the run is the service and what it needs. In a running
+    /// stack the service starts; one outside the profile joins the run, and the
+    /// services it needs that were outside the run start first.
+    func startFromRow(_ serviceID: String) {
+        guard let state = serviceStates[serviceID], let graph else { return }
+        if let refusal = startRefusal(state) {
+            showFeedback(refusal, .info, serviceID: serviceID)
+            return
+        }
+        userStopped.remove(serviceID)
+        let needed = graph.dependencies(of: serviceID, orderingOnly: ServiceCatalog.orderingOnlyDependencies)
+        if nothingRuns {
+            startAll(only: RunSelection(target: serviceID, members: needed.union([serviceID])))
+            return
+        }
+        let joining = needed.union([serviceID]).subtracting(profileMembers)
+        guard !joining.isEmpty else {
+            requestRestart(serviceID)
+            return
+        }
+        extraMembers.formUnion(joining)
+        recomputeMembers()
+        let first = sortedServiceIDs.filter { joining.contains($0) && $0 != serviceID && !userStopped.contains($0) }
+        // The row is busy from the press on: a second press starts nothing more.
+        beginAction(serviceID)
+        Task {
+            defer { endAction(serviceID) }
+            for id in first {
+                beginAction(id)
+                do {
+                    // One that already runs (after a profile change) stays as it is.
+                    if case .launched = try await startService(id, mode: .missingOnly) { await awaitReplacingLaunch(id) }
+                } catch {
+                    recordFailure(id, error: error, lastError: ownsBanner(id) ? "\(error)" : nil)
+                }
+                endAction(id)
+            }
+            recalculateHealth()
+            restartService(serviceID, announce: true)
+        }
+    }
+
+    /// Stop on a row, or `POST /api/stop/<id>`. The service stays off until a
+    /// person starts it or the next Start All: no automatic restart brings it back.
+    /// The services that need it keep running.
+    func stopService(_ serviceID: String) {
+        guard let state = serviceStates[serviceID] else { return }
+        if let refusal = stopRefusal(state) {
+            showFeedback(refusal, .info, serviceID: serviceID)
+            return
+        }
+        let name = state.definition.displayName
+        userStopped.insert(serviceID)
+        Task {
+            beginAction(serviceID)
+            defer { endAction(serviceID) }
+            let stopped = await lifecycle.withLock(serviceID) { () -> Bool in
+                // A Stop All since the press owns the phases.
+                guard !isShuttingDown, userStopped.contains(serviceID) else { return false }
+                state.phase = .stopping
+                await processRunner.stop(serviceID: serviceID)
+                // A dev server that outlived its parent keeps the port, as after Stop All.
+                if !state.definition.shouldReuseIfRunning, let port = state.definition.probe?.port, isPortBound(port) {
+                    await killPortOccupants(port)
+                }
+                guard !isShuttingDown else { return false }
+                // A breaker that tripped is over: the service is off, not failing.
+                clearFailureHistory(serviceID)
+                state.phase = .stopped
+                state.pid = nil
+                state.progressNote = nil
+                state.condition = ServiceCondition(
+                    kind: .stoppedByUser, headline: Self.stoppedByYouHeadline, detail: Self.stoppedByYouDetail,
+                    actions: [.startService], since: clock.date()
+                )
+                return true
+            }
+            guard stopped else { return }
+            notices.resolve(.service(serviceID))
+            clearCleanExitError(serviceID)
+            await logStore.append(serviceID: serviceID, entry: LogEntry(
+                stream: .stdout, text: "[travel-runner] \(name) stopped by you — it stays off until you start it or press Start All"
+            ))
+            // The services that waited for it do not wait for a service that is off.
+            startBlockedDependents(of: serviceID)
+            recalculateHealth()
+            showFeedback("\(name) stopped", .success, serviceID: serviceID)
+        }
+    }
+
+    /// `POST /api/start/<id>`: Start on the row of the service.
+    func apiStart(_ serviceID: String) -> ControlResult {
+        guard let state = serviceStates[serviceID] else { return .unknownService(serviceID, known: sortedServiceIDs) }
+        if let refusal = startRefusal(state) { return .refused(refusal) }
+        startFromRow(serviceID)
+        return .accepted
+    }
+
+    /// `POST /api/stop/<id>`: Stop on the row of the service.
+    func apiStop(_ serviceID: String) -> ControlResult {
+        guard let state = serviceStates[serviceID] else { return .unknownService(serviceID, known: sortedServiceIDs) }
+        if let refusal = stopRefusal(state) { return .refused(refusal) }
+        stopService(serviceID)
+        return .accepted
+    }
+
+    /// The page of a service for "Open in browser", with the LAN address in LAN mode.
+    func browserURL(for serviceID: String) -> URL? {
+        guard let definition = graph?.nodes[serviceID] else { return nil }
+        return ServiceCatalog.browserURL(for: definition, host: networkMode ? (localIP ?? "localhost") : "localhost")
     }
 
     /// The fb-travel-monolith checkout that the runner runs, or nil before setup.
@@ -751,7 +925,12 @@ final class EnvironmentSupervisor {
         Task { [logStore] in await logStore.setRunnerRedactor(redactor) }
         self.sortedServiceIDs = graph.sortedIDs
         self.profile = config.resolvedProfile
-        self.profileMembers = config.resolvedProfile.members(of: config.services)
+        // A reload keeps the marks of the services that the new graph still has.
+        let ids = Set(config.services.map(\.id))
+        if let selection = runSelection, !ids.contains(selection.target) { runSelection = nil }
+        extraMembers.formIntersection(ids)
+        userStopped.formIntersection(ids)
+        recomputeMembers()
         self.serviceStates = [:]
         for service in config.services {
             serviceStates[service.id] = ServiceState(definition: service)
@@ -851,7 +1030,10 @@ final class EnvironmentSupervisor {
         self.graph = graph
         self.sortedServiceIDs = graph.sortedIDs
         self.profile = profile
-        self.profileMembers = profile.members(of: services)
+        runSelection = nil
+        extraMembers = []
+        userStopped = []
+        recomputeMembers()
         self.serviceStates = [:]
         for service in services {
             serviceStates[service.id] = ServiceState(definition: service)
@@ -872,7 +1054,7 @@ final class EnvironmentSupervisor {
 
     /// Starts the stack. It is a stack operation: it waits for a stop that runs and
     /// for the operation before it, so a Start pressed during a Stop is not lost.
-    func startAll(skipPreflight: Bool = false, mode: StartMode = .everything) {
+    func startAll(skipPreflight: Bool = false, mode: StartMode = .everything, only selection: RunSelection? = nil) {
         guard startTask == nil else {
             showFeedback(ActionFeedback.startInProgress, .info)
             return
@@ -882,7 +1064,7 @@ final class EnvironmentSupervisor {
         preflightOnlyTask?.cancel()
         let waits = !stackIsIdle
         if !waits {
-            prepareStartAll()
+            prepareStartAll(mode: mode, selection: selection)
         } else if stopTask == nil {
             onActionFeedback?(Self.startWaitsText, true)
         }
@@ -895,13 +1077,28 @@ final class EnvironmentSupervisor {
             self.recalculateHealth()
         }) { [weak self] in
             guard let self else { return }
-            if waits { self.prepareStartAll() }
+            if waits { self.prepareStartAll(mode: mode, selection: selection) }
             await self.runStartAll(skipPreflight: skipPreflight, mode: mode)
         }
     }
 
-    /// The state of a new Start All.
-    private func prepareStartAll() {
+    /// The state of a new Start All. A full start is the profile again, or one
+    /// service and what it needs (`selection`); "Retry failed" keeps the run as it is.
+    private func prepareStartAll(mode: StartMode, selection: RunSelection?) {
+        if mode == .everything {
+            // The services of a run of one service that run now stay in the run.
+            if selection == nil, let previous = runSelection {
+                let live: Set<ServicePhase> = [.running, .starting, .waiting, .completed]
+                extraMembers.formUnion(previous.members.filter { id in
+                    serviceStates[id].map { live.contains($0.phase) } ?? false
+                })
+            }
+            if selection != nil { extraMembers = [] }
+            runSelection = selection
+            // A full start starts the services that a person stopped too.
+            userStopped = []
+            recomputeMembers()
+        }
         // The start uses the profile that is saved now.
         profileApplyPending = false
         startedProfile = profile
@@ -1049,6 +1246,8 @@ final class EnvironmentSupervisor {
                     return
                 }
             }
+
+            await self.warnAboutRedisMismatch()
 
             // Start registry. One registry runs: a retry replaces the one before.
             await self.registry?.stop()
@@ -1219,6 +1418,11 @@ final class EnvironmentSupervisor {
                 serviceStates[serviceID]?.phase = .stopped
                 serviceStates[serviceID]?.clearCondition()
             }
+            // The next start is the profile again.
+            runSelection = nil
+            extraMembers = []
+            userStopped = []
+            recomputeMembers()
 
             await registry?.stop()
             dbSetupFailedAtStart = false
@@ -1419,6 +1623,8 @@ final class EnvironmentSupervisor {
             },
             toggleLan: { [weak self] in await self?.apiToggleLan() ?? .runnerQuitting },
             restartCascade: { [weak self] id in await self?.apiRestartCascade(id) ?? .runnerQuitting },
+            startService: { [weak self] id in await self?.apiStart(id) ?? .runnerQuitting },
+            stopService: { [weak self] id in await self?.apiStop(id) ?? .runnerQuitting },
             dbResetBlock: { [weak self] in await self?.resetBlockJSON() },
             dbReset: { [weak self] in await self?.apiRunDbSetup(profile: "reset") ?? .runnerQuitting },
             dbSetupRun: { [weak self] profile in await self?.apiRunDbSetup(profile: profile) ?? .runnerQuitting },
@@ -1550,6 +1756,7 @@ final class EnvironmentSupervisor {
     /// the Supabase containers too, as the panel's confirmed restart does.
     func apiRestart(_ serviceID: String, stopsStack: Bool) -> ControlResult {
         if let refusal = serviceActionRefusal(serviceID, queued: queuedRestarts.contains(serviceID)) { return refusal }
+        userStopped.remove(serviceID)
         restartService(serviceID, stopsStack: stopsStack)
         return .accepted
     }
@@ -1728,7 +1935,76 @@ final class EnvironmentSupervisor {
             )
             RunnerEnv.apply(path: (cwd as NSString).appendingPathComponent(".env.local"), app: app, values: values)
         }
+        writeCoreEnv()
         writeLoginEnv(host: host)
+    }
+
+    /// Writes the runner block of Travel Core, when the checkout has the app. Its
+    /// own Doppler config has no Supabase and no Statsig values, so the block takes
+    /// them from the partner portal's shared `.env`.
+    private func writeCoreEnv() {
+        guard let cwd = travelCoreFolder else { return }
+        let host = networkMode ? (localIP ?? "localhost") : "localhost"
+        let values = RunnerEnv.values(
+            for: .core, mode: dbMode == .local ? .local : .remote, host: host, keys: localSupabaseKeys,
+            stripeWebhookSecret: nil, core: travelCoreShared(cwd)
+        )
+        RunnerEnv.apply(path: (cwd as NSString).appendingPathComponent(".env.local"), app: .core, values: values)
+    }
+
+    /// The warning when the booking portal and the partner portal read different
+    /// Redis instances, or nil (also when one of them is not in the run).
+    func redisMismatchWarning() -> String? {
+        func redisURL(_ serviceID: String) -> String? {
+            guard isInProfile(serviceID), let cwd = graph?.nodes[serviceID]?.resolvedCwd, !cwd.isEmpty else { return nil }
+            func text(_ name: String) -> String {
+                (try? String(contentsOfFile: (cwd as NSString).appendingPathComponent(name), encoding: .utf8)) ?? ""
+            }
+            return RunnerEnv.effectiveValue(of: RunnerEnv.redisURLKey, env: text(".env"), envLocal: text(".env.local"))
+        }
+        return RunnerEnv.redisMismatch(booking: redisURL("travel-portal"), partner: redisURL("partner-portal"))
+    }
+
+    /// Says in both portal logs, and in a toast, that the portals do not share a Redis.
+    private func warnAboutRedisMismatch() async {
+        guard let warning = redisMismatchWarning() else { return }
+        for serviceID in ["travel-portal", "partner-portal"] {
+            await logStore.append(serviceID: serviceID, entry: LogEntry(stream: .stderr, text: "[travel-runner] \(warning)"))
+        }
+        showFeedback("The two portals use different Redis instances — see the log of a portal", .info)
+    }
+
+    /// The folder of Travel Core, or nil when the checkout does not have the app.
+    private var travelCoreFolder: String? {
+        guard let cwd = graph?.nodes[ServiceCatalog.travelCoreID]?.resolvedCwd, ServiceCatalog.hasApp(at: cwd) else { return nil }
+        return cwd
+    }
+
+    private func travelCoreShared(_ cwd: String) -> RunnerEnv.CoreShared {
+        let own = RunnerEnv.rawValues(inFile: (cwd as NSString).appendingPathComponent(".env"))
+        let local = (try? String(contentsOfFile: (cwd as NSString).appendingPathComponent(".env.local"), encoding: .utf8)) ?? ""
+        let partner = sharedEnvPath("partner-portal").map(RunnerEnv.rawValues(inFile:)) ?? [:]
+        return RunnerEnv.CoreShared(
+            ownKeys: Set(own.keys), localKeys: Set(RunnerEnv.rawValues(in: RunnerEnv.outsideBlock(local)).keys),
+            partner: partner
+        )
+    }
+
+    nonisolated static let travelCoreNeedsStatsig =
+        "Travel Core needs STATSIG_SERVER_KEY, and no env file has it."
+    nonisolated static let travelCoreNeedsStatsigDetail =
+        "Its pages answer 500 without a real key. Put the shared .env of the partner portal in place (Health: Partner .env, Import… or Pull from Doppler), then start Travel Core."
+
+    /// Why Travel Core cannot run with the env files as they are, or nil. The block
+    /// is written first, so a shared `.env` that arrived since the load counts.
+    private func travelCoreEnvProblem() -> String? {
+        guard let cwd = travelCoreFolder else { return nil }
+        writeCoreEnv()
+        let files = [".env.local", ".env"].map { (cwd as NSString).appendingPathComponent($0) }
+        // The last assignment of a file wins, as in dotenv: an empty line of a copied
+        // .env.example before the block does not hide the key of the block.
+        let hasKey = files.contains { RunnerEnv.rawValues(inFile: $0)["STATSIG_SERVER_KEY"] != nil }
+        return hasKey ? nil : Self.travelCoreNeedsStatsig
     }
 
     /// universal-login is an external repo; its `.env.local` keeps the key-by-key writes.
@@ -1828,6 +2104,8 @@ final class EnvironmentSupervisor {
             showFeedback(ActionFeedback.alreadyRestarting(displayName(serviceID)), .info, serviceID: serviceID)
             return
         }
+        // A person asks for it: the service is no longer stopped by them.
+        userStopped.remove(serviceID)
         Task {
             beginAction(serviceID)
             defer { endAction(serviceID) }
@@ -1927,7 +2205,12 @@ final class EnvironmentSupervisor {
     /// The notice when a shared .env lacks the hosted dev values, or nil. Hosted dev
     /// comes from each app's shared .env; the runner block then stops overriding Supabase.
     private var missingHostedDevValues: String? {
-        let apps = ["travel-portal"] + (isInProfile("partner-portal") ? ["partner-portal"] : [])
+        var apps = ["travel-portal"] + (isInProfile("partner-portal") ? ["partner-portal"] : [])
+        // Travel Core takes the hosted dev values of the partner portal, unless its own file has them.
+        if isInProfile(ServiceCatalog.travelCoreID), !apps.contains("partner-portal"), let cwd = travelCoreFolder,
+           !travelCoreShared(cwd).ownKeys.contains("AMATEUR_SUPABASE_URL") {
+            apps.append("partner-portal")
+        }
         let lacking = apps.filter { serviceID in
             guard let shared = sharedEnvPath(serviceID),
                   let url = RunnerEnv.value(of: "AMATEUR_SUPABASE_URL", inFile: shared) else { return true }
@@ -2012,12 +2295,14 @@ final class EnvironmentSupervisor {
     /// The web services that a DB mode switch and the LAN toggle restart, in start
     /// order: Universal Login is up again before the portals that need it start.
     private var webServicesInStartOrder: [String] {
-        let web: Set = ["universal-login", "travel-portal", "partner-portal"]
+        let web: Set = ["universal-login", "travel-portal", "partner-portal", ServiceCatalog.travelCoreID]
         return sortedServiceIDs.filter { web.contains($0) && isInProfile($0) }
     }
 
     /// Why a restart of a mode switch did not bring the service back, or nil when it did.
     private func notRestarted(_ serviceID: String, _ outcome: StartOutcome?) -> String? {
+        // A person stopped it meanwhile: it is off on purpose, and no switch failed.
+        if userStopped.contains(serviceID) { return nil }
         switch outcome {
         case .skipped(let why)?: return "skipped — \(why)"
         case .blocked(let dependency)?: return "not started — waiting for \(dependencyState(of: waitTarget(dependency)))"
@@ -2088,7 +2373,12 @@ final class EnvironmentSupervisor {
             let ip = lanAddress?.ip ?? "localhost"
             writeAppEnv()
 
-            let servicesToRestart = webServicesInStartOrder
+            // A service that is off (stopped by a person, or skipped) stays off: it
+            // takes the new addresses from its env at its next start.
+            let servicesToRestart = webServicesInStartOrder.filter { serviceID in
+                guard let phase = serviceStates[serviceID]?.phase else { return false }
+                return phase != .stopped && phase != .skipped
+            }
 
             for serviceID in servicesToRestart {
                 serviceStates[serviceID]?.phase = .stopping
@@ -2164,6 +2454,9 @@ final class EnvironmentSupervisor {
     /// `announce` is true when a person pressed a button: a restart that is already
     /// queued then says so. A restart the runner starts by itself stays quiet.
     func restartService(_ serviceID: String, stopsStack: Bool = false, announce: Bool = false) {
+        // A person asks for it: the service is no longer stopped by them. A restart
+        // that the runner starts by itself leaves a service that a person stopped.
+        if announce { userStopped.remove(serviceID) } else if userStopped.contains(serviceID) { return }
         if serviceID == "stripe" { resetStripeRetries() }
         let stopsStack = stopsStack && isSupabaseStack(serviceID)
         if isSupabaseStack(serviceID) { supabaseRepairUsed = false }
@@ -2200,6 +2493,11 @@ final class EnvironmentSupervisor {
                 }
                 // A crash during the start: the automatic restart gives the answer.
                 if case .launched = outcome { await awaitReplacingLaunch(serviceID) }
+                // A person stopped it during the restart: the stop said so, and nothing failed.
+                if userStopped.contains(serviceID) {
+                    recalculateHealth()
+                    return
+                }
                 let (text, ok) = restartFeedback(serviceID, outcome)
                 if ok { clearCleanExitError(serviceID) }
                 // The containers ran on, so the start only reused them: nothing restarted.
@@ -2435,7 +2733,7 @@ final class EnvironmentSupervisor {
         case .keepWaiting:
             keepWaiting(serviceID)
         case .startService:
-            restartService(serviceID, announce: true)
+            startFromRow(serviceID)
         case .stopForeignAndRetry(let port):
             // The port can be another port of the app (the HMR port). With no port in
             // the line, the button frees the port of the probe: the start alone
@@ -2904,7 +3202,7 @@ final class EnvironmentSupervisor {
     }
 
     /// The Next apps: their `.next` cache can be cleared.
-    static let cacheClearingServices: Set<String> = ["travel-portal", "partner-portal"]
+    static let cacheClearingServices: Set<String> = ["travel-portal", "partner-portal", ServiceCatalog.travelCoreID]
 
     /// Stops the service's process and starts a new one. The stop and the start hold
     /// the service's lock, so two requests cannot start two processes that fight for
@@ -2957,6 +3255,7 @@ final class EnvironmentSupervisor {
 
     func restartCascade(_ serviceID: String) {
         guard let graph else { return }
+        userStopped.remove(serviceID)
         let dependents = graph.dependents(of: serviceID)
         let allAffected = dependents.union([serviceID])
         let topoOrder = graph.sortedIDs.filter { allAffected.contains($0) }
@@ -3062,7 +3361,9 @@ final class EnvironmentSupervisor {
         notices.resolve(.profile)
         let changed = newProfile != profile
         profile = newProfile
-        profileMembers = newProfile.members(of: loadedServices)
+        // A run of one service keeps its members: the profile applies at the next
+        // Start All, or with "Apply now".
+        recomputeMembers()
         // A stack that stops takes the profile at its next start, as a stopped one does.
         if stopTask != nil || (health == .stopped && startTask == nil) {
             profileApplyPending = false
@@ -3084,6 +3385,11 @@ final class EnvironmentSupervisor {
     func applyProfileNow() -> Task<Void, Never>? {
         profileApplyPending = false
         guard stopTask == nil, startTask != nil || health != .stopped else { return nil }
+        // The run becomes the saved profile: a run of one service, and the services
+        // that a person added, end here.
+        runSelection = nil
+        extraMembers = []
+        recomputeMembers()
         let stops = stopAllCount
         let leave = enqueueStackOperation { [self] in
             let live: Set<ServicePhase> = [.running, .starting, .pending, .waiting, .failed]
@@ -4139,7 +4445,7 @@ final class EnvironmentSupervisor {
 
     private func lanAwareDefinition(for definition: ServiceDefinition, serviceID: String) -> ServiceDefinition {
         guard networkMode, let ip = localIP else { return definition }
-        let lanServices: Set<String> = ["travel-portal", "universal-login", "partner-portal"]
+        let lanServices: Set<String> = ["travel-portal", "universal-login", "partner-portal", ServiceCatalog.travelCoreID]
         guard lanServices.contains(serviceID) else { return definition }
 
         let cmd = Self.lanCommand(definition.cmd)
@@ -4181,6 +4487,7 @@ final class EnvironmentSupervisor {
     private static let localKeyApps: [String: String] = [
         "travel-portal": "apps/booking-portal/.env",
         "partner-portal": "apps/partner-portal/.env",
+        ServiceCatalog.travelCoreID: "apps/travel-core/.env",
     ]
 
     /// What `awaitReady` needs to know about the process that `spawnService` started.
@@ -4225,6 +4532,8 @@ final class EnvironmentSupervisor {
         var blocked: (id: String, rank: Int)?
         for dependency in graph?.nodes[serviceID]?.dependsOn ?? [] {
             guard isInProfile(dependency), let state = serviceStates[dependency] else { continue }
+            // A person took the dependency out of the run: the service does not wait for it.
+            if userStopped.contains(dependency) { continue }
             if orderingOnly.contains(dependency), [.skipped, .failed].contains(state.phase) { continue }
             let rank: Int
             switch state.phase {
@@ -4319,21 +4628,53 @@ final class EnvironmentSupervisor {
             return .refused(Self.stackStoppedRefusal)
         }
 
+        // A service that a person stopped stays off. Each start comes through here:
+        // the automatic restart, the wake check, a branch change, a mode switch and
+        // "Retry failed" all leave it. Start on its row, and Start All, clear the mark first.
+        if userStopped.contains(serviceID) {
+            state.phase = .stopped
+            if state.condition?.kind != .stoppedByUser {
+                state.condition = ServiceCondition(
+                    kind: .stoppedByUser, headline: Self.stoppedByYouHeadline, detail: Self.stoppedByYouDetail,
+                    actions: [.startService], since: clock.date()
+                )
+            }
+            return .skipped("stopped by you")
+        }
+
         if mode == .missingOnly, await isUp(serviceID) { return .alreadyHealthy }
 
-        // Services outside the active profile are skipped. The verification
-        // oneshots drive the local CDC evidence chain against the dev fixture, so
-        // they run only in the full profile.
+        // Services outside the run are skipped. The verification oneshots drive the
+        // local CDC evidence chain against the dev fixture, so they run only in the
+        // full profile.
         if !isInProfile(serviceID) {
             state.phase = .skipped
-            noteSkip(state, .notInProfile, "Not in the \(profile.displayName) profile.")
+            let startable: [RecoveryAction] = state.definition.resolvedType == .oneshot ? [] : [.startService]
+            if let selection = runSelection {
+                let only = displayName(selection.target)
+                noteSkip(
+                    state, .notInProfile, "Not started — this run is \(only) and what it needs.",
+                    detail: "Press Start on this row to add it, or Start All for the \(profile.displayName) profile.",
+                    actions: startable
+                )
+                return .skipped("this run is \(only) and what it needs")
+            }
+            noteSkip(state, .notInProfile, "Not in the \(profile.displayName) profile.", actions: startable)
             return .skipped("not in the \(profile.displayName) profile")
         }
 
         // A service of an optional repo that is not there is skipped. The portals and
         // the rest of the stack start.
         if let reason = ServiceCatalog.missingOptionalRepo(definition) {
-            await skipOptional(state, reason, actions: [.openSettingsPaths])
+            // Settings does not set the folder of an app of the monolith.
+            let actions: [RecoveryAction] = ServiceCatalog.optionalAppIDs.contains(serviceID) ? [] : [.openSettingsPaths]
+            await skipOptional(state, reason, actions: actions)
+            return .skipped(reason)
+        }
+
+        // Travel Core without its Statsig key answers 500 on every page.
+        if serviceID == ServiceCatalog.travelCoreID, let reason = travelCoreEnvProblem() {
+            await skipOptional(state, reason, detail: Self.travelCoreNeedsStatsigDetail, actions: [.openHealth])
             return .skipped(reason)
         }
 
@@ -6053,7 +6394,7 @@ final class EnvironmentSupervisor {
         if let phase = graph?.nodes[id]?.phase { return phase }
         if id == "supabase" || id == "db-reset" { return "ground" }
         if id == "universal-login" || id == "stripe" { return "gateway" }
-        if id == "travel-portal" || id == "partner-portal" { return "portal" }
+        if id == "travel-portal" || id == "partner-portal" || id == ServiceCatalog.travelCoreID { return "portal" }
         if id.hasPrefix("stream-") { return "stream" }
         if id.hasPrefix("cache-") || id.hasPrefix("capacity-") { return "verification" }
         return nil
@@ -6852,6 +7193,7 @@ final class EnvironmentSupervisor {
         "travel-portal": "/",
         "universal-login": "/frontdoor",
         "partner-portal": "/",
+        ServiceCatalog.travelCoreID: "/",
     ]
 
     /// Kill anything holding the web service ports — including orphaned dev

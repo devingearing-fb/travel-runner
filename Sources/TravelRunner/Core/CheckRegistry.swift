@@ -52,8 +52,9 @@ enum CheckRegistry {
         "hotel-data",
     ]
 
-    static let bookingProfiles: Set<RunProfile> = [.booking, .both, .full]
-    static let partnerProfiles: Set<RunProfile> = [.partner, .both, .full]
+    static let bookingProfiles: Set<RunProfile> = [.booking, .both, .all, .full]
+    /// Travel Core takes its Statsig key, and the hosted dev values, from the partner env.
+    static let partnerProfiles: Set<RunProfile> = [.partner, .core, .both, .all, .full]
 
     /// The profiles of a check. Nil: every profile.
     static func profiles(of id: String) -> Set<RunProfile>? {

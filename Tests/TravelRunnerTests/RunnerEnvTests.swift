@@ -131,6 +131,182 @@ final class RunnerEnvTests: XCTestCase {
         XCTAssertNil(remote["AMATEUR_SUPABASE_URL"])
     }
 
+    // MARK: - The staff provider of the local database
+
+    /// The seed admins sign in as `sso:local-demo`. The partner portal takes one as
+    /// staff only when the provider is that one, so local mode writes it, with the
+    /// local stack's keys only. Remote mode leaves the real provider of the shared .env.
+    func testLocalModeWritesTheStaffProviderOfTheSeedForThePartnerPortal() {
+        let local = RunnerEnv.values(for: .partner, mode: .local, host: "localhost", keys: keys, stripeWebhookSecret: nil)
+        XCTAssertEqual(local.last?.0, "EMPLOYEE_SSO_PROVIDER_ID")
+        XCTAssertEqual(local.last?.1, "local-demo")
+
+        let noKeys = Dictionary(uniqueKeysWithValues: RunnerEnv.values(
+            for: .partner, mode: .local, host: "localhost", keys: nil, stripeWebhookSecret: nil
+        ))
+        XCTAssertNil(noKeys["EMPLOYEE_SSO_PROVIDER_ID"], "without the local keys the app may still read hosted dev")
+        let remote = Dictionary(uniqueKeysWithValues: RunnerEnv.values(
+            for: .partner, mode: .remote, host: "localhost", keys: keys, stripeWebhookSecret: nil
+        ))
+        XCTAssertNil(remote["EMPLOYEE_SSO_PROVIDER_ID"])
+        let booking = Dictionary(uniqueKeysWithValues: RunnerEnv.values(
+            for: .booking, mode: .local, host: "localhost", keys: keys, stripeWebhookSecret: nil
+        ))
+        XCTAssertNil(booking["EMPLOYEE_SSO_PROVIDER_ID"], "the booking portal does not read it")
+
+        // A switch to remote removes the local provider from .env.local: the shared value applies again.
+        let shared = "EMPLOYEE_SSO_PROVIDER_ID=real-provider\n"
+        let localFile = render(.partner, .local, existing: "")
+        XCTAssertEqual(layered(env: shared, envLocal: localFile)["EMPLOYEE_SSO_PROVIDER_ID"], "local-demo")
+        let remoteFile = render(.partner, .remote, existing: localFile)
+        XCTAssertEqual(layered(env: shared, envLocal: remoteFile)["EMPLOYEE_SSO_PROVIDER_ID"], "real-provider")
+    }
+
+    // MARK: - Travel Core
+
+    /// The partner portal's shared .env. The signing key is quoted JSON, as in Doppler.
+    private let partnerShared = [
+        "AMATEUR_SUPABASE_URL=https://hosted.supabase.co",
+        "AMATEUR_SUPABASE_ANON_KEY=hosted-anon",
+        #"AMATEUR_SUPABASE_SIGNING_KEY='{"kty":"EC","d":"secret"}'"#,
+        "LOGIN_URL=https://identity.example/login/init",
+        "EMPLOYEE_SSO_PROVIDER_ID=real-provider",
+        "STATSIG_SERVER_KEY=secret-statsig",
+        "EMPTY_KEY=",
+    ].joined(separator: "\n")
+
+    private func core(
+        _ mode: RunnerEnv.Mode, keys: LocalSupabaseKeys?, own: String = "", ownLocal: String = "", partner: String? = nil,
+        host: String = "localhost"
+    ) -> [(String, String)] {
+        let shared = RunnerEnv.CoreShared(
+            ownKeys: Set(RunnerEnv.rawValues(in: own).keys),
+            localKeys: Set(RunnerEnv.rawValues(in: RunnerEnv.outsideBlock(ownLocal)).keys),
+            partner: RunnerEnv.rawValues(in: partner ?? partnerShared)
+        )
+        return RunnerEnv.values(for: .core, mode: mode, host: host, keys: keys, stripeWebhookSecret: "whsec_x", core: shared)
+    }
+
+    /// The block that was tried against the real app: the local stack and login, its
+    /// own port as the base URL, no cookie domain, the seed's staff provider, and the
+    /// Statsig server key of the partner portal. The order is the one of the
+    /// monolith's `scripts/env-mode.mjs`, so the two tools write the same file.
+    func testTravelCoreLocalBlock() {
+        let values = core(.local, keys: keys)
+        XCTAssertEqual(values.map(\.0), [
+            "AMATEUR_SUPABASE_URL", "AMATEUR_SUPABASE_ANON_KEY", "AMATEUR_SUPABASE_SIGNING_KEY",
+            "NEXT_PUBLIC_APP_ENV", "NEXT_PUBLIC_BASE_URL", "NEXT_PUBLIC_TRAVEL_BOOKING_PORTAL_URL",
+            "AUTH_COOKIE_DOMAIN", "LOGIN_URL", "EMPLOYEE_SSO_PROVIDER_ID",
+            "STATSIG_SERVER_KEY", "NEXT_PUBLIC_STATSIG_CLIENT_KEY", "NEXT_PUBLIC_FASTBREAK_DOMAIN",
+        ])
+        let byKey = Dictionary(uniqueKeysWithValues: values)
+        XCTAssertEqual(byKey["AMATEUR_SUPABASE_URL"], "http://localhost:54321")
+        XCTAssertEqual(byKey["AMATEUR_SUPABASE_SIGNING_KEY"], "local-secret")
+        XCTAssertEqual(byKey["NEXT_PUBLIC_APP_ENV"], "local")
+        XCTAssertEqual(byKey["NEXT_PUBLIC_BASE_URL"], "http://localhost:4009")
+        XCTAssertEqual(byKey["NEXT_PUBLIC_TRAVEL_BOOKING_PORTAL_URL"], "http://localhost:3002")
+        XCTAssertEqual(byKey["AUTH_COOKIE_DOMAIN"], "", "an empty value must override a shared cookie domain")
+        XCTAssertEqual(byKey["LOGIN_URL"], "http://localhost:3000/login/init")
+        XCTAssertEqual(byKey["EMPLOYEE_SSO_PROVIDER_ID"], "local-demo")
+        XCTAssertEqual(byKey["STATSIG_SERVER_KEY"], "secret-statsig")
+        XCTAssertEqual(byKey["NEXT_PUBLIC_STATSIG_CLIENT_KEY"], "client-local-placeholder")
+        XCTAssertEqual(byKey["NEXT_PUBLIC_FASTBREAK_DOMAIN"], "fastbreak.test")
+        XCTAssertNil(byKey["STRIPE_WEBHOOK_SECRET"])
+
+        // The empty cookie domain wins over a shared one, and the local login over the shared auth URL.
+        let own = "AUTH_COOKIE_DOMAIN=.fastbreak.test\nNEXT_PUBLIC_APP_ENV=development\nNEXT_PUBLIC_BASE_URL=https://hosted.example\n"
+        let file = RunnerEnv.render(existing: "", values: core(.local, keys: keys, own: own), managedKeys: RunnerEnv.managedKeys(for: .core))
+        XCTAssertTrue(file.contains("\nAUTH_COOKIE_DOMAIN=\n"), file)
+        let effective = layered(env: own, envLocal: file)
+        XCTAssertEqual(effective["AUTH_COOKIE_DOMAIN"], "")
+        XCTAssertEqual(effective["NEXT_PUBLIC_APP_ENV"], "local")
+        XCTAssertEqual(effective["NEXT_PUBLIC_BASE_URL"], "http://localhost:4009")
+
+        // LAN mode: the addresses that a phone can reach.
+        let lan = Dictionary(uniqueKeysWithValues: core(.local, keys: keys, host: "10.0.0.5"))
+        XCTAssertEqual(lan["NEXT_PUBLIC_BASE_URL"], "http://10.0.0.5:4009")
+        XCTAssertEqual(lan["LOGIN_URL"], "http://10.0.0.5:3000/login/init")
+        XCTAssertEqual(lan["AMATEUR_SUPABASE_URL"], "http://10.0.0.5:54321")
+    }
+
+    /// Before the local stack reports its keys, the block has no database values and
+    /// no staff provider: the logins of the seed live in the local database.
+    func testTravelCoreLocalBlockWithoutKeys() {
+        let byKey = Dictionary(uniqueKeysWithValues: core(.local, keys: nil))
+        XCTAssertNil(byKey["AMATEUR_SUPABASE_URL"])
+        XCTAssertNil(byKey["EMPLOYEE_SSO_PROVIDER_ID"])
+        XCTAssertEqual(byKey["LOGIN_URL"], "http://localhost:3000/login/init")
+        XCTAssertEqual(byKey["NEXT_PUBLIC_BASE_URL"], "http://localhost:4009")
+    }
+
+    /// Hosted dev: what the app's own .env does not set comes from the partner
+    /// portal, with the quoting of that file. The app still runs on localhost.
+    func testTravelCoreRemoteBlockBorrowsFromThePartnerPortal() {
+        let byKey = Dictionary(uniqueKeysWithValues: core(.remote, keys: keys))
+        XCTAssertEqual(byKey["AMATEUR_SUPABASE_URL"], "https://hosted.supabase.co")
+        XCTAssertEqual(byKey["AMATEUR_SUPABASE_SIGNING_KEY"], #"'{"kty":"EC","d":"secret"}'"#, "a copy keeps the quotes of a JSON key")
+        XCTAssertEqual(byKey["LOGIN_URL"], "https://identity.example/login/init")
+        XCTAssertEqual(byKey["EMPLOYEE_SSO_PROVIDER_ID"], "real-provider", "never the local provider on hosted dev")
+        XCTAssertEqual(byKey["NEXT_PUBLIC_APP_ENV"], "local")
+        XCTAssertEqual(byKey["NEXT_PUBLIC_BASE_URL"], "http://localhost:4009")
+        XCTAssertEqual(byKey["AUTH_COOKIE_DOMAIN"], "")
+        XCTAssertEqual(byKey["STATSIG_SERVER_KEY"], "secret-statsig")
+
+        // The app's own shared .env wins where it has a value.
+        let own = [
+            "AMATEUR_SUPABASE_URL=https://own.supabase.co", "NEXT_PUBLIC_APP_ENV=development",
+            "NEXT_PUBLIC_UNIVERSAL_AUTH_URL=https://identity.own/login/", "EMPLOYEE_SSO_PROVIDER_ID=own-provider",
+            "STATSIG_SERVER_KEY=secret-own", "NEXT_PUBLIC_STATSIG_CLIENT_KEY=client-own", "NEXT_PUBLIC_FASTBREAK_DOMAIN=fastbreak-dev.ai",
+        ].joined(separator: "\n")
+        let withOwn = core(.remote, keys: keys, own: own)
+        XCTAssertEqual(withOwn.map(\.0), ["NEXT_PUBLIC_BASE_URL", "NEXT_PUBLIC_TRAVEL_BOOKING_PORTAL_URL", "AUTH_COOKIE_DOMAIN"])
+    }
+
+    /// The Statsig server key must be a real one. With no file that has it, the
+    /// block does not make one up: the runner then skips the service with the reason.
+    func testTravelCoreBlockNeverInventsAStatsigServerKey() {
+        let none = Dictionary(uniqueKeysWithValues: core(.local, keys: keys, partner: "LOGIN_URL=x\nSTATSIG_SERVER_KEY=\n"))
+        XCTAssertNil(none["STATSIG_SERVER_KEY"])
+        XCTAssertEqual(none["NEXT_PUBLIC_STATSIG_CLIENT_KEY"], "client-local-placeholder")
+
+        // A person's own line in .env.local, outside the block, stays and wins: the block writes no fallback.
+        let block = RunnerEnv.render(existing: "", values: core(.local, keys: keys), managedKeys: RunnerEnv.managedKeys(for: .core))
+        let mine = "STATSIG_SERVER_KEY=secret-mine\nNEXT_PUBLIC_FASTBREAK_DOMAIN=mine.test\n"
+        let again = core(.local, keys: keys, ownLocal: mine + block)
+        XCTAssertFalse(again.contains { $0.0 == "STATSIG_SERVER_KEY" })
+        XCTAssertFalse(again.contains { $0.0 == "NEXT_PUBLIC_FASTBREAK_DOMAIN" })
+        let file = RunnerEnv.render(existing: mine + block, values: again, managedKeys: RunnerEnv.managedKeys(for: .core))
+        XCTAssertTrue(file.hasPrefix(mine), file)
+        // The fallback that the block wrote itself is not a person's line: it is written again.
+        XCTAssertTrue(core(.local, keys: keys, ownLocal: block).contains { $0.0 == "STATSIG_SERVER_KEY" })
+    }
+
+    /// Both portals change the same inventory, so they must read one Redis. A line
+    /// in one `.env.local` that differs from the shared value is the usual cause.
+    func testTheTwoPortalsMustReadTheSameRedis() {
+        let shared = "UPSTASH_REDIS_REST_URL=\"https://shared-1.upstash.io\"\n"
+        let own = "UPSTASH_REDIS_REST_URL=https://mine-2.upstash.io\n"
+        func url(env: String, local: String) -> String? {
+            RunnerEnv.effectiveValue(of: RunnerEnv.redisURLKey, env: env, envLocal: local)
+        }
+        XCTAssertEqual(url(env: shared, local: ""), "https://shared-1.upstash.io")
+        XCTAssertEqual(url(env: shared, local: own), "https://mine-2.upstash.io", ".env.local wins")
+        XCTAssertNil(url(env: "", local: ""))
+
+        XCTAssertNil(RunnerEnv.redisMismatch(booking: url(env: shared, local: ""), partner: url(env: shared, local: "")))
+        let warning = RunnerEnv.redisMismatch(booking: url(env: shared, local: own), partner: url(env: shared, local: ""))
+        XCTAssertEqual(warning?.contains("mine-2.upstash.io and shared-1.upstash.io"), true, warning ?? "nil")
+        XCTAssertEqual(warning?.contains("https://"), false, "only the hosts are named")
+        // One portal without a Redis, or outside the run: nothing to compare.
+        XCTAssertNil(RunnerEnv.redisMismatch(booking: "https://a.upstash.io", partner: nil))
+    }
+
+    func testRawValuesKeepQuotesAndTakeTheLastAssignment() {
+        let values = RunnerEnv.rawValues(in: "A=1\nexport B = 'two words'\n# C=3\nA=\"last\"\nEMPTY=\nQUOTED_EMPTY=\"\"\n")
+        XCTAssertEqual(values, ["A": "\"last\"", "B": "'two words'"])
+        XCTAssertEqual(RunnerEnv.outsideBlock("X=1\n\(RunnerEnv.beginMarker)\nY=2\n\(RunnerEnv.endMarker)\nZ=3"), "X=1\nZ=3")
+    }
+
     func testLocalModeWithoutKeysWritesNoSupabaseValues() {
         let values = Dictionary(uniqueKeysWithValues: RunnerEnv.values(
             for: .booking, mode: .local, host: "localhost", keys: nil, stripeWebhookSecret: nil

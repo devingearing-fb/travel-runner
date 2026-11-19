@@ -109,6 +109,18 @@ struct TriageCard: View {
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
 
+                    // A failed service that should stay off: the retries stop too.
+                    if supervisor.canStopFromRow(state) {
+                        Button {
+                            supervisor.stopService(state.id)
+                        } label: {
+                            Label("Stop", systemImage: "stop.fill")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                        .help("Stop this service. It stays off until you start it or press Start All.")
+                    }
+
                     if let onClearCache, !conditionActions.contains(.clearCacheAndRestart) {
                         Button(action: onClearCache) {
                             Label("Clear Cache", systemImage: "arrow.clockwise")

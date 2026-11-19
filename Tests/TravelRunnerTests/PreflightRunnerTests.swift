@@ -341,6 +341,32 @@ final class PreflightRunnerTests: XCTestCase {
         ])
     }
 
+    /// A checkout from before Travel Core has no `apps/travel-core`. The app is
+    /// skipped at its start, so its folder and its port are no condition of the
+    /// start. With the folder, the port is checked, and the folder is still no
+    /// condition: a start must not stop when the app goes away after a branch change.
+    func testTravelCoreOfAnOldCheckoutIsNoConditionOfTheStart() throws {
+        let monorepo = try folder("mono")
+        let booking = try folder("mono/apps/booking-portal")
+        let corePath = workDir.appendingPathComponent("mono/apps/travel-core").path
+        let services = [
+            service("supabase", cwd: monorepo, port: 54322),
+            service("travel-portal", cwd: booking, port: 3002),
+            service("travel-core", cwd: corePath, port: 4009),
+        ]
+        let (preflight, _, _) = self.preflight([:])
+
+        XCTAssertEqual(preflight.allChecks(for: services).map(\.id), [
+            "node", "docker", "port-3002", "port-54322", "dir-mono", "dir-booking-portal",
+        ])
+
+        let core = try folder("mono/apps/travel-core")
+        try Data("{}".utf8).write(to: URL(fileURLWithPath: core).appendingPathComponent("package.json"))
+        XCTAssertEqual(preflight.allChecks(for: services).map(\.id), [
+            "node", "docker", "port-3002", "port-4009", "port-54322", "dir-mono", "dir-booking-portal",
+        ])
+    }
+
     // MARK: - Sockets of the test
 
     /// A socket that listens on a port of the system's choice, on ::1 only.

@@ -4,14 +4,18 @@ import Foundation
 enum RunProfile: String, Codable, CaseIterable, Sendable {
     case booking
     case partner
+    case core
     case both
+    case all
     case full
 
     var displayName: String {
         switch self {
         case .booking: "Booking"
         case .partner: "Partner"
+        case .core: "Travel Core"
         case .both: "Booking + Partner"
+        case .all: "Booking + Partner + Travel Core"
         case .full: "Full (CDC + verification, experimental)"
         }
     }
@@ -24,7 +28,12 @@ enum RunProfile: String, Codable, CaseIterable, Sendable {
         switch self {
         case .booking: return forkApps.union(["supabase", "universal-login", "stripe", "travel-portal"])
         case .partner: return forkApps.union(["supabase", "universal-login", "partner-portal"])
+        case .core: return forkApps.union(["supabase", "universal-login", ServiceCatalog.travelCoreID])
         case .both: return forkApps.union(["supabase", "universal-login", "stripe", "travel-portal", "partner-portal"])
+        case .all:
+            return forkApps.union([
+                "supabase", "universal-login", "stripe", "travel-portal", "partner-portal", ServiceCatalog.travelCoreID,
+            ])
         case .full: return nil
         }
     }
@@ -75,6 +84,30 @@ enum ServiceCatalog {
     /// The booking portal. In the fork it shows the chat of the agent.
     static let bookingPortalID = "travel-portal"
 
+    /// Travel Core (`apps/travel-core`, Next.js): the travel pages of an organization.
+    /// In production it is a zone behind platform-core. The runner runs it by itself
+    /// on its own port, with the local login.
+    static let travelCoreID = "travel-core"
+    static let travelCoreDirectory = "apps/travel-core"
+    /// The port of the app's `dev` script, and of `travel.routes.fastbreak.test` in
+    /// the Caddyfile of platform-core.
+    static let travelCorePort = 4009
+
+    /// The apps of the monolith that an older checkout does not have. Each one is
+    /// skipped there, and the rest of the stack starts.
+    static let optionalAppIDs: Set<String> = [travelCoreID]
+
+    /// True when `folder` holds an app. The folder alone is not enough: the runner's
+    /// `.env.local`, `.next` and `node_modules` are not in git, so they stay behind
+    /// when a branch from before the app is checked out.
+    static func hasApp(at folder: String) -> Bool {
+        !folder.isEmpty && FileManager.default.fileExists(atPath: (folder as NSString).appendingPathComponent("package.json"))
+    }
+
+    static func appNotInCheckout(_ name: String, directory: String) -> String {
+        "\(directory) is not in this checkout — update the monolith checkout (git pull on dev) to get \(name)."
+    }
+
     /// The agent app of the hackathon fork (`apps/amateur-agent`, eve).
     static let agentID = "amateur-agent"
     /// The default port of `eve dev`. The runner passes no `--port`, so that an
@@ -90,7 +123,7 @@ enum ServiceCatalog {
     }
 
     private static let standardIDs: Set<String> = [
-        "supabase", "universal-login", "stripe", "travel-portal", "partner-portal",
+        "supabase", "universal-login", "stripe", "travel-portal", "partner-portal", travelCoreID,
         "stream-services-install", "stream-qstash", "stream-db-setup", "stream-services",
         "stream-qstash-wire", "stream-sequin",
         "cache-apply-transport", "cache-cdc-rehearsal", "cache-cutover-audit",
@@ -110,6 +143,10 @@ enum ServiceCatalog {
     /// The repo that `definition` runs from, when it is optional and its folder is
     /// not there: the reason of its skip. Nil when the service can start.
     static func missingOptionalRepo(_ definition: ServiceDefinition) -> String? {
+        if optionalAppIDs.contains(definition.id) {
+            if hasApp(at: definition.resolvedCwd ?? "") { return nil }
+            return appNotInCheckout(definition.displayName, directory: travelCoreDirectory)
+        }
         guard let role = optionalRepoServices[definition.id] else { return nil }
         // The CDC setup runs in the booking app and reads the stream repo from its env.
         let path = definition.env?["STREAM_SERVICES_DIR"] ?? definition.resolvedCwd ?? ""
@@ -180,6 +217,7 @@ enum ServiceCatalog {
         let monorepo = expand(paths.monorepo ?? "")
         let booking = (monorepo as NSString).appendingPathComponent("apps/booking-portal")
         let partner = (monorepo as NSString).appendingPathComponent("apps/partner-portal")
+        let core = (monorepo as NSString).appendingPathComponent(travelCoreDirectory)
         let login = expand(paths.universalLogin ?? "")
         let stream = expand(paths.streamServices ?? "")
         let loadTest = expand(paths.loadTest ?? "")
@@ -215,6 +253,11 @@ enum ServiceCatalog {
                     ]),
             service("partner-portal", "Partner Portal", ["pnpm", "dev"], cwd: partner,
                     probe: http("http://127.0.0.1:3006/api/health", port: 3006, timeout: 240),
+                    restart: .onFailure, phase: "portal", dependsOn: ["universal-login"]),
+            // The app has no health route, so the probe is its port. The liveness
+            // check asks "/" (see `wakeHealthPaths`).
+            service(travelCoreID, "Travel Core", ["pnpm", "dev"], cwd: core,
+                    probe: tcp(travelCorePort, timeout: 240),
                     restart: .onFailure, phase: "portal", dependsOn: ["universal-login"]),
 
             // Local CDC: production logic runs in stream-services; the local
@@ -278,6 +321,15 @@ enum ServiceCatalog {
                     type: .oneshot, restart: .never, phase: "verification",
                     dependsOn: ["cache-apply-transport", "cache-cdc-rehearsal"]),
         ]
+    }
+
+    /// The page that "Open in browser" shows for a service, or nil when it has none:
+    /// the login page of Universal Login, and the root of each web app.
+    static func browserURL(for definition: ServiceDefinition, host: String = "localhost") -> URL? {
+        guard definition.resolvedType != .oneshot, let port = definition.probe?.port else { return nil }
+        if definition.id == "universal-login" { return URL(string: "http://\(host):\(port)/login") }
+        guard definition.phase == "portal", definition.id != agentID else { return nil }
+        return URL(string: "http://\(host):\(port)/")
     }
 
     static func expand(_ path: String) -> String {

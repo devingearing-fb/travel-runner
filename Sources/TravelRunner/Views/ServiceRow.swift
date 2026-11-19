@@ -32,7 +32,8 @@ struct ServiceRow: View {
     /// long, or why a running service is unhealthy.
     private var rowCondition: ServiceCondition? {
         switch (state.phase, state.condition?.kind) {
-        case (.skipped, _), (.failed, _), (.waiting, _), (.starting, .slowStart?), (.running, .unhealthy?): state.condition
+        case (.skipped, _), (.failed, _), (.waiting, _), (.stopped, .stoppedByUser?), (.starting, .slowStart?),
+             (.running, .unhealthy?): state.condition
         default: nil
         }
     }
@@ -53,6 +54,57 @@ struct ServiceRow: View {
     }
 
     private var canStart: Bool { supervisor.canStartFromRow(state) }
+
+    private var canRestart: Bool { state.phase == .running || state.phase == .failed }
+
+    /// In a stopped stack, Start on a row starts that service and what it needs.
+    private var startTitle: String {
+        supervisor.nothingRuns ? "Start \(state.definition.displayName) only (with what it needs)" : "Start"
+    }
+
+    /// One action of the row: an icon that is large enough to see, with a tooltip.
+    private func rowButton(_ systemName: String, help: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 18, height: 16)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .help(help)
+        .accessibilityLabel(help)
+    }
+
+    /// The actions of the service with their names. The "…" button and a right
+    /// click on the row show the same list.
+    @ViewBuilder private var menuItems: some View {
+        if canStart {
+            Button(startTitle) { supervisor.startFromRow(state.id) }
+        }
+        if canRerunOneshot {
+            Button("Run again") { onRestart() }
+        }
+        if canRestart {
+            Button("Restart") { onRestart() }
+        }
+        if canRestart || canRerunOneshot, let onCascadeRestart {
+            Button("Restart with dependents") { onCascadeRestart() }
+        }
+        if canRestart {
+            if EnvironmentSupervisor.cacheClearingServices.contains(state.id) {
+                Button("Clear cache and restart") { supervisor.clearCacheAndRestart(state.id) }
+            }
+        }
+        if supervisor.canStopFromRow(state) {
+            Button("Stop") { supervisor.stopService(state.id) }
+        }
+        Divider()
+        if let url = supervisor.browserURL(for: state.id) {
+            Button("Open in browser") { NSWorkspace.shared.open(url) }
+                .disabled(state.phase != .running)
+        }
+        Button(showLogs ? "Hide logs" : "Show logs") { showLogs.toggle() }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -133,41 +185,39 @@ struct ServiceRow: View {
 
                 if isActionInFlight {
                     ProgressView().controlSize(.mini)
-                } else if state.phase == .running || state.phase == .failed || canRerunOneshot {
-                    Button(action: onRestart) {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.caption2)
+                } else {
+                    if canRestart || canRerunOneshot {
+                        rowButton("arrow.clockwise", help: canRerunOneshot && state.phase != .failed ? "Run again" : "Restart",
+                                  action: onRestart)
                     }
-                    .buttonStyle(.borderless)
-                    .help(canRerunOneshot && state.phase != .failed ? "Run again" : "Restart")
-
-                    if let onCascadeRestart {
-                        Button(action: onCascadeRestart) {
-                            Image(systemName: "arrow.clockwise.circle")
-                                .font(.caption2)
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Restart with dependents")
+                    if supervisor.canStopFromRow(state) {
+                        rowButton("stop.fill", help: "Stop") { supervisor.stopService(state.id) }
                     }
-                } else if canStart {
-                    Button(action: onRestart) {
-                        Image(systemName: "play.fill")
-                            .font(.caption2)
+                    if canStart {
+                        rowButton("play.fill", help: startTitle) { supervisor.startFromRow(state.id) }
                     }
-                    .buttonStyle(.borderless)
-                    .help("Start")
                 }
 
-                Button {
-                    showLogs.toggle()
+                // Every action of the row, with its name.
+                Menu {
+                    menuItems
                 } label: {
-                    Image(systemName: showLogs ? "chevron.up" : "terminal")
-                        .font(.caption2)
-                        .foregroundStyle(showLogs ? .primary : .secondary)
+                    Image(systemName: "ellipsis.circle")
+                        .font(.system(size: 12, weight: .medium))
                 }
-                .buttonStyle(.borderless)
-                .help(showLogs ? "Hide logs" : "Show logs")
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("Actions: start, stop, restart, open in browser")
+                .accessibilityLabel("Actions of \(state.definition.displayName)")
+
+                rowButton(showLogs ? "chevron.up" : "terminal", help: showLogs ? "Hide logs" : "Show logs") {
+                    showLogs.toggle()
+                }
+                .foregroundStyle(showLogs ? .primary : .secondary)
             }
+            .contentShape(Rectangle())
+            .contextMenu { menuItems }
 
             if showSubtitle {
                 HStack(spacing: 8) {

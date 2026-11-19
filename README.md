@@ -22,7 +22,7 @@ Do these in order on a new Mac. The fb-travel-monolith README ("Once per machine
 4. **Find it in the menu bar.** The app has no Dock icon. Click its menu-bar icon to show or hide the window. Control-Shift-T does the same; from other apps it works only after you allow Travel Runner in System Settings > Privacy & Security > Accessibility.
 5. **Run the wizard.** It opens on the first launch. Drop your Codebases folder on it, or browse to each checkout: `fb-travel-monolith` is required, universal login too; stream-services and travel-load-test are optional. **Check Environment** then runs each check. A failed check has a fix button or a command to copy. **Re-check All** runs them again.
 6. **Bring in the two shared `.env` files.** The booking and partner apps each need `apps/<app>/.env` with the shared dev values. On the Environment Check (later: Settings → Reconfigure Repos…), use **Import…** on the booking and partner rows for a file a teammate sent you, or **Pull from Doppler** if you have Doppler access. The old file is kept as `.env.bak-<date>`. The runner never stores these values.
-7. **Press Start.** Pick a profile in Settings (`booking`, `partner` or `both`) and click **Start**. The first Start pulls the Supabase images, builds the local database and downloads the hotel catalog (about 285 MB), so it takes several minutes, more on a slow network. Later starts are much faster. The menu-bar dot turns green when every service answers.
+7. **Press Start.** Pick a profile in Settings (`booking`, `partner`, `core`, `both` or `all`) and click **Start**. To run one app only, press **Start** on its row instead. The first Start pulls the Supabase images, builds the local database and downloads the hotel catalog (about 285 MB), so it takes several minutes, more on a slow network. Later starts are much faster. The menu-bar dot turns green when every service answers.
 8. **Something failed?** See [Troubleshooting](#troubleshooting) and [Something broke](#something-broke).
 
 ### Troubleshooting
@@ -48,7 +48,14 @@ On first launch, a setup wizard guides you through configuring repo paths and ve
 
 ## What It Does
 
-- **One-click startup**: Starts the selected profile in dependency order — `booking` (Supabase, Universal Login, Stripe, booking portal on :3002), `partner` (Supabase, Universal Login, partner portal on :3006), `both` (default), or `full` (adds cache verification, stream-services, QStash, and Sequin; experimental)
+- **One-click startup**: Starts the selected profile in dependency order — `booking` (Supabase, Universal Login, Stripe, booking portal on :3002), `partner` (Supabase, Universal Login, partner portal on :3006), `core` (Supabase, Universal Login, Travel Core on :4009), `both` (booking + partner, the default), `all` (booking + partner + Travel Core), or `full` (adds cache verification, stream-services, QStash, and Sequin; experimental)
+- **One service at a time**: each row in Status has **Start**, **Stop** and **Restart** icons, and a **…** menu (also on a right click) with the same actions by name, plus **Restart with dependents**, **Clear cache and restart**, **Open in browser** and **Show logs**.
+  - **Start** on a row of a stopped stack starts that service and what it needs, and nothing else. In a running stack it starts a service that is stopped or skipped; a service outside the profile joins the run.
+  - **Stop** stops that service only. It stays off until you start it or press Start again after a stop: the automatic restart, the wake check, a branch change and "Retry failed" leave it. The services that need it keep running.
+  - After **Stop** for the whole stack, **Start** is the profile again.
+- **Travel Core** (`apps/travel-core`, port 4009): the runner runs it by itself, with the local login, and writes its block in `apps/travel-core/.env.local` (the local database, its own port as the base URL, no cookie domain). Its Doppler config has no Supabase and no Statsig values, so the block takes them from `apps/partner-portal/.env`. Sign in as `servicing-admin@example.com` / `password` (the servicing seed) and open `http://localhost:4009`. It is skipped, with the reason in its row, in a checkout without `apps/travel-core` and when no env file has a real `STATSIG_SERVER_KEY` (its pages answer 500 without one). Links into platform-core pages do not work without platform-core.
+- **One Redis for both portals**: the booking portal and the partner portal change the same inventory, so both must read the same `UPSTASH_REDIS_REST_URL`. A start warns in the logs of both portals when they differ (a hand-written line in one `.env.local` is the usual cause).
+- **Staff in the local database**: in local database mode the runner writes `EMPLOYEE_SSO_PROVIDER_ID=local-demo` for the partner portal and Travel Core. The seed admins sign in as `sso:local-demo`, and both apps take a user as staff only on an exact match. Dev mode leaves the real provider of the shared `.env`.
 - **Health monitoring**: Color-coded status dot in the menu bar (green/amber/red/gray)
 - **Health section**: every setup check of the first-run wizard, with its Fix and Import… buttons, and where each tool was found. The launch runs the fast checks; the network checks (GitHub Packages, Stripe, pnpm) run when Health opens. The preflight of a start runs the fast checks in parallel, 3 s each, and gives a Node check that times out one more try with the Health limit; Node must match `engines.node` of the monorepo. Status says "N setup items need attention — Open Health" while a check fails
 - **Stripe secret injection**: Captures `whsec_` from Stripe CLI stdout, writes to the runner block in `apps/booking-portal/.env.local` + serves via HTTP registry
@@ -112,13 +119,15 @@ When running, travel-runner exposes an HTTP API on `http://localhost:19900` (it 
 | `GET` | `/api/logs/{id}?lines=N` | Last N log lines (default 50) of a service or a DB step |
 | `POST` | `/api/restart/{serviceId}` | Restart a service; for `supabase`, `?stack=1` stops and starts the containers too |
 | `POST` | `/api/restart-cascade/{serviceId}` | Restart a service and its dependents |
-| `POST` | `/api/clear-cache-restart/{serviceId}` | Clear `.next` cache + restart (`travel-portal`, `partner-portal`) |
+| `POST` | `/api/start/{serviceId}` | Start one service: on a stopped stack with what it needs, on a running stack also a service outside the profile (409 with the reason when it cannot start) |
+| `POST` | `/api/stop/{serviceId}` | Stop one service; it stays off until it is started again or the next full start (409 when it does not run; `supabase` stops with the stack) |
+| `POST` | `/api/clear-cache-restart/{serviceId}` | Clear `.next` cache + restart (`travel-portal`, `partner-portal`, `travel-core`) |
 | `POST` | `/api/start-all` | Start the active profile's services |
 | `POST` | `/api/stop-all` | Stop all services |
 | `POST` | `/api/toggle-lan` | Toggle LAN mode for mobile testing |
 | `POST` | `/api/toggle-db-mode` | Toggle local Supabase / hosted dev database |
 | `GET` | `/api/profile` | Active profile, its services, available profiles |
-| `POST` | `/api/profile/{booking\|partner\|both\|full}` | Set the run profile (400 on unknown) |
+| `POST` | `/api/profile/{booking\|partner\|core\|both\|all\|full}` | Set the run profile (400 on unknown) |
 | `POST` | `/api/db-reset` | Reset the DB (manifest `reset` profile, selected seed scenario) |
 | `POST` | `/api/db-setup` | Run the DB setup pipeline; optional body `{"profile": "full\|reset\|fast\|migrate"}` (`migrate` never resets) |
 | `POST` | `/api/db-setup/retry/{stepId}` | Re-run the pipeline from a step |
@@ -164,6 +173,12 @@ curl -X POST http://localhost:19900/api/toggle-lan
 
 # Restart universal login
 curl -X POST http://localhost:19900/api/restart/universal-login
+
+# Start only Travel Core (and what it needs) on a stopped stack, or add it to a running one
+curl -X POST http://localhost:19900/api/start/travel-core
+
+# Stop the partner portal and leave the rest running
+curl -X POST http://localhost:19900/api/stop/partner-portal
 ```
 
 ## Cache CDC Rehearsal

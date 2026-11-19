@@ -41,7 +41,7 @@ struct WorkshopStatusView: View {
                             logStore: supervisor.logStore,
                             onRestart: { supervisor.requestRestart(state.id) },
                             onCascadeRestart: { supervisor.requestCascadeRestart(state.id) },
-                            onClearCache: ["travel-portal", "partner-portal"].contains(state.id)
+                            onClearCache: EnvironmentSupervisor.cacheClearingServices.contains(state.id)
                                 ? { supervisor.clearCacheAndRestart(state.id) } : nil
                         )
                         .overlay(

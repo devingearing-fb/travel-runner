@@ -166,6 +166,69 @@ final class ServiceCatalogTests: XCTestCase {
             ["supabase", "universal-login", "stripe", "travel-portal", "partner-portal"]
         )
         XCTAssertEqual(RunProfile.full.members(of: services), ServiceCatalog.canonicalIDs)
+        // Travel Core has its own profile and the one of all three apps. "Booking +
+        // Partner" stays as it was, so the Start of a teammate does not change.
+        XCTAssertEqual(RunProfile.core.members(of: services), ["supabase", "universal-login", "travel-core"])
+        XCTAssertEqual(
+            RunProfile.all.members(of: services),
+            ["supabase", "universal-login", "stripe", "travel-portal", "partner-portal", "travel-core"]
+        )
+        XCTAssertFalse(RunProfile.both.members(of: services).contains("travel-core"))
+        XCTAssertEqual(RunProfile.allCases.map(\.displayName).filter { $0.contains("Travel Core") },
+                       ["Travel Core", "Booking + Partner + Travel Core"])
+    }
+
+    func testTravelCoreRunsInItsFolderOnItsPortAfterTheLogin() throws {
+        let core = try XCTUnwrap(byID["travel-core"])
+        XCTAssertEqual(core.displayName, "Travel Core")
+        XCTAssertEqual(core.cmd, ["pnpm", "dev"])
+        XCTAssertEqual(core.resolvedCwd, "/work/TRAVEL BOOKING/fb-travel-monolith/apps/travel-core")
+        XCTAssertEqual(core.probe?.type, .tcp)
+        XCTAssertEqual(core.probe?.port, 4009)
+        XCTAssertEqual(core.dependsOn, ["universal-login"])
+        XCTAssertEqual(core.phase, "portal")
+        XCTAssertTrue(ServiceCatalog.canonicalIDs.contains("travel-core"))
+    }
+
+    /// A checkout from before the app has no `apps/travel-core`: the service has
+    /// its skip reason, and Settings is not the place that fixes it.
+    func testTravelCoreOfACheckoutWithoutTheAppHasItsSkipReason() throws {
+        let core = try XCTUnwrap(byID["travel-core"])
+        XCTAssertEqual(
+            ServiceCatalog.missingOptionalRepo(core),
+            "apps/travel-core is not in this checkout — update the monolith checkout (git pull on dev) to get Travel Core."
+        )
+        XCTAssertTrue(ServiceCatalog.optionalAppIDs.contains("travel-core"))
+
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ServiceCatalogTests-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = root.appendingPathComponent("apps/travel-core")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let present = try XCTUnwrap(ServiceCatalog.services(paths: RepoPaths(
+            monorepo: root.path, universalLogin: "/work/login", streamServices: nil, loadTest: nil
+        )).first { $0.id == "travel-core" })
+        // The runner's own .env.local stays behind when a branch from before the app is
+        // checked out (it is not in git). A folder with only that is not the app.
+        try Data("X=1\n".utf8).write(to: folder.appendingPathComponent(".env.local"))
+        XCTAssertNotNil(ServiceCatalog.missingOptionalRepo(present), "a leftover folder is not the app")
+        try Data("{}".utf8).write(to: folder.appendingPathComponent("package.json"))
+        XCTAssertNil(ServiceCatalog.missingOptionalRepo(present))
+    }
+
+    func testOpenInBrowserGoesToThePageOfEachWebApp() throws {
+        func url(_ id: String, host: String = "localhost") throws -> String? {
+            ServiceCatalog.browserURL(for: try XCTUnwrap(byID[id]), host: host)?.absoluteString
+        }
+        XCTAssertEqual(try url("travel-portal"), "http://localhost:3002/")
+        XCTAssertEqual(try url("partner-portal"), "http://localhost:3006/")
+        XCTAssertEqual(try url("travel-core"), "http://localhost:4009/")
+        XCTAssertEqual(try url("universal-login"), "http://localhost:3000/login")
+        XCTAssertEqual(try url("travel-core", host: "10.0.0.5"), "http://10.0.0.5:4009/")
+        // No page: the database, the Stripe listener, a stream service, a one-shot.
+        XCTAssertNil(try url("supabase"))
+        XCTAssertNil(try url("stripe"))
+        XCTAssertNil(try url("stream-qstash"))
+        XCTAssertNil(try url("cache-apply-transport"))
     }
 
     func testEveryProfileIsClosedUnderDependencies() {

@@ -60,4 +60,22 @@ final class ServiceGraphTests: XCTestCase {
         XCTAssertEqual(levels[stripeLevel - 1], ["supabase"], "Stripe starts as soon as the database is up")
         XCTAssertTrue(levels[stripeLevel].contains("universal-login"))
     }
+
+    /// What a service needs, through other services too. An edge that only sets
+    /// the order of a start is not a need.
+    func testDependenciesAreTransitiveAndLeaveOutOrderingEdges() throws {
+        func node(_ id: String, _ dependsOn: [String]) -> ServiceDefinition {
+            ServiceDefinition(id: id, name: nil, cmd: ["true"], cwd: nil, probe: nil, type: nil,
+                              restart: .never, dependsOn: dependsOn, env: nil, phase: nil, reuseIfRunning: nil)
+        }
+        let graph = try ServiceGraph(services: [
+            node("db", []), node("login", ["db"]), node("portal", ["login"]), node("audit", ["portal"]),
+            node("setup", ["db", "audit"]),
+        ])
+        XCTAssertEqual(graph.dependencies(of: "portal"), ["login", "db"])
+        XCTAssertEqual(graph.dependencies(of: "db"), [])
+        XCTAssertEqual(graph.dependencies(of: "setup"), ["db", "audit", "portal", "login"])
+        XCTAssertEqual(graph.dependencies(of: "setup", orderingOnly: ["setup": ["audit"]]), ["db"])
+        XCTAssertEqual(graph.dependencies(of: "missing"), [])
+    }
 }

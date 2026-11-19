@@ -3118,9 +3118,10 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertNil(supervisor.lastError)
     }
 
-    /// The Start control of a row: only for a daemon of the profile that has no
-    /// process while the environment runs.
-    func testTheRowOffersStartOnlyForAStoppedDaemonOfTheProfile() throws {
+    /// The Start control of a row: for a daemon that has no process. In a running
+    /// stack a service outside the profile can start too (it joins the run). In a
+    /// stopped stack each daemon has it: the run is then that service and what it needs.
+    func testTheRowOffersStartForADaemonWithNoProcess() throws {
         func service(_ id: String, type: ServiceType = .daemon) -> ServiceDefinition {
             ServiceDefinition(
                 id: id, name: id, cmd: ["sleep", "1"], cwd: workDir.path, probe: nil, type: type, restart: .never,
@@ -3136,17 +3137,36 @@ final class SupervisorLifecycleTests: XCTestCase {
         XCTAssertTrue(supervisor.canStartFromRow(state("stripe")))
         state("stripe").phase = .stopped
         XCTAssertTrue(supervisor.canStartFromRow(state("stripe")))
+        XCTAssertTrue(supervisor.canStartFromRow(state("partner-portal")), "outside the profile: it joins the run")
 
         // Negative controls.
-        XCTAssertFalse(supervisor.canStartFromRow(state("partner-portal")), "outside the profile")
         XCTAssertFalse(supervisor.canStartFromRow(state("seed")), "a oneshot")
-        for phase in [ServicePhase.running, .starting, .failed, .pending] {
+        XCTAssertEqual(supervisor.startRefusal(state("seed")), "seed is a one-shot step: use Run again.")
+        for phase in [ServicePhase.running, .starting, .pending] {
             state("stripe").phase = phase
-            XCTAssertFalse(supervisor.canStartFromRow(state("stripe")), phase.rawValue)
+            XCTAssertEqual(supervisor.startRefusal(state("stripe")), "stripe already runs or starts.", phase.rawValue)
         }
-        state("stripe").phase = .skipped
+        state("stripe").phase = .failed
+        XCTAssertEqual(supervisor.startRefusal(state("stripe")), "stripe failed: use Restart.")
+
+        // A stopped stack: Start on a row begins a run of that service, whatever its phase was.
         supervisor.health = .stopped
-        XCTAssertFalse(supervisor.canStartFromRow(state("stripe")), "the environment is stopped: Start All is the control")
+        for phase in [ServicePhase.skipped, .stopped, .pending, .failed] {
+            state("stripe").phase = phase
+            XCTAssertTrue(supervisor.canStartFromRow(state("stripe")), phase.rawValue)
+        }
+        XCTAssertTrue(supervisor.canStartFromRow(state("partner-portal")))
+        XCTAssertFalse(supervisor.canStartFromRow(state("seed")), "a oneshot has no Start in a stopped stack either")
+
+        // Stop: only for a service that runs, starts, waits or failed.
+        for (phase, offered) in [(ServicePhase.running, true), (.starting, true), (.waiting, true), (.failed, true),
+                                 (.stopped, false), (.skipped, false), (.pending, false), (.completed, false)] {
+            state("stripe").phase = phase
+            XCTAssertEqual(supervisor.canStopFromRow(state("stripe")), offered, phase.rawValue)
+        }
+        // A one-shot ends by itself, and has no Start that would bring it back.
+        state("seed").phase = .running
+        XCTAssertEqual(supervisor.stopRefusal(state("seed")), "seed is a one-shot step: it ends by itself.")
     }
 
     private func stripe(_ script: String) -> ServiceDefinition {
